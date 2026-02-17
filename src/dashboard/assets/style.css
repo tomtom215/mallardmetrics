@@ -40,3 +40,20 @@ h3 { font-size: 1rem; margin-bottom: 0.75rem; color: #555; }
 .breakdown-table tr:last-child td { border-bottom: none; }
 .breakdown-table td:nth-child(2), .breakdown-table td:nth-child(3),
 .breakdown-table th:nth-child(2), .breakdown-table th:nth-child(3) { text-align: right; }
+
+/* Analytics controls */
+.analytics-controls { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }
+.analytics-controls input { padding: 0.5rem; border: 1px solid #ddd; border-radius: 4px; flex: 1; font-size: 0.875rem; }
+.analytics-card { background: #fff; border-radius: 8px; padding: 1rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+
+/* Funnel chart */
+.funnel-chart { display: flex; flex-direction: column; gap: 0.5rem; }
+.funnel-step { display: flex; flex-direction: column; gap: 0.25rem; }
+.funnel-label { font-size: 0.875rem; color: #444; }
+.funnel-bar { height: 24px; background: #4a90d9; border-radius: 4px; min-width: 40px; transition: width 0.3s; }
+
+/* Retention table */
+.retention-table-wrap { overflow-x: auto; }
+.retention-table th, .retention-table td { text-align: center; min-width: 40px; }
+.retained-yes { background: #e8f5e9; color: #2e7d32; font-weight: 600; }
+.retained-no { background: #fafafa; color: #bbb; }

@@ -450,3 +450,207 @@ async fn test_health_check() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(&body[..], b"ok");
 }
+
+// --- Phase 3: Behavioral Analytics API integration tests ---
+
+#[tokio::test]
+async fn test_sessions_endpoint_returns_ok() {
+    let (state, _dir) = make_test_state();
+    {
+        let conn = state.buffer.conn().lock();
+        conn.execute(
+            "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname)
+             VALUES ('test.com', 'v1', CURRENT_TIMESTAMP, 'pageview', '/')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let app = build_router(Arc::clone(&state));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/sessions?site_id=test.com&period=30d")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Returns 200 OK with graceful degradation even without behavioral extension
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    // Should have session metric fields
+    assert!(json.get("total_sessions").is_some());
+    assert!(json.get("avg_session_duration_secs").is_some());
+    assert!(json.get("avg_pages_per_session").is_some());
+}
+
+#[tokio::test]
+async fn test_funnel_endpoint_with_valid_steps() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/funnel?site_id=test.com&period=30d&steps=page%3A%2F%2Cevent%3Asignup&window=1%20day")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Returns 200 OK with graceful degradation
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_funnel_endpoint_rejects_invalid_steps() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/funnel?site_id=test.com&period=30d&steps=DROP%20TABLE%20events&window=1%20day")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_funnel_endpoint_rejects_invalid_window() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/funnel?site_id=test.com&period=30d&steps=page%3A%2F&window=1%20day%3B%20DROP%20TABLE")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_retention_endpoint_returns_ok() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/retention?site_id=test.com&period=90d&weeks=4")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_retention_endpoint_rejects_invalid_weeks() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/retention?site_id=test.com&period=90d&weeks=0")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_sequences_endpoint_returns_ok() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/sequences?site_id=test.com&period=30d&steps=page%3A%2F%2Cevent%3Asignup")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.get("converting_visitors").is_some());
+    assert!(json.get("total_visitors").is_some());
+    assert!(json.get("conversion_rate").is_some());
+}
+
+#[tokio::test]
+async fn test_sequences_endpoint_requires_two_steps() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/sequences?site_id=test.com&period=30d&steps=page%3A%2F")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_flow_endpoint_returns_ok() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/flow?site_id=test.com&period=30d&page=/")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_flow_endpoint_rejects_empty_page() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/flow?site_id=test.com&period=30d&page=")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

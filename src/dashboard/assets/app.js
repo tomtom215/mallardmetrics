@@ -99,6 +99,120 @@ function BreakdownTable({ title, data }) {
   `;
 }
 
+function SessionCards({ data }) {
+  if (!data) return null;
+  return html`
+    <div class="metrics-grid session-metrics">
+      <div class="metric-card">
+        <div class="metric-value">${data.total_sessions}</div>
+        <div class="metric-label">Total Sessions</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-value">${data.avg_session_duration_secs.toFixed(1)}s</div>
+        <div class="metric-label">Avg Duration</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-value">${data.avg_pages_per_session.toFixed(1)}</div>
+        <div class="metric-label">Pages / Session</div>
+      </div>
+    </div>
+  `;
+}
+
+function FunnelChart({ data }) {
+  if (!data || data.length === 0) {
+    return html`<div class="chart-empty">No funnel data</div>`;
+  }
+
+  const maxVisitors = Math.max(1, ...data.map(d => d.visitors));
+  return html`
+    <div class="funnel-chart">
+      ${data.map((step, i) => {
+        const pct = (step.visitors / maxVisitors * 100).toFixed(1);
+        const width = Math.max(10, step.visitors / maxVisitors * 100);
+        return html`
+          <div class="funnel-step">
+            <div class="funnel-label">Step ${step.step}: ${step.visitors} visitors (${pct}%)</div>
+            <div class="funnel-bar" style="width: ${width}%"></div>
+          </div>
+        `;
+      })}
+    </div>
+  `;
+}
+
+function RetentionGrid({ data }) {
+  if (!data || data.length === 0) {
+    return html`<div class="chart-empty">No retention data</div>`;
+  }
+
+  const maxWeeks = Math.max(...data.map(d => d.retained.length));
+  return html`
+    <div class="retention-table-wrap">
+      <table class="breakdown-table retention-table">
+        <thead>
+          <tr>
+            <th>Cohort</th>
+            ${Array.from({ length: maxWeeks }, (_, i) => html`<th>W${i}</th>`)}
+          </tr>
+        </thead>
+        <tbody>
+          ${data.map(row => html`
+            <tr>
+              <td>${row.cohort_date}</td>
+              ${row.retained.map(r => html`
+                <td class=${r ? 'retained-yes' : 'retained-no'}>${r ? 'Y' : '-'}</td>
+              `)}
+            </tr>
+          `)}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function SequenceResult({ data }) {
+  if (!data) return null;
+  return html`
+    <div class="metrics-grid">
+      <div class="metric-card">
+        <div class="metric-value">${data.converting_visitors}</div>
+        <div class="metric-label">Converting</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-value">${data.total_visitors}</div>
+        <div class="metric-label">Total</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-value">${(data.conversion_rate * 100).toFixed(1)}%</div>
+        <div class="metric-label">Conversion Rate</div>
+      </div>
+    </div>
+  `;
+}
+
+function FlowTable({ data }) {
+  if (!data || data.length === 0) {
+    return html`<div class="chart-empty">No flow data</div>`;
+  }
+
+  return html`
+    <table class="breakdown-table">
+      <thead>
+        <tr><th>Next Page</th><th>Visitors</th></tr>
+      </thead>
+      <tbody>
+        ${data.map(row => html`
+          <tr>
+            <td>${row.next_page}</td>
+            <td>${row.visitors}</td>
+          </tr>
+        `)}
+      </tbody>
+    </table>
+  `;
+}
+
 class Dashboard extends Component {
   constructor() {
     super();
@@ -106,22 +220,30 @@ class Dashboard extends Component {
       metrics: null,
       timeseries: null,
       breakdowns: {},
+      sessions: null,
+      funnel: null,
+      retention: null,
+      sequences: null,
+      flow: null,
       period: '30d',
       siteId: '',
       loading: false,
       error: null,
+      funnelSteps: 'page:/,page:/pricing,event:signup',
+      sequenceSteps: 'page:/,event:signup',
+      flowPage: '/',
     };
   }
 
   async fetchMetrics() {
-    const { siteId, period } = this.state;
+    const { siteId, period, funnelSteps, sequenceSteps, flowPage } = this.state;
     if (!siteId) return;
 
     this.setState({ loading: true, error: null });
     const qs = `site_id=${encodeURIComponent(siteId)}&period=${period}`;
 
     try {
-      const [mainRes, tsRes, pagesRes, sourcesRes, browsersRes, osRes, devicesRes, countriesRes] =
+      const [mainRes, tsRes, pagesRes, sourcesRes, browsersRes, osRes, devicesRes, countriesRes, sessionsRes] =
         await Promise.all([
           fetch(`/api/stats/main?${qs}`),
           fetch(`/api/stats/timeseries?${qs}`),
@@ -131,6 +253,7 @@ class Dashboard extends Component {
           fetch(`/api/stats/breakdown/os?${qs}`),
           fetch(`/api/stats/breakdown/devices?${qs}`),
           fetch(`/api/stats/breakdown/countries?${qs}`),
+          fetch(`/api/stats/sessions?${qs}`),
         ]);
 
       if (!mainRes.ok) throw new Error(`HTTP ${mainRes.status}`);
@@ -145,15 +268,29 @@ class Dashboard extends Component {
         devices: devicesRes.ok ? await devicesRes.json() : [],
         countries: countriesRes.ok ? await countriesRes.json() : [],
       };
+      const sessions = sessionsRes.ok ? await sessionsRes.json() : null;
 
-      this.setState({ metrics, timeseries, breakdowns, loading: false });
+      // Fetch behavioral analytics (these may fail without the extension)
+      const [funnelRes, retentionRes, seqRes, flowRes] = await Promise.all([
+        fetch(`/api/stats/funnel?${qs}&steps=${encodeURIComponent(funnelSteps)}&window=1 day`),
+        fetch(`/api/stats/retention?${qs}&weeks=4`),
+        fetch(`/api/stats/sequences?${qs}&steps=${encodeURIComponent(sequenceSteps)}`),
+        fetch(`/api/stats/flow?${qs}&page=${encodeURIComponent(flowPage)}`),
+      ]);
+
+      const funnel = funnelRes.ok ? await funnelRes.json() : null;
+      const retention = retentionRes.ok ? await retentionRes.json() : null;
+      const sequences = seqRes.ok ? await seqRes.json() : null;
+      const flow = flowRes.ok ? await flowRes.json() : null;
+
+      this.setState({ metrics, timeseries, breakdowns, sessions, funnel, retention, sequences, flow, loading: false });
     } catch (e) {
       this.setState({ error: e.message, loading: false });
     }
   }
 
   render() {
-    const { metrics, timeseries, breakdowns, period, siteId, loading, error } = this.state;
+    const { metrics, timeseries, breakdowns, sessions, funnel, retention, sequences, flow, period, siteId, loading, error, funnelSteps, sequenceSteps, flowPage } = this.state;
 
     return html`
       <div class="dashboard">
@@ -207,6 +344,12 @@ class Dashboard extends Component {
             <${TimeseriesChart} data=${timeseries} />
           </section>
         `}
+        ${sessions && html`
+          <section class="section">
+            <h2>Sessions</h2>
+            <${SessionCards} data=${sessions} />
+          </section>
+        `}
         ${metrics && html`
           <section class="section">
             <h2>Breakdowns</h2>
@@ -217,6 +360,62 @@ class Dashboard extends Component {
               <${BreakdownTable} title="OS" data=${breakdowns.os} />
               <${BreakdownTable} title="Devices" data=${breakdowns.devices} />
               <${BreakdownTable} title="Countries" data=${breakdowns.countries} />
+            </div>
+          </section>
+        `}
+        ${metrics && html`
+          <section class="section">
+            <h2>Funnel Analysis</h2>
+            <div class="analytics-controls">
+              <input
+                type="text"
+                placeholder="Steps (e.g., page:/,page:/pricing,event:signup)"
+                value=${funnelSteps}
+                onInput=${(e) => this.setState({ funnelSteps: e.target.value })}
+              />
+            </div>
+            <div class="analytics-card">
+              <${FunnelChart} data=${funnel} />
+            </div>
+          </section>
+        `}
+        ${metrics && html`
+          <section class="section">
+            <h2>Retention Cohorts</h2>
+            <div class="analytics-card">
+              <${RetentionGrid} data=${retention} />
+            </div>
+          </section>
+        `}
+        ${metrics && html`
+          <section class="section">
+            <h2>Sequence Analysis</h2>
+            <div class="analytics-controls">
+              <input
+                type="text"
+                placeholder="Steps (e.g., page:/,event:signup)"
+                value=${sequenceSteps}
+                onInput=${(e) => this.setState({ sequenceSteps: e.target.value })}
+              />
+            </div>
+            <div class="analytics-card">
+              <${SequenceResult} data=${sequences} />
+            </div>
+          </section>
+        `}
+        ${metrics && html`
+          <section class="section">
+            <h2>Flow Analysis</h2>
+            <div class="analytics-controls">
+              <input
+                type="text"
+                placeholder="Page path (e.g., /)"
+                value=${flowPage}
+                onInput=${(e) => this.setState({ flowPage: e.target.value })}
+              />
+            </div>
+            <div class="analytics-card">
+              <${FlowTable} data=${flow} />
             </div>
           </section>
         `}

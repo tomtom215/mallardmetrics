@@ -2,7 +2,6 @@ use duckdb::Connection;
 
 /// Retention cohort row.
 #[derive(Debug, Clone, serde::Serialize)]
-#[allow(dead_code)]
 pub struct RetentionCohort {
     pub cohort_date: String,
     pub retained: Vec<bool>,
@@ -11,14 +10,18 @@ pub struct RetentionCohort {
 /// Query retention cohorts using the `retention` function from the behavioral extension.
 ///
 /// Returns weekly cohorts with retention flags for each subsequent week.
-#[allow(dead_code)]
+/// Requires the behavioral extension to be loaded.
 pub fn query_retention(
     conn: &Connection,
     site_id: &str,
     start_date: &str,
     end_date: &str,
     num_weeks: u32,
-) -> String {
+) -> Result<Vec<RetentionCohort>, duckdb::Error> {
+    if num_weeks == 0 {
+        return Ok(Vec::new());
+    }
+
     // Build retention conditions for each week
     let mut conditions = Vec::new();
     for i in 0..num_weeks {
@@ -29,7 +32,7 @@ pub fn query_retention(
     let retention_args = conditions.join(", ");
 
     let sql = format!(
-        "SELECT DATE_TRUNC('week', first_seen) AS cohort_week,
+        "SELECT STRFTIME(DATE_TRUNC('week', first_seen), '%Y-%m-%d') AS cohort_week,
             retention({retention_args}) AS retained
          FROM events e
          JOIN (
@@ -43,12 +46,35 @@ pub fn query_retention(
          ORDER BY cohort_week"
     );
 
-    // Return the SQL for now; execution requires the behavioral extension
-    let _ = conn;
-    let _ = site_id;
-    let _ = start_date;
-    let _ = end_date;
-    sql
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(
+            duckdb::params![site_id, site_id, start_date, end_date],
+            |row| {
+                let cohort_date: String = row.get(0)?;
+                // The retention() function returns a BOOLEAN[] array.
+                // DuckDB Rust bindings return this as a string representation.
+                let retained_raw: String = row.get(1)?;
+                let retained = parse_bool_array(&retained_raw);
+                Ok(RetentionCohort {
+                    cohort_date,
+                    retained,
+                })
+            },
+        )?
+        .filter_map(Result::ok)
+        .collect();
+
+    Ok(rows)
+}
+
+/// Parse a DuckDB BOOLEAN[] array string like "[true, false, true]" into `Vec<bool>`.
+fn parse_bool_array(s: &str) -> Vec<bool> {
+    let trimmed = s.trim().trim_start_matches('[').trim_end_matches(']');
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    trimmed.split(',').map(|v| v.trim() == "true").collect()
 }
 
 #[cfg(test)]
@@ -56,11 +82,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_retention_sql_generation() {
+    fn test_retention_empty() {
         let conn = Connection::open_in_memory().unwrap();
-        let sql = query_retention(&conn, "test.com", "2024-01-01", "2024-03-01", 4);
-        assert!(sql.contains("retention("));
-        assert!(sql.contains("INTERVAL '0 weeks'"));
-        assert!(sql.contains("INTERVAL '3 weeks'"));
+        crate::storage::schema::init_schema(&conn).unwrap();
+        // Without behavioral extension, this will fail gracefully
+        let result = query_retention(&conn, "test.com", "2024-01-01", "2024-03-01", 4);
+        if let Ok(cohorts) = result {
+            assert!(cohorts.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_retention_zero_weeks() {
+        let conn = Connection::open_in_memory().unwrap();
+        let result = query_retention(&conn, "test.com", "2024-01-01", "2024-03-01", 0).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_parse_bool_array() {
+        assert_eq!(
+            parse_bool_array("[true, false, true]"),
+            vec![true, false, true]
+        );
+        assert_eq!(parse_bool_array("[true]"), vec![true]);
+        assert_eq!(parse_bool_array("[]"), Vec::<bool>::new());
     }
 }

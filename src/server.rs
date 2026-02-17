@@ -1,4 +1,4 @@
-use crate::api::{funnels, stats};
+use crate::api::stats;
 use crate::dashboard;
 use crate::ingest::handler::{ingest_event, AppState};
 use axum::routing::{get, post};
@@ -36,7 +36,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/stats/breakdown/countries",
             get(stats::get_countries_breakdown),
         )
-        .route("/funnels", get(funnels::get_funnel));
+        .route("/stats/sessions", get(stats::get_sessions))
+        .route("/stats/funnel", get(stats::get_funnel))
+        .route("/stats/retention", get(stats::get_retention))
+        .route("/stats/sequences", get(stats::get_sequences))
+        .route("/stats/flow", get(stats::get_flow));
 
     Router::new()
         .route("/health", get(health_check))
