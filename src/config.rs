@@ -110,6 +110,12 @@ impl Config {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::Mutex;
+
+    /// Mutex to serialize tests that call `Config::load`, which reads
+    /// environment variables. Without this, `test_env_var_overrides` can
+    /// pollute other tests running in parallel.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_default_config() {
@@ -124,6 +130,7 @@ mod tests {
 
     #[test]
     fn test_load_from_toml() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         let mut file = std::fs::File::create(&config_path).unwrap();
@@ -151,12 +158,14 @@ site_ids = ["example.com", "other.org"]
 
     #[test]
     fn test_load_missing_file_uses_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let config = Config::load(Some(Path::new("/nonexistent/config.toml")));
         assert_eq!(config.port, 8000);
     }
 
     #[test]
     fn test_load_no_path_uses_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let config = Config::load(None);
         assert_eq!(config.port, 8000);
         assert_eq!(config.host, "0.0.0.0");
@@ -173,6 +182,8 @@ site_ids = ["example.com", "other.org"]
 
     #[test]
     fn test_env_var_overrides() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
         // Save original values
         let orig_port = std::env::var("MALLARD_PORT").ok();
 
@@ -189,6 +200,7 @@ site_ids = ["example.com", "other.org"]
 
     #[test]
     fn test_invalid_toml_uses_defaults() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
         std::fs::write(&config_path, "this is not valid toml {{{").unwrap();
