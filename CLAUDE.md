@@ -20,7 +20,7 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 # Build
 cargo build
 
-# Run all tests (111 total: 104 unit + 7 integration)
+# Run all tests (138 total: 116 unit + 22 integration)
 cargo test
 
 # Clippy (zero warnings required)
@@ -51,9 +51,9 @@ cargo bench
 
 | Metric | Value | Verified |
 |---|---|---|
-| Unit tests | 104 | `cargo test --lib` |
-| Integration tests | 7 | `cargo test --test ingest_test` |
-| Total tests | 111 | `cargo test` |
+| Unit tests | 116 | `cargo test --lib` |
+| Integration tests | 22 | `cargo test --test ingest_test` |
+| Total tests | 138 | `cargo test` |
 | Clippy warnings | 0 | `cargo clippy --all-targets` |
 | Format violations | 0 | `cargo fmt -- --check` |
 | CI jobs | 10 | `.github/workflows/ci.yml` |
@@ -77,13 +77,13 @@ cargo bench
 | `query/timeseries.rs` | Time-bucketed aggregations |
 | `query/sessions.rs` | sessionize-based session queries |
 | `query/funnel.rs` | window_funnel query builder |
-| `query/retention.rs` | retention query builder |
-| `query/sequences.rs` | sequence_match/count query builder |
-| `query/flow.rs` | sequence_next_node query builder |
-| `api/stats.rs` | Dashboard API handlers |
+| `query/retention.rs` | retention cohort query execution |
+| `query/sequences.rs` | sequence_match query execution |
+| `query/flow.rs` | sequence_next_node flow analysis |
+| `api/stats.rs` | All analytics API handlers (core, sessions, funnel, retention, sequences, flow) |
 | `api/errors.rs` | API error types |
-| `api/auth.rs` | Authentication (stub for Phase 1) |
-| `dashboard/` | Embedded SPA (Preact + HTM) |
+| `api/auth.rs` | Origin validation + authentication stub |
+| `dashboard/` | Embedded SPA (Preact + HTM) with 5 advanced analytics views |
 
 ## Session Protocol
 
@@ -139,3 +139,76 @@ cargo bench
 - Query metrics (unique visitors, pageviews, date ranges)
 - Breakdowns (by page, browser, with limits, null handling)
 - Timeseries (daily, hourly)
+
+### Session 2: Phase 2 — Dashboard & Integration Fixes
+
+**Changes:**
+- **Task 2.1:** Integrated UA parser into ingestion handler — `parse_user_agent()` now called from `ingest_event()`, replacing hardcoded `None` values for browser, browser_version, os, os_version fields (`handler.rs:93-94`)
+- **Task 2.2:** Integrated GeoIP stub into ingestion handler — `geoip::lookup()` now called from `ingest_event()`, replacing hardcoded `None` values for country_code, region, city fields (`handler.rs:97`). Returns `None` for all fields until Phase 4 MaxMind integration.
+- **Task 2.3:** Added timeseries line chart to dashboard — SVG-based chart component renders visitors (solid blue) and pageviews (dashed green) lines using existing `/api/stats/timeseries` endpoint. Zero external dependencies.
+- **Task 2.4:** Added all 6 breakdown tables to dashboard — Pages, Sources, Browsers, OS, Devices, and Countries breakdowns fetched via `Promise.all()` from existing API endpoints. Displayed in responsive grid layout.
+- **Task 2.5:** Enhanced tracking script with custom events and revenue support — exposed `window.mallard(eventName, options)` public API. Supports `props` (custom properties), `revenue`, `currency`, and `callback` options. Script size: 774 bytes (under 1KB constraint).
+- **Task 2.6:** Integrated origin validation into ingestion handler — `validate_origin()` now called from `ingest_event()` using `allowed_sites` from config. Returns 403 Forbidden for disallowed origins. Empty `site_ids` config allows all origins (default behavior).
+- Removed all `#[allow(dead_code)]` annotations from newly-wired code: `parse_user_agent`, `ParsedUserAgent`, `detect_browser`, `detect_browser_version`, `detect_os`, `detect_os_version`, `extract_version_after`, `GeoInfo`, `geoip::lookup`, `validate_origin`, `Config.site_ids`
+- Added `allowed_sites` field to `AppState` struct
+
+**Test results:**
+- 104 unit tests passing (`cargo test --lib`)
+- 12 integration tests passing (`cargo test --test ingest_test`)
+- Total: 116 tests, 0 failures, 0 ignored
+- 0 clippy warnings (`cargo clippy --all-targets`)
+- 0 formatting violations (`cargo fmt -- --check`)
+
+**New integration tests added (5):**
+- `test_ua_parsing_populates_browser_os_fields` — verifies Chrome/Windows UA produces correct browser/OS fields in Parquet
+- `test_ua_parsing_firefox_on_linux` — verifies Firefox/Linux UA produces correct fields
+- `test_origin_validation_rejects_disallowed_origin` — verifies 403 for non-matching origin
+- `test_origin_validation_allows_matching_origin` — verifies 202 for matching origin
+- `test_origin_validation_allows_no_origin_header` — verifies 202 when no Origin header (server-side requests)
+
+### Session 3: Phase 3 — Behavioral Analytics (Advanced Queries)
+
+**Changes:**
+- **Task 3.1:** Wired session analytics — `query_session_metrics()` now exposed via `GET /api/stats/sessions`. Removed `#[allow(dead_code)]` from `sessions.rs`. Handler returns graceful defaults (all zeros) when behavioral extension is unavailable. Dashboard shows session cards (total sessions, avg duration, pages/session).
+- **Task 3.2:** Replaced funnel 501 stub — `GET /api/stats/funnel` now accepts `steps` parameter in safe `page:/path` or `event:name` format, parsed by `parse_funnel_step()` which prevents SQL injection. Validates `window` interval via `is_safe_interval()`. Removed `funnels.rs` stub; handler moved to `stats.rs`. Dashboard shows horizontal bar funnel visualization with configurable steps.
+- **Task 3.3:** Refactored retention from SQL-string-builder to executor — `query_retention()` now returns `Result<Vec<RetentionCohort>>` instead of `String`. Executes the SQL with parameterized site_id/dates. Parses DuckDB `BOOLEAN[]` array output via `parse_bool_array()`. Uses `STRFTIME` for consistent date formatting (L6). Dashboard shows retention cohort grid table.
+- **Task 3.4:** Refactored sequences from SQL-string-builders to executor — Replaced `build_sequence_match_sql(pattern, conditions)` and `build_sequence_count_sql` with `execute_sequence_match()` that builds safe patterns from condition count (`(?1).*(?2)`) instead of accepting raw pattern strings. API accepts safe `page:/event:` step format (same as funnel). Dashboard shows conversion metrics cards.
+- **Task 3.5:** Fixed flow analysis SQL injection — `build_flow_sql(target_page)` replaced with `query_flow()` that escapes single quotes in `target_page` via `replace('\'', "''")`. API validates page path length. Added `FlowNode` result struct. Dashboard shows next-page table.
+- Removed `api/funnels.rs` module (stub replaced)
+- Removed all `#[allow(dead_code)]` from: `SessionMetrics`, `query_session_metrics`, `query_funnel`, `RetentionCohort`, `SequenceMatchResult`, `FlowNode`
+- All 5 new routes registered in `server.rs`: `/api/stats/sessions`, `/api/stats/funnel`, `/api/stats/retention`, `/api/stats/sequences`, `/api/stats/flow`
+- All features degrade gracefully without behavioral extension (return defaults/empty results)
+
+**Test results:**
+- 116 unit tests passing (`cargo test --lib`)
+- 22 integration tests passing (`cargo test --test ingest_test`)
+- Total: 138 tests, 0 failures, 0 ignored
+- 0 clippy warnings (`cargo clippy --all-targets`)
+- 0 formatting violations (`cargo fmt -- --check`)
+- Documentation builds without errors (`cargo doc --no-deps`)
+
+**New unit tests added (12):**
+- `test_parse_funnel_step_page` — validates `page:/pricing` → `pathname = '/pricing'`
+- `test_parse_funnel_step_event` — validates `event:signup` → `event_name = 'signup'`
+- `test_parse_funnel_step_escapes_quotes` — validates single-quote escaping
+- `test_parse_funnel_step_invalid_format` — rejects arbitrary strings
+- `test_is_safe_interval_valid` — validates safe interval formats
+- `test_is_safe_interval_invalid` — rejects injection attempts in intervals
+- `test_retention_zero_weeks` — validates early return for zero weeks
+- `test_parse_bool_array` — validates DuckDB BOOLEAN[] parsing
+- `test_build_pattern` — validates sequence pattern generation
+- `test_execute_empty_conditions` — validates early return for empty sequences
+- `test_query_flow_escapes_quotes` — validates SQL injection prevention in flow
+- `test_session_metrics_with_data_no_extension` — validates graceful degradation
+
+**New integration tests added (10):**
+- `test_sessions_endpoint_returns_ok` — verifies 200 with session metric fields
+- `test_funnel_endpoint_with_valid_steps` — verifies 200 with valid step format
+- `test_funnel_endpoint_rejects_invalid_steps` — verifies 400 for SQL injection attempts
+- `test_funnel_endpoint_rejects_invalid_window` — verifies 400 for malicious window intervals
+- `test_retention_endpoint_returns_ok` — verifies 200 for retention query
+- `test_retention_endpoint_rejects_invalid_weeks` — verifies 400 for weeks=0
+- `test_sequences_endpoint_returns_ok` — verifies 200 with conversion metrics
+- `test_sequences_endpoint_requires_two_steps` — verifies 400 for single step
+- `test_flow_endpoint_returns_ok` — verifies 200 for flow analysis
+- `test_flow_endpoint_rejects_empty_page` — verifies 400 for empty page path

@@ -84,6 +84,7 @@ async fn main() {
             tracing::warn!("No MALLARD_SECRET set, using random secret: {secret}. Set MALLARD_SECRET for deterministic visitor IDs across restarts.");
             secret
         }),
+        allowed_sites: config.site_ids,
     });
 
     let app = server::build_router(state);

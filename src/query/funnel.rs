@@ -11,7 +11,6 @@ pub struct FunnelStep {
 ///
 /// `steps` defines the funnel conditions as SQL boolean expressions.
 /// `window_interval` is the maximum time between first and last step (e.g., "1 day").
-#[allow(dead_code)]
 pub fn query_funnel(
     conn: &Connection,
     site_id: &str,

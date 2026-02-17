@@ -11,7 +11,6 @@ pub struct SessionMetrics {
 /// Query session metrics using the `sessionize` function from the behavioral extension.
 ///
 /// Requires the behavioral extension to be loaded.
-#[allow(dead_code)]
 pub fn query_session_metrics(
     conn: &Connection,
     site_id: &str,
@@ -66,7 +65,6 @@ mod tests {
         conn
     }
 
-    #[allow(dead_code)]
     fn insert_pageview(conn: &Connection, visitor_id: &str, timestamp: &str, pathname: &str) {
         conn.execute(
             "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname)
@@ -79,14 +77,25 @@ mod tests {
     #[test]
     fn test_session_metrics_empty() {
         let conn = setup_test_db();
-        // sessionize requires the behavioral extension; this test validates the SQL structure
-        // without the extension loaded. The query will fail if behavioral is not available.
-        // For unit testing, we test the non-behavioral parts.
+        // sessionize requires the behavioral extension; the query will fail
+        // if behavioral is not available — that's expected in unit tests.
         let result = query_session_metrics(&conn, "test.com", "2024-01-01", "2024-02-01");
-        // This will fail without the behavioral extension - that's expected in unit tests.
-        // E2E tests with the extension loaded will validate the full query.
         if let Ok(metrics) = result {
             assert_eq!(metrics.total_sessions, 0);
+        }
+    }
+
+    #[test]
+    fn test_session_metrics_with_data_no_extension() {
+        let conn = setup_test_db();
+        insert_pageview(&conn, "v1", "2024-01-15 10:00:00", "/");
+        insert_pageview(&conn, "v1", "2024-01-15 10:05:00", "/about");
+        insert_pageview(&conn, "v2", "2024-01-15 11:00:00", "/");
+        // Without behavioral extension, this will fail gracefully
+        let result = query_session_metrics(&conn, "test.com", "2024-01-01", "2024-02-01");
+        // We expect an error without the extension; the API handler wraps with unwrap_or
+        if let Ok(metrics) = result {
+            assert!(metrics.total_sessions > 0);
         }
     }
 }

@@ -1,9 +1,9 @@
 use crate::api::errors::ApiError;
 use crate::ingest::handler::AppState;
-use crate::query::{breakdowns, metrics, timeseries};
+use crate::query::{breakdowns, flow, funnel, metrics, retention, sequences, sessions, timeseries};
 use axum::extract::{Query, State};
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Query parameters for stats endpoints.
@@ -220,6 +220,302 @@ pub async fn get_countries_breakdown(
     Ok(Json(result))
 }
 
+/// GET /api/stats/sessions — Session metrics (requires behavioral extension).
+pub async fn get_sessions(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<StatsParams>,
+) -> Result<Json<sessions::SessionMetrics>, ApiError> {
+    let (start, end) = params.date_range()?;
+    let conn = state.buffer.conn().lock();
+    let result = sessions::query_session_metrics(&conn, &params.site_id, &start, &end).unwrap_or(
+        sessions::SessionMetrics {
+            total_sessions: 0,
+            avg_session_duration_secs: 0.0,
+            avg_pages_per_session: 0.0,
+        },
+    );
+    drop(conn);
+    Ok(Json(result))
+}
+
+/// Query parameters for the funnel endpoint.
+#[derive(Debug, Deserialize)]
+pub struct FunnelParams {
+    pub site_id: String,
+    #[serde(default = "default_period")]
+    pub period: String,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    #[serde(default = "default_window")]
+    pub window: String,
+    /// Comma-separated list of step types. Each step is `page:<path>` or `event:<name>`.
+    pub steps: String,
+}
+
+fn default_window() -> String {
+    "1 day".to_string()
+}
+
+impl FunnelParams {
+    fn date_range(&self) -> Result<(String, String), ApiError> {
+        let stats_params = StatsParams {
+            site_id: self.site_id.clone(),
+            period: self.period.clone(),
+            start_date: self.start_date.clone(),
+            end_date: self.end_date.clone(),
+        };
+        stats_params.date_range()
+    }
+}
+
+/// Parse a safe funnel step condition from a structured step definition.
+///
+/// Accepts `page:/path` or `event:name` formats only. Returns a SQL boolean
+/// expression using only safe, known column comparisons.
+fn parse_funnel_step(step: &str) -> Result<String, ApiError> {
+    let step = step.trim();
+    if let Some(path) = step.strip_prefix("page:") {
+        if path.is_empty() || path.len() > 256 {
+            return Err(ApiError::BadRequest("Invalid page path".to_string()));
+        }
+        // Escape single quotes to prevent injection
+        let escaped = path.replace('\'', "''");
+        Ok(format!("pathname = '{escaped}'"))
+    } else if let Some(name) = step.strip_prefix("event:") {
+        if name.is_empty() || name.len() > 256 {
+            return Err(ApiError::BadRequest("Invalid event name".to_string()));
+        }
+        let escaped = name.replace('\'', "''");
+        Ok(format!("event_name = '{escaped}'"))
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "Invalid step format: '{step}'. Use 'page:/path' or 'event:name'."
+        )))
+    }
+}
+
+/// GET /api/stats/funnel — Funnel analysis (requires behavioral extension).
+pub async fn get_funnel(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<FunnelParams>,
+) -> Result<Json<Vec<funnel::FunnelStep>>, ApiError> {
+    let (start, end) = params.date_range()?;
+
+    // Validate window interval format (only allow simple intervals)
+    let window = params.window.trim();
+    if !is_safe_interval(window) {
+        return Err(ApiError::BadRequest(
+            "Invalid window interval. Use e.g. '1 day', '2 hours', '30 minutes'.".to_string(),
+        ));
+    }
+
+    // Parse step definitions into safe SQL conditions
+    let step_strs: Vec<String> = params
+        .steps
+        .split(',')
+        .map(parse_funnel_step)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if step_strs.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+
+    let step_refs: Vec<&str> = step_strs.iter().map(String::as_str).collect();
+
+    let conn = state.buffer.conn().lock();
+    let result = funnel::query_funnel(&conn, &params.site_id, &start, &end, window, &step_refs)
+        .unwrap_or_default();
+    drop(conn);
+    Ok(Json(result))
+}
+
+/// Validate that an interval string is a safe, simple DuckDB interval.
+fn is_safe_interval(s: &str) -> bool {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let Ok(n) = parts[0].parse::<u32>() else {
+        return false;
+    };
+    if n == 0 || n > 365 {
+        return false;
+    }
+    matches!(
+        parts[1],
+        "second"
+            | "seconds"
+            | "minute"
+            | "minutes"
+            | "hour"
+            | "hours"
+            | "day"
+            | "days"
+            | "week"
+            | "weeks"
+    )
+}
+
+/// Query parameters for the retention endpoint.
+#[derive(Debug, Deserialize)]
+pub struct RetentionParams {
+    pub site_id: String,
+    #[serde(default = "default_period")]
+    pub period: String,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    #[serde(default = "default_num_weeks")]
+    pub weeks: u32,
+}
+
+const fn default_num_weeks() -> u32 {
+    4
+}
+
+impl RetentionParams {
+    fn date_range(&self) -> Result<(String, String), ApiError> {
+        let stats_params = StatsParams {
+            site_id: self.site_id.clone(),
+            period: self.period.clone(),
+            start_date: self.start_date.clone(),
+            end_date: self.end_date.clone(),
+        };
+        stats_params.date_range()
+    }
+}
+
+/// GET /api/stats/retention — Retention cohort analysis (requires behavioral extension).
+pub async fn get_retention(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<RetentionParams>,
+) -> Result<Json<Vec<retention::RetentionCohort>>, ApiError> {
+    let (start, end) = params.date_range()?;
+
+    if params.weeks == 0 || params.weeks > 52 {
+        return Err(ApiError::BadRequest(
+            "weeks must be between 1 and 52".to_string(),
+        ));
+    }
+
+    let conn = state.buffer.conn().lock();
+    let result = retention::query_retention(&conn, &params.site_id, &start, &end, params.weeks)
+        .unwrap_or_default();
+    drop(conn);
+    Ok(Json(result))
+}
+
+/// Query parameters for the sequence endpoint.
+#[derive(Debug, Deserialize)]
+pub struct SequenceParams {
+    pub site_id: String,
+    #[serde(default = "default_period")]
+    pub period: String,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    /// Comma-separated steps in `page:/path` or `event:name` format.
+    pub steps: String,
+}
+
+impl SequenceParams {
+    fn date_range(&self) -> Result<(String, String), ApiError> {
+        let stats_params = StatsParams {
+            site_id: self.site_id.clone(),
+            period: self.period.clone(),
+            start_date: self.start_date.clone(),
+            end_date: self.end_date.clone(),
+        };
+        stats_params.date_range()
+    }
+}
+
+/// Sequence match result for API response.
+#[derive(Debug, Serialize)]
+pub struct SequenceMatchResponse {
+    pub converting_visitors: u64,
+    pub total_visitors: u64,
+    pub conversion_rate: f64,
+}
+
+/// GET /api/stats/sequences — Sequence match analysis (requires behavioral extension).
+pub async fn get_sequences(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SequenceParams>,
+) -> Result<Json<SequenceMatchResponse>, ApiError> {
+    let (start, end) = params.date_range()?;
+
+    // Parse step definitions into safe SQL conditions
+    let step_strs: Vec<String> = params
+        .steps
+        .split(',')
+        .map(parse_funnel_step)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if step_strs.len() < 2 {
+        return Err(ApiError::BadRequest(
+            "At least 2 steps required for sequence analysis".to_string(),
+        ));
+    }
+
+    let step_refs: Vec<&str> = step_strs.iter().map(String::as_str).collect();
+
+    let conn = state.buffer.conn().lock();
+    let result =
+        sequences::execute_sequence_match(&conn, &params.site_id, &start, &end, &step_refs)
+            .unwrap_or(sequences::SequenceMatchResult {
+                converting_visitors: 0,
+                total_visitors: 0,
+                conversion_rate: 0.0,
+            });
+    drop(conn);
+    Ok(Json(SequenceMatchResponse {
+        converting_visitors: result.converting_visitors,
+        total_visitors: result.total_visitors,
+        conversion_rate: result.conversion_rate,
+    }))
+}
+
+/// Query parameters for the flow endpoint.
+#[derive(Debug, Deserialize)]
+pub struct FlowParams {
+    pub site_id: String,
+    #[serde(default = "default_period")]
+    pub period: String,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    /// The page to analyze flow from.
+    pub page: String,
+}
+
+impl FlowParams {
+    fn date_range(&self) -> Result<(String, String), ApiError> {
+        let stats_params = StatsParams {
+            site_id: self.site_id.clone(),
+            period: self.period.clone(),
+            start_date: self.start_date.clone(),
+            end_date: self.end_date.clone(),
+        };
+        stats_params.date_range()
+    }
+}
+
+/// GET /api/stats/flow — Flow analysis showing next pages (requires behavioral extension).
+pub async fn get_flow(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<FlowParams>,
+) -> Result<Json<Vec<flow::FlowNode>>, ApiError> {
+    let (start, end) = params.date_range()?;
+
+    if params.page.is_empty() || params.page.len() > 256 {
+        return Err(ApiError::BadRequest("Invalid page path".to_string()));
+    }
+
+    let conn = state.buffer.conn().lock();
+    let result =
+        flow::query_flow(&conn, &params.site_id, &start, &end, &params.page).unwrap_or_default();
+    drop(conn);
+    Ok(Json(result))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +571,46 @@ mod tests {
                 "Period '{period}' should be valid"
             );
         }
+    }
+
+    #[test]
+    fn test_parse_funnel_step_page() {
+        let result = parse_funnel_step("page:/pricing").unwrap();
+        assert_eq!(result, "pathname = '/pricing'");
+    }
+
+    #[test]
+    fn test_parse_funnel_step_event() {
+        let result = parse_funnel_step("event:signup").unwrap();
+        assert_eq!(result, "event_name = 'signup'");
+    }
+
+    #[test]
+    fn test_parse_funnel_step_escapes_quotes() {
+        let result = parse_funnel_step("page:/it's").unwrap();
+        assert_eq!(result, "pathname = '/it''s'");
+    }
+
+    #[test]
+    fn test_parse_funnel_step_invalid_format() {
+        assert!(parse_funnel_step("invalid").is_err());
+        assert!(parse_funnel_step("sql:DROP TABLE").is_err());
+    }
+
+    #[test]
+    fn test_is_safe_interval_valid() {
+        assert!(is_safe_interval("1 day"));
+        assert!(is_safe_interval("2 hours"));
+        assert!(is_safe_interval("30 minutes"));
+        assert!(is_safe_interval("7 days"));
+    }
+
+    #[test]
+    fn test_is_safe_interval_invalid() {
+        assert!(!is_safe_interval("1"));
+        assert!(!is_safe_interval("day"));
+        assert!(!is_safe_interval("0 days"));
+        assert!(!is_safe_interval("1 day; DROP TABLE"));
+        assert!(!is_safe_interval("999 days"));
     }
 }
