@@ -56,7 +56,7 @@ cargo bench
 | Total tests | 111 | `cargo test` |
 | Clippy warnings | 0 | `cargo clippy --all-targets` |
 | Format violations | 0 | `cargo fmt -- --check` |
-| CI jobs | 11 | `.github/workflows/ci.yml` |
+| CI jobs | 10 | `.github/workflows/ci.yml` |
 
 ## Module Map
 
@@ -116,7 +116,7 @@ cargo bench
 - Built Axum HTTP server with health check, ingestion, stats, and breakdown endpoints
 - Created dashboard SPA (Preact + HTM, embedded via rust-embed)
 - Created tracking script (<1KB)
-- Created CI pipeline (11 jobs: build, test, clippy, fmt, docs, MSRV, bench, security, coverage, docker, cross-compile)
+- Created CI pipeline (10 jobs: build, test, clippy, fmt, docs, MSRV, bench, security, coverage, docker)
 - All GitHub Actions pinned to commit SHAs
 
 **Test results:**
