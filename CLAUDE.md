@@ -20,7 +20,7 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 # Build
 cargo build
 
-# Run all tests (111 total: 104 unit + 7 integration)
+# Run all tests (116 total: 104 unit + 12 integration)
 cargo test
 
 # Clippy (zero warnings required)
@@ -52,8 +52,8 @@ cargo bench
 | Metric | Value | Verified |
 |---|---|---|
 | Unit tests | 104 | `cargo test --lib` |
-| Integration tests | 7 | `cargo test --test ingest_test` |
-| Total tests | 111 | `cargo test` |
+| Integration tests | 12 | `cargo test --test ingest_test` |
+| Total tests | 116 | `cargo test` |
 | Clippy warnings | 0 | `cargo clippy --all-targets` |
 | Format violations | 0 | `cargo fmt -- --check` |
 | CI jobs | 10 | `.github/workflows/ci.yml` |
@@ -82,7 +82,8 @@ cargo bench
 | `query/flow.rs` | sequence_next_node query builder |
 | `api/stats.rs` | Dashboard API handlers |
 | `api/errors.rs` | API error types |
-| `api/auth.rs` | Authentication (stub for Phase 1) |
+| `api/auth.rs` | Origin validation + authentication stub |
+| `api/funnels.rs` | Funnel API handler (stub) |
 | `dashboard/` | Embedded SPA (Preact + HTM) |
 
 ## Session Protocol
@@ -139,3 +140,29 @@ cargo bench
 - Query metrics (unique visitors, pageviews, date ranges)
 - Breakdowns (by page, browser, with limits, null handling)
 - Timeseries (daily, hourly)
+
+### Session 2: Phase 2 — Dashboard & Integration Fixes
+
+**Changes:**
+- **Task 2.1:** Integrated UA parser into ingestion handler — `parse_user_agent()` now called from `ingest_event()`, replacing hardcoded `None` values for browser, browser_version, os, os_version fields (`handler.rs:93-94`)
+- **Task 2.2:** Integrated GeoIP stub into ingestion handler — `geoip::lookup()` now called from `ingest_event()`, replacing hardcoded `None` values for country_code, region, city fields (`handler.rs:97`). Returns `None` for all fields until Phase 4 MaxMind integration.
+- **Task 2.3:** Added timeseries line chart to dashboard — SVG-based chart component renders visitors (solid blue) and pageviews (dashed green) lines using existing `/api/stats/timeseries` endpoint. Zero external dependencies.
+- **Task 2.4:** Added all 6 breakdown tables to dashboard — Pages, Sources, Browsers, OS, Devices, and Countries breakdowns fetched via `Promise.all()` from existing API endpoints. Displayed in responsive grid layout.
+- **Task 2.5:** Enhanced tracking script with custom events and revenue support — exposed `window.mallard(eventName, options)` public API. Supports `props` (custom properties), `revenue`, `currency`, and `callback` options. Script size: 774 bytes (under 1KB constraint).
+- **Task 2.6:** Integrated origin validation into ingestion handler — `validate_origin()` now called from `ingest_event()` using `allowed_sites` from config. Returns 403 Forbidden for disallowed origins. Empty `site_ids` config allows all origins (default behavior).
+- Removed all `#[allow(dead_code)]` annotations from newly-wired code: `parse_user_agent`, `ParsedUserAgent`, `detect_browser`, `detect_browser_version`, `detect_os`, `detect_os_version`, `extract_version_after`, `GeoInfo`, `geoip::lookup`, `validate_origin`, `Config.site_ids`
+- Added `allowed_sites` field to `AppState` struct
+
+**Test results:**
+- 104 unit tests passing (`cargo test --lib`)
+- 12 integration tests passing (`cargo test --test ingest_test`)
+- Total: 116 tests, 0 failures, 0 ignored
+- 0 clippy warnings (`cargo clippy --all-targets`)
+- 0 formatting violations (`cargo fmt -- --check`)
+
+**New integration tests added (5):**
+- `test_ua_parsing_populates_browser_os_fields` — verifies Chrome/Windows UA produces correct browser/OS fields in Parquet
+- `test_ua_parsing_firefox_on_linux` — verifies Firefox/Linux UA produces correct fields
+- `test_origin_validation_rejects_disallowed_origin` — verifies 403 for non-matching origin
+- `test_origin_validation_allows_matching_origin` — verifies 202 for matching origin
+- `test_origin_validation_allows_no_origin_header` — verifies 202 when no Origin header (server-side requests)

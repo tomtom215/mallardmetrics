@@ -75,6 +75,7 @@ mod tests {
         let state = Arc::new(AppState {
             buffer,
             secret: "test-secret".to_string(),
+            allowed_sites: Vec::new(),
         });
         (state, dir)
     }

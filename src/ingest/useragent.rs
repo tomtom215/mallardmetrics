@@ -3,7 +3,6 @@
 /// Phase 1 uses simple string matching. Phase 4 will integrate a full UA parser.
 /// Parsed User-Agent information.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct ParsedUserAgent {
     pub browser: Option<String>,
     pub browser_version: Option<String>,
@@ -12,7 +11,6 @@ pub struct ParsedUserAgent {
 }
 
 /// Parse a User-Agent string into browser and OS components.
-#[allow(dead_code)]
 pub fn parse_user_agent(ua: &str) -> ParsedUserAgent {
     ParsedUserAgent {
         browser: detect_browser(ua),
@@ -22,7 +20,6 @@ pub fn parse_user_agent(ua: &str) -> ParsedUserAgent {
     }
 }
 
-#[allow(dead_code)]
 fn detect_browser(ua: &str) -> Option<String> {
     // Order matters: check more specific patterns first
     if ua.contains("Edg/") || ua.contains("Edge/") {
@@ -40,7 +37,6 @@ fn detect_browser(ua: &str) -> Option<String> {
     }
 }
 
-#[allow(dead_code)]
 fn detect_browser_version(ua: &str) -> Option<String> {
     let patterns = [
         ("Edg/", "Edg/"),
@@ -68,7 +64,6 @@ fn detect_browser_version(ua: &str) -> Option<String> {
     None
 }
 
-#[allow(dead_code)]
 fn detect_os(ua: &str) -> Option<String> {
     if ua.contains("Windows") {
         Some("Windows".to_string())
@@ -88,7 +83,6 @@ fn detect_os(ua: &str) -> Option<String> {
     }
 }
 
-#[allow(dead_code)]
 fn detect_os_version(ua: &str) -> Option<String> {
     if ua.contains("Windows NT") {
         extract_version_after(ua, "Windows NT ")
@@ -104,7 +98,6 @@ fn detect_os_version(ua: &str) -> Option<String> {
     }
 }
 
-#[allow(dead_code)]
 fn extract_version_after(ua: &str, prefix: &str) -> Option<String> {
     let pos = ua.find(prefix)?;
     let start = pos + prefix.len();

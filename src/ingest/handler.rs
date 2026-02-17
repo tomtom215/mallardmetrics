@@ -1,4 +1,6 @@
 use crate::ingest::buffer::{Event, EventBuffer};
+use crate::ingest::geoip;
+use crate::ingest::useragent;
 use crate::ingest::visitor_id;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -50,6 +52,7 @@ pub struct EventPayload {
 pub struct AppState {
     pub buffer: EventBuffer,
     pub secret: String,
+    pub allowed_sites: Vec<String>,
 }
 
 /// POST /api/event — Ingestion endpoint.
@@ -61,6 +64,12 @@ pub async fn ingest_event(
     headers: HeaderMap,
     Json(payload): Json<EventPayload>,
 ) -> impl IntoResponse {
+    // Validate origin against allowed sites
+    let origin = headers.get("origin").and_then(|v| v.to_str().ok());
+    if !crate::api::auth::validate_origin(origin, &state.allowed_sites) {
+        return StatusCode::FORBIDDEN;
+    }
+
     // Validate required fields
     if payload.domain.is_empty() || payload.name.is_empty() || payload.url.is_empty() {
         return StatusCode::BAD_REQUEST;
@@ -97,6 +106,12 @@ pub async fn ingest_event(
         .as_deref()
         .and_then(extract_referrer_source);
 
+    // Parse User-Agent for browser/OS information
+    let parsed_ua = useragent::parse_user_agent(user_agent);
+
+    // Look up geographic information from IP
+    let geo_info = geoip::lookup(&ip);
+
     // Determine device type from screen width
     let device_type = payload.screen_width.map(classify_device);
 
@@ -120,15 +135,15 @@ pub async fn ingest_event(
         utm_campaign,
         utm_content,
         utm_term,
-        browser: None,
-        browser_version: None,
-        os: None,
-        os_version: None,
+        browser: parsed_ua.browser,
+        browser_version: parsed_ua.browser_version,
+        os: parsed_ua.os,
+        os_version: parsed_ua.os_version,
         device_type,
         screen_size: payload.screen_width.map(|w| format!("{w}")),
-        country_code: None,
-        region: None,
-        city: None,
+        country_code: geo_info.country_code,
+        region: geo_info.region,
+        city: geo_info.city,
         props: payload.props.as_deref().map(|p| sanitize_string(p, 4096)),
         revenue_amount: payload.revenue_amount,
         revenue_currency: payload

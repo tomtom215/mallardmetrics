@@ -5,7 +5,6 @@
 /// will use, returning `None` for all lookups.
 /// Geographic information resolved from an IP address.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)]
 pub struct GeoInfo {
     pub country_code: Option<String>,
     pub region: Option<String>,
@@ -16,7 +15,6 @@ pub struct GeoInfo {
 ///
 /// Returns `GeoInfo` with all fields `None` in Phase 1.
 /// Will be implemented with MaxMind GeoLite2 in Phase 4.
-#[allow(dead_code)]
 pub fn lookup(_ip: &str) -> GeoInfo {
     GeoInfo::default()
 }

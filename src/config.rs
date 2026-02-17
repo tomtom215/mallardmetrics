@@ -15,7 +15,6 @@ pub struct Config {
     #[serde(default = "default_flush_interval_secs")]
     pub flush_interval_secs: u64,
     #[serde(default)]
-    #[allow(dead_code)]
     pub site_ids: Vec<String>,
 }
 

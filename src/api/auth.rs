@@ -6,7 +6,6 @@
 /// For Phase 1, the dashboard is open (no auth required).
 /// The ingestion endpoint uses origin checking only.
 /// Validate that the request origin is allowed for event ingestion.
-#[allow(dead_code)]
 pub fn validate_origin(origin: Option<&str>, allowed_sites: &[String]) -> bool {
     if allowed_sites.is_empty() {
         return true; // No restrictions configured
