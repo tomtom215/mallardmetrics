@@ -2,6 +2,7 @@ use duckdb::Connection;
 
 /// Retention cohort row.
 #[derive(Debug, Clone, serde::Serialize)]
+#[allow(dead_code)]
 pub struct RetentionCohort {
     pub cohort_date: String,
     pub retained: Vec<bool>,

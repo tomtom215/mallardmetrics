@@ -1,5 +1,6 @@
 /// Result of a sequence match query.
 #[derive(Debug, Clone, serde::Serialize)]
+#[allow(dead_code)]
 pub struct SequenceMatchResult {
     pub converting_visitors: u64,
     pub total_visitors: u64,

@@ -2,7 +2,7 @@
 name = "mallard-metrics"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85.0"
+rust-version = "1.93.0"
 description = "Self-hosted, privacy-focused web analytics powered by DuckDB and the behavioral extension"
 license = "MIT"
 repository = "https://github.com/tomtom215/mallardmetrics"

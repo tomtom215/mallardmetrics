@@ -1,11 +1,6 @@
-FROM rust:1.85-slim AS builder
+FROM rust:1.93-alpine AS builder
 
-RUN apt-get update && apt-get install -y \
-    musl-tools \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN rustup target add x86_64-unknown-linux-musl
+RUN apk add --no-cache build-base linux-headers
 
 WORKDIR /build
 COPY . .

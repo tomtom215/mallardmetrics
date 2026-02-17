@@ -85,8 +85,7 @@ mod tests {
         let result = query_session_metrics(&conn, "test.com", "2024-01-01", "2024-02-01");
         // This will fail without the behavioral extension - that's expected in unit tests.
         // E2E tests with the extension loaded will validate the full query.
-        if result.is_ok() {
-            let metrics = result.unwrap();
+        if let Ok(metrics) = result {
             assert_eq!(metrics.total_sessions, 0);
         }
     }

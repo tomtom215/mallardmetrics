@@ -6,7 +6,7 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 
 ## Architecture
 
-- **Language**: Rust (MSRV 1.85.0)
+- **Language**: Rust (MSRV 1.93.0)
 - **Web framework**: Axum 0.8.x
 - **Database**: DuckDB (embedded, via `duckdb` crate with `bundled` + `parquet` features)
 - **Analytics**: `behavioral` extension (loaded at runtime)
