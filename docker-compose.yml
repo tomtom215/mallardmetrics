@@ -1,0 +1,14 @@
+services:
+  mallard-metrics:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - mallard-data:/data
+    environment:
+      - MALLARD_SECRET=${MALLARD_SECRET:-change-me-in-production}
+      - MALLARD_DATA_DIR=/data
+      - RUST_LOG=mallard_metrics=info
+
+volumes:
+  mallard-data:
