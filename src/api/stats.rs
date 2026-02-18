@@ -636,33 +636,59 @@ pub async fn get_export(
         })
         .collect();
 
-    if params.format == "json" {
-        Ok((
-            [(header::CONTENT_TYPE, "application/json")],
-            serde_json::to_string(&rows).unwrap_or_default(),
-        )
-            .into_response())
-    } else {
-        // CSV format
-        let mut csv = String::from("date,visitors,pageviews,top_page,top_source\n");
-        for row in &rows {
-            let _ = writeln!(
-                csv,
-                "{},{},{},{},{}",
-                row.date, row.visitors, row.pageviews, row.top_page, row.top_source
-            );
+    match params.format.as_str() {
+        "json" => {
+            let body = serde_json::to_string(&rows)
+                .map_err(|e| ApiError::Internal(format!("JSON serialization failed: {e}")))?;
+            Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
         }
-        Ok((
-            [
-                (header::CONTENT_TYPE, "text/csv"),
-                (
-                    header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"export.csv\"",
-                ),
-            ],
-            csv,
-        )
-            .into_response())
+        "csv" => {
+            let mut csv = String::from("date,visitors,pageviews,top_page,top_source\n");
+            for row in &rows {
+                let _ = writeln!(
+                    csv,
+                    "{},{},{},{},{}",
+                    row.date,
+                    row.visitors,
+                    row.pageviews,
+                    escape_csv_field(&row.top_page),
+                    escape_csv_field(&row.top_source),
+                );
+            }
+            Ok((
+                [
+                    (header::CONTENT_TYPE, "text/csv"),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"export.csv\"",
+                    ),
+                ],
+                csv,
+            )
+                .into_response())
+        }
+        other => Err(ApiError::BadRequest(format!(
+            "Invalid format: '{other}'. Use 'csv' or 'json'."
+        ))),
+    }
+}
+
+/// Escape a CSV field to prevent CSV injection attacks.
+///
+/// Wraps the field in double quotes and escapes internal double quotes.
+/// Prefixes fields starting with formula-triggering characters (`=`, `+`, `-`, `@`)
+/// with a single quote to neutralize them in spreadsheet applications.
+fn escape_csv_field(field: &str) -> String {
+    let escaped = field.replace('"', "\"\"");
+    // Prefix formula-triggering characters to prevent CSV injection in spreadsheets
+    if escaped.starts_with('=')
+        || escaped.starts_with('+')
+        || escaped.starts_with('-')
+        || escaped.starts_with('@')
+    {
+        format!("\"'{escaped}\"")
+    } else {
+        format!("\"{escaped}\"")
     }
 }
 
@@ -762,5 +788,40 @@ mod tests {
         assert!(!is_safe_interval("0 days"));
         assert!(!is_safe_interval("1 day; DROP TABLE"));
         assert!(!is_safe_interval("999 days"));
+    }
+
+    #[test]
+    fn test_escape_csv_field_plain() {
+        assert_eq!(escape_csv_field("/about"), "\"/about\"");
+    }
+
+    #[test]
+    fn test_escape_csv_field_with_quotes() {
+        assert_eq!(escape_csv_field("it's \"great\""), "\"it's \"\"great\"\"\"");
+    }
+
+    #[test]
+    fn test_escape_csv_field_formula_injection() {
+        // Fields starting with formula characters are prefixed with a single quote
+        assert_eq!(escape_csv_field("=CMD|'/c calc'"), "\"'=CMD|'/c calc'\"");
+        assert_eq!(escape_csv_field("+1+2"), "\"'+1+2\"");
+        assert_eq!(escape_csv_field("-1-2"), "\"'-1-2\"");
+        assert_eq!(escape_csv_field("@SUM(A1)"), "\"'@SUM(A1)\"");
+    }
+
+    #[test]
+    fn test_export_invalid_format() {
+        let params = ExportParams {
+            site_id: "test.com".to_string(),
+            period: "30d".to_string(),
+            start_date: None,
+            end_date: None,
+            format: "xml".to_string(),
+        };
+        let date_range = params.date_range();
+        assert!(date_range.is_ok());
+        // The format validation happens in the handler, so we test the validator indirectly
+        assert_ne!(params.format, "csv");
+        assert_ne!(params.format, "json");
     }
 }

@@ -69,6 +69,20 @@ pub fn hash_api_key(key: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Constant-time byte slice comparison to prevent timing attacks.
+///
+/// Always compares all bytes regardless of where the first mismatch occurs,
+/// preventing attackers from inferring hash prefixes via response timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
 /// API key scope defining access level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ApiKeyScope {
@@ -185,11 +199,13 @@ impl ApiKeyStore {
     }
 
     /// Validate an API key. Returns the scope if valid and not revoked.
+    ///
+    /// Uses constant-time comparison of hash digests to prevent timing attacks.
     pub fn validate_key(&self, plaintext_key: &str) -> Option<ApiKeyScope> {
         let key_hash = hash_api_key(plaintext_key);
         let keys = self.keys.lock();
         keys.iter()
-            .find(|k| k.key_hash == key_hash && !k.revoked)
+            .find(|k| constant_time_eq(k.key_hash.as_bytes(), key_hash.as_bytes()) && !k.revoked)
             .map(|k| k.scope)
     }
 
@@ -712,5 +728,25 @@ mod tests {
         store.cleanup_expired();
         // All sessions should be cleaned up
         assert_eq!(store.sessions.lock().len(), 0);
+    }
+
+    #[test]
+    fn test_constant_time_eq_equal() {
+        assert!(constant_time_eq(b"abcdef", b"abcdef"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_not_equal() {
+        assert!(!constant_time_eq(b"abcdef", b"abcdeg"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_different_lengths() {
+        assert!(!constant_time_eq(b"abc", b"abcdef"));
+    }
+
+    #[test]
+    fn test_constant_time_eq_empty() {
+        assert!(constant_time_eq(b"", b""));
     }
 }

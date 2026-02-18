@@ -83,7 +83,6 @@ impl EventBuffer {
     }
 
     /// Returns the current number of buffered events.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.events.lock().len()
     }

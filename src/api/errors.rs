@@ -10,7 +10,6 @@ pub enum ApiError {
     Unauthorized(String),
     #[allow(dead_code)]
     NotFound(String),
-    #[allow(dead_code)]
     Internal(String),
     DatabaseError(duckdb::Error),
 }
