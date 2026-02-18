@@ -61,6 +61,8 @@ pub struct AppState {
     /// Hashed admin password (Argon2id). None if no admin user set up yet.
     pub admin_password_hash: parking_lot::Mutex<Option<String>>,
     pub dashboard_origin: Option<String>,
+    pub query_cache: crate::query::cache::QueryCache,
+    pub rate_limiter: crate::ingest::ratelimit::RateLimiter,
 }
 
 /// POST /api/event — Ingestion endpoint.
@@ -81,6 +83,11 @@ pub async fn ingest_event(
     // Validate required fields
     if payload.domain.is_empty() || payload.name.is_empty() || payload.url.is_empty() {
         return StatusCode::BAD_REQUEST;
+    }
+
+    // Rate limiting per site
+    if !state.rate_limiter.check(&payload.domain) {
+        return StatusCode::TOO_MANY_REQUESTS;
     }
 
     // Length validation to prevent abuse

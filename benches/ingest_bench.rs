@@ -91,5 +91,65 @@ fn bench_flush(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_buffer_push, bench_flush);
+fn bench_query_metrics(c: &mut Criterion) {
+    let mut group = c.benchmark_group("query_metrics");
+
+    // Set up a database with pre-loaded events
+    let conn = Connection::open_in_memory().unwrap();
+    schema::init_schema(&conn).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let storage = ParquetStorage::new(dir.path());
+    let arc_conn = Arc::new(Mutex::new(conn));
+    let buffer = EventBuffer::new(20_000, Arc::clone(&arc_conn), storage);
+
+    for i in 0..10_000 {
+        buffer.push(make_event(i)).unwrap();
+    }
+
+    group.bench_function("core_metrics_10k", |b| {
+        b.iter(|| {
+            let conn = arc_conn.lock();
+            mallard_metrics::query::metrics::query_core_metrics(
+                &conn,
+                "bench.example.com",
+                "2024-01-01",
+                "2024-02-01",
+            )
+            .unwrap();
+        });
+    });
+
+    group.bench_function("timeseries_10k", |b| {
+        b.iter(|| {
+            let conn = arc_conn.lock();
+            mallard_metrics::query::timeseries::query_timeseries(
+                &conn,
+                "bench.example.com",
+                "2024-01-01",
+                "2024-02-01",
+                mallard_metrics::query::timeseries::Granularity::Day,
+            )
+            .unwrap();
+        });
+    });
+
+    group.bench_function("breakdown_pages_10k", |b| {
+        b.iter(|| {
+            let conn = arc_conn.lock();
+            mallard_metrics::query::breakdowns::query_breakdown(
+                &conn,
+                "bench.example.com",
+                "2024-01-01",
+                "2024-02-01",
+                mallard_metrics::query::breakdowns::Dimension::Page,
+                10,
+            )
+            .unwrap();
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_buffer_push, bench_flush, bench_query_metrics);
 criterion_main!(benches);

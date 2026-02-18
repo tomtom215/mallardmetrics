@@ -30,6 +30,8 @@ fn make_test_state() -> (Arc<AppState>, tempfile::TempDir) {
         api_keys: ApiKeyStore::new(),
         admin_password_hash: Mutex::new(None),
         dashboard_origin: None,
+        query_cache: mallard_metrics::query::cache::QueryCache::new(0),
+        rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(0),
     });
     (state, dir)
 }
@@ -360,6 +362,8 @@ fn make_test_state_with_sites(sites: Vec<String>) -> (Arc<AppState>, tempfile::T
         api_keys: ApiKeyStore::new(),
         admin_password_hash: Mutex::new(None),
         dashboard_origin: None,
+        query_cache: mallard_metrics::query::cache::QueryCache::new(0),
+        rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(0),
     });
     (state, dir)
 }
@@ -689,6 +693,8 @@ fn make_test_state_with_password(password: &str) -> (Arc<AppState>, tempfile::Te
         api_keys: ApiKeyStore::new(),
         admin_password_hash: Mutex::new(Some(hash)),
         dashboard_origin: None,
+        query_cache: mallard_metrics::query::cache::QueryCache::new(0),
+        rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(0),
     });
     (state, dir)
 }
@@ -1095,4 +1101,172 @@ async fn test_api_key_endpoints_require_auth() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+// --- Phase 5: Operational Excellence integration tests ---
+
+#[tokio::test]
+async fn test_detailed_health_check_endpoint() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health/detailed")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+    assert!(json.get("version").is_some());
+    assert_eq!(json["buffered_events"], 0);
+    assert_eq!(json["auth_configured"], false);
+    assert_eq!(json["geoip_loaded"], false);
+    assert_eq!(json["filter_bots"], false);
+}
+
+#[tokio::test]
+async fn test_export_csv_format() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/export?site_id=test.com&period=7d&format=csv")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(content_type, "text/csv");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(text.starts_with("date,visitors,pageviews,top_page,top_source"));
+}
+
+#[tokio::test]
+async fn test_export_json_format() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/export?site_id=test.com&period=7d&format=json")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(content_type, "application/json");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json.is_array());
+}
+
+#[tokio::test]
+async fn test_rate_limiting() {
+    // Create state with rate limit of 2 per second
+    let conn = Connection::open_in_memory().unwrap();
+    schema::init_schema(&conn).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let storage = ParquetStorage::new(dir.path());
+    let conn = Arc::new(Mutex::new(conn));
+    let buffer = EventBuffer::new(1000, conn, storage);
+    let state = Arc::new(AppState {
+        buffer,
+        secret: "test-secret".to_string(),
+        allowed_sites: Vec::new(),
+        geoip: GeoIpReader::open(None),
+        filter_bots: false,
+        sessions: SessionStore::new(3600),
+        api_keys: ApiKeyStore::new(),
+        admin_password_hash: Mutex::new(None),
+        dashboard_origin: None,
+        query_cache: mallard_metrics::query::cache::QueryCache::new(0),
+        rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(2),
+    });
+
+    let payload = serde_json::json!({
+        "d": "example.com",
+        "n": "pageview",
+        "u": "https://example.com/",
+    });
+    let body_str = serde_json::to_string(&payload).unwrap();
+
+    // First two requests should succeed
+    for _ in 0..2 {
+        let app = build_router(Arc::clone(&state));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/event")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body_str.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    // Third request should be rate limited
+    let app = build_router(Arc::clone(&state));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/event")
+                .header("content-type", "application/json")
+                .body(Body::from(body_str))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_detailed_health_check_with_auth() {
+    let (state, _dir) = make_test_state_with_password("admin-pass");
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health/detailed")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["auth_configured"], true);
 }

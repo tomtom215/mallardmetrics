@@ -2,6 +2,7 @@ use crate::api::auth;
 use crate::api::stats;
 use crate::dashboard;
 use crate::ingest::handler::{ingest_event, AppState};
+use axum::extract::State;
 use axum::http::{header, Method};
 use axum::middleware;
 use axum::routing::{delete, get, post};
@@ -56,6 +57,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/stats/breakdown/countries",
             get(stats::get_countries_breakdown),
         )
+        .route("/stats/export", get(stats::get_export))
         .route("/stats/sessions", get(stats::get_sessions))
         .route("/stats/funnel", get(stats::get_funnel))
         .route("/stats/retention", get(stats::get_retention))
@@ -83,6 +85,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/health", get(health_check))
+        .route("/health/detailed", get(detailed_health_check))
+        .route("/metrics", get(prometheus_metrics))
         .nest("/api", api_routes)
         .route("/", get(dashboard::serve_index))
         .route("/{*path}", get(dashboard::serve_asset))
@@ -113,9 +117,76 @@ fn build_dashboard_cors(dashboard_origin: Option<&str>) -> CorsLayer {
     )
 }
 
-/// GET /health — Health check endpoint.
+/// GET /health — Simple health check endpoint.
 async fn health_check() -> &'static str {
     "ok"
+}
+
+/// GET /health/detailed — Detailed health check with system info.
+async fn detailed_health_check(
+    State(state): State<Arc<AppState>>,
+) -> axum::Json<serde_json::Value> {
+    let buffered_events = state.buffer.len();
+    let auth_configured = state.admin_password_hash.lock().is_some();
+    let geoip_loaded = state.geoip.is_loaded();
+
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "buffered_events": buffered_events,
+        "auth_configured": auth_configured,
+        "geoip_loaded": geoip_loaded,
+        "filter_bots": state.filter_bots,
+        "cache_entries": state.query_cache.len(),
+        "cache_empty": state.query_cache.is_empty(),
+    }))
+}
+
+/// GET /metrics — Prometheus-compatible metrics endpoint.
+async fn prometheus_metrics(
+    State(state): State<Arc<AppState>>,
+) -> ([(header::HeaderName, &'static str); 1], String) {
+    use std::fmt::Write;
+
+    let buffered = state.buffer.len();
+    let cache_entries = state.query_cache.len();
+    let auth_configured = u8::from(state.admin_password_hash.lock().is_some());
+    let geoip_loaded = u8::from(state.geoip.is_loaded());
+    let filter_bots = u8::from(state.filter_bots);
+
+    let mut out = String::with_capacity(512);
+    let _ = writeln!(
+        out,
+        "# HELP mallard_buffered_events Number of events in the in-memory buffer"
+    );
+    let _ = writeln!(out, "# TYPE mallard_buffered_events gauge");
+    let _ = writeln!(out, "mallard_buffered_events {buffered}");
+    let _ = writeln!(
+        out,
+        "# HELP mallard_cache_entries Number of cached query results"
+    );
+    let _ = writeln!(out, "# TYPE mallard_cache_entries gauge");
+    let _ = writeln!(out, "mallard_cache_entries {cache_entries}");
+    let _ = writeln!(
+        out,
+        "# HELP mallard_auth_configured Whether admin password is set"
+    );
+    let _ = writeln!(out, "# TYPE mallard_auth_configured gauge");
+    let _ = writeln!(out, "mallard_auth_configured {auth_configured}");
+    let _ = writeln!(
+        out,
+        "# HELP mallard_geoip_loaded Whether GeoIP database is loaded"
+    );
+    let _ = writeln!(out, "# TYPE mallard_geoip_loaded gauge");
+    let _ = writeln!(out, "mallard_geoip_loaded {geoip_loaded}");
+    let _ = writeln!(
+        out,
+        "# HELP mallard_filter_bots Whether bot filtering is enabled"
+    );
+    let _ = writeln!(out, "# TYPE mallard_filter_bots gauge");
+    let _ = writeln!(out, "mallard_filter_bots {filter_bots}");
+
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], out)
 }
 
 #[cfg(test)]
@@ -148,6 +219,8 @@ mod tests {
             api_keys: ApiKeyStore::new(),
             admin_password_hash: Mutex::new(None),
             dashboard_origin: None,
+            query_cache: crate::query::cache::QueryCache::new(0),
+            rate_limiter: crate::ingest::ratelimit::RateLimiter::new(0),
         });
         (state, dir)
     }
@@ -170,6 +243,38 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"ok");
+    }
+
+    #[tokio::test]
+    async fn test_prometheus_metrics() {
+        let (state, _dir) = make_test_state();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(content_type.contains("text/plain"));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("mallard_buffered_events 0"));
+        assert!(text.contains("mallard_cache_entries 0"));
+        assert!(text.contains("mallard_auth_configured 0"));
+        assert!(text.contains("mallard_geoip_loaded 0"));
+        assert!(text.contains("mallard_filter_bots 0"));
     }
 
     #[tokio::test]
@@ -274,6 +379,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_detailed_health_check() {
+        let (state, _dir) = make_test_state();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health/detailed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert!(json.get("version").is_some());
+        assert_eq!(json["buffered_events"], 0);
+        assert_eq!(json["auth_configured"], false);
+        assert_eq!(json["geoip_loaded"], false);
+        assert_eq!(json["filter_bots"], false);
     }
 
     #[tokio::test]

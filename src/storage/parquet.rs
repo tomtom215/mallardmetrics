@@ -120,6 +120,51 @@ impl ParquetStorage {
         conn.execute_batch(&sql).map_err(FlushError::Query)?;
         Ok(())
     }
+
+    /// Delete Parquet partition directories older than the given number of days.
+    ///
+    /// Returns the number of partition directories removed.
+    pub fn cleanup_old_partitions(&self, retention_days: u32) -> std::io::Result<usize> {
+        if retention_days == 0 {
+            return Ok(0); // Unlimited retention
+        }
+
+        let cutoff =
+            chrono::Utc::now().date_naive() - chrono::Duration::days(i64::from(retention_days));
+        let cutoff_str = cutoff.format("%Y-%m-%d").to_string();
+        let mut removed = 0usize;
+
+        // Iterate site_id=* directories
+        let entries = match fs::read_dir(&self.base_dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+
+        for site_entry in entries.flatten() {
+            let site_path = site_entry.path();
+            if !site_path.is_dir() {
+                continue;
+            }
+            // Iterate date=* directories inside each site
+            for date_entry in fs::read_dir(&site_path)?.flatten() {
+                let date_path = date_entry.path();
+                if !date_path.is_dir() {
+                    continue;
+                }
+                let dir_name = date_entry.file_name();
+                let dir_name = dir_name.to_string_lossy();
+                if let Some(date_str) = dir_name.strip_prefix("date=") {
+                    if date_str < cutoff_str.as_str() {
+                        fs::remove_dir_all(&date_path)?;
+                        removed += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(removed)
+    }
 }
 
 #[derive(Debug)]
@@ -263,5 +308,67 @@ mod tests {
         let partition = storage.partition_dir("example.com", "2024-01-15");
         assert!(partition.join("0001.parquet").exists());
         assert!(partition.join("0002.parquet").exists());
+    }
+
+    #[test]
+    fn test_cleanup_zero_retention_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ParquetStorage::new(dir.path());
+        let removed = storage.cleanup_old_partitions(0).unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_cleanup_nonexistent_dir() {
+        let storage = ParquetStorage::new(Path::new("/nonexistent/path/events"));
+        let removed = storage.cleanup_old_partitions(30).unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_cleanup_removes_old_partitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ParquetStorage::new(dir.path());
+
+        // Create old partition (far in the past)
+        let old_dir = storage.partition_dir("example.com", "2020-01-01");
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::write(old_dir.join("0001.parquet"), b"fake").unwrap();
+
+        // Create recent partition (today)
+        let today = chrono::Utc::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let new_dir = storage.partition_dir("example.com", &today);
+        fs::create_dir_all(&new_dir).unwrap();
+        fs::write(new_dir.join("0001.parquet"), b"fake").unwrap();
+
+        let removed = storage.cleanup_old_partitions(30).unwrap();
+        assert_eq!(removed, 1);
+
+        // Old partition should be gone
+        assert!(!old_dir.exists());
+        // Recent partition should remain
+        assert!(new_dir.exists());
+    }
+
+    #[test]
+    fn test_cleanup_across_multiple_sites() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ParquetStorage::new(dir.path());
+
+        // Create old partitions for two sites
+        let old_a = storage.partition_dir("site-a.com", "2020-06-15");
+        let old_b = storage.partition_dir("site-b.com", "2020-03-10");
+        fs::create_dir_all(&old_a).unwrap();
+        fs::create_dir_all(&old_b).unwrap();
+        fs::write(old_a.join("0001.parquet"), b"fake").unwrap();
+        fs::write(old_b.join("0001.parquet"), b"fake").unwrap();
+
+        let removed = storage.cleanup_old_partitions(30).unwrap();
+        assert_eq!(removed, 2);
+        assert!(!old_a.exists());
+        assert!(!old_b.exists());
     }
 }

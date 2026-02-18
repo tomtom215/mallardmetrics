@@ -42,6 +42,9 @@ pub struct Config {
     /// Query cache TTL in seconds (default: 60). 0 = no caching.
     #[serde(default = "default_cache_ttl_secs")]
     pub cache_ttl_secs: u64,
+    /// Log output format: "text" (default) or "json" for structured JSON logs.
+    #[serde(default = "default_log_format")]
+    pub log_format: String,
 }
 
 fn default_host() -> String {
@@ -80,6 +83,10 @@ const fn default_cache_ttl_secs() -> u64 {
     60
 }
 
+fn default_log_format() -> String {
+    "text".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -97,6 +104,7 @@ impl Default for Config {
             shutdown_timeout_secs: default_shutdown_timeout_secs(),
             rate_limit_per_site: 0,
             cache_ttl_secs: default_cache_ttl_secs(),
+            log_format: default_log_format(),
         }
     }
 }
@@ -118,6 +126,7 @@ impl Config {
     /// - `MALLARD_SHUTDOWN_TIMEOUT` → shutdown_timeout_secs
     /// - `MALLARD_RATE_LIMIT` → rate_limit_per_site
     /// - `MALLARD_CACHE_TTL` → cache_ttl_secs
+    /// - `MALLARD_LOG_FORMAT` → log_format
     pub fn load(config_path: Option<&Path>) -> Self {
         let mut config =
             config_path.map_or_else(Self::default, |path| match std::fs::read_to_string(path) {
@@ -187,6 +196,9 @@ impl Config {
                 config.cache_ttl_secs = t;
             }
         }
+        if let Ok(val) = std::env::var("MALLARD_LOG_FORMAT") {
+            config.log_format = val;
+        }
 
         config
     }
@@ -225,6 +237,7 @@ mod tests {
         assert_eq!(config.shutdown_timeout_secs, 30);
         assert_eq!(config.rate_limit_per_site, 0);
         assert_eq!(config.cache_ttl_secs, 60);
+        assert_eq!(config.log_format, "text");
     }
 
     #[test]

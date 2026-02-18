@@ -41,6 +41,11 @@ impl GeoIpReader {
         Self { reader }
     }
 
+    /// Returns `true` if a GeoIP database is loaded.
+    pub const fn is_loaded(&self) -> bool {
+        self.reader.is_some()
+    }
+
     /// Look up geographic information for an IP address.
     ///
     /// PRIVACY: The IP address is passed by reference, used only for the lookup,
@@ -129,5 +134,17 @@ mod tests {
         let reader = GeoIpReader::open(None);
         let info = reader.lookup("");
         assert!(info.country_code.is_none());
+    }
+
+    #[test]
+    fn test_is_loaded_without_db() {
+        let reader = GeoIpReader::open(None);
+        assert!(!reader.is_loaded());
+    }
+
+    #[test]
+    fn test_is_loaded_with_missing_file() {
+        let reader = GeoIpReader::open(Some(Path::new("/nonexistent/GeoLite2.mmdb")));
+        assert!(!reader.is_loaded());
     }
 }

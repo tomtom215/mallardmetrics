@@ -89,6 +89,7 @@ pub struct StoredApiKey {
 }
 
 /// Thread-safe session store for dashboard authentication.
+#[derive(Clone)]
 pub struct SessionStore {
     /// Maps session token → (username, expiry).
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
@@ -143,7 +144,6 @@ impl SessionStore {
     }
 
     /// Remove all expired sessions (housekeeping).
-    #[allow(dead_code)] // Used in Phase 5 (periodic cleanup task)
     pub fn cleanup_expired(&self) {
         let now = Instant::now();
         self.sessions

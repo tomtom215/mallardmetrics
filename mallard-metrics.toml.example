@@ -1,0 +1,49 @@
+# Mallard Metrics — Example Configuration
+# Copy this file to mallard-metrics.toml and adjust settings as needed.
+# All values shown are the defaults.
+
+# Server bind address and port
+host = "0.0.0.0"
+port = 8000
+
+# Directory for Parquet data files
+data_dir = "data"
+
+# Event buffer settings
+flush_event_count = 1000       # Flush after this many buffered events
+flush_interval_secs = 60       # Flush every N seconds regardless of count
+
+# Allowed site IDs (empty = allow all origins)
+# site_ids = ["example.com", "mysite.org"]
+
+# GeoIP database path (optional, MaxMind GeoLite2-City.mmdb)
+# geoip_db_path = "/data/GeoLite2-City.mmdb"
+
+# Dashboard CORS origin (optional, restricts API access to this origin)
+# dashboard_origin = "https://analytics.example.com"
+
+# Filter bot traffic from analytics
+filter_bots = true
+
+# Data retention in days (0 = unlimited, no automatic cleanup)
+retention_days = 0
+
+# Dashboard session TTL in seconds (default: 24 hours)
+session_ttl_secs = 86400
+
+# Graceful shutdown timeout in seconds
+shutdown_timeout_secs = 30
+
+# Rate limiting: max events per second per site_id (0 = no limit)
+rate_limit_per_site = 0
+
+# Query cache TTL in seconds (0 = no caching)
+cache_ttl_secs = 60
+
+# Log output format: "text" or "json"
+log_format = "text"
+
+# Environment variables (not set via TOML):
+# MALLARD_SECRET        — HMAC secret for visitor ID hashing (required for production)
+# MALLARD_ADMIN_PASSWORD — Admin password for dashboard authentication
+# RUST_LOG              — Log level filter (e.g., "mallard_metrics=debug,tower_http=info")
