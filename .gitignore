@@ -2,4 +2,3 @@
 /data
 *.parquet
 .env
-Cargo.lock

@@ -1,7 +1,7 @@
 use duckdb::Connection;
 
 /// Core metric results for a given time range.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CoreMetrics {
     pub unique_visitors: u64,
     pub total_pageviews: u64,

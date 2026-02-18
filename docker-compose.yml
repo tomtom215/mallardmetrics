@@ -8,7 +8,10 @@ services:
     environment:
       - MALLARD_SECRET=${MALLARD_SECRET:-change-me-in-production}
       - MALLARD_DATA_DIR=/data
+      - MALLARD_ADMIN_PASSWORD=${MALLARD_ADMIN_PASSWORD:-}
+      - MALLARD_LOG_FORMAT=${MALLARD_LOG_FORMAT:-text}
       - RUST_LOG=mallard_metrics=info
+    restart: unless-stopped
 
 volumes:
   mallard-data:

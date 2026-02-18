@@ -2,8 +2,11 @@ use crate::api::errors::ApiError;
 use crate::ingest::handler::AppState;
 use crate::query::{breakdowns, flow, funnel, metrics, retention, sequences, sessions, timeseries};
 use axum::extract::{Query, State};
+use axum::http::header;
+use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use std::fmt::Write;
 use std::sync::Arc;
 
 /// Query parameters for stats endpoints.
@@ -51,10 +54,21 @@ pub async fn get_main_stats(
     Query(params): Query<StatsParams>,
 ) -> Result<Json<metrics::CoreMetrics>, ApiError> {
     let (start, end) = params.date_range()?;
+    let cache_key = format!("main:{}:{}:{}", params.site_id, start, end);
+
+    if let Some(cached) = state.query_cache.get(&cache_key) {
+        if let Ok(val) = serde_json::from_str(&cached) {
+            return Ok(Json(val));
+        }
+    }
 
     let conn = state.buffer.conn().lock();
     let result = metrics::query_core_metrics(&conn, &params.site_id, &start, &end)?;
     drop(conn);
+
+    if let Ok(serialized) = serde_json::to_string(&result) {
+        state.query_cache.insert(cache_key, serialized);
+    }
     Ok(Json(result))
 }
 
@@ -72,9 +86,20 @@ pub async fn get_timeseries(
         timeseries::Granularity::Day
     };
 
+    let cache_key = format!("ts:{}:{}:{}:{granularity:?}", params.site_id, start, end);
+    if let Some(cached) = state.query_cache.get(&cache_key) {
+        if let Ok(val) = serde_json::from_str(&cached) {
+            return Ok(Json(val));
+        }
+    }
+
     let conn = state.buffer.conn().lock();
     let result = timeseries::query_timeseries(&conn, &params.site_id, &start, &end, granularity)?;
     drop(conn);
+
+    if let Ok(serialized) = serde_json::to_string(&result) {
+        state.query_cache.insert(cache_key, serialized);
+    }
     Ok(Json(result))
 }
 
@@ -514,6 +539,131 @@ pub async fn get_flow(
         flow::query_flow(&conn, &params.site_id, &start, &end, &params.page).unwrap_or_default();
     drop(conn);
     Ok(Json(result))
+}
+
+/// Query parameters for the export endpoint.
+#[derive(Debug, Deserialize)]
+pub struct ExportParams {
+    pub site_id: String,
+    #[serde(default = "default_period")]
+    pub period: String,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+    /// Export format: "csv" (default) or "json"
+    #[serde(default = "default_export_format")]
+    pub format: String,
+}
+
+fn default_export_format() -> String {
+    "csv".to_string()
+}
+
+impl ExportParams {
+    fn date_range(&self) -> Result<(String, String), ApiError> {
+        let stats_params = StatsParams {
+            site_id: self.site_id.clone(),
+            period: self.period.clone(),
+            start_date: self.start_date.clone(),
+            end_date: self.end_date.clone(),
+        };
+        stats_params.date_range()
+    }
+}
+
+/// A single row for the export response.
+#[derive(Debug, Serialize)]
+struct ExportRow {
+    date: String,
+    visitors: u64,
+    pageviews: u64,
+    top_page: String,
+    top_source: String,
+}
+
+/// GET /api/stats/export — Export analytics data as CSV or JSON.
+pub async fn get_export(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ExportParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (start, end) = params.date_range()?;
+    let conn = state.buffer.conn().lock();
+
+    // Get timeseries data for daily breakdown
+    let ts_data = timeseries::query_timeseries(
+        &conn,
+        &params.site_id,
+        &start,
+        &end,
+        timeseries::Granularity::Day,
+    )?;
+
+    // Get top page and source
+    let top_pages = breakdowns::query_breakdown(
+        &conn,
+        &params.site_id,
+        &start,
+        &end,
+        breakdowns::Dimension::Page,
+        1,
+    )?;
+    let top_sources = breakdowns::query_breakdown(
+        &conn,
+        &params.site_id,
+        &start,
+        &end,
+        breakdowns::Dimension::ReferrerSource,
+        1,
+    )?;
+    drop(conn);
+
+    let top_page = top_pages
+        .first()
+        .map_or("(none)", |r| r.value.as_str())
+        .to_string();
+    let top_source = top_sources
+        .first()
+        .map_or("(direct)", |r| r.value.as_str())
+        .to_string();
+
+    let rows: Vec<ExportRow> = ts_data
+        .iter()
+        .map(|b| ExportRow {
+            date: b.date.clone(),
+            visitors: b.visitors,
+            pageviews: b.pageviews,
+            top_page: top_page.clone(),
+            top_source: top_source.clone(),
+        })
+        .collect();
+
+    if params.format == "json" {
+        Ok((
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::to_string(&rows).unwrap_or_default(),
+        )
+            .into_response())
+    } else {
+        // CSV format
+        let mut csv = String::from("date,visitors,pageviews,top_page,top_source\n");
+        for row in &rows {
+            let _ = writeln!(
+                csv,
+                "{},{},{},{},{}",
+                row.date, row.visitors, row.pageviews, row.top_page, row.top_source
+            );
+        }
+        Ok((
+            [
+                (header::CONTENT_TYPE, "text/csv"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"export.csv\"",
+                ),
+            ],
+            csv,
+        )
+            .into_response())
+    }
 }
 
 #[cfg(test)]

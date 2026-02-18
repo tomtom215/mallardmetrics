@@ -1,7 +1,7 @@
 use duckdb::Connection;
 
 /// A single time bucket with visitor and pageview counts.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TimeBucket {
     pub date: String,
     pub visitors: u64,

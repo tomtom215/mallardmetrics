@@ -20,7 +20,7 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 # Build
 cargo build
 
-# Run all tests (138 total: 116 unit + 22 integration)
+# Run all tests (209 total: 166 unit + 43 integration)
 cargo test
 
 # Clippy (zero warnings required)
@@ -51,9 +51,9 @@ cargo bench
 
 | Metric | Value | Verified |
 |---|---|---|
-| Unit tests | 116 | `cargo test --lib` |
-| Integration tests | 22 | `cargo test --test ingest_test` |
-| Total tests | 138 | `cargo test` |
+| Unit tests | 166 | `cargo test --lib` |
+| Integration tests | 43 | `cargo test --test ingest_test` |
+| Total tests | 209 | `cargo test` |
 | Clippy warnings | 0 | `cargo clippy --all-targets` |
 | Format violations | 0 | `cargo fmt -- --check` |
 | CI jobs | 10 | `.github/workflows/ci.yml` |
@@ -68,7 +68,8 @@ cargo bench
 | `ingest/buffer.rs` | In-memory event buffer with periodic flush |
 | `ingest/visitor_id.rs` | HMAC-SHA256 privacy-safe visitor ID |
 | `ingest/useragent.rs` | User-Agent parsing |
-| `ingest/geoip.rs` | GeoIP stub (Phase 4) |
+| `ingest/geoip.rs` | MaxMind GeoIP reader with graceful fallback |
+| `ingest/ratelimit.rs` | Per-site token-bucket rate limiter |
 | `storage/schema.rs` | DuckDB table definitions |
 | `storage/parquet.rs` | Parquet write/read/partitioning |
 | `storage/migrations.rs` | Schema versioning |
@@ -80,9 +81,10 @@ cargo bench
 | `query/retention.rs` | retention cohort query execution |
 | `query/sequences.rs` | sequence_match query execution |
 | `query/flow.rs` | sequence_next_node flow analysis |
-| `api/stats.rs` | All analytics API handlers (core, sessions, funnel, retention, sequences, flow) |
+| `query/cache.rs` | TTL-based query result cache |
+| `api/stats.rs` | All analytics API handlers (core, sessions, funnel, retention, sequences, flow, export) |
 | `api/errors.rs` | API error types |
-| `api/auth.rs` | Origin validation + authentication stub |
+| `api/auth.rs` | Origin validation, session auth, API key management |
 | `dashboard/` | Embedded SPA (Preact + HTM) with 5 advanced analytics views |
 
 ## Session Protocol
@@ -212,3 +214,42 @@ cargo bench
 - `test_sequences_endpoint_requires_two_steps` — verifies 400 for single step
 - `test_flow_endpoint_returns_ok` — verifies 200 for flow analysis
 - `test_flow_endpoint_rejects_empty_page` — verifies 400 for empty page path
+
+### Session 4: Phase 4 — Production Hardening
+
+**Changes:**
+- Implemented Argon2id password hashing for dashboard authentication
+- Added session management with 256-bit cryptographic tokens (HttpOnly cookies)
+- Added API key management (CRUD endpoints, SHA-256 hashed at rest, `mm_` prefix)
+- Added auth middleware protecting stats and key management routes
+- Added CORS hardening: permissive for ingestion, restrictive for dashboard
+- Added MaxMind GeoLite2 GeoIP reader with graceful fallback
+- Added bot traffic filtering via User-Agent detection
+
+**Test results:**
+- 146 unit tests, 38 integration tests, total 184
+- 0 clippy warnings, 0 format violations
+
+### Session 5: Phases 5+6 — Operational Excellence & Scale
+
+**Changes:**
+- **Phase 5.1:** Data retention cleanup — `cleanup_old_partitions()` removes Parquet files older than configured retention period, runs daily
+- **Phase 5.2:** Data export API — `GET /api/stats/export` returns CSV or JSON format with daily visitor/pageview data
+- **Phase 5.3:** Graceful shutdown — SIGINT/SIGTERM handling with buffered event flush before exit
+- **Phase 5.4:** Enhanced health check — `GET /health/detailed` returns JSON with version, buffer, auth, geoip, cache status
+- **Phase 5.5:** Structured logging — `MALLARD_LOG_FORMAT=json` enables JSON-formatted tracing output
+- **Phase 5.6:** Config template — `mallard-metrics.toml.example` with all options documented
+- **Phase 5.7:** Docker optimization — Dependency caching layer in Dockerfile, enhanced docker-compose with restart policy
+- **Phase 6.1:** Query result caching — TTL-based in-memory cache for main stats and timeseries endpoints
+- **Phase 6.2:** Rate limiting — Per-site token-bucket rate limiter for ingestion endpoint (configurable via `rate_limit_per_site`)
+- **Phase 6.4:** Benchmark suite — Added query benchmarks (core metrics, timeseries, breakdowns) to Criterion suite
+- **Phase 6.5:** Prometheus metrics — `GET /metrics` endpoint with `text/plain; version=0.0.4` format
+
+**New modules:**
+- `query/cache.rs` — Thread-safe query cache with TTL expiration
+- `ingest/ratelimit.rs` — Token-bucket rate limiter per site_id
+
+**Test results:**
+- 166 unit tests, 43 integration tests, total 209
+- 0 clippy warnings, 0 format violations
+- Documentation builds without errors
