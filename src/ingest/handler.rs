@@ -1,5 +1,6 @@
+use crate::api::auth::{ApiKeyStore, SessionStore};
 use crate::ingest::buffer::{Event, EventBuffer};
-use crate::ingest::geoip;
+use crate::ingest::geoip::GeoIpReader;
 use crate::ingest::useragent;
 use crate::ingest::visitor_id;
 use axum::extract::State;
@@ -48,11 +49,18 @@ pub struct EventPayload {
     pub revenue_currency: Option<String>,
 }
 
-/// Shared application state for the ingestion handler.
+/// Shared application state.
 pub struct AppState {
     pub buffer: EventBuffer,
     pub secret: String,
     pub allowed_sites: Vec<String>,
+    pub geoip: GeoIpReader,
+    pub filter_bots: bool,
+    pub sessions: SessionStore,
+    pub api_keys: ApiKeyStore,
+    /// Hashed admin password (Argon2id). None if no admin user set up yet.
+    pub admin_password_hash: parking_lot::Mutex<Option<String>>,
+    pub dashboard_origin: Option<String>,
 }
 
 /// POST /api/event — Ingestion endpoint.
@@ -92,6 +100,14 @@ pub async fn ingest_event(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
+    // Parse User-Agent for browser/OS information and bot detection
+    let parsed_ua = useragent::parse_user_agent(user_agent);
+
+    // Filter bot traffic if configured
+    if state.filter_bots && parsed_ua.is_bot {
+        return StatusCode::ACCEPTED;
+    }
+
     let today = Utc::now().date_naive();
     let salt = visitor_id::daily_salt(&state.secret, today);
     let vid = visitor_id::generate_visitor_id(&ip, user_agent, &salt);
@@ -106,11 +122,8 @@ pub async fn ingest_event(
         .as_deref()
         .and_then(extract_referrer_source);
 
-    // Parse User-Agent for browser/OS information
-    let parsed_ua = useragent::parse_user_agent(user_agent);
-
-    // Look up geographic information from IP
-    let geo_info = geoip::lookup(&ip);
+    // Look up geographic information from IP (PRIVACY: IP used only for lookup, never stored)
+    let geo_info = state.geoip.lookup(&ip);
 
     // Determine device type from screen width
     let device_type = payload.screen_width.map(classify_device);

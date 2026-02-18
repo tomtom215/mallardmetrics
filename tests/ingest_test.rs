@@ -2,7 +2,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use duckdb::Connection;
 use http_body_util::BodyExt;
+use mallard_metrics::api::auth::{ApiKeyStore, SessionStore};
 use mallard_metrics::ingest::buffer::EventBuffer;
+use mallard_metrics::ingest::geoip::GeoIpReader;
 use mallard_metrics::ingest::handler::AppState;
 use mallard_metrics::server::build_router;
 use mallard_metrics::storage::parquet::ParquetStorage;
@@ -22,6 +24,12 @@ fn make_test_state() -> (Arc<AppState>, tempfile::TempDir) {
         buffer,
         secret: "test-secret-integration".to_string(),
         allowed_sites: Vec::new(),
+        geoip: GeoIpReader::open(None),
+        filter_bots: false,
+        sessions: SessionStore::new(3600),
+        api_keys: ApiKeyStore::new(),
+        admin_password_hash: Mutex::new(None),
+        dashboard_origin: None,
     });
     (state, dir)
 }
@@ -346,6 +354,12 @@ fn make_test_state_with_sites(sites: Vec<String>) -> (Arc<AppState>, tempfile::T
         buffer,
         secret: "test-secret-integration".to_string(),
         allowed_sites: sites,
+        geoip: GeoIpReader::open(None),
+        filter_bots: false,
+        sessions: SessionStore::new(3600),
+        api_keys: ApiKeyStore::new(),
+        admin_password_hash: Mutex::new(None),
+        dashboard_origin: None,
     });
     (state, dir)
 }
@@ -653,4 +667,432 @@ async fn test_flow_endpoint_rejects_empty_page() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// --- Phase 4.2: Authentication integration tests ---
+
+fn make_test_state_with_password(password: &str) -> (Arc<AppState>, tempfile::TempDir) {
+    let conn = Connection::open_in_memory().unwrap();
+    schema::init_schema(&conn).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let storage = ParquetStorage::new(dir.path());
+    let conn = Arc::new(Mutex::new(conn));
+    let buffer = EventBuffer::new(1000, conn, storage);
+    let hash = mallard_metrics::api::auth::hash_password(password).unwrap();
+    let state = Arc::new(AppState {
+        buffer,
+        secret: "test-secret-integration".to_string(),
+        allowed_sites: Vec::new(),
+        geoip: GeoIpReader::open(None),
+        filter_bots: false,
+        sessions: SessionStore::new(3600),
+        api_keys: ApiKeyStore::new(),
+        admin_password_hash: Mutex::new(Some(hash)),
+        dashboard_origin: None,
+    });
+    (state, dir)
+}
+
+#[tokio::test]
+async fn test_auth_status_no_password_configured() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["setup_required"], true);
+    assert_eq!(json["authenticated"], true); // Open access when no password
+}
+
+#[tokio::test]
+async fn test_auth_setup_creates_password() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(Arc::clone(&state));
+
+    let payload = serde_json::json!({ "password": "secure-password-123" });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/setup")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Verify Set-Cookie header is present
+    let cookie = response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(cookie.contains("mm_session="));
+    assert!(cookie.contains("HttpOnly"));
+    assert!(cookie.contains("SameSite=Strict"));
+
+    // Verify password is now configured
+    assert!(state.admin_password_hash.lock().is_some());
+}
+
+#[tokio::test]
+async fn test_auth_setup_rejects_short_password() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(state);
+
+    let payload = serde_json::json!({ "password": "short" });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/setup")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_auth_setup_rejects_second_setup() {
+    let (state, _dir) = make_test_state_with_password("existing-password");
+    let app = build_router(state);
+
+    let payload = serde_json::json!({ "password": "new-password-123" });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/setup")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn test_auth_login_success() {
+    let (state, _dir) = make_test_state_with_password("my-secure-password");
+    let app = build_router(state);
+
+    let payload = serde_json::json!({ "password": "my-secure-password" });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(cookie.contains("mm_session="));
+}
+
+#[tokio::test]
+async fn test_auth_login_wrong_password() {
+    let (state, _dir) = make_test_state_with_password("correct-password");
+    let app = build_router(state);
+
+    let payload = serde_json::json!({ "password": "wrong-password" });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_auth_middleware_blocks_unauthenticated_stats() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let app = build_router(state);
+
+    // Stats route without session cookie should return 401
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/main?site_id=test.com&period=30d")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_auth_middleware_allows_authenticated_stats() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+
+    // Create a session directly
+    let token = state.sessions.create_session("admin");
+
+    let app = build_router(Arc::clone(&state));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/main?site_id=test.com&period=30d")
+                .header("cookie", format!("mm_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_auth_middleware_allows_api_key() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+
+    // Add an API key
+    let key = mallard_metrics::api::auth::generate_api_key();
+    state.api_keys.add_key(
+        "test",
+        &key,
+        mallard_metrics::api::auth::ApiKeyScope::ReadOnly,
+    );
+
+    let app = build_router(Arc::clone(&state));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/main?site_id=test.com&period=30d")
+                .header("authorization", format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_auth_middleware_allows_event_ingestion_without_auth() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let app = build_router(state);
+
+    // Event ingestion should work even when auth is configured
+    let payload = serde_json::json!({
+        "d": "example.com",
+        "n": "pageview",
+        "u": "https://example.com/",
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/event")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn test_auth_logout() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let token = state.sessions.create_session("admin");
+
+    let app = build_router(Arc::clone(&state));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/logout")
+                .header("cookie", format!("mm_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Session should be invalidated
+    assert!(state.sessions.validate_session(&token).is_none());
+}
+
+#[tokio::test]
+async fn test_auth_status_with_password_configured() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let token = state.sessions.create_session("admin");
+
+    let app = build_router(Arc::clone(&state));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/auth/status")
+                .header("cookie", format!("mm_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["setup_required"], false);
+    assert_eq!(json["authenticated"], true);
+}
+
+// --- Phase 4.4: API Key Management integration tests ---
+
+#[tokio::test]
+async fn test_create_api_key() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let token = state.sessions.create_session("admin");
+
+    let app = build_router(Arc::clone(&state));
+    let payload = serde_json::json!({ "name": "test-key", "scope": "ReadOnly" });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/keys")
+                .header("content-type", "application/json")
+                .header("cookie", format!("mm_session={token}"))
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["key"].as_str().unwrap().starts_with("mm_"));
+    assert_eq!(json["name"], "test-key");
+    assert_eq!(json["scope"], "ReadOnly");
+}
+
+#[tokio::test]
+async fn test_list_api_keys() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let token = state.sessions.create_session("admin");
+
+    // Create a key
+    let key = mallard_metrics::api::auth::generate_api_key();
+    state.api_keys.add_key(
+        "my-key",
+        &key,
+        mallard_metrics::api::auth::ApiKeyScope::Admin,
+    );
+
+    let app = build_router(Arc::clone(&state));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/keys")
+                .header("cookie", format!("mm_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json.len(), 1);
+    assert_eq!(json[0]["name"], "my-key");
+    assert_eq!(json[0]["scope"], "Admin");
+}
+
+#[tokio::test]
+async fn test_revoke_api_key() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let token = state.sessions.create_session("admin");
+
+    let key = mallard_metrics::api::auth::generate_api_key();
+    let key_hash = state.api_keys.add_key(
+        "revoke-me",
+        &key,
+        mallard_metrics::api::auth::ApiKeyScope::ReadOnly,
+    );
+
+    let app = build_router(Arc::clone(&state));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/keys/{key_hash}"))
+                .header("cookie", format!("mm_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Key should now be revoked
+    assert!(state.api_keys.validate_key(&key).is_none());
+}
+
+#[tokio::test]
+async fn test_api_key_endpoints_require_auth() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let app = build_router(state);
+
+    // Unauthenticated list should fail
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/keys")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }

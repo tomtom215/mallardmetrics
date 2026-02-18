@@ -6,8 +6,10 @@ mod query;
 mod server;
 mod storage;
 
+use crate::api::auth::{ApiKeyStore, SessionStore};
 use crate::config::Config;
 use crate::ingest::buffer::EventBuffer;
+use crate::ingest::geoip::GeoIpReader;
 use crate::ingest::handler::AppState;
 use crate::storage::parquet::ParquetStorage;
 use duckdb::Connection;
@@ -55,6 +57,9 @@ async fn main() {
     let storage = ParquetStorage::new(&config.events_dir());
     let buffer = EventBuffer::new(config.flush_event_count, Arc::clone(&conn), storage);
 
+    // Initialize GeoIP reader (gracefully degrades if .mmdb not available)
+    let geoip = GeoIpReader::open(config.geoip_db_path.as_deref());
+
     // Set up periodic flush
     let flush_conn = Arc::clone(&conn);
     let flush_interval = config.flush_interval_secs;
@@ -77,6 +82,20 @@ async fn main() {
         }
     });
 
+    // Initialize auth stores
+    let sessions = SessionStore::new(config.session_ttl_secs);
+    let api_keys = ApiKeyStore::new();
+
+    // Hash admin password from env var if provided
+    let admin_password_hash = std::env::var("MALLARD_ADMIN_PASSWORD")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let hash = crate::api::auth::hash_password(&p).expect("Failed to hash admin password");
+            tracing::info!("Admin password configured from MALLARD_ADMIN_PASSWORD");
+            hash
+        });
+
     let state = Arc::new(AppState {
         buffer,
         secret: std::env::var("MALLARD_SECRET").unwrap_or_else(|_| {
@@ -85,6 +104,12 @@ async fn main() {
             secret
         }),
         allowed_sites: config.site_ids,
+        geoip,
+        filter_bots: config.filter_bots,
+        sessions,
+        api_keys,
+        admin_password_hash: Mutex::new(admin_password_hash),
+        dashboard_origin: config.dashboard_origin,
     });
 
     let app = server::build_router(state);

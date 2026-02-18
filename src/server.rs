@@ -1,7 +1,10 @@
+use crate::api::auth;
 use crate::api::stats;
 use crate::dashboard;
 use crate::ingest::handler::{ingest_event, AppState};
-use axum::routing::{get, post};
+use axum::http::{header, Method};
+use axum::middleware;
+use axum::routing::{delete, get, post};
 use axum::Router;
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
@@ -9,13 +12,30 @@ use tower_http::trace::TraceLayer;
 
 /// Build the Axum router with all routes.
 pub fn build_router(state: Arc<AppState>) -> Router {
-    let cors = CorsLayer::new()
+    // Permissive CORS for ingestion (tracking script runs on any origin)
+    let ingestion_cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_methods([Method::POST])
+        .allow_headers([header::CONTENT_TYPE]);
 
-    let api_routes = Router::new()
-        .route("/event", post(ingest_event))
+    // Restrictive CORS for dashboard/stats/admin routes
+    let dashboard_cors = build_dashboard_cors(state.dashboard_origin.as_deref());
+
+    // Auth routes — always accessible (needed to log in)
+    let auth_routes = Router::new()
+        .route("/auth/setup", post(auth::auth_setup))
+        .route("/auth/login", post(auth::auth_login))
+        .route("/auth/logout", post(auth::auth_logout))
+        .route("/auth/status", get(auth::auth_status));
+
+    // API key management routes
+    let key_routes = Router::new()
+        .route("/keys", post(auth::create_api_key))
+        .route("/keys", get(auth::list_api_keys))
+        .route("/keys/{key_hash}", delete(auth::revoke_api_key_handler));
+
+    // Stats routes
+    let stats_routes = Router::new()
         .route("/stats/main", get(stats::get_main_stats))
         .route("/stats/timeseries", get(stats::get_timeseries))
         .route("/stats/breakdown/pages", get(stats::get_pages_breakdown))
@@ -42,14 +62,55 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/stats/sequences", get(stats::get_sequences))
         .route("/stats/flow", get(stats::get_flow));
 
+    // Protected routes — stats + key management, guarded by auth middleware
+    let protected_routes = stats_routes
+        .merge(key_routes)
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            auth::require_auth,
+        ))
+        .layer(dashboard_cors);
+
+    // Ingestion with permissive CORS
+    let ingestion_routes = Router::new()
+        .route("/event", post(ingest_event))
+        .layer(ingestion_cors);
+
+    let api_routes = Router::new()
+        .merge(ingestion_routes)
+        .merge(auth_routes)
+        .merge(protected_routes);
+
     Router::new()
         .route("/health", get(health_check))
         .nest("/api", api_routes)
         .route("/", get(dashboard::serve_index))
         .route("/{*path}", get(dashboard::serve_asset))
-        .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Build CORS layer for dashboard routes based on configured origin.
+fn build_dashboard_cors(dashboard_origin: Option<&str>) -> CorsLayer {
+    dashboard_origin.map_or_else(
+        || {
+            // No origin configured — permissive (same-origin requests work by default)
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        },
+        |origin| {
+            let allowed_origin = origin
+                .parse::<axum::http::HeaderValue>()
+                .unwrap_or_else(|_| axum::http::HeaderValue::from_static("*"));
+            CorsLayer::new()
+                .allow_origin(allowed_origin)
+                .allow_methods([Method::GET, Method::POST, Method::DELETE])
+                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::COOKIE])
+                .allow_credentials(true)
+        },
+    )
 }
 
 /// GET /health — Health check endpoint.
@@ -60,6 +121,7 @@ async fn health_check() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::auth::{ApiKeyStore, SessionStore};
     use crate::ingest::buffer::EventBuffer;
     use crate::storage::parquet::ParquetStorage;
     use axum::body::Body;
@@ -80,6 +142,12 @@ mod tests {
             buffer,
             secret: "test-secret".to_string(),
             allowed_sites: Vec::new(),
+            geoip: crate::ingest::geoip::GeoIpReader::open(None),
+            filter_bots: false,
+            sessions: SessionStore::new(3600),
+            api_keys: ApiKeyStore::new(),
+            admin_password_hash: Mutex::new(None),
+            dashboard_origin: None,
         });
         (state, dir)
     }
