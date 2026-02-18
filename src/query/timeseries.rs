@@ -46,7 +46,7 @@ pub fn query_timeseries(
         "SELECT strftime(DATE_TRUNC('{trunc}', timestamp), '{fmt}') AS bucket,
                 COUNT(DISTINCT visitor_id) AS visitors,
                 COUNT(*) FILTER (WHERE event_name = 'pageview') AS pageviews
-         FROM events
+         FROM events_all
          WHERE site_id = ? AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)
          GROUP BY bucket
          ORDER BY bucket"
@@ -74,6 +74,9 @@ mod tests {
     fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::storage::schema::init_schema(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::schema::setup_query_view(&conn, dir.path()).unwrap();
+        drop(dir); // view was already created; TempDir no longer needed
         conn
     }
 

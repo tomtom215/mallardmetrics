@@ -34,10 +34,10 @@ pub fn query_retention(
     let sql = format!(
         "SELECT STRFTIME(DATE_TRUNC('week', first_seen), '%Y-%m-%d') AS cohort_week,
             retention({retention_args}) AS retained
-         FROM events e
+         FROM events_all e
          JOIN (
              SELECT visitor_id, MIN(timestamp) AS first_seen
-             FROM events WHERE site_id = ?
+             FROM events_all WHERE site_id = ?
              GROUP BY visitor_id
          ) f ON e.visitor_id = f.visitor_id
          WHERE e.site_id = ?
@@ -81,10 +81,18 @@ fn parse_bool_array(s: &str) -> Vec<bool> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_retention_empty() {
+    fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::storage::schema::init_schema(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::schema::setup_query_view(&conn, dir.path()).unwrap();
+        drop(dir); // view was already created; TempDir no longer needed
+        conn
+    }
+
+    #[test]
+    fn test_retention_empty() {
+        let conn = setup_test_db();
         // Without behavioral extension, this will fail gracefully
         let result = query_retention(&conn, "test.com", "2024-01-01", "2024-03-01", 4);
         if let Ok(cohorts) = result {
@@ -94,7 +102,7 @@ mod tests {
 
     #[test]
     fn test_retention_zero_weeks() {
-        let conn = Connection::open_in_memory().unwrap();
+        let conn = setup_test_db();
         let result = query_retention(&conn, "test.com", "2024-01-01", "2024-03-01", 0).unwrap();
         assert!(result.is_empty());
     }

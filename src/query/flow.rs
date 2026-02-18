@@ -31,7 +31,7 @@ pub fn query_flow(
                  sequence_next_node('forward', 'first_match', timestamp, pathname,
                      TRUE, pathname = '{escaped_page}'
                  ) AS next_page
-             FROM events
+             FROM events_all
              WHERE site_id = ? AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)
              GROUP BY visitor_id
          )
@@ -57,10 +57,18 @@ pub fn query_flow(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_query_flow_no_extension() {
+    fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::storage::schema::init_schema(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::schema::setup_query_view(&conn, dir.path()).unwrap();
+        drop(dir);
+        conn
+    }
+
+    #[test]
+    fn test_query_flow_no_extension() {
+        let conn = setup_test_db();
         // Without behavioral extension, this will fail gracefully
         let result = query_flow(&conn, "test.com", "2024-01-01", "2024-02-01", "/pricing");
         if let Ok(nodes) = result {
@@ -70,8 +78,7 @@ mod tests {
 
     #[test]
     fn test_query_flow_escapes_quotes() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::storage::schema::init_schema(&conn).unwrap();
+        let conn = setup_test_db();
         // This should not cause a SQL error from unbalanced quotes
         let result = query_flow(
             &conn,

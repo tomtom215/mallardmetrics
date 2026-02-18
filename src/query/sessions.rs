@@ -26,7 +26,7 @@ pub fn query_session_metrics(
                 ) AS session_id,
                 timestamp,
                 event_name
-            FROM events
+            FROM events_all
             WHERE site_id = ? AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)
         ),
         session_stats AS (
@@ -62,6 +62,9 @@ mod tests {
     fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::storage::schema::init_schema(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::schema::setup_query_view(&conn, dir.path()).unwrap();
+        drop(dir); // view was already created; TempDir no longer needed
         conn
     }
 

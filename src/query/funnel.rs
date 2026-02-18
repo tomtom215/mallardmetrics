@@ -34,7 +34,7 @@ pub fn query_funnel(
                  window_funnel(INTERVAL '{window_interval}', timestamp,
                      {step_conditions}
                  ) AS steps
-             FROM events
+             FROM events_all
              WHERE site_id = ? AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)
              GROUP BY visitor_id
          )
@@ -59,11 +59,18 @@ pub fn query_funnel(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_funnel_empty_steps() {
+    fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::storage::schema::init_schema(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::schema::setup_query_view(&conn, dir.path()).unwrap();
+        drop(dir);
+        conn
+    }
 
+    #[test]
+    fn test_funnel_empty_steps() {
+        let conn = setup_test_db();
         let result =
             query_funnel(&conn, "test.com", "2024-01-01", "2024-02-01", "1 day", &[]).unwrap();
         assert!(result.is_empty());

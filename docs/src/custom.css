@@ -1,0 +1,58 @@
+/* Mallard Metrics documentation custom styles */
+
+:root {
+    --mallard-teal: #0f9488;
+    --mallard-teal-light: #14b8a6;
+    --mallard-navy: #1e3a5f;
+}
+
+/* Wider content area */
+.content main {
+    max-width: 900px;
+}
+
+/* Colored header accent */
+h1 {
+    border-bottom: 3px solid var(--mallard-teal);
+    padding-bottom: 0.3em;
+}
+
+/* Table improvements */
+table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 1em 0;
+}
+
+th {
+    background-color: var(--mallard-teal);
+    color: #fff;
+    text-align: left;
+    padding: 0.5em 0.75em;
+}
+
+td {
+    padding: 0.45em 0.75em;
+    border-bottom: 1px solid #ddd;
+}
+
+/* Inline code */
+code {
+    font-size: 0.88em;
+    padding: 0.1em 0.3em;
+    border-radius: 3px;
+}
+
+/* Navbar brand */
+.menu-title {
+    font-weight: 700;
+    letter-spacing: 0.5px;
+}
+
+/* Note/warning callouts */
+blockquote {
+    border-left: 4px solid var(--mallard-teal);
+    padding: 0.5em 1em;
+    margin: 1em 0;
+    background: rgba(15, 148, 136, 0.07);
+}

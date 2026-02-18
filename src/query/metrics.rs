@@ -48,7 +48,7 @@ pub fn query_unique_visitors(
     end_date: &str,
 ) -> Result<u64, duckdb::Error> {
     let mut stmt = conn.prepare(
-        "SELECT COUNT(DISTINCT visitor_id) FROM events
+        "SELECT COUNT(DISTINCT visitor_id) FROM events_all
          WHERE site_id = ? AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)",
     )?;
     let count: u64 = stmt.query_row(duckdb::params![site_id, start_date, end_date], |row| {
@@ -65,7 +65,7 @@ pub fn query_total_pageviews(
     end_date: &str,
 ) -> Result<u64, duckdb::Error> {
     let mut stmt = conn.prepare(
-        "SELECT COUNT(*) FROM events
+        "SELECT COUNT(*) FROM events_all
          WHERE site_id = ? AND event_name = 'pageview'
          AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)",
     )?;
@@ -92,7 +92,7 @@ pub fn query_bounce_rate(
                     PARTITION BY visitor_id ORDER BY timestamp
                 ) AS session_id,
                 event_name
-            FROM events
+            FROM events_all
             WHERE site_id = ? AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)
         )
         SELECT
@@ -125,6 +125,9 @@ mod tests {
     fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::storage::schema::init_schema(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::schema::setup_query_view(&conn, dir.path()).unwrap();
+        drop(dir); // view was already created; TempDir no longer needed
         conn
     }
 
