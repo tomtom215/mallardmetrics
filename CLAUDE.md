@@ -20,7 +20,7 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 # Build
 cargo build
 
-# Run all tests (209 total: 166 unit + 43 integration)
+# Run all tests (222 total: 179 unit + 43 integration)
 cargo test
 
 # Clippy (zero warnings required)
@@ -51,9 +51,9 @@ cargo bench
 
 | Metric | Value | Verified |
 |---|---|---|
-| Unit tests | 166 | `cargo test --lib` |
+| Unit tests | 179 | `cargo test --lib` |
 | Integration tests | 43 | `cargo test --test ingest_test` |
-| Total tests | 209 | `cargo test` |
+| Total tests | 222 | `cargo test` |
 | Clippy warnings | 0 | `cargo clippy --all-targets` |
 | Format violations | 0 | `cargo fmt -- --check` |
 | CI jobs | 10 | `.github/workflows/ci.yml` |
@@ -253,3 +253,35 @@ cargo bench
 - 166 unit tests, 43 integration tests, total 209
 - 0 clippy warnings, 0 format violations
 - Documentation builds without errors
+
+### Session 6: Comprehensive Project Audit
+
+**Scope:** Full codebase audit covering all Rust source files, tests, documentation, CI/CD, and frontend code.
+
+**Security fixes:**
+- **CSV injection prevention** (`api/stats.rs`) — Added `escape_csv_field()` that prefixes formula-triggering characters (`=`, `+`, `-`, `@`) with a single quote in CSV export output
+- **Constant-time API key comparison** (`api/auth.rs`) — Added `constant_time_eq()` using XOR accumulation to prevent timing side-channel attacks in `validate_key()`
+- **Path traversal prevention** (`storage/parquet.rs`) — Added `is_safe_path_component()` validation rejecting `..`, `/`, `\`, null bytes, and empty strings in site_id before filesystem operations
+
+**Code quality fixes:**
+- **Export format validation** (`api/stats.rs`) — Replaced `if/else` with `match` on format parameter; invalid formats now return 400 with descriptive message instead of silently defaulting to CSV
+- **JSON serialization error handling** (`api/stats.rs`) — Replaced `unwrap_or_default()` with proper error propagation via `ApiError::Internal` for JSON serialization failures
+
+**New unit tests added (13):**
+- `test_escape_csv_field_plain` — plain text passes through unchanged
+- `test_escape_csv_field_with_quotes` — double quotes are escaped
+- `test_escape_csv_field_formula_injection` — formula characters get single-quote prefix
+- `test_export_invalid_format` — invalid format returns BadRequest
+- `test_constant_time_eq_equal` — matching byte slices return true
+- `test_constant_time_eq_not_equal` — differing byte slices return false
+- `test_constant_time_eq_different_lengths` — length mismatch returns false
+- `test_constant_time_eq_empty` — empty slices return true
+- `test_is_safe_path_component_valid` — normal site_ids accepted
+- `test_is_safe_path_component_rejects_traversal` — `..` rejected
+- `test_is_safe_path_component_rejects_slashes` — `/` and `\` rejected
+- `test_is_safe_path_component_rejects_empty` — empty string rejected
+- `test_is_safe_path_component_rejects_null` — null bytes rejected
+
+**Test results:**
+- 179 unit tests, 43 integration tests, total 222
+- 0 clippy warnings, 0 format violations

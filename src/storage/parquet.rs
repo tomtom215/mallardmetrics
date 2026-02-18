@@ -12,6 +12,19 @@ pub struct ParquetStorage {
     base_dir: PathBuf,
 }
 
+/// Validate that a site_id is safe for use in filesystem paths.
+///
+/// Rejects path traversal sequences (`..`, `/`, `\`) and control characters
+/// that could be used to escape the partition directory.
+fn is_safe_path_component(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains("..")
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains('\0')
+        && s.len() <= 256
+}
+
 impl ParquetStorage {
     pub fn new(base_dir: &Path) -> Self {
         Self {
@@ -70,6 +83,11 @@ impl ParquetStorage {
         let mut total_flushed = 0usize;
 
         for (site_id, date, count) in &partitions {
+            // Validate site_id to prevent path traversal in filesystem operations
+            if !is_safe_path_component(site_id) {
+                tracing::warn!(site_id, "Skipping flush for invalid site_id");
+                continue;
+            }
             let file_path = self.next_file_path(site_id, date);
             let file_path_str = file_path.to_string_lossy();
 
@@ -104,6 +122,9 @@ impl ParquetStorage {
         start_date: &str,
         end_date: &str,
     ) -> Result<(), FlushError> {
+        if !is_safe_path_component(site_id) {
+            return Ok(());
+        }
         let site_dir = self.base_dir.join(format!("site_id={site_id}"));
         if !site_dir.exists() {
             return Ok(());
@@ -370,5 +391,35 @@ mod tests {
         assert_eq!(removed, 2);
         assert!(!old_a.exists());
         assert!(!old_b.exists());
+    }
+
+    #[test]
+    fn test_is_safe_path_component_valid() {
+        assert!(is_safe_path_component("example.com"));
+        assert!(is_safe_path_component("my-site.org"));
+        assert!(is_safe_path_component("site123"));
+    }
+
+    #[test]
+    fn test_is_safe_path_component_rejects_traversal() {
+        assert!(!is_safe_path_component("../../../etc"));
+        assert!(!is_safe_path_component("site/../secret"));
+        assert!(!is_safe_path_component("site/../../passwd"));
+    }
+
+    #[test]
+    fn test_is_safe_path_component_rejects_slashes() {
+        assert!(!is_safe_path_component("site/subdir"));
+        assert!(!is_safe_path_component("site\\subdir"));
+    }
+
+    #[test]
+    fn test_is_safe_path_component_rejects_empty() {
+        assert!(!is_safe_path_component(""));
+    }
+
+    #[test]
+    fn test_is_safe_path_component_rejects_null() {
+        assert!(!is_safe_path_component("site\0id"));
     }
 }
