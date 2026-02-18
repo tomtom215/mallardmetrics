@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
+  <defs>
+    <linearGradient id="g2head" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#065F46;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#10B981;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="g2bill" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#D97706;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#FBBF24;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded square background -->
+  <rect x="15" y="15" width="370" height="370" rx="60" fill="#111827"/>
+
+  <!-- Duck head profile - large and centered -->
+  <g transform="translate(45, 30)">
+    <!-- Head -->
+    <path d="M 170 200
+             Q 100 190, 75 150
+             Q 55 115, 70 80
+             Q 85 48, 130 35
+             Q 170 25, 205 40
+             Q 240 55, 248 85
+             Q 255 110, 240 140
+             Q 225 170, 195 190 Z"
+          fill="url(#g2head)"/>
+
+    <!-- Eye -->
+    <circle cx="185" cy="95" r="18" fill="#111827"/>
+    <circle cx="188" cy="92" r="10" fill="white"/>
+    <circle cx="190" cy="90" r="5" fill="#111827"/>
+    <circle cx="192" cy="88" r="2" fill="white"/>
+
+    <!-- Bill -->
+    <path d="M 240 120 L 300 135 Q 310 142, 300 150 L 240 155 Q 245 138, 240 120 Z"
+          fill="url(#g2bill)"/>
+    <!-- Bill nostril -->
+    <ellipse cx="260" cy="136" rx="4" ry="3" fill="#B45309" opacity="0.6"/>
+
+    <!-- White neck ring -->
+    <path d="M 120 180 Q 155 205, 200 195" stroke="white" stroke-width="5" fill="none" stroke-linecap="round" opacity="0.9"/>
+  </g>
+
+  <!-- Uptrend line chart overlay -->
+  <g opacity="0.9">
+    <polyline points="60,320 120,300 170,310 220,275 270,260 320,220 350,200"
+              stroke="#10B981" stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+    <!-- Data points -->
+    <circle cx="60" cy="320" r="5" fill="#10B981"/>
+    <circle cx="120" cy="300" r="5" fill="#10B981"/>
+    <circle cx="170" cy="310" r="5" fill="#10B981"/>
+    <circle cx="220" cy="275" r="5" fill="#10B981"/>
+    <circle cx="270" cy="260" r="5" fill="#10B981"/>
+    <circle cx="320" cy="220" r="5" fill="#10B981"/>
+    <circle cx="350" cy="200" r="5" fill="#34D399"/>
+    <!-- Glow on last point -->
+    <circle cx="350" cy="200" r="10" fill="#10B981" opacity="0.3"/>
+  </g>
+
+  <!-- Text -->
+  <text x="200" y="370" text-anchor="middle" font-family="'SF Mono', 'Fira Code', monospace" font-weight="600" font-size="20" fill="#9CA3AF" letter-spacing="4">MALLARD</text>
+</svg>

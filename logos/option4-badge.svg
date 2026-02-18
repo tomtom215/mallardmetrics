@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="400" height="400">
+  <defs>
+    <linearGradient id="g4bg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#1E3A5F" />
+      <stop offset="100%" style="stop-color:#0F2441" />
+    </linearGradient>
+    <linearGradient id="g4gold" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#F59E0B" />
+      <stop offset="100%" style="stop-color:#D97706" />
+    </linearGradient>
+  </defs>
+
+  <!-- Outer ring -->
+  <circle cx="200" cy="200" r="190" fill="url(#g4bg)"/>
+  <circle cx="200" cy="200" r="180" fill="none" stroke="url(#g4gold)" stroke-width="3"/>
+  <circle cx="200" cy="200" r="170" fill="none" stroke="url(#g4gold)" stroke-width="1" opacity="0.4"/>
+
+  <!-- Top arc text path -->
+  <path id="topArc" d="M 60,200 A 140,140 0 0,1 340,200" fill="none"/>
+  <text font-family="'Georgia', serif" font-size="18" fill="#F59E0B" letter-spacing="6">
+    <textPath href="#topArc" startOffset="50%" text-anchor="middle">MALLARD</textPath>
+  </text>
+
+  <!-- Bottom arc text path -->
+  <path id="bottomArc" d="M 65,220 A 140,140 0 0,0 335,220" fill="none"/>
+  <text font-family="'Georgia', serif" font-size="18" fill="#F59E0B" letter-spacing="6">
+    <textPath href="#bottomArc" startOffset="50%" text-anchor="middle">METRICS</textPath>
+  </text>
+
+  <!-- Small decorative diamonds on sides -->
+  <polygon points="52,200 58,194 64,200 58,206" fill="#F59E0B"/>
+  <polygon points="336,200 342,194 348,200 342,206" fill="#F59E0B"/>
+
+  <!-- Central mallard in flight silhouette -->
+  <g transform="translate(200, 185) scale(1.1)" opacity="0.95">
+    <!-- Body -->
+    <ellipse cx="0" cy="0" rx="55" ry="20" fill="#E2E8F0" transform="rotate(-5)"/>
+
+    <!-- Head and neck -->
+    <path d="M 45,-8 Q 60,-20, 68,-30 Q 72,-36, 70,-38 Q 74,-42, 80,-40 L 82,-36 Q 78,-34, 75,-30 Q 70,-22, 58,-12" fill="#38BDF8"/>
+
+    <!-- Eye -->
+    <circle cx="72" cy="-36" r="2.5" fill="#0F2441"/>
+
+    <!-- Bill -->
+    <path d="M 78,-38 L 92,-35 L 90,-31 L 78,-33 Z" fill="#F59E0B"/>
+
+    <!-- Wing up -->
+    <path d="M -10,-10 Q -20,-55, 10,-75 Q 25,-65, 15,-40 Q 10,-25, 0,-12 Z" fill="#CBD5E1"/>
+    <path d="M -10,-10 Q -25,-50, -5,-72 Q 5,-65, 0,-45 Q -3,-28, -5,-12 Z" fill="#E2E8F0"/>
+
+    <!-- Wing down feathers -->
+    <path d="M -15,-8 Q -35,-20, -50,-15 Q -40,-10, -20,-5 Z" fill="#CBD5E1" opacity="0.8"/>
+
+    <!-- Tail -->
+    <path d="M -50,0 L -68,-5 L -65,3 L -72,0 L -65,8 L -52,8 Z" fill="#CBD5E1"/>
+
+    <!-- Speculum (wing patch) -->
+    <rect x="-25" y="-12" width="20" height="5" rx="2" fill="#3B82F6" transform="rotate(-5, -15, -10)" opacity="0.8"/>
+    <rect x="-25" y="-7" width="20" height="2" rx="1" fill="white" transform="rotate(-5, -15, -6)" opacity="0.6"/>
+  </g>
+
+  <!-- Small uptrend sparkline under the duck -->
+  <polyline points="140,240 160,235 180,238 200,228 220,222 240,215 260,205"
+            stroke="#F59E0B" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" opacity="0.6"/>
+</svg>
