@@ -98,7 +98,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 fn build_dashboard_cors(dashboard_origin: Option<&str>) -> CorsLayer {
     dashboard_origin.map_or_else(
         || {
-            // No origin configured — permissive (same-origin requests work by default)
+            // No dashboard origin configured — allow all origins.
+            // Set `dashboard_origin` in config to restrict cross-origin access.
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)

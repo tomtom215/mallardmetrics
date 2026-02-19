@@ -31,8 +31,7 @@ Errors are returned as JSON objects:
 
 ```json
 {
-  "error": "human-readable description",
-  "code": "MACHINE_CODE"
+  "error": "human-readable description"
 }
 ```
 

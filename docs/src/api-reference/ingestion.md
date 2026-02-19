@@ -17,9 +17,9 @@ Records a single analytics event. This endpoint is called by the tracking script
   "u": "https://example.com/pricing",
   "r": "https://google.com/",
   "w": 1920,
-  "p": {"plan": "pro"},
-  "$": 99.00,
-  "c": "USD"
+  "p": "{\"plan\": \"pro\"}",
+  "ra": 99.00,
+  "rc": "USD"
 }
 ```
 
@@ -30,9 +30,9 @@ Records a single analytics event. This endpoint is called by the tracking script
 | `u` | string | Yes | Full URL of the page where the event occurred. |
 | `r` | string | No | Referrer URL. |
 | `w` | number | No | Screen width in pixels (for device-type detection). |
-| `p` | object | No | Custom properties. Stored as a JSON string in the `props` column. |
-| `$` | number | No | Revenue amount (stored as `DECIMAL(12,2)`). |
-| `c` | string | No | ISO 4217 currency code (e.g. `"USD"`, `"EUR"`). Maximum 3 characters. |
+| `p` | string | No | Custom properties as a JSON-encoded string. Stored in the `props` column and queryable via `json_extract`. |
+| `ra` | number | No | Revenue amount (stored as `DECIMAL(12,2)`). |
+| `rc` | string | No | ISO 4217 currency code (e.g. `"USD"`, `"EUR"`). Maximum 3 characters. |
 
 ### Response
 

@@ -42,7 +42,9 @@ impl ParquetStorage {
     /// Generates the next available Parquet file path in the partition.
     fn next_file_path(&self, site_id: &str, date: &str) -> PathBuf {
         let dir = self.partition_dir(site_id, date);
-        fs::create_dir_all(&dir).ok();
+        if let Err(e) = fs::create_dir_all(&dir) {
+            tracing::warn!(path = %dir.display(), error = %e, "Failed to create partition directory");
+        }
 
         let mut num = 1u32;
         loop {

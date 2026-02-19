@@ -52,7 +52,7 @@ function TimeseriesChart({ data }) {
         ${data.map((d, i) => {
           if (i % labelStep !== 0 && i !== data.length - 1) return null;
           const x = PAD.left + (data.length > 1 ? i * xStep : cw / 2);
-          const label = d.date.length > 10 ? d.date.slice(5) : d.date.slice(5);
+          const label = d.date.slice(5);
           return html`<text x=${x} y=${H - 5} text-anchor="middle" fill="#999" font-size="10">${label}</text>`;
         })}
       </svg>
@@ -213,6 +213,60 @@ function FlowTable({ data }) {
   `;
 }
 
+// --- Authentication components ---
+
+function LoginForm({ onLogin, setupRequired }) {
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    const password = e.target.elements.password.value;
+    const endpoint = setupRequired ? '/api/auth/setup' : '/api/auth/login';
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      });
+      if (res.ok) {
+        onLogin();
+      } else {
+        const body = await res.json().catch(() => ({}));
+        alert(body.error || `Error ${res.status}`);
+      }
+    } catch (err) {
+      alert('Network error — could not reach server.');
+    }
+  };
+
+  const title = setupRequired ? 'Set Admin Password' : 'Sign In';
+  const hint = setupRequired
+    ? 'No password is currently set. Create one to protect the dashboard.'
+    : 'Enter your admin password to access the dashboard.';
+  const action = setupRequired ? 'Set Password' : 'Sign In';
+
+  return html`
+    <div class="auth-overlay">
+      <div class="auth-card">
+        <h1>Mallard Metrics</h1>
+        <h2>${title}</h2>
+        <p class="auth-hint">${hint}</p>
+        <form onSubmit=${handleSubmit}>
+          <input
+            type="password"
+            name="password"
+            placeholder="Password"
+            minlength="8"
+            required
+            autofocus
+          />
+          <button type="submit">${action}</button>
+        </form>
+      </div>
+    </div>
+  `;
+}
+
+// --- Main Dashboard ---
+
 class Dashboard extends Component {
   constructor() {
     super();
@@ -256,6 +310,11 @@ class Dashboard extends Component {
           fetch(`/api/stats/sessions?${qs}`),
         ]);
 
+      if (mainRes.status === 401) {
+        // Session expired — force re-auth
+        if (this.props.onAuthExpired) this.props.onAuthExpired();
+        return;
+      }
       if (!mainRes.ok) throw new Error(`HTTP ${mainRes.status}`);
 
       const metrics = await mainRes.json();
@@ -291,6 +350,7 @@ class Dashboard extends Component {
 
   render() {
     const { metrics, timeseries, breakdowns, sessions, funnel, retention, sequences, flow, period, siteId, loading, error, funnelSteps, sequenceSteps, flowPage } = this.state;
+    const { onLogout } = this.props;
 
     return html`
       <div class="dashboard">
@@ -315,6 +375,9 @@ class Dashboard extends Component {
             <button onClick=${() => this.fetchMetrics()} disabled=${loading}>
               ${loading ? 'Loading...' : 'Load'}
             </button>
+            ${onLogout && html`
+              <button class="btn-logout" onClick=${onLogout}>Sign Out</button>
+            `}
           </div>
         </header>
         ${error && html`<div class="error">${error}</div>`}
@@ -424,4 +487,72 @@ class Dashboard extends Component {
   }
 }
 
-render(html`<${Dashboard} />`, document.getElementById('app'));
+// --- App shell with auth gate ---
+
+class App extends Component {
+  constructor() {
+    super();
+    this.state = {
+      authChecked: false,
+      authenticated: false,
+      setupRequired: false,
+    };
+  }
+
+  async componentDidMount() {
+    await this.checkAuth();
+  }
+
+  async checkAuth() {
+    try {
+      const res = await fetch('/api/auth/status');
+      if (res.ok) {
+        const { authenticated, setup_required } = await res.json();
+        this.setState({ authChecked: true, authenticated, setupRequired: setup_required });
+      } else {
+        // Treat fetch errors as unauthenticated
+        this.setState({ authChecked: true, authenticated: false, setupRequired: false });
+      }
+    } catch (_) {
+      this.setState({ authChecked: true, authenticated: false, setupRequired: false });
+    }
+  }
+
+  async handleLogout() {
+    await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+    this.setState({ authenticated: false });
+  }
+
+  handleLogin() {
+    // After login/setup, recheck auth status to get the updated state
+    this.checkAuth();
+  }
+
+  render() {
+    const { authChecked, authenticated, setupRequired } = this.state;
+
+    if (!authChecked) {
+      return html`<div class="loading-screen">Loading...</div>`;
+    }
+
+    if (!authenticated) {
+      return html`
+        <${LoginForm}
+          setupRequired=${setupRequired}
+          onLogin=${() => this.handleLogin()}
+        />
+      `;
+    }
+
+    // authenticated=true: password not set (open access) or valid session
+    const showLogout = !setupRequired; // only show logout when password is configured
+    return html`
+      <${Dashboard}
+        onLogout=${showLogout ? () => this.handleLogout() : null}
+        onAuthExpired=${() => this.setState({ authenticated: false })}
+      />
+    `;
+  }
+}
+
+render(html`<${App} />`, document.getElementById('app'));

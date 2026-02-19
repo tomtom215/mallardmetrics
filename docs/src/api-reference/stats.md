@@ -11,7 +11,7 @@ Query results for `/api/stats/main` and `/api/stats/timeseries` are cached per `
 | Parameter | Type | Description |
 |---|---|---|
 | `site_id` | string | Required. The site to query. |
-| `period` | string | Optional. One of `24h`, `7d`, `30d`, `90d`, `12mo`, `all`. Defaults to `30d`. |
+| `period` | string | Optional. One of `day`, `today`, `7d`, `30d`, `90d`. Defaults to `30d`. |
 | `start_date` | string | Optional. Explicit start date (`YYYY-MM-DD`). Overrides `period`. |
 | `end_date` | string | Optional. Explicit end date (`YYYY-MM-DD`, exclusive). Overrides `period`. |
 
@@ -47,20 +47,18 @@ Returns core aggregate metrics.
 
 Returns visitors and pageviews bucketed by time.
 
-### Additional Parameters
-
-| Parameter | Type | Description |
-|---|---|---|
-| `interval` | string | `day` (default) or `hour`. |
+Granularity is determined automatically from the `period`: `day`/`today` returns hourly buckets; all other periods return daily buckets.
 
 ### Response
 
 ```json
 [
-  {"bucket": "2024-01-15", "visitors": 142, "pageviews": 518},
-  {"bucket": "2024-01-16", "visitors": 167, "pageviews": 603}
+  {"date": "2024-01-15", "visitors": 142, "pageviews": 518},
+  {"date": "2024-01-16", "visitors": 167, "pageviews": 603}
 ]
 ```
+
+For `period=day` the `date` field includes the hour (e.g. `"2024-01-15 10:00"`).
 
 ---
 
@@ -83,7 +81,7 @@ Returns visitor and pageview counts grouped by a single dimension.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `limit` | integer | Maximum rows to return. Default 50. |
+| `limit` | integer | Maximum rows to return. Default 10. |
 
 ### Response
 
@@ -109,8 +107,8 @@ Requires the behavioral extension. Returns zeroes if the extension is not loaded
 ```json
 {
   "total_sessions": 892,
-  "avg_duration_secs": 124.7,
-  "pages_per_session": 3.2
+  "avg_session_duration_secs": 124.7,
+  "avg_pages_per_session": 3.2
 }
 ```
 
@@ -124,7 +122,7 @@ Returns a conversion funnel where each step is a filter condition.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `steps` | string (repeated) | One `steps` parameter per funnel step. Format: `page:/path` or `event:name`. |
+| `steps` | string | Comma-separated list of steps. Format: `page:/path` or `event:name`. |
 | `window` | string | Session window duration. Default `"1 day"`. Must be of the form `N unit` (e.g. `"30 minutes"`, `"2 hours"`). |
 
 ### Step Format
@@ -137,7 +135,7 @@ Returns a conversion funnel where each step is a filter condition.
 ### Example Request
 
 ```
-GET /api/stats/funnel?site_id=example.com&steps=page:/pricing&steps=event:signup&window=1+hour
+GET /api/stats/funnel?site_id=example.com&steps=page:/pricing,event:signup&window=1+hour
 ```
 
 ### Response
@@ -161,7 +159,7 @@ Returns weekly retention cohorts using the `retention` behavioral function.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `weeks` | integer | Number of cohort weeks to compute. Minimum 1. |
+| `weeks` | integer | Number of cohort weeks to compute. Range: 1–52. Default 4. |
 
 ### Response
 
@@ -186,7 +184,9 @@ Returns conversion metrics for a sequence of behavioral steps using `sequence_ma
 
 ### Additional Parameters
 
-Same as `/api/stats/funnel`: `steps` (minimum 2) and optional `window`.
+| Parameter | Type | Description |
+|---|---|---|
+| `steps` | string | Comma-separated steps in `page:/path` or `event:name` format. Minimum 2 steps required. |
 
 ### Response
 
@@ -233,22 +233,32 @@ Exports daily aggregated stats as CSV or JSON.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `format` | string | `csv` (default) or `json`. |
+| `format` | string | `csv` (default) or `json`. Any other value returns 400. |
 
 ### CSV Response
 
 ```csv
-date,visitors,pageviews
-2024-01-15,142,518
-2024-01-16,167,603
+date,visitors,pageviews,top_page,top_source
+2024-01-15,142,518,/pricing,(direct)
+2024-01-16,167,603,/pricing,google
 ```
 
 CSV fields that might trigger formula injection (start with `=`, `+`, `-`, `@`) are prefixed with a single quote.
+
+`Content-Disposition: attachment; filename="export.csv"` is set so browsers prompt a download.
 
 ### JSON Response
 
 ```json
 [
-  {"date": "2024-01-15", "visitors": 142, "pageviews": 518}
+  {
+    "date": "2024-01-15",
+    "visitors": 142,
+    "pageviews": 518,
+    "top_page": "/pricing",
+    "top_source": "(direct)"
+  }
 ]
 ```
+
+`top_page` and `top_source` reflect the single highest-traffic page and referrer source for the entire queried period, not per-day.

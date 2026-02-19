@@ -20,21 +20,24 @@ No names, email addresses, or device fingerprints are collected or stored.
 
 ### Privacy-Safe Visitor ID
 
-To distinguish unique visitors without storing PII, Mallard Metrics computes:
+To distinguish unique visitors without storing PII, Mallard Metrics computes a two-step HMAC-SHA256 derivation:
 
 ```
-visitor_id = HMAC-SHA256(
-    key   = MALLARD_SECRET,
-    input = IP_address + User-Agent + today_UTC_date
-)
+daily_salt   = HMAC-SHA256(key = "mallard-metrics-salt",
+                           input = MALLARD_SECRET + ":" + today_UTC_date)
+
+visitor_id   = HMAC-SHA256(key = daily_salt,
+                           input = IP_address + "|" + User-Agent)
 ```
+
+The intermediate `daily_salt` binds the secret and the current date together, rotating the effective key every 24 hours while keeping the outer HMAC's message short.
 
 Properties of this approach:
 
 - **Deterministic within a day** — The same visitor from the same browser produces the same ID throughout the day, enabling accurate unique-visitor counting.
-- **Rotates daily** — The UTC date is included in the input, so the ID changes every 24 hours. A visitor cannot be tracked across days.
+- **Rotates daily** — The UTC date changes the salt each day, so IDs cannot be correlated across days.
 - **Not reversible** — Without `MALLARD_SECRET`, the IP address cannot be recovered from the stored hash.
-- **No IP storage** — The input to the HMAC is discarded after hashing.
+- **No IP storage** — The IP address is discarded immediately after hashing.
 
 ### GDPR/CCPA Compliance
 
@@ -118,7 +121,7 @@ Access-Control-Allow-Methods: GET, POST, DELETE
 Access-Control-Allow-Credentials: true
 ```
 
-If `dashboard_origin` is not configured, the dashboard routes also use a permissive policy (same-origin browsers work without any extra configuration).
+If `dashboard_origin` is not configured, the dashboard routes use a permissive policy that allows any origin. Set `dashboard_origin` in production to restrict cross-origin access to your dashboard domain.
 
 ### TLS
 

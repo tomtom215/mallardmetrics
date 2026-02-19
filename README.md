@@ -254,33 +254,30 @@ All `/api/stats/*`, `/api/keys/*`, and `/api/stats/export` endpoints require aut
 ## Architecture
 
 ```
-                    +---------------------+
-  Tracking Script   |                     |
-  POST /api/event --+--> Ingest Handler   |
-                    |    |  Bot Filter     |
-                    |    |  Rate Limiter   |
-                    |    |  Origin Check   |
-                    |    |  UA Parser      |
-                    |    |  GeoIP Lookup   |
-                    |    |  Visitor ID     |
-                    |    v                 |
-                    |  Event Buffer       |
-                    |    | (flush)        |
-                    |    v                 |
-                    |  Parquet Writer     |--> data/events/site_id=X/date=YYYY-MM-DD/
-                    |    |                |
-                    |    v                |
-                    |  DuckDB (embedded)  |<-- behavioral extension
-                    |    ^                |
-                    |    |                |
-                    |  Query Engine       |
-                    |    |  Cache Layer   |
-                    |    v                |
-  Dashboard/API  <--+-- Axum Router      |
-                    |    |  Auth Layer    |
-                    |    |  CORS Layer    |
-                    +---------------------+
-                      Single Process
+                    +------------------------------------------+
+  Tracking Script   |                                          |
+  POST /api/event --+--> Ingest Handler                       |
+                    |    |  Origin Check  |  Bot Filter        |
+                    |    |  Rate Limiter  |  UA Parser         |
+                    |    |  GeoIP Lookup  |  Visitor ID        |
+                    |    v                                      |
+                    |  In-Memory Event Buffer                   |
+                    |    |  (flush: threshold / timer / SIGINT) |
+                    |    v                                      |
+                    |  DuckDB (embedded) <-- behavioral ext    |
+                    |    |  hot: events table                   |
+                    |    |  COPY TO Parquet (ZSTD)              |
+                    |    v                                      |
+                    |  data/events/site_id=*/date=*/*.parquet  |
+                    |                                          |
+                    |  events_all VIEW                         |
+                    |    = events (hot) + read_parquet (cold)  |
+                    |    |  Cache Layer                        |
+                    |    v                                      |
+  Dashboard/API  <--+-- Axum Router                           |
+                    |    Auth Layer  |  CORS Layer             |
+                    +------------------------------------------+
+                                Single Process
 ```
 
 ### Module Map
@@ -360,7 +357,7 @@ The dashboard is a single-page application built with Preact + HTM and embedded 
 # Build
 cargo build
 
-# Run all tests (209 total: 166 unit + 43 integration)
+# Run all tests (226 total: 183 unit + 43 integration)
 cargo test
 
 # Clippy (zero warnings required)
@@ -383,7 +380,7 @@ cargo bench
 
 - **Zero clippy warnings** -- pedantic, nursery, and cargo lint groups enabled
 - **Zero formatting violations** -- enforced via `cargo fmt`
-- **All 209 tests pass** -- no ignored tests
+- **All 226 tests pass** -- no ignored tests
 - **Documentation builds without errors**
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow.
