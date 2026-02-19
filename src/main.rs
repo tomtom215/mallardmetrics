@@ -58,6 +58,17 @@ async fn main() {
         ),
     }
 
+    // Create the events_all view that unions the hot events table with persisted
+    // Parquet files on disk.  This makes historical data queryable immediately,
+    // including data written by previous server runs.  Non-fatal: if no Parquet
+    // files exist yet the view falls back to a passthrough over the events table.
+    match storage::schema::setup_query_view(&conn, &config.events_dir()) {
+        Ok(()) => tracing::info!("Query view initialised"),
+        Err(e) => {
+            tracing::warn!(error = %e, "Could not create events_all view; queries limited to buffered events");
+        }
+    }
+
     let conn = Arc::new(Mutex::new(conn));
     let storage = ParquetStorage::new(&config.events_dir());
     let buffer = EventBuffer::new(config.flush_event_count, Arc::clone(&conn), storage);
@@ -208,14 +219,29 @@ async fn shutdown_signal(state: Arc<AppState>, timeout_secs: u64) {
         "Shutting down gracefully, flushing buffered events..."
     );
 
-    // Flush remaining buffered events before shutdown
-    match state.buffer.flush() {
-        Ok(count) if count > 0 => {
+    // Flush remaining buffered events before shutdown, bounded by the configured timeout.
+    let flush_fut = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        move || state.buffer.flush()
+    });
+
+    let timeout = std::time::Duration::from_secs(timeout_secs.max(1));
+    match tokio::time::timeout(timeout, flush_fut).await {
+        Ok(Ok(Ok(count))) if count > 0 => {
             tracing::info!(count, "Flushed remaining events during shutdown");
         }
-        Ok(_) => {}
-        Err(e) => {
+        Ok(Ok(Ok(_))) => {}
+        Ok(Ok(Err(e))) => {
             tracing::error!(error = %e, "Failed to flush events during shutdown");
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "Flush task panicked during shutdown");
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs,
+                "Graceful shutdown flush timed out; some buffered events may be lost"
+            );
         }
     }
 

@@ -32,7 +32,7 @@ fn build_sequence_match_sql(conditions: &[&str]) -> String {
          FROM (
              SELECT visitor_id,
                  sequence_match('{pattern}', timestamp, {conds}) AS matched
-             FROM events
+             FROM events_all
              WHERE site_id = ? AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)
              GROUP BY visitor_id
          )"
@@ -90,10 +90,18 @@ mod tests {
         assert_eq!(build_pattern(3), "(?1).*(?2).*(?3)");
     }
 
-    #[test]
-    fn test_execute_empty_conditions() {
+    fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         crate::storage::schema::init_schema(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        crate::storage::schema::setup_query_view(&conn, dir.path()).unwrap();
+        drop(dir);
+        conn
+    }
+
+    #[test]
+    fn test_execute_empty_conditions() {
+        let conn = setup_test_db();
         let result =
             execute_sequence_match(&conn, "test.com", "2024-01-01", "2024-02-01", &[]).unwrap();
         assert_eq!(result.converting_visitors, 0);
@@ -102,8 +110,7 @@ mod tests {
 
     #[test]
     fn test_execute_sequence_match_no_extension() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::storage::schema::init_schema(&conn).unwrap();
+        let conn = setup_test_db();
         // Without behavioral extension, this will fail — expected behavior
         let result = execute_sequence_match(
             &conn,

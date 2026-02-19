@@ -206,6 +206,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::storage::schema::init_schema(&conn).unwrap();
         let dir = tempfile::tempdir().unwrap();
+        crate::storage::schema::setup_query_view(&conn, dir.path()).unwrap();
         let storage = ParquetStorage::new(dir.path());
         let conn = Arc::new(Mutex::new(conn));
         let buffer = EventBuffer::new(1000, conn, storage);

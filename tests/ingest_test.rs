@@ -17,6 +17,7 @@ fn make_test_state() -> (Arc<AppState>, tempfile::TempDir) {
     let conn = Connection::open_in_memory().unwrap();
     schema::init_schema(&conn).unwrap();
     let dir = tempfile::tempdir().unwrap();
+    schema::setup_query_view(&conn, dir.path()).unwrap();
     let storage = ParquetStorage::new(dir.path());
     let conn = Arc::new(Mutex::new(conn));
     let buffer = EventBuffer::new(1000, conn, storage);
@@ -349,6 +350,7 @@ fn make_test_state_with_sites(sites: Vec<String>) -> (Arc<AppState>, tempfile::T
     let conn = Connection::open_in_memory().unwrap();
     schema::init_schema(&conn).unwrap();
     let dir = tempfile::tempdir().unwrap();
+    schema::setup_query_view(&conn, dir.path()).unwrap();
     let storage = ParquetStorage::new(dir.path());
     let conn = Arc::new(Mutex::new(conn));
     let buffer = EventBuffer::new(1000, conn, storage);
@@ -679,6 +681,7 @@ fn make_test_state_with_password(password: &str) -> (Arc<AppState>, tempfile::Te
     let conn = Connection::open_in_memory().unwrap();
     schema::init_schema(&conn).unwrap();
     let dir = tempfile::tempdir().unwrap();
+    schema::setup_query_view(&conn, dir.path()).unwrap();
     let storage = ParquetStorage::new(dir.path());
     let conn = Arc::new(Mutex::new(conn));
     let buffer = EventBuffer::new(1000, conn, storage);

@@ -106,6 +106,10 @@ fn bench_query_metrics(c: &mut Criterion) {
         buffer.push(make_event(i)).unwrap();
     }
 
+    // Create the events_all view that unions the hot events table with any Parquet files.
+    // All query modules target events_all rather than events directly.
+    schema::setup_query_view(&arc_conn.lock(), dir.path()).unwrap();
+
     group.bench_function("core_metrics_10k", |b| {
         b.iter(|| {
             let conn = arc_conn.lock();

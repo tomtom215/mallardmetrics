@@ -51,12 +51,12 @@ cargo bench
 
 | Metric | Value | Verified |
 |---|---|---|
-| Unit tests | 179 | `cargo test --lib` |
+| Unit tests | 183 | `cargo test --lib` |
 | Integration tests | 43 | `cargo test --test ingest_test` |
-| Total tests | 222 | `cargo test` |
+| Total tests | 226 | `cargo test` |
 | Clippy warnings | 0 | `cargo clippy --all-targets` |
 | Format violations | 0 | `cargo fmt -- --check` |
-| CI jobs | 10 | `.github/workflows/ci.yml` |
+| CI jobs | 11 | `.github/workflows/ci.yml`, `.github/workflows/pages.yml` |
 
 ## Module Map
 
@@ -285,3 +285,35 @@ cargo bench
 **Test results:**
 - 179 unit tests, 43 integration tests, total 222
 - 0 clippy warnings, 0 format violations
+
+### Session 7: Enterprise Code Review & GitHub Pages Documentation
+
+**Scope:** Full peer review of all source files, security findings fixed, and GitHub Pages documentation site created.
+
+**Security fixes:**
+- **`validate_origin` prefix-bypass (CRITICAL)** (`api/auth.rs`) — `host.starts_with(s)` allowed `example.com.evil.com` to bypass an allowlist containing `"example.com"`. Fixed: extract the authority (host[:port]) by splitting on `/` after stripping the scheme, then use exact equality or explicit port-suffix check. Added 2 regression tests.
+
+**Correctness fixes:**
+- **`shutdown_timeout_secs` not enforced** (`main.rs`) — The timeout was logged but not used. Fixed: flush is now wrapped in `tokio::time::timeout(Duration::from_secs(timeout_secs))` via `spawn_blocking`; a `WARN` log is emitted if the flush does not complete in time.
+- **Parquet query gap (CRITICAL)** — Events written to Parquet were deleted from the DuckDB in-memory `events` table, making all flushed data invisible to analytics queries. Fixed: added `storage::schema::setup_query_view(conn, parquet_dir)` which creates an `events_all` DuckDB VIEW unioning the hot `events` table with a `read_parquet()` glob over all persisted files. All 11 query sites across 8 modules now target `events_all`. The view is refreshed at startup (for restart recovery) and after each `flush_events()` call (so new Parquet files are immediately queryable). Added 1 new unit test (`test_setup_query_view_no_parquet`).
+
+**Documentation:**
+- Created GitHub Pages documentation site using mdBook (`docs/`):
+  - `docs/book.toml` — mdBook configuration (mdBook v0.4.40)
+  - `docs/src/SUMMARY.md` — Table of contents (13 pages)
+  - Introduction, Quick Start, Tracking Script, Configuration, API Reference (4 sub-pages), Architecture, Security & Privacy, Behavioral Analytics, Deployment, Monitoring, Data Management
+  - `docs/src/custom.css` — Brand-consistent styling
+- Created `.github/workflows/pages.yml` — Deploys to GitHub Pages on push to `main` using SHA-pinned actions.
+
+**Test results:**
+- 183 unit tests passing (`cargo test --lib`)
+- 43 integration tests passing (`cargo test --test ingest_test`)
+- Total: 226 tests, 0 failures, 0 ignored
+- 0 clippy warnings (`cargo clippy --all-targets`)
+- 0 formatting violations (`cargo fmt -- --check`)
+
+**New unit tests added (4):**
+- `test_validate_origin_with_port` — validates `http://example.com:3000` against `"example.com"`
+- `test_validate_origin_prefix_bypass_rejected` — `https://example.com.evil.com` must NOT match `"example.com"`
+- `test_validate_origin_prefix_subdomain_bypass_rejected` — `https://example.com-other.io` must NOT match `"example.com"`
+- `test_setup_query_view_no_parquet` — `events_all` view is queryable even with no Parquet files present

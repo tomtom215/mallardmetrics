@@ -103,43 +103,20 @@ impl ParquetStorage {
 
             total_flushed += count;
 
-            // Delete flushed events from the in-memory table
+            // Delete flushed events from the in-memory events table.
+            // The events_all view unions this table with the Parquet files,
+            // so deleted events remain visible to queries via the cold tier.
             conn.execute_batch(&format!(
                 "DELETE FROM events WHERE site_id = '{escaped_site}' AND STRFTIME(CAST(timestamp AS DATE), '%Y-%m-%d') = '{date}'"
             ))
             .map_err(FlushError::Delete)?;
         }
 
+        // Refresh the query view so newly written Parquet files are included.
+        // Non-fatal: hot events remain visible through the events table.
+        let _ = crate::storage::schema::setup_query_view(conn, &self.base_dir);
+
         Ok(total_flushed)
-    }
-
-    /// Load events from Parquet files back into DuckDB for querying.
-    #[allow(dead_code)]
-    pub fn load_events(
-        &self,
-        conn: &Connection,
-        site_id: &str,
-        start_date: &str,
-        end_date: &str,
-    ) -> Result<(), FlushError> {
-        if !is_safe_path_component(site_id) {
-            return Ok(());
-        }
-        let site_dir = self.base_dir.join(format!("site_id={site_id}"));
-        if !site_dir.exists() {
-            return Ok(());
-        }
-
-        // Use DuckDB's glob to read all matching Parquet files
-        let pattern = format!("{}/date=*/**.parquet", site_dir.to_string_lossy());
-
-        // Create a view from parquet files, filtering by date range
-        let sql = format!(
-            "INSERT INTO events SELECT * FROM read_parquet('{pattern}') WHERE CAST(timestamp AS DATE) >= CAST('{start_date}' AS DATE) AND CAST(timestamp AS DATE) < CAST('{end_date}' AS DATE)"
-        );
-
-        conn.execute_batch(&sql).map_err(FlushError::Query)?;
-        Ok(())
     }
 
     /// Delete Parquet partition directories older than the given number of days.

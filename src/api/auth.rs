@@ -12,17 +12,33 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Validate that the request origin is allowed for event ingestion.
+///
+/// Extracts the host (authority) from the Origin header and compares it exactly
+/// against each allowed site. A port suffix is permitted (e.g. `example.com:8080`
+/// matches the allowed entry `"example.com"`), but a leading prefix match is
+/// explicitly rejected to prevent bypass via domains such as `example.com.evil.com`.
 pub fn validate_origin(origin: Option<&str>, allowed_sites: &[String]) -> bool {
     if allowed_sites.is_empty() {
         return true; // No restrictions configured
     }
 
     origin.is_none_or(|origin| {
-        let host = origin
+        // Strip scheme to obtain the authority (host[:port]) portion only.
+        // HTTP Origins never contain a path component, so splitting on '/' is
+        // not strictly required, but we do it defensively.
+        let authority = origin
             .strip_prefix("https://")
             .or_else(|| origin.strip_prefix("http://"))
+            .unwrap_or(origin)
+            .split('/')
+            .next()
             .unwrap_or(origin);
-        allowed_sites.iter().any(|s| host.starts_with(s.as_str()))
+
+        // Exact match or match with an explicit port suffix.
+        // "example.com.evil.com" does NOT match "example.com".
+        allowed_sites
+            .iter()
+            .any(|s| authority == s.as_str() || authority.starts_with(&format!("{s}:")))
     })
 }
 
@@ -586,6 +602,32 @@ mod tests {
     fn test_validate_origin_http() {
         let sites = vec!["example.com".to_string()];
         assert!(validate_origin(Some("http://example.com"), &sites));
+    }
+
+    #[test]
+    fn test_validate_origin_with_port() {
+        let sites = vec!["example.com".to_string()];
+        assert!(validate_origin(Some("http://example.com:3000"), &sites));
+    }
+
+    #[test]
+    fn test_validate_origin_prefix_bypass_rejected() {
+        // "example.com.evil.com" must NOT match the allowed site "example.com".
+        let sites = vec!["example.com".to_string()];
+        assert!(!validate_origin(
+            Some("https://example.com.evil.com"),
+            &sites
+        ));
+    }
+
+    #[test]
+    fn test_validate_origin_prefix_subdomain_bypass_rejected() {
+        // "example.com-other.io" must NOT match "example.com".
+        let sites = vec!["example.com".to_string()];
+        assert!(!validate_origin(
+            Some("https://example.com-other.io"),
+            &sites
+        ));
     }
 
     // Password hashing tests
