@@ -25,8 +25,8 @@ Uses `sessionize(timestamp, INTERVAL '30 minutes')` to group events into session
 
 **Metrics returned:**
 - `total_sessions` — Total number of distinct sessions.
-- `avg_duration_secs` — Mean session duration in seconds.
-- `pages_per_session` — Mean pageviews per session.
+- `avg_session_duration_secs` — Mean session duration in seconds.
+- `avg_pages_per_session` — Mean pageviews per session.
 
 ---
 
@@ -39,10 +39,7 @@ Uses `window_funnel(interval, timestamp, step1, step2, ...)` to find visitors wh
 **Example — Pricing to Signup funnel:**
 
 ```
-GET /api/stats/funnel?site_id=example.com
-  &steps=page:/pricing
-  &steps=event:signup
-  &window=1+day
+GET /api/stats/funnel?site_id=example.com&steps=page:/pricing,event:signup&window=1+day
 ```
 
 **Step format:**
@@ -57,7 +54,7 @@ GET /api/stats/funnel?site_id=example.com
 **Notes:**
 - Steps must be ordered (each must follow the previous).
 - The `window` parameter controls the maximum elapsed time allowed between the first and last step.
-- Minimum 1 step required; 2+ steps recommended for meaningful funnel analysis.
+- At least 1 step is required; 2+ steps produce a meaningful funnel analysis.
 
 ---
 
@@ -89,9 +86,7 @@ Uses `sequence_match(pattern, timestamp, cond1, cond2, ...)` to find visitors wh
 **Example — Pricing → Signup conversion:**
 
 ```
-GET /api/stats/sequences?site_id=example.com
-  &steps=page:/pricing
-  &steps=event:signup
+GET /api/stats/sequences?site_id=example.com&steps=page:/pricing,event:signup
 ```
 
 **Response:**
@@ -133,6 +128,6 @@ Returns up to 10 next-page destinations ordered by visitor count.
 The dashboard includes interactive views for all behavioral analytics:
 
 - **Funnel** — Horizontal bar chart with configurable steps.
-- **Retention** — Cohort grid table with percentage overlays.
+- **Retention** — Cohort grid table showing Y (returned) / - (not returned) per week.
 - **Sequences** — Conversion metrics cards.
 - **Flow** — Next-page table with visitor counts.

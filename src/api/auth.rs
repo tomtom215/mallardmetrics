@@ -483,17 +483,16 @@ pub async fn list_api_keys(State(state): State<Arc<AppState>>) -> impl IntoRespo
 pub async fn revoke_api_key_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(key_hash): axum::extract::Path<String>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, crate::api::errors::ApiError> {
     if state.api_keys.revoke_key(&key_hash) {
-        (
+        Ok((
             StatusCode::OK,
             Json(serde_json::json!({"status": "revoked"})),
-        )
+        ))
     } else {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Key not found"})),
-        )
+        Err(crate::api::errors::ApiError::NotFound(
+            "Key not found".to_string(),
+        ))
     }
 }
 

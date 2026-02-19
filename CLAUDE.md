@@ -20,7 +20,7 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 # Build
 cargo build
 
-# Run all tests (222 total: 179 unit + 43 integration)
+# Run all tests (226 total: 183 unit + 43 integration)
 cargo test
 
 # Clippy (zero warnings required)
@@ -56,7 +56,7 @@ cargo bench
 | Total tests | 226 | `cargo test` |
 | Clippy warnings | 0 | `cargo clippy --all-targets` |
 | Format violations | 0 | `cargo fmt -- --check` |
-| CI jobs | 11 | `.github/workflows/ci.yml`, `.github/workflows/pages.yml` |
+| CI jobs | 12 | `.github/workflows/ci.yml` (10 jobs), `.github/workflows/pages.yml` (2 jobs) |
 
 ## Module Map
 
@@ -317,3 +317,55 @@ cargo bench
 - `test_validate_origin_prefix_bypass_rejected` — `https://example.com.evil.com` must NOT match `"example.com"`
 - `test_validate_origin_prefix_subdomain_bypass_rejected` — `https://example.com-other.io` must NOT match `"example.com"`
 - `test_setup_query_view_no_parquet` — `events_all` view is queryable even with no Parquet files present
+
+### Session 8: Full Code Review & Audit Remediation
+
+**Scope:** Comprehensive peer-review audit of all Rust source, tests, documentation, CI/CD, and frontend code.
+
+**Code fixes:**
+- **`api/errors.rs` — removed dead `Unauthorized` variant** with `#[allow(dead_code)]`. The variant was never constructed in production code and violated YAGNI. The matching `Display` and `IntoResponse` arms were removed. `test_not_found_status` is preserved (it tests the `NotFound` variant which is now used in production via `revoke_api_key_handler`).
+- **`api/auth.rs` — `revoke_api_key_handler` uses `ApiError::NotFound`** — Changed return type from `impl IntoResponse` to `Result<impl IntoResponse, ApiError>` and returns `ApiError::NotFound("Key not found")` instead of a raw `(StatusCode::NOT_FOUND, Json(...))` tuple. This is consistent with all other error handling in the codebase.
+- **`server.rs` — fixed misleading CORS comment** — Comment on the permissive dashboard CORS branch previously said "same-origin requests work by default", implying same-origin-only behavior. Corrected to explicitly state it allows all origins and to set `dashboard_origin` to restrict access.
+- **`storage/parquet.rs` — `next_file_path` no longer silently discards `create_dir_all` errors** — Replaced `.ok()` with an explicit `tracing::warn!` log. The partition path is still returned (the subsequent `COPY TO` will produce the definitive error), but the operator now sees the root cause in logs.
+- **`dashboard/assets/app.js` — eliminated dead ternary** — `d.date.length > 10 ? d.date.slice(5) : d.date.slice(5)` had identical then/else branches. Simplified to `d.date.slice(5)`.
+- **`dashboard/assets/app.js` — added authentication flow** — The dashboard had no auth UI: a password-protected instance would show an unhelpful "HTTP 401" error with no way to sign in. Added:
+  - `App` shell component that calls `GET /api/auth/status` on mount.
+  - `LoginForm` component for sign-in (password configured) and first-run setup (no password yet).
+  - `Dashboard` now accepts `onLogout` and `onAuthExpired` props; shows "Sign Out" button when a password is configured; re-shows `LoginForm` on session expiry.
+  - Auth form styles added to `style.css` (`.auth-overlay`, `.auth-card`, `.btn-logout`, `.loading-screen`).
+- **`dashboard/assets/app.js` — corrected `SessionCards` field names** — Component was reading `data.avg_duration_secs` and `data.pages_per_session`, which do not exist in the API response. Corrected to `data.avg_session_duration_secs` and `data.avg_pages_per_session` (matching `SessionMetrics` in `sessions.rs`).
+
+**Documentation fixes (22 issues corrected):**
+- `docs/src/api-reference/stats.md` — Period values corrected (`24h`, `12mo`, `all` → `day`, `today`, `7d`, `30d`, `90d`).
+- `docs/src/api-reference/stats.md` — Timeseries response field `bucket` → `date`.
+- `docs/src/api-reference/stats.md` — Sessions response field names corrected (`avg_duration_secs` → `avg_session_duration_secs`, `pages_per_session` → `avg_pages_per_session`).
+- `docs/src/api-reference/stats.md` — Export CSV format corrected from 3-column to 5-column (`date,visitors,pageviews,top_page,top_source`).
+- `docs/src/api-reference/stats.md` — Export JSON corrected from 3-field to 5-field response.
+- `docs/src/api-reference/stats.md` — Breakdown default limit corrected from 50 → 10.
+- `docs/src/api-reference/stats.md` — Funnel `steps` format corrected from repeated query params to comma-separated value.
+- `docs/src/api-reference/stats.md` — Removed fake `interval` parameter from timeseries (granularity is auto-determined from `period`).
+- `docs/src/api-reference/auth.md` — Login/setup response format corrected (`{"message": "..."}` → `{"token": "..."}`).
+- `docs/src/api-reference/auth.md` — Logout response format corrected (`{"message": "Logged out"}` → `{"status": "logged_out"}`).
+- `docs/src/api-reference/auth.md` — Auth status response fields corrected (`has_password` removed, `setup_required` added).
+- `docs/src/api-reference/auth.md` — Revoke key response corrected (204 No Content → 200 `{"status": "revoked"}` / 404 `{"error": "Key not found"}`).
+- `docs/src/api-reference/auth.md` — `ApiKeyScope` serialization corrected (`"read_only"` → `"ReadOnly"`; `Admin` scope documented).
+- `docs/src/api-reference/auth.md` — `key_hash` format corrected (removed non-existent `"sha256:"` prefix).
+- `docs/src/api-reference/ingestion.md` — Revenue field names corrected (`"$"` → `"ra"`, `"c"` → `"rc"`); `props` type corrected (JSON-encoded string, not object).
+- `docs/src/api-reference/index.md` — Removed non-existent `"code"` field from error response examples.
+- `docs/src/behavioral-analytics.md` — Sessions field names corrected to match API.
+- `docs/src/behavioral-analytics.md` — Funnel example URL corrected to comma-separated `steps` format.
+- `docs/src/behavioral-analytics.md` — Sequences example URL corrected to comma-separated format.
+- `docs/src/behavioral-analytics.md` — "Retention — Cohort grid table with percentage overlays" corrected (no percentages; cells show Y / - booleans).
+- `docs/src/security.md` — Visitor ID algorithm documented accurately (two-step HMAC-SHA256 derivation with intermediate `daily_salt`; MALLARD_SECRET is an input to the intermediate hash, not the outer HMAC key).
+- `docs/src/security.md` — CORS comment corrected: permissive dashboard CORS explicitly allows all origins (not "same-origin only").
+- `README.md` — Test count corrected (209 → 226; 166 unit → 183 unit).
+- `README.md` — Architecture diagram redrawn to accurately show two-tier DuckDB/Parquet storage model and `events_all` VIEW.
+- `CLAUDE.md` — CI job count corrected (11 → 12).
+- `CLAUDE.md` — Test count comment corrected (222 → 226).
+
+**Test results:**
+- 183 unit tests passing (`cargo test --lib`)
+- 43 integration tests passing (`cargo test --test ingest_test`)
+- Total: 226 tests, 0 failures, 0 ignored
+- 0 clippy warnings (`cargo clippy --all-targets`)
+- 0 formatting violations (`cargo fmt -- --check`)

@@ -19,8 +19,8 @@ Sets the admin password for the first time. Returns `409 Conflict` if a password
 // Request
 {"password": "your-secure-password"}
 
-// Response 200
-{"message": "Admin password configured"}
+// Response 200 — also sets HttpOnly, SameSite=Strict cookie mm_session
+{"token": "<session-token>"}
 ```
 
 Passwords are hashed with Argon2id before storage. The plaintext password is never persisted.
@@ -38,7 +38,7 @@ Authenticates with the admin password and creates a session.
 {"password": "your-secure-password"}
 
 // Response 200 — sets HttpOnly, SameSite=Strict cookie mm_session
-{"message": "Logged in"}
+{"token": "<session-token>"}
 ```
 
 Sessions are stored in memory and expire after `session_ttl_secs` (default 24 hours). Sessions are cleared on server restart.
@@ -51,9 +51,9 @@ Invalidates the current session.
 
 **Session cookie required.**
 
-```
-// Response 200
-{"message": "Logged out"}
+```json
+// Response 200 — clears mm_session cookie
+{"status": "logged_out"}
 ```
 
 ---
@@ -63,15 +63,20 @@ Invalidates the current session.
 Returns the current authentication state.
 
 ```json
-// Not logged in, no password configured
-{"authenticated": false, "has_password": false}
+// No password configured (open access mode)
+{"setup_required": true, "authenticated": true}
 
-// Not logged in, password configured
-{"authenticated": false, "has_password": true}
+// Password configured, not logged in
+{"setup_required": false, "authenticated": false}
 
-// Logged in
-{"authenticated": true, "has_password": true, "username": "admin"}
+// Password configured, logged in
+{"setup_required": false, "authenticated": true}
 ```
+
+| Field | Type | Notes |
+|---|---|---|
+| `setup_required` | boolean | `true` when no admin password has been set. System is in open-access mode. |
+| `authenticated` | boolean | `true` when the request carries a valid session or API key, or when `setup_required` is `true`. |
 
 ---
 
@@ -87,32 +92,40 @@ Creates a new API key.
 
 ```json
 // Request
-{"name": "ci-pipeline", "scope": "read_only"}
+{"name": "ci-pipeline", "scope": "ReadOnly"}
 
 // Response 201
 {
   "key": "mm_abc123...",
+  "key_hash": "a1b2c3...",
   "name": "ci-pipeline",
-  "key_hash": "sha256:abc..."
+  "scope": "ReadOnly"
 }
 ```
 
 The `key` field is the only time the plaintext key is returned. Store it securely.
 
-**Scopes:** `read_only` (currently the only supported scope).
+**Scopes:**
+
+| Value | Access |
+|---|---|
+| `ReadOnly` | Read-only access to stats queries. |
+| `Admin` | Full admin access (key management, config). |
 
 ---
 
 ### `GET /api/keys`
 
-Lists all active API keys (without plaintext values).
+Lists all API keys (without plaintext values).
 
 ```json
 [
   {
+    "key_hash": "a1b2c3...",
     "name": "ci-pipeline",
-    "key_hash": "sha256:abc...",
-    "created_at": "2024-01-15T10:00:00Z"
+    "scope": "ReadOnly",
+    "created_at": "2024-01-15T10:00:00Z",
+    "revoked": false
   }
 ]
 ```
@@ -121,10 +134,14 @@ Lists all active API keys (without plaintext values).
 
 ### `DELETE /api/keys/{key_hash}`
 
-Revokes an API key by its hash.
+Revokes an API key by its SHA-256 hex hash.
 
-```
-// Response 204 No Content
+```json
+// Response 200
+{"status": "revoked"}
+
+// Response 404 if hash not found
+{"error": "Key not found"}
 ```
 
 ---
