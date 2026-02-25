@@ -736,6 +736,25 @@ fn get_auth_info(state: &AppState, headers: &HeaderMap) -> AuthInfo {
     AuthInfo::None
 }
 
+/// Extract the scheme+authority (origin) from a full Referer URL.
+///
+/// `"https://analytics.example.com/dashboard/page"` → `"https://analytics.example.com"`
+///
+/// Returns `None` if the URL does not start with `http://` or `https://`.
+fn extract_origin_from_referer(referer: &str) -> Option<&str> {
+    let scheme_len = if referer.starts_with("https://") {
+        8 // len("https://")
+    } else if referer.starts_with("http://") {
+        7 // len("http://")
+    } else {
+        return None;
+    };
+    // Everything after the scheme up to the first '/' is the host[:port].
+    let after_scheme = &referer[scheme_len..];
+    let host_len = after_scheme.find('/').unwrap_or(after_scheme.len());
+    Some(&referer[..scheme_len + host_len])
+}
+
 /// Validate that the request Origin or Referer matches the configured dashboard origin.
 ///
 /// This prevents CSRF attacks on session-authenticated state-changing endpoints.
@@ -754,7 +773,11 @@ fn validate_csrf_origin(headers: &HeaderMap, dashboard_origin: Option<&String>) 
 
     if let Some(referer) = headers.get("referer") {
         if let Ok(referer_str) = referer.to_str() {
-            return referer_str.starts_with(expected.as_str());
+            // Extract only the scheme+authority from the Referer URL before comparing.
+            // Using starts_with() would allow "https://example.com.evil.com/…" to bypass
+            // a rule for "https://example.com".
+            let referer_origin = extract_origin_from_referer(referer_str).unwrap_or("");
+            return referer_origin == expected.as_str();
         }
         return false;
     }
@@ -1244,6 +1267,67 @@ mod tests {
             &headers,
             Some(&"https://analytics.example.com".to_string())
         ));
+    }
+
+    #[test]
+    fn test_csrf_validate_referer_authority_match_allowed() {
+        // A Referer from the correct host (with a path) must be accepted.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "referer",
+            "https://analytics.example.com/dashboard/settings"
+                .parse()
+                .unwrap(),
+        );
+        assert!(validate_csrf_origin(
+            &headers,
+            Some(&"https://analytics.example.com".to_string())
+        ));
+    }
+
+    #[test]
+    fn test_csrf_validate_referer_authority_bypass_rejected() {
+        // "starts_with" would incorrectly allow this; authority extraction rejects it.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "referer",
+            "https://analytics.example.com.evil.com/attack"
+                .parse()
+                .unwrap(),
+        );
+        assert!(!validate_csrf_origin(
+            &headers,
+            Some(&"https://analytics.example.com".to_string())
+        ));
+    }
+
+    #[test]
+    fn test_extract_origin_from_referer_https() {
+        assert_eq!(
+            extract_origin_from_referer("https://example.com/path/page"),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn test_extract_origin_from_referer_with_port() {
+        assert_eq!(
+            extract_origin_from_referer("http://localhost:3000/dashboard"),
+            Some("http://localhost:3000")
+        );
+    }
+
+    #[test]
+    fn test_extract_origin_from_referer_no_path() {
+        assert_eq!(
+            extract_origin_from_referer("https://example.com"),
+            Some("https://example.com")
+        );
+    }
+
+    #[test]
+    fn test_extract_origin_from_referer_non_http_returns_none() {
+        assert_eq!(extract_origin_from_referer("ftp://example.com/file"), None);
     }
 
     // X-API-Key / X-Forwarded-For helper tests
