@@ -80,6 +80,14 @@ Lessons learned during Mallard Metrics development, organized by category. Each 
 
 **Session 1.** Validate all inbound event data for type, length, and format in the handler before passing to the buffer. Sanitize strings by removing control characters and truncating to maximum lengths.
 
+### L14: TimeoutLayer::with_status_code argument order
+
+**Session 10.** `tower_http::timeout::TimeoutLayer::with_status_code` takes `(status_code: StatusCode, timeout: Duration)` — status code **first**, duration second. The deprecated `TimeoutLayer::new` takes `(Duration)` only. Always check the signature; the argument order is counter-intuitive relative to the "with_status_code" naming. Swapping them produces E0308 with a "swap these arguments" hint.
+
+### L15: clippy::significant_drop_tightening with MutexGuard + entry API
+
+**Session 10.** The nursery lint `significant_drop_tightening` fires when a `MutexGuard` is held past its last meaningful use. Fix: wrap the entire mutex interaction in an inner block (`{...}`) so the guard drops at the closing brace. For `HashMap::entry()` patterns where `&mut V` borrows the guard: copy the return value into a local (`let fc = entry.val;`) then call `drop(map)` explicitly — NLL ends the entry borrow at its last use, making the explicit drop valid. Never use `drop(&mut T)` — that is a no-op and triggers `clippy::dropping_references`.
+
 ---
 
 ## Inherited Lessons from duckdb-behavioral
