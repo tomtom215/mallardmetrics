@@ -31,6 +31,12 @@ retention_days = 0
 # Dashboard session TTL in seconds (default: 24 hours)
 session_ttl_secs = 86400
 
+# Brute-force protection: lock out an IP after this many failed login attempts (default: 5, 0 = disabled)
+max_login_attempts = 5
+
+# Duration in seconds to lock out an IP after exceeding max_login_attempts (default: 300)
+login_lockout_secs = 300
+
 # Graceful shutdown timeout in seconds
 shutdown_timeout_secs = 30
 
@@ -44,6 +50,8 @@ cache_ttl_secs = 60
 log_format = "text"
 
 # Environment variables (not set via TOML):
-# MALLARD_SECRET        — HMAC secret for visitor ID hashing (required for production)
-# MALLARD_ADMIN_PASSWORD — Admin password for dashboard authentication
-# RUST_LOG              — Log level filter (e.g., "mallard_metrics=debug,tower_http=info")
+# MALLARD_SECRET           — HMAC secret for visitor ID hashing (required for production)
+# MALLARD_ADMIN_PASSWORD   — Admin password for dashboard authentication
+# MALLARD_MAX_LOGIN_ATTEMPTS — Override max_login_attempts at runtime
+# MALLARD_LOGIN_LOCKOUT      — Override login_lockout_secs at runtime
+# RUST_LOG                 — Log level filter (e.g., "mallard_metrics=debug,tower_http=info")
