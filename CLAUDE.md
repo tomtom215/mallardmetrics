@@ -51,9 +51,9 @@ cargo bench
 
 | Metric | Value | Verified |
 |---|---|---|
-| Unit tests | 209 | `cargo test --lib` |
-| Integration tests | 56 | `cargo test --test ingest_test` |
-| Total tests | 265 | `cargo test` |
+| Unit tests | 219 | `cargo test --lib` |
+| Integration tests | 61 | `cargo test --test ingest_test` |
+| Total tests | 280 | `cargo test` |
 | Clippy warnings | 0 | `cargo clippy --all-targets` |
 | Format violations | 0 | `cargo fmt -- --check` |
 | CI jobs | 12 | `.github/workflows/ci.yml` (10 jobs), `.github/workflows/pages.yml` (2 jobs) |
@@ -454,6 +454,39 @@ cargo bench
 - 183 unit tests passing (`cargo test --lib`)
 - 43 integration tests passing (`cargo test --test ingest_test`)
 - Total: 226 tests, 0 failures, 0 ignored
+- 0 clippy warnings (`cargo clippy --all-targets`)
+- 0 formatting violations (`cargo fmt -- --check`)
+- Documentation builds without errors (`cargo doc --no-deps`)
+
+### Session 11: Documentation Sync, Benchmark Baseline, Property Tests
+
+**Scope:** T1 (doc test-count sync), T2 (Criterion baseline), T3 (proptest), T6 (LESSONS.md L16–L18).
+
+**Changes:**
+
+- **T1: Documentation sync** — Corrected stale test counts in README.md, CONTRIBUTING.md, CLAUDE.md, and ROADMAP.md. Prior session (10) left counts at 265 (209 unit + 56 integration); actual counts at session start were 219 unit + 61 integration = 280 total (verified by `cargo test --lib` and `cargo test --test ingest_test`). All four files updated.
+
+- **T2: Criterion benchmark baseline** — Established first formal baseline in PERF.md "Current Baseline" section (previously "Not yet published"). Three runs completed for `ingest_throughput` (100/1K/10K) and `query_metrics` (core_metrics, timeseries, breakdown_pages). One run completed for `parquet_flush/1000` (6.04 s per iteration; 100-sample run = 612 s). `parquet_flush/10000` not measured (Criterion estimated 6027 s per run; impractical for 3× in a session). Environment: rustc 1.93.1, Linux 4.4.0, Intel 2.1 GHz, 16 cores, 21 GiB RAM. Canonical values (median run):
+  - `ingest_throughput/100`: 17.265 ms [16.964 ms, 17.582 ms]
+  - `ingest_throughput/1000`: 19.794 ms [19.317 ms, 20.264 ms]
+  - `ingest_throughput/10000`: 29.715 ms [28.726 ms, 30.694 ms]
+  - `parquet_flush/1000`: 6.0407 s [6.0238 s, 6.0600 s] (1 run)
+  - `core_metrics_10k`: 4.1724 ms [4.1462 ms, 4.1992 ms]
+  - `timeseries_10k`: 3.0019 ms [2.9860 ms, 3.0181 ms]
+  - `breakdown_pages_10k`: 3.5319 ms [3.5102 ms, 3.5541 ms]
+
+- **T3: Property-based tests** — Added proptest property tests to 3 modules:
+  - `ingest/visitor_id.rs` (3 tests): determinism, IP uniqueness, daily salt rotation
+  - `ingest/ratelimit.rs` (2 tests): bucket independence, monotonic depletion
+  - `query/cache.rs` (2 tests): round-trip, disabled-always-misses
+  - 7 new tests, all passing.
+
+- **T6: LESSONS.md** — Added L16 (documentation staleness compounds), L17 (security headers need integration tests), L18 (Prometheus counters need end-to-end wiring verification).
+
+**Test results:**
+- 219 unit tests passing (`cargo test --lib`)
+- 61 integration tests passing (`cargo test --test ingest_test`)
+- Total: 280 tests, 0 failures, 0 ignored
 - 0 clippy warnings (`cargo clippy --all-targets`)
 - 0 formatting violations (`cargo fmt -- --check`)
 - Documentation builds without errors (`cargo doc --no-deps`)

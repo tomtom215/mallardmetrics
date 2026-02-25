@@ -88,6 +88,18 @@ Lessons learned during Mallard Metrics development, organized by category. Each 
 
 **Session 10.** The nursery lint `significant_drop_tightening` fires when a `MutexGuard` is held past its last meaningful use. Fix: wrap the entire mutex interaction in an inner block (`{...}`) so the guard drops at the closing brace. For `HashMap::entry()` patterns where `&mut V` borrows the guard: copy the return value into a local (`let fc = entry.val;`) then call `drop(map)` explicitly — NLL ends the entry borrow at its last use, making the explicit drop valid. Never use `drop(&mut T)` — that is a no-op and triggers `clippy::dropping_references`.
 
+### L16: Documentation staleness compounds across sessions
+
+**Session 11.** Test counts drifted across multiple sessions (Sessions 5–10) before being caught each time. The pattern: a session adds tests, updates CLAUDE.md, but misses README.md, CONTRIBUTING.md, or ROADMAP.md. Each uncorrected file becomes a stale reference for future sessions. Fix: immediately after every `cargo test` run, grep all documentation files for the previous count and replace with the verified current count. Do not defer this to the end of the session. A post-session checklist item — `grep -rn "<old_count>" *.md` — catches stragglers before commit.
+
+### L17: Security headers must be verified in integration tests
+
+**Session 11.** OWASP headers (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Content-Security-Policy`) were added in Session 10 and the integration test `test_security_headers_present` is the only automated enforcement. Without a test, a future refactor of the middleware stack could silently drop a header. Add an integration test for every security invariant at the time the invariant is introduced — not as a follow-up. A security property without a test is an unverified claim.
+
+### L18: Prometheus counters require end-to-end wiring verification
+
+**Session 11.** `mallard_events_ingested_total` was declared as an `AtomicU64` in `AppState` in an earlier session but was not incremented in the ingest handler until Session 10. The counter existed and `/metrics` exposed it, but it was always zero. The pattern: declaring a counter and wiring it to the metrics endpoint is not sufficient — the counter must also be incremented at the actual event boundary. Add an integration test that ingests N events and reads `/metrics`, asserting the counter equals N. Without this test, a non-incremented counter is invisible until a user notices flat graphs in production.
+
 ---
 
 ## Inherited Lessons from duckdb-behavioral
