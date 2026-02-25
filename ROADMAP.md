@@ -13,6 +13,7 @@ This document tracks the implementation phases of Mallard Metrics, including com
 - [Phase 4: Production Hardening -- COMPLETE](#phase-4-production-hardening----complete)
 - [Phase 5: Operational Excellence -- COMPLETE](#phase-5-operational-excellence----complete)
 - [Phase 6: Scale and Performance -- COMPLETE](#phase-6-scale-and-performance----complete)
+- [Phase 7: Security and Production Readiness -- COMPLETE](#phase-7-security-and-production-readiness----complete)
 - [Future Considerations](#future-considerations)
 - [Implementation Summary](#implementation-summary)
 
@@ -28,8 +29,9 @@ This document tracks the implementation phases of Mallard Metrics, including com
 | Phase 4 | COMPLETE | Auth, GeoIP, API keys, CORS hardening, bot filtering |
 | Phase 5 | COMPLETE | Data retention, export, graceful shutdown, logging, health checks |
 | Phase 6 | COMPLETE | Query caching, rate limiting, benchmarks, Prometheus metrics |
+| Phase 7 | COMPLETE | Security hardening, brute-force protection, scope enforcement, production readiness |
 
-**Current test suite:** 226 tests (183 unit + 43 integration), 0 clippy warnings, 0 format violations.
+**Current test suite:** 265 tests (209 unit + 56 integration), 0 clippy warnings, 0 format violations.
 
 ---
 
@@ -126,6 +128,28 @@ All 5 advanced analytics views added to the dashboard.
 | 6.2 | Per-site token-bucket rate limiter (`ingest/ratelimit.rs`) |
 | 6.4 | Query benchmarks (core metrics, timeseries, breakdowns) in Criterion suite |
 | 6.5 | Prometheus metrics endpoint (`GET /metrics`) |
+
+---
+
+## Phase 7: Security and Production Readiness -- COMPLETE
+
+### Delivered
+
+| Task | Description |
+|---|---|
+| 7.1 | Brute-force protection: `LoginAttemptTracker` with per-IP lockout (`MALLARD_MAX_LOGIN_ATTEMPTS`, `MALLARD_LOGIN_LOCKOUT`) |
+| 7.2 | Body size limit: `DefaultBodyLimit::max(65_536)` on ingestion routes; 413 on overflow |
+| 7.3 | OWASP security headers: `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, `Content-Security-Policy` |
+| 7.4 | HTTP timeout: `TimeoutLayer` with 30-second limit to prevent Slowloris |
+| 7.5 | CSRF protection: `validate_csrf_origin()` on all session-auth state-mutating routes |
+| 7.6 | API key scope enforcement: `require_admin_auth` middleware; `X-API-Key` header support |
+| 7.7 | IP audit logging with anonymization (last IPv4 octet masked, IPv6 truncated) |
+| 7.8 | Prometheus counter `mallard_events_ingested_total` wired end-to-end |
+| 7.9 | Config validation at startup via `Config::validate()` |
+| 7.10 | `site_id` validation on all stats endpoints |
+| 7.11 | Revoked API key GC in 15-minute background task |
+| 7.12 | Dashboard export download buttons (CSV + JSON) |
+| 7.13 | Local JS bundles (`preact.js` + `htm.js`) via `rust-embed`; CDN dependency eliminated |
 
 ---
 
