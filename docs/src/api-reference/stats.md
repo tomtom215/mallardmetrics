@@ -1,6 +1,6 @@
 # Analytics Stats API
 
-All stats endpoints require authentication (session cookie or `Authorization: Bearer` API key).
+All stats endpoints require authentication (session cookie, `Authorization: Bearer` API key, or `X-API-Key` header).
 
 Query results for `/api/stats/main` and `/api/stats/timeseries` are cached per `(site_id, period)` for `cache_ttl_secs` seconds (default 60).
 
@@ -14,6 +14,19 @@ Query results for `/api/stats/main` and `/api/stats/timeseries` are cached per `
 | `period` | string | Optional. One of `day`, `today`, `7d`, `30d`, `90d`. Defaults to `30d`. |
 | `start_date` | string | Optional. Explicit start date (`YYYY-MM-DD`). Overrides `period`. |
 | `end_date` | string | Optional. Explicit end date (`YYYY-MM-DD`, exclusive). Overrides `period`. |
+
+### `site_id` Validation
+
+All endpoints validate `site_id` and return `400 Bad Request` if any of the following conditions are not met:
+
+- Non-empty string.
+- At most 256 characters.
+- ASCII alphanumeric characters plus `.`, `-`, `_`, and `:` only.
+
+```json
+// 400 response for invalid site_id
+{"error": "Invalid site_id"}
+```
 
 ---
 
