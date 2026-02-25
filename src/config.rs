@@ -45,6 +45,12 @@ pub struct Config {
     /// Log output format: "text" (default) or "json" for structured JSON logs.
     #[serde(default = "default_log_format")]
     pub log_format: String,
+    /// Maximum failed login attempts per IP before lockout. 0 = disabled (default: 5).
+    #[serde(default = "default_max_login_attempts")]
+    pub max_login_attempts: u32,
+    /// Duration in seconds to lock out an IP after exceeding max_login_attempts (default: 300).
+    #[serde(default = "default_login_lockout_secs")]
+    pub login_lockout_secs: u64,
 }
 
 fn default_host() -> String {
@@ -87,6 +93,14 @@ fn default_log_format() -> String {
     "text".to_string()
 }
 
+const fn default_max_login_attempts() -> u32 {
+    5
+}
+
+const fn default_login_lockout_secs() -> u64 {
+    300
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -105,6 +119,8 @@ impl Default for Config {
             rate_limit_per_site: 0,
             cache_ttl_secs: default_cache_ttl_secs(),
             log_format: default_log_format(),
+            max_login_attempts: default_max_login_attempts(),
+            login_lockout_secs: default_login_lockout_secs(),
         }
     }
 }
@@ -199,6 +215,16 @@ impl Config {
         if let Ok(val) = std::env::var("MALLARD_LOG_FORMAT") {
             config.log_format = val;
         }
+        if let Ok(val) = std::env::var("MALLARD_MAX_LOGIN_ATTEMPTS") {
+            if let Ok(n) = val.parse() {
+                config.max_login_attempts = n;
+            }
+        }
+        if let Ok(val) = std::env::var("MALLARD_LOGIN_LOCKOUT") {
+            if let Ok(t) = val.parse() {
+                config.login_lockout_secs = t;
+            }
+        }
 
         config
     }
@@ -206,6 +232,31 @@ impl Config {
     /// Returns the path to the events directory.
     pub fn events_dir(&self) -> PathBuf {
         self.data_dir.join("events")
+    }
+
+    /// Validate that configuration values are internally consistent.
+    ///
+    /// Called at startup to catch misconfiguration before the server binds.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.flush_event_count == 0 {
+            return Err(
+                "flush_event_count must be > 0; set to 0 would cause events to never auto-flush"
+                    .to_string(),
+            );
+        }
+        if self.flush_interval_secs == 0 {
+            return Err(
+                "flush_interval_secs must be > 0; set to 0 would cause the flush timer to spin at maximum CPU speed"
+                    .to_string(),
+            );
+        }
+        if self.session_ttl_secs == 0 {
+            return Err(
+                "session_ttl_secs must be > 0; set to 0 would expire all sessions immediately, breaking authentication"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -238,6 +289,44 @@ mod tests {
         assert_eq!(config.rate_limit_per_site, 0);
         assert_eq!(config.cache_ttl_secs, 60);
         assert_eq!(config.log_format, "text");
+        assert_eq!(config.max_login_attempts, 5);
+        assert_eq!(config.login_lockout_secs, 300);
+    }
+
+    #[test]
+    fn test_validate_valid_config() {
+        let config = Config::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_zero_flush_count() {
+        let config = Config {
+            flush_event_count: 0,
+            ..Config::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("flush_event_count"));
+    }
+
+    #[test]
+    fn test_validate_zero_flush_interval() {
+        let config = Config {
+            flush_interval_secs: 0,
+            ..Config::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("flush_interval_secs"));
+    }
+
+    #[test]
+    fn test_validate_zero_session_ttl() {
+        let config = Config {
+            session_ttl_secs: 0,
+            ..Config::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("session_ttl_secs"));
     }
 
     #[test]

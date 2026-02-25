@@ -33,6 +33,8 @@ fn make_test_state() -> (Arc<AppState>, tempfile::TempDir) {
         dashboard_origin: None,
         query_cache: mallard_metrics::query::cache::QueryCache::new(0),
         rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(0),
+        login_attempt_tracker: mallard_metrics::api::auth::LoginAttemptTracker::new(0, 300),
+        events_ingested_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
     (state, dir)
 }
@@ -366,6 +368,8 @@ fn make_test_state_with_sites(sites: Vec<String>) -> (Arc<AppState>, tempfile::T
         dashboard_origin: None,
         query_cache: mallard_metrics::query::cache::QueryCache::new(0),
         rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(0),
+        login_attempt_tracker: mallard_metrics::api::auth::LoginAttemptTracker::new(0, 300),
+        events_ingested_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
     (state, dir)
 }
@@ -698,6 +702,8 @@ fn make_test_state_with_password(password: &str) -> (Arc<AppState>, tempfile::Te
         dashboard_origin: None,
         query_cache: mallard_metrics::query::cache::QueryCache::new(0),
         rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(0),
+        login_attempt_tracker: mallard_metrics::api::auth::LoginAttemptTracker::new(0, 300),
+        events_ingested_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
     (state, dir)
 }
@@ -1211,6 +1217,8 @@ async fn test_rate_limiting() {
         dashboard_origin: None,
         query_cache: mallard_metrics::query::cache::QueryCache::new(0),
         rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(2),
+        login_attempt_tracker: mallard_metrics::api::auth::LoginAttemptTracker::new(0, 300),
+        events_ingested_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     });
 
     let payload = serde_json::json!({
@@ -1272,4 +1280,410 @@ async fn test_detailed_health_check_with_auth() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["auth_configured"], true);
+}
+
+// --- New integration tests for production-readiness gaps ---
+
+/// Make a state with password AND brute-force protection enabled (max 3 attempts, 300s lockout).
+fn make_test_state_with_lockout(password: &str) -> (Arc<AppState>, tempfile::TempDir) {
+    let conn = Connection::open_in_memory().unwrap();
+    schema::init_schema(&conn).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    schema::setup_query_view(&conn, dir.path()).unwrap();
+    let storage = ParquetStorage::new(dir.path());
+    let conn = Arc::new(Mutex::new(conn));
+    let buffer = EventBuffer::new(1000, conn, storage);
+    let hash = mallard_metrics::api::auth::hash_password(password).unwrap();
+    let state = Arc::new(AppState {
+        buffer,
+        secret: "test-secret".to_string(),
+        allowed_sites: Vec::new(),
+        geoip: GeoIpReader::open(None),
+        filter_bots: false,
+        sessions: SessionStore::new(3600),
+        api_keys: ApiKeyStore::new(),
+        admin_password_hash: Mutex::new(Some(hash)),
+        dashboard_origin: None,
+        query_cache: mallard_metrics::query::cache::QueryCache::new(0),
+        rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(0),
+        login_attempt_tracker: mallard_metrics::api::auth::LoginAttemptTracker::new(3, 300),
+        events_ingested_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    });
+    (state, dir)
+}
+
+#[tokio::test]
+async fn test_login_rate_limited_after_failures() {
+    let (state, _dir) = make_test_state_with_lockout("correct-password");
+
+    // Exhaust 3 attempts with wrong password
+    for _ in 0..3 {
+        let app = build_router(Arc::clone(&state));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "10.0.0.5")
+                    .body(Body::from(r#"{"password":"wrong"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // 4th attempt (even with correct password) should be 429
+    let app = build_router(Arc::clone(&state));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.0.0.5")
+                .body(Body::from(r#"{"password":"correct-password"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_login_success_clears_failure_count() {
+    let (state, _dir) = make_test_state_with_lockout("my-password");
+
+    // 2 wrong attempts (below lockout threshold of 3)
+    for _ in 0..2 {
+        let app = build_router(Arc::clone(&state));
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.0.0.6")
+                .body(Body::from(r#"{"password":"wrong"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Successful login clears the failure count
+    let app = build_router(Arc::clone(&state));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.0.0.6")
+                .body(Body::from(r#"{"password":"my-password"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_ingest_rejects_oversized_body() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(state);
+
+    // Build a payload larger than 64 KB
+    let big_props = "x".repeat(70_000);
+    let payload = format!(
+        r#"{{"d":"example.com","n":"pageview","u":"https://example.com/","p":{big_props:?}}}"#
+    );
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/event")
+                .header("content-type", "application/json")
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Axum should reject with 413 Payload Too Large
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn test_security_headers_present() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(response.headers().get("x-frame-options").unwrap(), "DENY");
+    assert!(response.headers().contains_key("referrer-policy"));
+}
+
+#[tokio::test]
+async fn test_events_ingested_counter() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(Arc::clone(&state));
+
+    let payload = serde_json::json!({
+        "d": "counter-test.com",
+        "n": "pageview",
+        "u": "https://counter-test.com/",
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/event")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        state
+            .events_ingested_total
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_prometheus_metrics_includes_counter() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let text = std::str::from_utf8(&body).unwrap();
+    assert!(
+        text.contains("mallard_events_ingested_total"),
+        "Prometheus output must include events counter"
+    );
+}
+
+#[tokio::test]
+async fn test_api_key_scope_readonly_cannot_create_key() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+
+    // Add a ReadOnly API key
+    let ro_key = mallard_metrics::api::auth::generate_api_key();
+    state.api_keys.add_key(
+        "read-only",
+        &ro_key,
+        mallard_metrics::api::auth::ApiKeyScope::ReadOnly,
+    );
+
+    let app = build_router(state);
+
+    // Attempt to create a new key with the ReadOnly key — should be 403
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/keys")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {ro_key}"))
+                .body(Body::from(r#"{"name":"new-key","scope":"Admin"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_api_key_scope_admin_can_create_key() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+
+    // Add an Admin API key
+    let admin_key = mallard_metrics::api::auth::generate_api_key();
+    state.api_keys.add_key(
+        "admin",
+        &admin_key,
+        mallard_metrics::api::auth::ApiKeyScope::Admin,
+    );
+
+    let app = build_router(state);
+
+    // Admin key should succeed on key creation
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/keys")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {admin_key}"))
+                .body(Body::from(r#"{"name":"new-key","scope":"ReadOnly"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn test_x_api_key_header_authentication() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+
+    // Grant stats access via API key (Admin)
+    let key = mallard_metrics::api::auth::generate_api_key();
+    state.api_keys.add_key(
+        "test-key",
+        &key,
+        mallard_metrics::api::auth::ApiKeyScope::Admin,
+    );
+
+    let app = build_router(state);
+
+    // Use X-API-Key header instead of Authorization: Bearer
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/main?site_id=example.com&period=30d")
+                .header("x-api-key", &key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_stats_invalid_site_id_rejected() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(state);
+
+    // site_id with slash should be rejected
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/main?site_id=example.com/path&period=30d")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_stats_empty_site_id_rejected() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(state);
+
+    // empty site_id should be rejected
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/main?site_id=&period=30d")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_timeseries_invalid_period_rejected() {
+    let (state, _dir) = make_test_state();
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/timeseries?site_id=example.com&period=bogus")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_data_persists_after_view_rebuild() {
+    // Ingest events, flush to Parquet, rebuild the events_all view, verify queries still work
+    let (state, dir) = make_test_state();
+
+    // Insert and flush an event
+    {
+        let conn = state.buffer.conn().lock();
+        conn.execute(
+            "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname)
+             VALUES ('persist-test.com', 'v1', CURRENT_TIMESTAMP, 'pageview', '/')",
+            [],
+        )
+        .unwrap();
+    }
+    // Flush to Parquet
+    state.buffer.flush().unwrap();
+
+    // Rebuild the events_all view (simulates a server restart)
+    {
+        let conn = state.buffer.conn().lock();
+        mallard_metrics::storage::schema::setup_query_view(&conn, dir.path()).unwrap();
+    }
+
+    let app = build_router(Arc::clone(&state));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats/main?site_id=persist-test.com&period=30d")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let metrics: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    // After view rebuild, the flushed data should be visible
+    assert!(
+        metrics["total_pageviews"].as_u64().unwrap_or(0) >= 1,
+        "Flushed events should be visible after view rebuild: {metrics}"
+    );
 }

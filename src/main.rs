@@ -35,6 +35,12 @@ async fn main() {
     let config_path = std::env::args().nth(1);
     let config = Config::load(config_path.as_deref().map(std::path::Path::new));
 
+    // Validate configuration before binding
+    if let Err(e) = config.validate() {
+        eprintln!("Configuration error: {e}");
+        std::process::exit(1);
+    }
+
     tracing::info!(
         host = %config.host,
         port = config.port,
@@ -102,6 +108,10 @@ fn build_app_state(config: &Config, buffer: EventBuffer, geoip: GeoIpReader) -> 
     let api_keys = ApiKeyStore::new();
     let query_cache = crate::query::cache::QueryCache::new(config.cache_ttl_secs);
     let rate_limiter = crate::ingest::ratelimit::RateLimiter::new(config.rate_limit_per_site);
+    let login_attempt_tracker = crate::api::auth::LoginAttemptTracker::new(
+        config.max_login_attempts,
+        config.login_lockout_secs,
+    );
 
     let admin_password_hash = std::env::var("MALLARD_ADMIN_PASSWORD")
         .ok()
@@ -128,6 +138,8 @@ fn build_app_state(config: &Config, buffer: EventBuffer, geoip: GeoIpReader) -> 
         dashboard_origin: config.dashboard_origin.clone(),
         query_cache,
         rate_limiter,
+        login_attempt_tracker,
+        events_ingested_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     })
 }
 
@@ -176,10 +188,12 @@ fn spawn_background_tasks(config: &Config, conn: &Arc<Mutex<Connection>>, state:
         });
     }
 
-    // Session, cache, and rate limiter cleanup task (runs every 15 minutes)
+    // Session, cache, rate limiter, login tracker, and API key cleanup (runs every 15 minutes)
     let session_store = state.sessions.clone();
     let cache = state.query_cache.clone();
     let rl = state.rate_limiter.clone();
+    let login_tracker = state.login_attempt_tracker.clone();
+    let api_keys = state.api_keys.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15 * 60));
         loop {
@@ -187,6 +201,8 @@ fn spawn_background_tasks(config: &Config, conn: &Arc<Mutex<Connection>>, state:
             session_store.cleanup_expired();
             cache.cleanup_expired();
             rl.cleanup();
+            login_tracker.cleanup();
+            api_keys.cleanup_revoked();
         }
     });
 }

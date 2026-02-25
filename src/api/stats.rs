@@ -23,7 +23,41 @@ fn default_period() -> String {
     "30d".to_string()
 }
 
+/// Validate that a `site_id` parameter is safe for use in queries and storage.
+///
+/// - Must be non-empty and at most 256 bytes.
+/// - Must contain only alphanumeric ASCII characters or `.`, `-`, `_`, `:`.
+fn validate_site_id(site_id: &str) -> Result<(), ApiError> {
+    if site_id.is_empty() {
+        return Err(ApiError::BadRequest(
+            "site_id must not be empty".to_string(),
+        ));
+    }
+    if site_id.len() > 256 {
+        return Err(ApiError::BadRequest(
+            "site_id must be at most 256 characters".to_string(),
+        ));
+    }
+    let valid = site_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':'));
+    if !valid {
+        return Err(ApiError::BadRequest(
+            "site_id may only contain alphanumeric characters, '.', '-', '_', ':'".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl StatsParams {
+    /// Resolve the start and end dates from the period or explicit params.
+    ///
+    /// Also validates `site_id` format.
+    pub fn validate_and_date_range(&self) -> Result<(String, String), ApiError> {
+        validate_site_id(&self.site_id)?;
+        self.date_range()
+    }
+
     /// Resolve the start and end dates from the period or explicit params.
     pub fn date_range(&self) -> Result<(String, String), ApiError> {
         if let (Some(start), Some(end)) = (&self.start_date, &self.end_date) {
@@ -53,7 +87,7 @@ pub async fn get_main_stats(
     State(state): State<Arc<AppState>>,
     Query(params): Query<StatsParams>,
 ) -> Result<Json<metrics::CoreMetrics>, ApiError> {
-    let (start, end) = params.date_range()?;
+    let (start, end) = params.validate_and_date_range()?;
     let cache_key = format!("main:{}:{}:{}", params.site_id, start, end);
 
     if let Some(cached) = state.query_cache.get(&cache_key) {
@@ -77,7 +111,7 @@ pub async fn get_timeseries(
     State(state): State<Arc<AppState>>,
     Query(params): Query<StatsParams>,
 ) -> Result<Json<Vec<timeseries::TimeBucket>>, ApiError> {
-    let (start, end) = params.date_range()?;
+    let (start, end) = params.validate_and_date_range()?;
 
     // Choose granularity based on range
     let granularity = if params.period == "day" || params.period == "today" {
@@ -121,6 +155,7 @@ const fn default_limit() -> usize {
 
 impl BreakdownParams {
     fn date_range(&self) -> Result<(String, String), ApiError> {
+        validate_site_id(&self.site_id)?;
         let stats_params = StatsParams {
             site_id: self.site_id.clone(),
             period: self.period.clone(),
@@ -250,7 +285,7 @@ pub async fn get_sessions(
     State(state): State<Arc<AppState>>,
     Query(params): Query<StatsParams>,
 ) -> Result<Json<sessions::SessionMetrics>, ApiError> {
-    let (start, end) = params.date_range()?;
+    let (start, end) = params.validate_and_date_range()?;
     let conn = state.buffer.conn().lock();
     let result = sessions::query_session_metrics(&conn, &params.site_id, &start, &end).unwrap_or(
         sessions::SessionMetrics {
@@ -283,6 +318,7 @@ fn default_window() -> String {
 
 impl FunnelParams {
     fn date_range(&self) -> Result<(String, String), ApiError> {
+        validate_site_id(&self.site_id)?;
         let stats_params = StatsParams {
             site_id: self.site_id.clone(),
             period: self.period.clone(),
@@ -399,6 +435,7 @@ const fn default_num_weeks() -> u32 {
 
 impl RetentionParams {
     fn date_range(&self) -> Result<(String, String), ApiError> {
+        validate_site_id(&self.site_id)?;
         let stats_params = StatsParams {
             site_id: self.site_id.clone(),
             period: self.period.clone(),
@@ -443,6 +480,7 @@ pub struct SequenceParams {
 
 impl SequenceParams {
     fn date_range(&self) -> Result<(String, String), ApiError> {
+        validate_site_id(&self.site_id)?;
         let stats_params = StatsParams {
             site_id: self.site_id.clone(),
             period: self.period.clone(),
@@ -513,6 +551,7 @@ pub struct FlowParams {
 
 impl FlowParams {
     fn date_range(&self) -> Result<(String, String), ApiError> {
+        validate_site_id(&self.site_id)?;
         let stats_params = StatsParams {
             site_id: self.site_id.clone(),
             period: self.period.clone(),
@@ -560,6 +599,7 @@ fn default_export_format() -> String {
 
 impl ExportParams {
     fn date_range(&self) -> Result<(String, String), ApiError> {
+        validate_site_id(&self.site_id)?;
         let stats_params = StatsParams {
             site_id: self.site_id.clone(),
             period: self.period.clone(),
@@ -788,6 +828,32 @@ mod tests {
         assert!(!is_safe_interval("0 days"));
         assert!(!is_safe_interval("1 day; DROP TABLE"));
         assert!(!is_safe_interval("999 days"));
+    }
+
+    #[test]
+    fn test_validate_site_id_valid() {
+        assert!(validate_site_id("example.com").is_ok());
+        assert!(validate_site_id("my-site.co.uk").is_ok());
+        assert!(validate_site_id("localhost:8080").is_ok());
+        assert!(validate_site_id("my_analytics_site").is_ok());
+    }
+
+    #[test]
+    fn test_validate_site_id_empty() {
+        assert!(validate_site_id("").is_err());
+    }
+
+    #[test]
+    fn test_validate_site_id_too_long() {
+        let long = "a".repeat(257);
+        assert!(validate_site_id(&long).is_err());
+    }
+
+    #[test]
+    fn test_validate_site_id_invalid_chars() {
+        assert!(validate_site_id("example.com/path").is_err());
+        assert!(validate_site_id("site id with spaces").is_err());
+        assert!(validate_site_id("site\x00null").is_err());
     }
 
     #[test]

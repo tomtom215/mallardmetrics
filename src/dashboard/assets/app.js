@@ -1,5 +1,5 @@
-import { h, render, Component } from 'https://esm.sh/preact@10.19.3';
-import htm from 'https://esm.sh/htm@3.1.1';
+import { h, render, Component } from '/preact.js';
+import htm from '/htm.js';
 
 const html = htm.bind(h);
 
@@ -124,7 +124,10 @@ function FunnelChart({ data }) {
     return html`<div class="chart-empty">No funnel data</div>`;
   }
 
-  const maxVisitors = Math.max(1, ...data.map(d => d.visitors));
+  const maxVisitors = Math.max(...data.map(d => d.visitors));
+  if (maxVisitors === 0) {
+    return html`<div class="chart-empty">No visitor data for this funnel</div>`;
+  }
   return html`
     <div class="funnel-chart">
       ${data.map((step, i) => {
@@ -386,6 +389,10 @@ class Dashboard extends Component {
             <div class="metric-card">
               <div class="metric-value">${metrics.unique_visitors}</div>
               <div class="metric-label">Unique Visitors</div>
+            </div>
+            <div class="export-buttons" style="grid-column: 1 / -1; text-align: right; margin-top: 8px;">
+              <a href=${`/api/stats/export?site_id=${encodeURIComponent(siteId)}&period=${period}&format=csv`} download="mallard-export.csv" class="btn-export">Export CSV</a>
+              <a href=${`/api/stats/export?site_id=${encodeURIComponent(siteId)}&period=${period}&format=json`} download="mallard-export.json" class="btn-export">Export JSON</a>
             </div>
             <div class="metric-card">
               <div class="metric-value">${metrics.total_pageviews}</div>
