@@ -20,7 +20,7 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 # Build
 cargo build
 
-# Run all tests (265 total: 209 unit + 56 integration)
+# Run all tests (285 total: 223 unit + 62 integration)
 cargo test
 
 # Clippy (zero warnings required)
@@ -51,9 +51,9 @@ cargo bench
 
 | Metric | Value | Verified |
 |---|---|---|
-| Unit tests | 219 | `cargo test --lib` |
-| Integration tests | 61 | `cargo test --test ingest_test` |
-| Total tests | 280 | `cargo test` |
+| Unit tests | 223 | `cargo test --lib` |
+| Integration tests | 62 | `cargo test --test ingest_test` |
+| Total tests | 285 | `cargo test` |
 | Clippy warnings | 0 | `cargo clippy --all-targets` |
 | Format violations | 0 | `cargo fmt -- --check` |
 | CI jobs | 12 | `.github/workflows/ci.yml` (10 jobs), `.github/workflows/pages.yml` (2 jobs) |
@@ -490,3 +490,44 @@ cargo bench
 - 0 clippy warnings (`cargo clippy --all-targets`)
 - 0 formatting violations (`cargo fmt -- --check`)
 - Documentation builds without errors (`cargo doc --no-deps`)
+
+### Session 12: Correctness, Performance, and Benchmark Fixes
+
+**Scope:** F1 (event data loss), F2 (blocking async), F3 (Appender API), F4 (benchmark cold-start), F5 (O(n) stat loop), F6 (site_id validation gap). All findings verified from code analysis before implementation.
+
+**Changes:**
+
+- **T1: Fix event data loss on flush failure (F1)** — `flush()` previously called `std::mem::take` to drain the buffer BEFORE DuckDB inserts succeeded. If any insert failed, all drained events were permanently lost. Fix: drain atomically (to prevent double-processing), attempt inserts via Appender (T3), and if Appender creation or any `append_row` fails, restore the drained events to the front of the buffer before returning `Err`. Buffer is cleared only when all inserts succeed. Two new unit tests verify this contract: `test_flush_failure_preserves_events` and `test_flush_partial_failure_restores_all_events`.
+
+- **T2: Fix blocking I/O in tokio::spawn periodic flush (F2)** — The periodic flush task in `spawn_background_tasks()` called `flush_conn.lock()` (blocking mutex) and `storage.flush_events()` (filesystem I/O, 6 s at 1000 events) directly inside a `tokio::spawn` async block. This held an async worker thread, starving the scheduler under load. Fix: `interval.tick().await` remains on the async side; all blocking work is wrapped in `tokio::task::spawn_blocking(move || { ... }).await`. Pattern matches the correct usage in `shutdown_signal()` which already used `spawn_blocking`.
+
+- **T3: Replace row-by-row INSERT with DuckDB Appender API (F3)** — The `for event in &events { conn.execute(...) }` loop executed 1 000 sequential SQL parses and inserts for a 1000-event flush. Replaced with DuckDB's Appender API (`conn.appender("events")` + `appender.append_row(...)` + `appender.flush()`), which uses columnar batch insertion bypassing per-row SQL parsing overhead. Appender lifetime is scoped to an inner block so it drops before subsequent `flush_events()` call on the same connection.
+
+- **T4: Fix benchmark cold-start contamination (F4)** — `bench_buffer_push` and `bench_flush` previously placed `Connection::open_in_memory()` + `schema::init_schema()` + `tempfile::tempdir()` + buffer construction INSIDE `b.iter()`. The ~500 ms DuckDB cold-start dominated every iteration, making timings across all input sizes nearly identical (17 ms for 100 events vs 19 ms for 1000 events). Fix: setup moved OUTSIDE `b.iter()`. `bench_flush` uses `iter_batched` (Criterion's correct pattern for per-iteration state). The old baselines (PERF.md "Superseded Baselines") are explicitly marked as measuring cold-start, not steady-state. `bench_query_metrics` was already correct; unchanged.
+
+- **T5: Fix next_file_path O(n) stat loop (F5)** — `next_file_path()` previously iterated `path.exists()` in a loop, performing one filesystem stat syscall per existing file. After K flushes of the same partition, this was K stat syscalls per new flush. Fixed with a single `fs::read_dir()` call that reads all directory entries, parses the max existing file number, and returns `max + 1`. O(K) stat calls → O(1) directory reads. Two new unit tests verify: `test_next_file_path_with_many_existing_files` (100 existing files → 0101.parquet) and `test_next_file_path_ignores_non_parquet_files` (.tmp and .txt files ignored).
+
+- **T6: Unify site_id validation between ingest and stats (F6)** — The stats API's `validate_site_id()` rejects characters outside `[a-zA-Z0-9._-:]` but the ingest handler only checked length and emptiness. A domain like `"my site.com"` (space) was accepted by `POST /api/event`, stored in Parquet, but permanently unqueryable via any stats endpoint. Fix: `validate_site_id` made `pub(crate)` in `api/stats.rs`; called from the ingest handler after length validation. Events with disallowed characters in domain now return 400. New integration test: `test_ingest_rejects_invalid_site_id_chars`.
+
+- **T8: LESSONS.md** — Added L19 (blocking I/O in tokio::spawn), L20 (std::mem::take before success), L21 (Criterion cold-start contamination).
+
+**Test results (before → after):**
+- 219 → 223 unit tests passing (`cargo test --lib`)
+- 61 → 62 integration tests passing (`cargo test --test ingest_test`)
+- Total: 280 → 285 tests, 0 failures, 0 ignored
+- 0 clippy warnings (`cargo clippy --all-targets`)
+- 0 formatting violations (`cargo fmt -- --check`)
+- Benchmarks compile: `cargo bench --no-run` passes
+
+**New unit tests added (4):**
+- `test_flush_failure_preserves_events` — flush with missing table → events preserved in buffer
+- `test_flush_partial_failure_restores_all_events` — all 5 events restored after Appender failure
+- `test_next_file_path_with_many_existing_files` — 100 existing files → correct next number
+- `test_next_file_path_ignores_non_parquet_files` — .tmp and .txt files ignored
+
+**New integration tests added (1):**
+- `test_ingest_rejects_invalid_site_id_chars` — domain with space → 400 Bad Request
+
+**Not done (out of scope):**
+- T7 (steady-state concurrency benchmarks) — depends on T4 restructure being correct; benchmarks must be run 3× to publish baselines; skipped to stay within session scope
+- WAL, compaction, multi-node — explicitly listed as do-not-implement

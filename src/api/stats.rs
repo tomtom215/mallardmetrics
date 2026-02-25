@@ -27,7 +27,10 @@ fn default_period() -> String {
 ///
 /// - Must be non-empty and at most 256 bytes.
 /// - Must contain only alphanumeric ASCII characters or `.`, `-`, `_`, `:`.
-fn validate_site_id(site_id: &str) -> Result<(), ApiError> {
+///
+/// Used by both the stats API handlers and the ingest handler to ensure a
+/// domain accepted at ingestion is also queryable through the stats API.
+pub fn validate_site_id(site_id: &str) -> Result<(), ApiError> {
     if site_id.is_empty() {
         return Err(ApiError::BadRequest(
             "site_id must not be empty".to_string(),

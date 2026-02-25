@@ -144,7 +144,13 @@ fn build_app_state(config: &Config, buffer: EventBuffer, geoip: GeoIpReader) -> 
 }
 
 fn spawn_background_tasks(config: &Config, conn: &Arc<Mutex<Connection>>, state: &Arc<AppState>) {
-    // Periodic flush task
+    // Periodic flush task.
+    //
+    // The flush involves blocking operations: parking_lot::Mutex::lock() (futex
+    // wait under contention) and DuckDB COPY TO Parquet (filesystem I/O).
+    // Running these on a Tokio async worker thread would starve the scheduler.
+    // Instead, we await the interval (non-blocking) then hand the blocking work
+    // to `tokio::task::spawn_blocking`, which runs it on a dedicated thread pool.
     let flush_conn = Arc::clone(conn);
     let flush_interval = config.flush_interval_secs;
     let events_dir = config.events_dir();
@@ -152,15 +158,24 @@ fn spawn_background_tasks(config: &Config, conn: &Arc<Mutex<Connection>>, state:
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(flush_interval));
         loop {
             interval.tick().await;
-            let conn_guard = flush_conn.lock();
-            let storage = ParquetStorage::new(&events_dir);
-            match storage.flush_events(&conn_guard) {
-                Ok(count) if count > 0 => {
+            let conn = Arc::clone(&flush_conn);
+            let dir = events_dir.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let conn_guard = conn.lock();
+                let storage = ParquetStorage::new(&dir);
+                storage.flush_events(&conn_guard)
+            })
+            .await;
+            match result {
+                Ok(Ok(count)) if count > 0 => {
                     tracing::info!(count, "Periodic flush completed");
                 }
-                Ok(_) => {}
-                Err(e) => {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
                     tracing::error!(error = %e, "Periodic flush failed");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Periodic flush task panicked");
                 }
             }
         }

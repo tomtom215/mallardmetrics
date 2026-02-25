@@ -69,30 +69,33 @@ HTML reports are generated in `target/criterion/` after each run.
 
 #### `ingest_throughput` — Buffer push (event → in-memory buffer)
 
-Each Criterion iteration creates a fresh DuckDB in-memory connection and initializes the schema. Timing includes DuckDB startup overhead, which dominates at small sizes. This is a cold-start cost, not steady-state throughput.
+> **SUPERSEDED — Session 12.** These baselines are invalid. DuckDB connection setup and schema
+> initialisation ran INSIDE `b.iter()`, so the ~500 ms cold-start dominated every sample.
+> The near-flat scaling from 100 → 1 000 events (17 ms vs 19 ms) is the diagnostic signal:
+> the fixed cold-start cost completely masked the variable push cost. The benchmarks have been
+> restructured in Session 12 (setup outside `b.iter()`). New steady-state baselines must be
+> measured in a future session.
 
 | Benchmark | Run 1 mean | Run 2 mean | Run 3 mean | **Canonical (median run 95% CI)** |
 |---|---|---|---|---|
-| `ingest_throughput/100` | 17.265 ms | 17.153 ms | 17.544 ms | **17.265 ms \[16.964 ms, 17.582 ms\]** |
-| `ingest_throughput/1000` | 19.794 ms | 20.178 ms | 18.640 ms | **19.794 ms \[19.317 ms, 20.264 ms\]** |
-| `ingest_throughput/10000` | 28.503 ms | 32.340 ms | 29.715 ms | **29.715 ms \[28.726 ms, 30.694 ms\]** |
-
-The near-flat scaling from 100 → 1000 events confirms DuckDB schema initialization (fixed per-iteration overhead) dominates over the per-event buffer push cost. Incremental cost per event at the 1K → 10K boundary is approximately 1 µs.
+| `ingest_throughput/100` | 17.265 ms | 17.153 ms | 17.544 ms | ~~17.265 ms \[16.964 ms, 17.582 ms\]~~ (**invalid — cold-start**) |
+| `ingest_throughput/1000` | 19.794 ms | 20.178 ms | 18.640 ms | ~~19.794 ms \[19.317 ms, 20.264 ms\]~~ (**invalid — cold-start**) |
+| `ingest_throughput/10000` | 28.503 ms | 32.340 ms | 29.715 ms | ~~29.715 ms \[28.726 ms, 30.694 ms\]~~ (**invalid — cold-start**) |
 
 ---
 
 #### `parquet_flush` — Buffer flush to Parquet file
 
-Each iteration creates a fresh DuckDB connection and schema, pushes N events, then flushes to a temp directory (cold-start).
+> **SUPERSEDED — Session 12.** Same cold-start contamination as `ingest_throughput`. Each
+> iteration created a fresh DuckDB connection and ran ~1000 row-by-row INSERTs before
+> timing the Parquet flush. The 6 s/iter cost was dominated by the row-by-row INSERT loop
+> (replaced with DuckDB Appender API in Session 12) and DuckDB cold-start, not by COPY TO Parquet.
+> Benchmarks restructured with `iter_batched`; new baselines needed.
 
 | Benchmark | Run 1 (95% CI) | Run 2 | Run 3 | **Canonical** |
 |---|---|---|---|---|
-| `parquet_flush/1000` | 6.0407 s \[6.0238 s, 6.0600 s\] | — | — | **6.04 s (1 run)** ¹ |
-| `parquet_flush/10000` | — | — | — | Not measured ² |
-
-¹ Only 1 of 3 runs completed. Each run takes ~612 s (100 samples × ~6 s/iter). The single run shows a tight CI (< 0.4% width), indicating stable performance on this hardware. A future session should confirm with 2 more runs.
-
-² Criterion estimated 6027 s per run for `parquet_flush/10000` (~60 s/iter × 100 samples). Three runs would require ~5 hours. This benchmark will be re-measured in a dedicated session using `--sample-size 10` or equivalent.
+| `parquet_flush/1000` | 6.0407 s \[6.0238 s, 6.0600 s\] | — | — | ~~6.04 s~~ (**invalid — cold-start + row-by-row inserts**) |
+| `parquet_flush/10000` | — | — | — | Not measured |
 
 ---
 
@@ -128,8 +131,9 @@ cargo bench
 | Operation | Complexity | Notes |
 |---|---|---|
 | Event buffer push | O(1) amortized | `Vec` push with pre-allocated capacity |
-| Buffer flush | O(n) | Linear scan of events for partitioning by site_id + date |
+| Buffer flush (DuckDB insert) | O(n) | DuckDB Appender API — columnar batch insert, no per-row SQL parse |
 | Parquet write | O(n) | DuckDB `COPY TO` with ZSTD compression |
+| Next Parquet file path | O(k) | `read_dir` scan of k existing files in partition — one syscall. Was O(k) stat syscalls (one per file); fixed Session 12. |
 | Visitor ID hash | O(len(IP) + len(UA)) | HMAC-SHA256, constant-time comparison |
 | Daily salt generation | O(1) | HMAC-SHA256 of fixed-size date input |
 | Unique visitors query | O(n) | `COUNT(DISTINCT)` scan over partition |

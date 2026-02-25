@@ -31,7 +31,7 @@ This document tracks the implementation phases of Mallard Metrics, including com
 | Phase 6 | COMPLETE | Query caching, rate limiting, benchmarks, Prometheus metrics |
 | Phase 7 | COMPLETE | Security hardening, brute-force protection, scope enforcement, production readiness |
 
-**Current test suite:** 280 tests (219 unit + 61 integration), 0 clippy warnings, 0 format violations.
+**Current test suite:** 285 tests (223 unit + 62 integration), 0 clippy warnings, 0 format violations.
 
 ---
 

@@ -100,6 +100,36 @@ Lessons learned during Mallard Metrics development, organized by category. Each 
 
 **Session 11.** `mallard_events_ingested_total` was declared as an `AtomicU64` in `AppState` in an earlier session but was not incremented in the ingest handler until Session 10. The counter existed and `/metrics` exposed it, but it was always zero. The pattern: declaring a counter and wiring it to the metrics endpoint is not sufficient — the counter must also be incremented at the actual event boundary. Add an integration test that ingests N events and reads `/metrics`, asserting the counter equals N. Without this test, a non-incremented counter is invisible until a user notices flat graphs in production.
 
+### L19: Blocking I/O inside tokio::spawn starves the async worker pool
+
+**Session 12.** Tokio's async runtime uses a fixed-size thread pool (default: number of CPU cores). Any blocking call inside `tokio::spawn(async { ... })` — including `parking_lot::Mutex::lock()` under contention and DuckDB filesystem I/O — holds an async worker thread for the duration of the block. When a Parquet flush takes 6 seconds (`parquet_flush/1000` in PERF.md), a worker thread is stuck for 6 seconds, starving all HTTP request handling on that thread.
+
+Detection: slow HTTP response latency correlating with flush intervals; blocked worker threads visible in Tokio console.
+
+Fix: use `tokio::task::spawn_blocking` for any operation that may block for more than ~1 ms. This runs the work on a dedicated blocking thread pool (default: 512 threads) that does not affect the async scheduler. The pattern from `shutdown_signal()` in `main.rs` is the template — the periodic flush was missing this wrapper while shutdown used it correctly.
+
+Rule: any `Mutex::lock()` that might wait, any filesystem I/O, and any DuckDB SQL call must be in `spawn_blocking`. Call `spawn_blocking(...).await` from the async side — non-blocking wait.
+
+### L20: std::mem::take before success creates silent data loss
+
+**Session 12.** `std::mem::take(&mut *buf)` atomically drains the in-memory event buffer. If this is called before the DuckDB insert loop and any insert fails (schema mismatch, OOM, corrupt state), the local `Vec<Event>` is dropped and all drained events are permanently lost. The caller receives a `500 Internal Server Error` but the event data is unrecoverable.
+
+Correct pattern: drain atomically (to prevent double-processing by concurrent flushes), attempt inserts, and if any fail, restore the drained events to the front of the buffer before returning `Err`. Events pushed after the drain will be at the back of the buffer; prepend the failed events to preserve them. Only leave the buffer empty when all inserts have succeeded.
+
+Code contract: `flush()` must never silently discard events. If it returns `Err`, all events must either be in the buffer (for retry) or in the DuckDB table (visible via `events_all`). Both are acceptable; disappearing into thin air is not.
+
+### L21: Criterion benchmarks must never put setup code inside b.iter()
+
+**Session 12.** Setup code inside `b.iter()` is measured as part of every iteration. When setup dominates (e.g., DuckDB cold-start at ~500 ms per call), the measurement is invalid and misleading.
+
+Diagnostic signal: near-identical timings across dramatically different input sizes. If inserting 100 events takes 17 ms and inserting 1 000 events takes 19 ms, the measurement is dominated by a fixed cost that dwarfs the variable work. The input size should make a proportional difference.
+
+Correct pattern (steady-state): set up DuckDB connection, schema, and buffer OUTSIDE `b.iter()`. Inside `b.iter()`, measure only the operation under test (push or flush). Reset state at the end of each iteration (e.g., call `buffer.flush()` to empty the buffer, but don't measure it).
+
+Correct pattern (per-iteration state): use `b.iter_batched(setup_fn, bench_fn, BatchSize::SmallInput)`. The `setup_fn` runs once per batch (not measured); `bench_fn` is measured. This is correct for flush benchmarks where each flush consumes state that must be recreated.
+
+The three-run minimum (L9 from duckdb-behavioral) catches fluke measurements. Publish before/after baselines when restructuring benchmarks; always note whether old baselines are being superseded and why.
+
 ---
 
 ## Inherited Lessons from duckdb-behavioral

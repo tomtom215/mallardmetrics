@@ -105,6 +105,14 @@ pub async fn ingest_event(
         return StatusCode::BAD_REQUEST;
     }
 
+    // Character-set validation for domain: must satisfy the same constraints as
+    // the stats API's `validate_site_id`.  Without this check a domain accepted
+    // here (e.g. "my site.com" with a space) would be stored but permanently
+    // unqueryable because the stats API rejects any site_id with disallowed chars.
+    if crate::api::stats::validate_site_id(&payload.domain).is_err() {
+        return StatusCode::BAD_REQUEST;
+    }
+
     // Extract client IP and User-Agent for visitor ID
     let ip = extract_ip(&headers);
     let user_agent = headers
