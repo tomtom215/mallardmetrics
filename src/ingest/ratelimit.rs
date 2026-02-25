@@ -114,3 +114,47 @@ mod tests {
         assert!(rl.buckets.lock().contains_key("active.com"));
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Independence: exhausting site A's tokens does not affect site B's allowance.
+        ///
+        /// suffix_a starts with 'a', suffix_b starts with 'b', so the sites are always distinct.
+        #[test]
+        fn prop_rate_limit_independence(
+            capacity in 1u32..10u32,
+            suffix_a in "a[a-z]{2,5}",
+            suffix_b in "b[a-z]{2,5}",
+        ) {
+            let rl = RateLimiter::new(capacity);
+            let site_a = format!("{suffix_a}.test");
+            let site_b = format!("{suffix_b}.test");
+
+            for _ in 0..capacity {
+                rl.check(&site_a);
+            }
+
+            prop_assert!(!rl.check(&site_a), "site_a must be rate-limited after token depletion");
+            prop_assert!(rl.check(&site_b), "site_b must have its own independent token bucket");
+        }
+
+        /// Monotonicity: once tokens are depleted, all subsequent requests are blocked
+        /// until time passes (no time passes within a single test, so all remain blocked).
+        #[test]
+        fn prop_rate_limit_monotonic_depletion(
+            capacity in 1u32..5u32,
+            site in "[a-z]{3,8}",
+        ) {
+            let rl = RateLimiter::new(capacity);
+            for _ in 0..capacity {
+                rl.check(&site);
+            }
+            prop_assert!(!rl.check(&site), "first check after depletion must be blocked");
+            prop_assert!(!rl.check(&site), "second check after depletion must also be blocked");
+        }
+    }
+}

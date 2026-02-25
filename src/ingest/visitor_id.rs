@@ -100,3 +100,58 @@ mod tests {
         assert_ne!(s1, s2);
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use chrono::{Duration, NaiveDate};
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Determinism: identical inputs always yield the same visitor ID.
+        #[test]
+        fn prop_visitor_id_deterministic(
+            ip in "[0-9a-z.]{1,20}",
+            ua in "[A-Za-z0-9]{1,50}",
+            salt in "[A-Za-z0-9]{1,30}",
+        ) {
+            let id1 = generate_visitor_id(&ip, &ua, &salt);
+            let id2 = generate_visitor_id(&ip, &ua, &salt);
+            prop_assert_eq!(id1, id2);
+        }
+
+        /// Uniqueness: distinct IP addresses (same UA and salt) produce distinct visitor IDs.
+        ///
+        /// Uses non-overlapping suffix ranges to guarantee the two IPs are always different.
+        #[test]
+        fn prop_visitor_id_unique_per_ip(
+            suffix_a in 0u8..128u8,
+            suffix_b in 128u8..=255u8,
+            ua in "[A-Za-z0-9]{1,20}",
+            salt in "[A-Za-z0-9]{1,20}",
+        ) {
+            let ip_a = format!("10.0.0.{suffix_a}");
+            let ip_b = format!("10.0.0.{suffix_b}");
+            let id_a = generate_visitor_id(&ip_a, &ua, &salt);
+            let id_b = generate_visitor_id(&ip_b, &ua, &salt);
+            prop_assert_ne!(id_a, id_b);
+        }
+
+        /// Daily rotation: the same IP+UA always yields a different salt on different days.
+        ///
+        /// day_a is in [0, 180) and day_b is in [180, 360), so they always differ.
+        #[test]
+        fn prop_daily_salt_changes_per_day(
+            secret in "[A-Za-z0-9]{1,20}",
+            day_a in 0u32..180u32,
+            day_b in 180u32..360u32,
+        ) {
+            let base = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+            let d_a = base + Duration::days(i64::from(day_a));
+            let d_b = base + Duration::days(i64::from(day_b));
+            let s_a = daily_salt(&secret, d_a);
+            let s_b = daily_salt(&secret, d_b);
+            prop_assert_ne!(s_a, s_b);
+        }
+    }
+}

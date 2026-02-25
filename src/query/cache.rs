@@ -130,3 +130,35 @@ mod tests {
         assert_eq!(cache2.get("shared"), Some("data".to_string()));
     }
 }
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Round-trip: a value inserted with a positive TTL is immediately retrievable.
+        #[test]
+        fn prop_cache_round_trip(
+            key in "[a-z]{1,20}",
+            value in "[A-Za-z0-9]{1,100}",
+            ttl in 1u64..3600u64,
+        ) {
+            let cache = QueryCache::new(ttl);
+            cache.insert(key.clone(), value.clone());
+            prop_assert_eq!(cache.get(&key), Some(value));
+        }
+
+        /// Expiry: a cache with TTL=0 behaves as if always disabled — inserts are no-ops
+        /// and all lookups return None.
+        #[test]
+        fn prop_cache_disabled_always_misses(
+            key in "[a-z]{1,20}",
+            value in "[A-Za-z0-9]{1,100}",
+        ) {
+            let cache = QueryCache::new(0);
+            cache.insert(key.clone(), value);
+            prop_assert_eq!(cache.get(&key), None);
+        }
+    }
+}
