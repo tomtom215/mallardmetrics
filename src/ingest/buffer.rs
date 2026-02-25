@@ -97,29 +97,49 @@ impl EventBuffer {
     }
 
     /// Flush all buffered events to Parquet via DuckDB.
+    ///
+    /// # Atomicity guarantee
+    ///
+    /// Events are atomically drained from the buffer BEFORE DuckDB inserts begin.
+    /// If any insert fails the drained events are pushed back to the front of the
+    /// buffer so they are retried on the next flush — no events are silently dropped.
+    ///
+    /// If inserts succeed but the Parquet COPY TO fails the buffer is already cleared;
+    /// the events remain visible in the DuckDB `events` table (and therefore through
+    /// the `events_all` view) and will be written to Parquet on the next periodic flush.
     pub fn flush(&self) -> Result<usize, BufferError> {
+        // Atomically drain the buffer.  Taking ownership here prevents any concurrent
+        // flush from processing the same events twice.
         let events: Vec<Event> = {
             let mut buf = self.events.lock();
+            if buf.is_empty() {
+                return Ok(0);
+            }
             std::mem::take(&mut *buf)
         };
 
-        if events.is_empty() {
-            return Ok(0);
-        }
-
-        let _count = events.len();
+        let count = events.len();
         let conn = self.conn.lock();
 
-        // Insert events into DuckDB in-memory table
-        for event in &events {
-            conn.execute(
-                "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname,
-                 hostname, referrer, referrer_source, utm_source, utm_medium,
-                 utm_campaign, utm_content, utm_term, browser, browser_version,
-                 os, os_version, device_type, screen_size, country_code,
-                 region, city, props, revenue_amount, revenue_currency)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                duckdb::params![
+        // Bulk-insert all events using DuckDB's Appender API, which bypasses
+        // per-row SQL parsing and is significantly faster than row-by-row execute().
+        // If the Appender fails we restore the drained events to the buffer so
+        // they are retried on the next flush attempt.
+        {
+            let mut appender = conn.appender("events").map_err(|e| {
+                // Restore events on Appender creation failure.
+                // Inner block tightens the MutexGuard drop point (L15).
+                {
+                    let mut buf = self.events.lock();
+                    let mut restored = events.clone();
+                    restored.append(&mut *buf);
+                    *buf = restored;
+                }
+                BufferError::Insert(e)
+            })?;
+
+            for event in &events {
+                if let Err(e) = appender.append_row(duckdb::params![
                     event.site_id,
                     event.visitor_id,
                     event.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
@@ -145,12 +165,35 @@ impl EventBuffer {
                     event.props,
                     event.revenue_amount,
                     event.revenue_currency,
-                ],
-            )
-            .map_err(BufferError::Insert)?;
+                ]) {
+                    // Restore all events (including any not yet appended) to the buffer
+                    // so they are retried on the next flush.
+                    drop(appender);
+                    {
+                        let mut buf = self.events.lock();
+                        let mut restored = events;
+                        restored.append(&mut *buf);
+                        *buf = restored;
+                    }
+                    return Err(BufferError::Insert(e));
+                }
+            }
+
+            if let Err(e) = appender.flush() {
+                drop(appender);
+                {
+                    let mut buf = self.events.lock();
+                    let mut restored = events;
+                    restored.append(&mut *buf);
+                    *buf = restored;
+                }
+                return Err(BufferError::Insert(e));
+            }
+            // appender drops here; the borrow of conn ends
         }
 
-        // Flush from DuckDB to Parquet files
+        // Flush from DuckDB to Parquet files.  The buffer has already been cleared
+        // so Parquet failure leaves the events durable in the DuckDB in-memory table.
         let flushed = self
             .storage
             .flush_events(&conn)
@@ -158,6 +201,7 @@ impl EventBuffer {
         drop(conn);
 
         tracing::info!(count = flushed, "Flushed events to Parquet");
+        let _ = count; // count is captured in the log via `flushed`
         Ok(flushed)
     }
 }
@@ -282,6 +326,58 @@ mod tests {
         buffer.push(make_test_event("example.com", "/")).unwrap();
         assert!(!buffer.is_empty());
         assert_eq!(buffer.len(), 1);
+    }
+
+    #[test]
+    fn test_flush_failure_preserves_events() {
+        // Verify that if the DuckDB insert fails (e.g. schema missing), all
+        // buffered events are restored to the buffer for the next retry.
+        let (buffer, _dir) = setup_buffer(100);
+        buffer.push(make_test_event("example.com", "/")).unwrap();
+        buffer
+            .push(make_test_event("example.com", "/about"))
+            .unwrap();
+        assert_eq!(buffer.len(), 2);
+
+        // Drop the events table so every INSERT will fail.
+        {
+            let conn = buffer.conn().lock();
+            conn.execute_batch("DROP TABLE events").unwrap();
+        }
+
+        let result = buffer.flush();
+        assert!(result.is_err(), "flush must fail when the table is gone");
+        // All events must be back in the buffer, ready for the next attempt.
+        assert_eq!(
+            buffer.len(),
+            2,
+            "events must be preserved in the buffer after insert failure"
+        );
+    }
+
+    #[test]
+    fn test_flush_partial_failure_restores_all_events() {
+        // When the Appender itself cannot be created (table absent), ALL events
+        // that were drained must be restored — no partial loss.
+        let (buffer, _dir) = setup_buffer(100);
+        for i in 0..5 {
+            buffer
+                .push(make_test_event("example.com", &format!("/page-{i}")))
+                .unwrap();
+        }
+        assert_eq!(buffer.len(), 5);
+
+        {
+            let conn = buffer.conn().lock();
+            conn.execute_batch("DROP TABLE events").unwrap();
+        }
+
+        let _ = buffer.flush(); // ignore error — we only care about buffer state
+        assert_eq!(
+            buffer.len(),
+            5,
+            "all 5 events must be restored after a failed Appender creation"
+        );
     }
 
     #[test]

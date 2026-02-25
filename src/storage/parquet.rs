@@ -40,20 +40,28 @@ impl ParquetStorage {
     }
 
     /// Generates the next available Parquet file path in the partition.
+    ///
+    /// Uses a single `read_dir` call to find the maximum existing file number,
+    /// rather than an O(n) loop of `path.exists()` stat syscalls.  After K
+    /// flushes this reduces K stat syscalls per flush to 1 directory read.
     fn next_file_path(&self, site_id: &str, date: &str) -> PathBuf {
         let dir = self.partition_dir(site_id, date);
         if let Err(e) = fs::create_dir_all(&dir) {
             tracing::warn!(path = %dir.display(), error = %e, "Failed to create partition directory");
         }
 
-        let mut num = 1u32;
-        loop {
-            let path = dir.join(format!("{num:04}.parquet"));
-            if !path.exists() {
-                return path;
-            }
-            num += 1;
-        }
+        let max_num = fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                name.to_str()?.strip_suffix(".parquet")?.parse::<u32>().ok()
+            })
+            .max()
+            .unwrap_or(0);
+
+        dir.join(format!("{:04}.parquet", max_num + 1))
     }
 
     /// Flush events from the in-memory DuckDB table to partitioned Parquet files.
@@ -370,6 +378,39 @@ mod tests {
         assert_eq!(removed, 2);
         assert!(!old_a.exists());
         assert!(!old_b.exists());
+    }
+
+    #[test]
+    fn test_next_file_path_with_many_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ParquetStorage::new(dir.path());
+        let partition = storage.partition_dir("example.com", "2024-01-15");
+        fs::create_dir_all(&partition).unwrap();
+
+        // Create 100 numbered Parquet files
+        for n in 1u32..=100 {
+            fs::write(partition.join(format!("{n:04}.parquet")), b"fake").unwrap();
+        }
+
+        let next = storage.next_file_path("example.com", "2024-01-15");
+        assert_eq!(next.file_name().unwrap(), "0101.parquet");
+    }
+
+    #[test]
+    fn test_next_file_path_ignores_non_parquet_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ParquetStorage::new(dir.path());
+        let partition = storage.partition_dir("example.com", "2024-01-15");
+        fs::create_dir_all(&partition).unwrap();
+
+        // Mix of Parquet and non-Parquet files
+        fs::write(partition.join("0001.parquet"), b"fake").unwrap();
+        fs::write(partition.join("0002.parquet"), b"fake").unwrap();
+        fs::write(partition.join("temp.tmp"), b"fake").unwrap();
+        fs::write(partition.join("README.txt"), b"fake").unwrap();
+
+        let next = storage.next_file_path("example.com", "2024-01-15");
+        assert_eq!(next.file_name().unwrap(), "0003.parquet");
     }
 
     #[test]

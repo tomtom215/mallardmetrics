@@ -90,12 +90,8 @@ pub async fn ingest_event(
         return StatusCode::BAD_REQUEST;
     }
 
-    // Rate limiting per site
-    if !state.rate_limiter.check(&payload.domain) {
-        return StatusCode::TOO_MANY_REQUESTS;
-    }
-
-    // Length validation to prevent abuse
+    // Length validation before further processing (and before rate limiting) to
+    // prevent allocating resources for clearly oversized inputs.
     if payload.domain.len() > 256
         || payload.name.len() > 256
         || payload.url.len() > 2048
@@ -103,6 +99,20 @@ pub async fn ingest_event(
         || payload.props.as_ref().is_some_and(|p| p.len() > 4096)
     {
         return StatusCode::BAD_REQUEST;
+    }
+
+    // Character-set validation for domain BEFORE rate limiting.
+    //
+    // Without this ordering an invalid domain (e.g. "my site.com" with a space)
+    // would create a rate-limiter bucket for the invalid string and then return
+    // 400 — wasting bucket memory for strings that can never be valid site IDs.
+    if crate::api::stats::validate_site_id(&payload.domain).is_err() {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    // Rate limiting per site (only reached for well-formed site IDs)
+    if !state.rate_limiter.check(&payload.domain) {
+        return StatusCode::TOO_MANY_REQUESTS;
     }
 
     // Extract client IP and User-Agent for visitor ID
@@ -177,15 +187,24 @@ pub async fn ingest_event(
             .map(|c| sanitize_string(c, 3)),
     };
 
-    match state.buffer.push(event) {
-        Ok(_) => {
+    // Push the event on a blocking thread so that a threshold-triggered flush
+    // (which acquires the DuckDB mutex and writes Parquet) does not hold a Tokio
+    // worker thread.  The counter is incremented from the async side after the
+    // blocking task completes.
+    let state2 = Arc::clone(&state);
+    match tokio::task::spawn_blocking(move || state2.buffer.push(event)).await {
+        Ok(Ok(_)) => {
             state
                 .events_ingested_total
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             StatusCode::ACCEPTED
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             tracing::error!(error = %e, "Failed to buffer event");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Event buffer task panicked");
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }

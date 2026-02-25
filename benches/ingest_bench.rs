@@ -1,4 +1,4 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use duckdb::Connection;
 use mallard_metrics::ingest::buffer::{Event, EventBuffer};
 use mallard_metrics::storage::parquet::ParquetStorage;
@@ -43,23 +43,37 @@ fn make_event(i: usize) -> Event {
     }
 }
 
+/// Benchmark steady-state buffer push on a warm connection.
+///
+/// Previously, DuckDB connection setup and schema initialisation ran inside
+/// `b.iter()`, causing the cold-start cost (~500 ms) to completely dominate the
+/// measurement.  The near-identical timings across all input sizes (17 ms for
+/// 100 events vs 19 ms for 1 000 events) were a clear signal that setup
+/// dominated rather than the push cost itself.
+///
+/// Setup now runs OUTSIDE `b.iter()` so only the push operations are timed.
+/// See PERF.md "Superseded Baselines" for the old (invalid) numbers.
 fn bench_buffer_push(c: &mut Criterion) {
     let mut group = c.benchmark_group("ingest_throughput");
 
     for size in [100, 1_000, 10_000] {
+        // One-time setup — warm DuckDB connection, schema, and storage
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_schema(&conn).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = ParquetStorage::new(dir.path());
+        let conn = Arc::new(Mutex::new(conn));
+        // Threshold above size so auto-flush never fires during push measurement
+        let buffer = Arc::new(EventBuffer::new(size + 1, Arc::clone(&conn), storage));
+
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             b.iter(|| {
-                let conn = Connection::open_in_memory().unwrap();
-                schema::init_schema(&conn).unwrap();
-                let dir = tempfile::tempdir().unwrap();
-                let storage = ParquetStorage::new(dir.path());
-                let conn = Arc::new(Mutex::new(conn));
-                // Set threshold above test size to avoid auto-flush during push
-                let buffer = EventBuffer::new(size + 1, conn, storage);
-
+                // Measure: push N events into an already-warm buffer
                 for i in 0..size {
                     buffer.push(make_event(i)).unwrap();
                 }
+                // Reset without measuring flush cost
+                buffer.flush().unwrap();
             });
         });
     }
@@ -67,24 +81,39 @@ fn bench_buffer_push(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark steady-state Parquet flush on a warm connection.
+///
+/// Previously the entire connection setup + event push + flush ran inside
+/// `b.iter()`, so DuckDB cold-start dominated.  Now `iter_batched` is used:
+/// the setup closure (not measured) creates a fresh warm buffer pre-populated
+/// with N events; only `buffer.flush()` is measured.
 fn bench_flush(c: &mut Criterion) {
     let mut group = c.benchmark_group("parquet_flush");
 
     for size in [1_000, 10_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
-            b.iter(|| {
-                let conn = Connection::open_in_memory().unwrap();
-                schema::init_schema(&conn).unwrap();
-                let dir = tempfile::tempdir().unwrap();
-                let storage = ParquetStorage::new(dir.path());
-                let conn = Arc::new(Mutex::new(conn));
-                let buffer = EventBuffer::new(size + 1, Arc::clone(&conn), storage);
+        let dir = tempfile::TempDir::new().unwrap();
+        let dir_path = dir.path().to_path_buf();
 
-                for i in 0..size {
-                    buffer.push(make_event(i)).unwrap();
-                }
-                buffer.flush().unwrap();
-            });
+        group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
+            b.iter_batched(
+                || {
+                    // Setup (not measured): warm connection + pre-pushed events
+                    let conn = Connection::open_in_memory().unwrap();
+                    schema::init_schema(&conn).unwrap();
+                    let storage = ParquetStorage::new(&dir_path);
+                    let conn = Arc::new(Mutex::new(conn));
+                    let buffer = EventBuffer::new(size + 1, conn, storage);
+                    for i in 0..size {
+                        buffer.push(make_event(i)).unwrap();
+                    }
+                    buffer
+                },
+                |buffer| {
+                    // Measure: flush only
+                    buffer.flush().unwrap();
+                },
+                BatchSize::SmallInput,
+            );
         });
     }
 

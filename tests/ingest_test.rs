@@ -1914,3 +1914,32 @@ async fn test_login_429_includes_retry_after_header() {
 
     assert!(retry_secs >= 1, "Retry-After must be at least 1 second");
 }
+
+#[tokio::test]
+async fn test_ingest_rejects_invalid_site_id_chars() {
+    // A domain with characters outside [a-zA-Z0-9._-:] must be rejected with 400.
+    // Without this check the event would be stored but permanently unqueryable via
+    // the stats API (which applies the same character-set restriction).
+    let (state, _dir) = make_test_state();
+    let app = build_router(state);
+
+    let payload = serde_json::json!({
+        "d": "bad domain.com",   // space is disallowed
+        "n": "pageview",
+        "u": "https://bad-domain.com/"
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/event")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

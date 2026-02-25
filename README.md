@@ -357,7 +357,7 @@ The dashboard is a single-page application built with Preact + HTM and embedded 
 # Build
 cargo build
 
-# Run all tests (280 total: 219 unit + 61 integration)
+# Run all tests (285 total: 223 unit + 62 integration)
 cargo test
 
 # Clippy (zero warnings required)
@@ -380,7 +380,7 @@ cargo bench
 
 - **Zero clippy warnings** -- pedantic, nursery, and cargo lint groups enabled
 - **Zero formatting violations** -- enforced via `cargo fmt`
-- **All 280 tests pass** -- no ignored tests
+- **All 285 tests pass** -- no ignored tests
 - **Documentation builds without errors**
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow.

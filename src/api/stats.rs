@@ -27,7 +27,10 @@ fn default_period() -> String {
 ///
 /// - Must be non-empty and at most 256 bytes.
 /// - Must contain only alphanumeric ASCII characters or `.`, `-`, `_`, `:`.
-fn validate_site_id(site_id: &str) -> Result<(), ApiError> {
+///
+/// Used by both the stats API handlers and the ingest handler to ensure a
+/// domain accepted at ingestion is also queryable through the stats API.
+pub fn validate_site_id(site_id: &str) -> Result<(), ApiError> {
     if site_id.is_empty() {
         return Err(ApiError::BadRequest(
             "site_id must not be empty".to_string(),
@@ -96,9 +99,14 @@ pub async fn get_main_stats(
         }
     }
 
-    let conn = state.buffer.conn().lock();
-    let result = metrics::query_core_metrics(&conn, &params.site_id, &start, &end)?;
-    drop(conn);
+    let site_id = params.site_id.clone();
+    let state2 = Arc::clone(&state);
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state2.buffer.conn().lock();
+        metrics::query_core_metrics(&conn, &site_id, &start, &end)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))??;
 
     if let Ok(serialized) = serde_json::to_string(&result) {
         state.query_cache.insert(cache_key, serialized);
@@ -127,9 +135,14 @@ pub async fn get_timeseries(
         }
     }
 
-    let conn = state.buffer.conn().lock();
-    let result = timeseries::query_timeseries(&conn, &params.site_id, &start, &end, granularity)?;
-    drop(conn);
+    let site_id = params.site_id.clone();
+    let state2 = Arc::clone(&state);
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state2.buffer.conn().lock();
+        timeseries::query_timeseries(&conn, &site_id, &start, &end, granularity)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))??;
 
     if let Ok(serialized) = serde_json::to_string(&result) {
         state.query_cache.insert(cache_key, serialized);
@@ -172,16 +185,21 @@ pub async fn get_pages_breakdown(
     Query(params): Query<BreakdownParams>,
 ) -> Result<Json<Vec<breakdowns::BreakdownRow>>, ApiError> {
     let (start, end) = params.date_range()?;
-    let conn = state.buffer.conn().lock();
-    let result = breakdowns::query_breakdown(
-        &conn,
-        &params.site_id,
-        &start,
-        &end,
-        breakdowns::Dimension::Page,
-        params.limit,
-    )?;
-    drop(conn);
+    let site_id = params.site_id.clone();
+    let limit = params.limit;
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.buffer.conn().lock();
+        breakdowns::query_breakdown(
+            &conn,
+            &site_id,
+            &start,
+            &end,
+            breakdowns::Dimension::Page,
+            limit,
+        )
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))??;
     Ok(Json(result))
 }
 
@@ -191,16 +209,21 @@ pub async fn get_sources_breakdown(
     Query(params): Query<BreakdownParams>,
 ) -> Result<Json<Vec<breakdowns::BreakdownRow>>, ApiError> {
     let (start, end) = params.date_range()?;
-    let conn = state.buffer.conn().lock();
-    let result = breakdowns::query_breakdown(
-        &conn,
-        &params.site_id,
-        &start,
-        &end,
-        breakdowns::Dimension::ReferrerSource,
-        params.limit,
-    )?;
-    drop(conn);
+    let site_id = params.site_id.clone();
+    let limit = params.limit;
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.buffer.conn().lock();
+        breakdowns::query_breakdown(
+            &conn,
+            &site_id,
+            &start,
+            &end,
+            breakdowns::Dimension::ReferrerSource,
+            limit,
+        )
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))??;
     Ok(Json(result))
 }
 
@@ -210,16 +233,21 @@ pub async fn get_browsers_breakdown(
     Query(params): Query<BreakdownParams>,
 ) -> Result<Json<Vec<breakdowns::BreakdownRow>>, ApiError> {
     let (start, end) = params.date_range()?;
-    let conn = state.buffer.conn().lock();
-    let result = breakdowns::query_breakdown(
-        &conn,
-        &params.site_id,
-        &start,
-        &end,
-        breakdowns::Dimension::Browser,
-        params.limit,
-    )?;
-    drop(conn);
+    let site_id = params.site_id.clone();
+    let limit = params.limit;
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.buffer.conn().lock();
+        breakdowns::query_breakdown(
+            &conn,
+            &site_id,
+            &start,
+            &end,
+            breakdowns::Dimension::Browser,
+            limit,
+        )
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))??;
     Ok(Json(result))
 }
 
@@ -229,16 +257,21 @@ pub async fn get_os_breakdown(
     Query(params): Query<BreakdownParams>,
 ) -> Result<Json<Vec<breakdowns::BreakdownRow>>, ApiError> {
     let (start, end) = params.date_range()?;
-    let conn = state.buffer.conn().lock();
-    let result = breakdowns::query_breakdown(
-        &conn,
-        &params.site_id,
-        &start,
-        &end,
-        breakdowns::Dimension::Os,
-        params.limit,
-    )?;
-    drop(conn);
+    let site_id = params.site_id.clone();
+    let limit = params.limit;
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.buffer.conn().lock();
+        breakdowns::query_breakdown(
+            &conn,
+            &site_id,
+            &start,
+            &end,
+            breakdowns::Dimension::Os,
+            limit,
+        )
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))??;
     Ok(Json(result))
 }
 
@@ -248,16 +281,21 @@ pub async fn get_devices_breakdown(
     Query(params): Query<BreakdownParams>,
 ) -> Result<Json<Vec<breakdowns::BreakdownRow>>, ApiError> {
     let (start, end) = params.date_range()?;
-    let conn = state.buffer.conn().lock();
-    let result = breakdowns::query_breakdown(
-        &conn,
-        &params.site_id,
-        &start,
-        &end,
-        breakdowns::Dimension::DeviceType,
-        params.limit,
-    )?;
-    drop(conn);
+    let site_id = params.site_id.clone();
+    let limit = params.limit;
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.buffer.conn().lock();
+        breakdowns::query_breakdown(
+            &conn,
+            &site_id,
+            &start,
+            &end,
+            breakdowns::Dimension::DeviceType,
+            limit,
+        )
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))??;
     Ok(Json(result))
 }
 
@@ -267,16 +305,21 @@ pub async fn get_countries_breakdown(
     Query(params): Query<BreakdownParams>,
 ) -> Result<Json<Vec<breakdowns::BreakdownRow>>, ApiError> {
     let (start, end) = params.date_range()?;
-    let conn = state.buffer.conn().lock();
-    let result = breakdowns::query_breakdown(
-        &conn,
-        &params.site_id,
-        &start,
-        &end,
-        breakdowns::Dimension::CountryCode,
-        params.limit,
-    )?;
-    drop(conn);
+    let site_id = params.site_id.clone();
+    let limit = params.limit;
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.buffer.conn().lock();
+        breakdowns::query_breakdown(
+            &conn,
+            &site_id,
+            &start,
+            &end,
+            breakdowns::Dimension::CountryCode,
+            limit,
+        )
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))??;
     Ok(Json(result))
 }
 
@@ -286,15 +329,19 @@ pub async fn get_sessions(
     Query(params): Query<StatsParams>,
 ) -> Result<Json<sessions::SessionMetrics>, ApiError> {
     let (start, end) = params.validate_and_date_range()?;
-    let conn = state.buffer.conn().lock();
-    let result = sessions::query_session_metrics(&conn, &params.site_id, &start, &end).unwrap_or(
-        sessions::SessionMetrics {
-            total_sessions: 0,
-            avg_session_duration_secs: 0.0,
-            avg_pages_per_session: 0.0,
-        },
-    );
-    drop(conn);
+    let site_id = params.site_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.buffer.conn().lock();
+        sessions::query_session_metrics(&conn, &site_id, &start, &end).unwrap_or(
+            sessions::SessionMetrics {
+                total_sessions: 0,
+                avg_session_duration_secs: 0.0,
+                avg_pages_per_session: 0.0,
+            },
+        )
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))?;
     Ok(Json(result))
 }
 
@@ -363,8 +410,8 @@ pub async fn get_funnel(
     let (start, end) = params.date_range()?;
 
     // Validate window interval format (only allow simple intervals)
-    let window = params.window.trim();
-    if !is_safe_interval(window) {
+    let window = params.window.trim().to_string();
+    if !is_safe_interval(&window) {
         return Err(ApiError::BadRequest(
             "Invalid window interval. Use e.g. '1 day', '2 hours', '30 minutes'.".to_string(),
         ));
@@ -381,12 +428,14 @@ pub async fn get_funnel(
         return Ok(Json(Vec::new()));
     }
 
-    let step_refs: Vec<&str> = step_strs.iter().map(String::as_str).collect();
-
-    let conn = state.buffer.conn().lock();
-    let result = funnel::query_funnel(&conn, &params.site_id, &start, &end, window, &step_refs)
-        .unwrap_or_default();
-    drop(conn);
+    let site_id = params.site_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.buffer.conn().lock();
+        let step_refs: Vec<&str> = step_strs.iter().map(String::as_str).collect();
+        funnel::query_funnel(&conn, &site_id, &start, &end, &window, &step_refs).unwrap_or_default()
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))?;
     Ok(Json(result))
 }
 
@@ -459,10 +508,14 @@ pub async fn get_retention(
         ));
     }
 
-    let conn = state.buffer.conn().lock();
-    let result = retention::query_retention(&conn, &params.site_id, &start, &end, params.weeks)
-        .unwrap_or_default();
-    drop(conn);
+    let site_id = params.site_id.clone();
+    let weeks = params.weeks;
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.buffer.conn().lock();
+        retention::query_retention(&conn, &site_id, &start, &end, weeks).unwrap_or_default()
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))?;
     Ok(Json(result))
 }
 
@@ -519,17 +572,20 @@ pub async fn get_sequences(
         ));
     }
 
-    let step_refs: Vec<&str> = step_strs.iter().map(String::as_str).collect();
-
-    let conn = state.buffer.conn().lock();
-    let result =
-        sequences::execute_sequence_match(&conn, &params.site_id, &start, &end, &step_refs)
-            .unwrap_or(sequences::SequenceMatchResult {
+    let site_id = params.site_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.buffer.conn().lock();
+        let step_refs: Vec<&str> = step_strs.iter().map(String::as_str).collect();
+        sequences::execute_sequence_match(&conn, &site_id, &start, &end, &step_refs).unwrap_or(
+            sequences::SequenceMatchResult {
                 converting_visitors: 0,
                 total_visitors: 0,
                 conversion_rate: 0.0,
-            });
-    drop(conn);
+            },
+        )
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))?;
     Ok(Json(SequenceMatchResponse {
         converting_visitors: result.converting_visitors,
         total_visitors: result.total_visitors,
@@ -573,12 +629,24 @@ pub async fn get_flow(
         return Err(ApiError::BadRequest("Invalid page path".to_string()));
     }
 
-    let conn = state.buffer.conn().lock();
-    let result =
-        flow::query_flow(&conn, &params.site_id, &start, &end, &params.page).unwrap_or_default();
-    drop(conn);
+    let site_id = params.site_id.clone();
+    let page = params.page.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = state.buffer.conn().lock();
+        flow::query_flow(&conn, &site_id, &start, &end, &page).unwrap_or_default()
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))?;
     Ok(Json(result))
 }
+
+/// Maximum number of days allowed for an explicit-date export request.
+///
+/// Prevents unbounded in-memory accumulation of daily rows when the caller
+/// supplies `start_date` + `end_date` directly.  Period-based requests
+/// (`day` / `7d` / `30d` / `90d`) are already bounded; only explicit ranges
+/// need this guard.
+const MAX_EXPORT_DAYS: i64 = 366;
 
 /// Query parameters for the export endpoint.
 #[derive(Debug, Deserialize)]
@@ -600,6 +668,32 @@ fn default_export_format() -> String {
 impl ExportParams {
     fn date_range(&self) -> Result<(String, String), ApiError> {
         validate_site_id(&self.site_id)?;
+
+        // When explicit dates are provided, validate their format and enforce the
+        // maximum range to prevent building an arbitrarily large in-memory result.
+        if let (Some(start_str), Some(end_str)) = (&self.start_date, &self.end_date) {
+            let start_date =
+                chrono::NaiveDate::parse_from_str(start_str, "%Y-%m-%d").map_err(|_| {
+                    ApiError::BadRequest("Invalid start_date format. Use YYYY-MM-DD.".to_string())
+                })?;
+            let end_date =
+                chrono::NaiveDate::parse_from_str(end_str, "%Y-%m-%d").map_err(|_| {
+                    ApiError::BadRequest("Invalid end_date format. Use YYYY-MM-DD.".to_string())
+                })?;
+            let days = (end_date - start_date).num_days();
+            if days < 0 {
+                return Err(ApiError::BadRequest(
+                    "end_date must be on or after start_date".to_string(),
+                ));
+            }
+            if days > MAX_EXPORT_DAYS {
+                return Err(ApiError::BadRequest(format!(
+                    "Export date range must not exceed {MAX_EXPORT_DAYS} days. \
+                     Use the period parameter or a shorter explicit range."
+                )));
+            }
+        }
+
         let stats_params = StatsParams {
             site_id: self.site_id.clone(),
             period: self.period.clone(),
@@ -626,35 +720,40 @@ pub async fn get_export(
     Query(params): Query<ExportParams>,
 ) -> Result<impl IntoResponse, ApiError> {
     let (start, end) = params.date_range()?;
-    let conn = state.buffer.conn().lock();
+    let site_id = params.site_id.clone();
 
-    // Get timeseries data for daily breakdown
-    let ts_data = timeseries::query_timeseries(
-        &conn,
-        &params.site_id,
-        &start,
-        &end,
-        timeseries::Granularity::Day,
-    )?;
-
-    // Get top page and source
-    let top_pages = breakdowns::query_breakdown(
-        &conn,
-        &params.site_id,
-        &start,
-        &end,
-        breakdowns::Dimension::Page,
-        1,
-    )?;
-    let top_sources = breakdowns::query_breakdown(
-        &conn,
-        &params.site_id,
-        &start,
-        &end,
-        breakdowns::Dimension::ReferrerSource,
-        1,
-    )?;
-    drop(conn);
+    // Run all three queries together on a blocking thread so the DuckDB mutex
+    // is acquired once and no Tokio worker is blocked.
+    let (ts_data, top_pages, top_sources) = tokio::task::spawn_blocking(move || {
+        let conn = state.buffer.conn().lock();
+        let ts = timeseries::query_timeseries(
+            &conn,
+            &site_id,
+            &start,
+            &end,
+            timeseries::Granularity::Day,
+        )?;
+        let pages = breakdowns::query_breakdown(
+            &conn,
+            &site_id,
+            &start,
+            &end,
+            breakdowns::Dimension::Page,
+            1,
+        )?;
+        let sources = breakdowns::query_breakdown(
+            &conn,
+            &site_id,
+            &start,
+            &end,
+            breakdowns::Dimension::ReferrerSource,
+            1,
+        )?;
+        drop(conn);
+        Ok::<_, ApiError>((ts, pages, sources))
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Export task panicked: {e}")))??;
 
     let top_page = top_pages
         .first()
@@ -889,5 +988,85 @@ mod tests {
         // The format validation happens in the handler, so we test the validator indirectly
         assert_ne!(params.format, "csv");
         assert_ne!(params.format, "json");
+    }
+
+    // --- B4: Export date range limit tests ---
+
+    #[test]
+    fn test_export_date_range_too_long_rejected() {
+        let params = ExportParams {
+            site_id: "test.com".to_string(),
+            period: "30d".to_string(),
+            start_date: Some("2000-01-01".to_string()),
+            end_date: Some("2030-01-01".to_string()),
+            format: "csv".to_string(),
+        };
+        let err = params.date_range().unwrap_err();
+        assert!(
+            matches!(err, ApiError::BadRequest(_)),
+            "Exceeding {MAX_EXPORT_DAYS} days must return BadRequest"
+        );
+    }
+
+    #[test]
+    fn test_export_date_range_within_limit_allowed() {
+        let params = ExportParams {
+            site_id: "test.com".to_string(),
+            period: "30d".to_string(),
+            start_date: Some("2024-01-01".to_string()),
+            end_date: Some("2024-06-30".to_string()),
+            format: "csv".to_string(),
+        };
+        assert!(
+            params.date_range().is_ok(),
+            "Range under {MAX_EXPORT_DAYS} days must be accepted"
+        );
+    }
+
+    #[test]
+    fn test_export_date_range_end_before_start_rejected() {
+        let params = ExportParams {
+            site_id: "test.com".to_string(),
+            period: "30d".to_string(),
+            start_date: Some("2024-06-30".to_string()),
+            end_date: Some("2024-01-01".to_string()),
+            format: "csv".to_string(),
+        };
+        assert!(
+            params.date_range().is_err(),
+            "end_date before start_date must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_export_date_range_invalid_format_rejected() {
+        let params = ExportParams {
+            site_id: "test.com".to_string(),
+            period: "30d".to_string(),
+            start_date: Some("not-a-date".to_string()),
+            end_date: Some("2024-01-01".to_string()),
+            format: "csv".to_string(),
+        };
+        assert!(
+            params.date_range().is_err(),
+            "Invalid date format must return an error"
+        );
+    }
+
+    #[test]
+    fn test_export_period_based_no_range_check() {
+        // Period-based export (no explicit dates) must bypass the range check
+        // and use the normal period resolution instead.
+        let params = ExportParams {
+            site_id: "test.com".to_string(),
+            period: "90d".to_string(),
+            start_date: None,
+            end_date: None,
+            format: "csv".to_string(),
+        };
+        assert!(
+            params.date_range().is_ok(),
+            "Period-based export must not be rejected by the date-range guard"
+        );
     }
 }
