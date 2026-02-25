@@ -39,9 +39,15 @@ Authenticates with the admin password and creates a session.
 
 // Response 200 — sets HttpOnly, SameSite=Strict cookie mm_session
 {"token": "<session-token>"}
+
+// Response 429 — Too Many Requests (IP locked out after max failed attempts)
+// Retry-After header contains the remaining lockout seconds
+{"error": "Too many login attempts. Try again later."}
 ```
 
 Sessions are stored in memory and expire after `session_ttl_secs` (default 24 hours). Sessions are cleared on server restart.
+
+**Brute-force protection:** After `max_login_attempts` (default 5) consecutive failures from the same IP, the IP is locked out for `login_lockout_secs` (default 300 seconds). A successful login clears the failure count. Configure via `MALLARD_MAX_LOGIN_ATTEMPTS` and `MALLARD_LOGIN_LOCKOUT` environment variables, or the corresponding TOML fields. Set `max_login_attempts = 0` to disable.
 
 ---
 
@@ -148,9 +154,20 @@ Revokes an API key by its SHA-256 hex hash.
 
 ## Using API Keys
 
-Pass the key as a Bearer token in the `Authorization` header:
+API keys can be passed in two ways:
+
+**Authorization header (Bearer token):**
 
 ```bash
-curl https://your-instance.com/api/stats/main?site_id=example.com&period=30d \
+curl "https://your-instance.com/api/stats/main?site_id=example.com&period=30d" \
   -H "Authorization: Bearer mm_abc123..."
 ```
+
+**X-API-Key header:**
+
+```bash
+curl "https://your-instance.com/api/stats/main?site_id=example.com&period=30d" \
+  -H "X-API-Key: mm_abc123..."
+```
+
+Both headers are accepted on all stats and admin endpoints. `ReadOnly` keys can access stats endpoints; key management endpoints (`POST /api/keys`, `DELETE /api/keys/{hash}`) require an `Admin`-scoped key.

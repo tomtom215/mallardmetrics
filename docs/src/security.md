@@ -102,6 +102,43 @@ The CSV export endpoint (`GET /api/stats/export?format=csv`) escapes fields that
 
 ---
 
+## Brute-Force Protection
+
+Login attempts are tracked per client IP address. After `max_login_attempts` consecutive failures (default 5), the IP is locked out for `login_lockout_secs` seconds (default 300). The server returns `429 Too Many Requests` with a `Retry-After` header containing the remaining lockout duration in seconds.
+
+A successful login clears the failure count for that IP. Failure counts are stored in memory and reset on server restart.
+
+Configure using TOML fields `max_login_attempts` and `login_lockout_secs`, or the environment variables `MALLARD_MAX_LOGIN_ATTEMPTS` and `MALLARD_LOGIN_LOCKOUT`. Set `max_login_attempts = 0` to disable.
+
+---
+
+## Security Headers
+
+All HTTP responses include these OWASP-recommended headers:
+
+| Header | Value |
+|---|---|
+| `X-Content-Type-Options` | `nosniff` — prevents MIME-type sniffing |
+| `X-Frame-Options` | `DENY` — prevents clickjacking via iframe embedding |
+| `Referrer-Policy` | `strict-origin-when-cross-origin` — limits referrer leakage |
+| `Content-Security-Policy` | HTML responses only — restricts scripts and resources to same origin |
+
+---
+
+## HTTP Timeout
+
+All requests have a 30-second server-side timeout. Connections that do not complete within this window are closed with `408 Request Timeout`. This prevents Slowloris-style attacks that hold connections open indefinitely.
+
+---
+
+## CSRF Protection
+
+State-mutating endpoints authenticated via session cookie (login, logout, setup, key creation, key revocation) validate the `Origin` or `Referer` header against the configured `dashboard_origin`. Requests with a mismatched or missing origin receive `403 Forbidden`.
+
+When `dashboard_origin` is not set, CSRF checks are bypassed (all origins allowed). Set `dashboard_origin` in production to enable CSRF protection.
+
+---
+
 ## Network Security
 
 ### CORS Policy

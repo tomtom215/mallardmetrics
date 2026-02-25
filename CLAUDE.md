@@ -20,7 +20,7 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 # Build
 cargo build
 
-# Run all tests (226 total: 183 unit + 43 integration)
+# Run all tests (265 total: 209 unit + 56 integration)
 cargo test
 
 # Clippy (zero warnings required)
@@ -51,9 +51,9 @@ cargo bench
 
 | Metric | Value | Verified |
 |---|---|---|
-| Unit tests | 183 | `cargo test --lib` |
-| Integration tests | 43 | `cargo test --test ingest_test` |
-| Total tests | 226 | `cargo test` |
+| Unit tests | 209 | `cargo test --lib` |
+| Integration tests | 56 | `cargo test --test ingest_test` |
+| Total tests | 265 | `cargo test` |
 | Clippy warnings | 0 | `cargo clippy --all-targets` |
 | Format violations | 0 | `cargo fmt -- --check` |
 | CI jobs | 12 | `.github/workflows/ci.yml` (10 jobs), `.github/workflows/pages.yml` (2 jobs) |
@@ -369,6 +369,78 @@ cargo bench
 - Total: 226 tests, 0 failures, 0 ignored
 - 0 clippy warnings (`cargo clippy --all-targets`)
 - 0 formatting violations (`cargo fmt -- --check`)
+
+### Session 10: Production-Readiness Audit Remediation
+
+**Scope:** All 25 production-readiness gaps from external audit — BLOCKING (5), HIGH (7), MEDIUM (8), LOW (5).
+
+**Security fixes:**
+- Brute-force protection: `LoginAttemptTracker` (per-IP attempt counting, configurable lockout via `MALLARD_MAX_LOGIN_ATTEMPTS` / `MALLARD_LOGIN_LOCKOUT`). Returns 429 after `max_attempts` failures from same IP. Lock cleared on success.
+- Body size limit: `DefaultBodyLimit::max(65_536)` on ingestion routes; 413 on overflow.
+- OWASP security headers: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, `Content-Security-Policy` (HTML only) injected via `add_security_headers` `map_response` middleware.
+- HTTP timeout: `TimeoutLayer::with_status_code(REQUEST_TIMEOUT, 30s)` on router.
+- CSRF protection: `validate_csrf_origin()` checks Origin/Referer on all session-auth state-mutating routes.
+- API key scope enforcement: `require_admin_auth` middleware returns 403 for `ReadOnly` keys on admin-only routes. `X-API-Key` header supported alongside `Authorization: Bearer`.
+- IP audit logging: `tracing::warn!/info!` on login failures, lockouts, setup, logout, key operations. IPs anonymized (last IPv4 octet masked, IPv6 truncated).
+
+**Completeness fixes:**
+- Prometheus counter: `mallard_events_ingested_total` (`AtomicU64`) wired end-to-end.
+- Config validation: `Config::validate()` exits 1 at startup for invalid config fields.
+- `site_id` validation: `validate_site_id()` rejects empty, >256 chars, disallowed chars on all stats endpoints.
+- Revoked key GC: `api_keys.cleanup_revoked()` runs in 15-minute background task.
+- Dashboard: CSV + JSON export download buttons added.
+- Dashboard: Funnel chart division-by-zero guard added.
+- Local JS: `preact.js` + `htm.js` bundled via `rust-embed`; CDN dependency eliminated.
+
+**Test results:**
+- 209 unit tests passing (`cargo test --lib`)
+- 56 integration tests passing (`cargo test --test ingest_test`)
+- Total: 265 tests, 0 failures, 0 ignored
+- 0 clippy warnings (`cargo clippy --all-targets`)
+- 0 formatting violations (`cargo fmt -- --check`)
+
+**New unit tests added (26):**
+- `test_login_tracker_allows_below_limit` — per-IP tracker permits requests below max
+- `test_login_tracker_lockout_after_max_attempts` — returns 429 after threshold
+- `test_login_tracker_success_clears_failures` — successful login resets failure count
+- `test_login_tracker_independent_ips` — different IPs do not share lockout state
+- `test_login_tracker_disabled_when_max_zero` — max_attempts=0 disables protection
+- `test_csrf_validate_matching_origin_allowed` — matching Origin passes CSRF check
+- `test_csrf_validate_mismatching_origin_rejected` — mismatched Origin rejected
+- `test_csrf_validate_no_dashboard_origin_allows_all` — no dashboard_origin bypasses CSRF
+- `test_csrf_validate_no_origin_or_referer_allows` — server-side requests without Origin pass
+- `test_api_key_store_scope_distinction` — ReadOnly and Admin keys are distinct scopes
+- `test_api_key_store_cleanup_revoked` — revoked keys are removed by cleanup
+- `test_validate_site_id_valid` — normal site_ids accepted
+- `test_validate_site_id_empty` — empty string rejected
+- `test_validate_site_id_too_long` — >256 chars rejected
+- `test_validate_site_id_invalid_chars` — disallowed characters rejected
+- `test_validate_valid_config` — valid config passes validation
+- `test_validate_zero_flush_count` — flush_count=0 rejected at startup
+- `test_validate_zero_flush_interval` — flush_interval=0 rejected at startup
+- `test_validate_zero_session_ttl` — session_ttl=0 rejected at startup
+- `test_cors_headers` — CORS response headers present on OPTIONS request
+- `test_dashboard_index` — dashboard HTML served correctly
+- `test_classify_device_desktop` — desktop UA classified correctly
+- `test_classify_device_mobile` — mobile UA classified correctly
+- `test_classify_device_tablet` — tablet UA classified correctly
+- `test_extract_ip_from_x_forwarded_for` — real IP extracted from X-Forwarded-For
+- `test_extract_ip_from_x_real_ip` — real IP extracted from X-Real-Ip
+
+**New integration tests added (13):**
+- `test_login_rate_limited_after_failures` — 429 returned after max attempts
+- `test_login_success_clears_failure_count` — lock cleared on valid credential
+- `test_ingest_rejects_oversized_body` — 413 returned for body >65 536 bytes
+- `test_security_headers_present` — OWASP headers verified on response
+- `test_events_ingested_counter` — events_ingested counter increments on ingest
+- `test_prometheus_metrics_includes_counter` — /metrics includes the counter
+- `test_api_key_scope_readonly_cannot_create_key` — ReadOnly key rejected on admin route
+- `test_api_key_scope_admin_can_create_key` — Admin key accepted on admin route
+- `test_x_api_key_header_authentication` — X-API-Key header auth works
+- `test_stats_invalid_site_id_rejected` — invalid site_id returns 400
+- `test_stats_empty_site_id_rejected` — empty site_id returns 400
+- `test_timeseries_invalid_period_rejected` — invalid period returns 400
+- `test_data_persists_after_view_rebuild` — events_all VIEW rebuilt correctly after restart
 
 ### Session 9: Documentation Audit — Stale Test Counts
 

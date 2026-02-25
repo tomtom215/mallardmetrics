@@ -20,6 +20,8 @@ These two values are secrets and must not be stored in files committed to source
 |---|---|---|
 | `MALLARD_SECRET` | Recommended | 32+ character random string used as HMAC key for visitor ID hashing. If unset, a random value is generated on each start (visitor IDs will change across restarts). |
 | `MALLARD_ADMIN_PASSWORD` | Recommended | Dashboard password. If unset, the dashboard is unauthenticated. |
+| `MALLARD_MAX_LOGIN_ATTEMPTS` | Optional | Override `max_login_attempts` at runtime. |
+| `MALLARD_LOGIN_LOCKOUT` | Optional | Override `login_lockout_secs` at runtime. |
 | `MALLARD_LOG_FORMAT` | Optional | Set to `json` for structured JSON log output. Omit or set to any other value for human-readable text logs. |
 
 ## TOML Configuration Reference
@@ -57,6 +59,12 @@ retention_days = 0
 
 # Session authentication TTL in seconds (default: 86400 = 24 hours)
 session_ttl_secs = 86400
+
+# Brute-force protection: lock out an IP after this many failed login attempts (0 = disabled)
+max_login_attempts = 5
+
+# Duration in seconds to lock out an IP after exceeding max_login_attempts
+login_lockout_secs = 300
 
 # Graceful shutdown timeout in seconds (default: 30)
 shutdown_timeout_secs = 30
@@ -125,3 +133,12 @@ Query results for `/api/stats/main` and `/api/stats/timeseries` are cached in me
 ### `retention_days`
 
 Parquet partition directories older than `retention_days` days are deleted automatically by a background task that runs daily. Set to `0` (default) for unlimited retention.
+
+### `max_login_attempts` / `login_lockout_secs`
+
+Brute-force protection for the dashboard login endpoint. After `max_login_attempts` consecutive failures from the same IP, that IP is blocked for `login_lockout_secs` seconds. The server responds with `429 Too Many Requests` and a `Retry-After` header during the lockout period.
+
+- `max_login_attempts`: Default `5`. Set to `0` to disable brute-force protection entirely.
+- `login_lockout_secs`: Default `300` (5 minutes).
+
+These can also be set via `MALLARD_MAX_LOGIN_ATTEMPTS` and `MALLARD_LOGIN_LOCKOUT` environment variables.

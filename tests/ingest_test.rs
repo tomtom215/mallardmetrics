@@ -1687,3 +1687,230 @@ async fn test_data_persists_after_view_rebuild() {
         "Flushed events should be visible after view rebuild: {metrics}"
     );
 }
+
+#[tokio::test]
+async fn test_login_lockout_respects_ip_isolation() {
+    // IP-A exhausts its attempts; IP-B must remain unaffected.
+    let (state, _dir) = make_test_state_with_lockout("secret-pass");
+
+    // Exhaust 3 attempts from IP-A with a wrong password
+    for _ in 0..3 {
+        let app = build_router(Arc::clone(&state));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/login")
+                    .header("content-type", "application/json")
+                    .header("x-forwarded-for", "10.1.2.3")
+                    .body(Body::from(r#"{"password":"wrong"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // IP-A is now locked out
+    let app = build_router(Arc::clone(&state));
+    let locked = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.1.2.3")
+                .body(Body::from(r#"{"password":"secret-pass"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(locked.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // IP-B has a clean slate and should authenticate successfully
+    let app = build_router(Arc::clone(&state));
+    let ok = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.9.9.9")
+                .body(Body::from(r#"{"password":"secret-pass"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_security_headers_on_html_response() {
+    // CSP should appear on HTML (dashboard) responses but NOT on JSON API responses.
+    let (state, _dir) = make_test_state();
+    let app = build_router(Arc::clone(&state));
+
+    // The dashboard index returns text/html — CSP must be present
+    let html_response = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert!(
+        html_response
+            .headers()
+            .contains_key("content-security-policy"),
+        "CSP must be present on HTML response"
+    );
+
+    // A JSON API endpoint must NOT carry CSP
+    let app = build_router(Arc::clone(&state));
+    let json_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !json_response
+            .headers()
+            .contains_key("content-security-policy"),
+        "CSP must NOT be present on non-HTML JSON response"
+    );
+}
+
+#[tokio::test]
+async fn test_csrf_blocks_session_auth_key_creation() {
+    // When dashboard_origin is configured, a session-authenticated POST /api/keys
+    // without a matching Origin header must receive 403.
+    let conn = Connection::open_in_memory().unwrap();
+    schema::init_schema(&conn).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    schema::setup_query_view(&conn, dir.path()).unwrap();
+    let storage = ParquetStorage::new(dir.path());
+    let conn = Arc::new(Mutex::new(conn));
+    let buffer = EventBuffer::new(1000, conn, storage);
+    let hash = mallard_metrics::api::auth::hash_password("csrf-test-pass").unwrap();
+    let state = Arc::new(AppState {
+        buffer,
+        secret: "test-secret".to_string(),
+        allowed_sites: Vec::new(),
+        geoip: GeoIpReader::open(None),
+        filter_bots: false,
+        sessions: SessionStore::new(3600),
+        api_keys: ApiKeyStore::new(),
+        admin_password_hash: Mutex::new(Some(hash)),
+        dashboard_origin: Some("https://analytics.example.com".to_string()),
+        query_cache: mallard_metrics::query::cache::QueryCache::new(0),
+        rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(0),
+        login_attempt_tracker: mallard_metrics::api::auth::LoginAttemptTracker::new(0, 300),
+        events_ingested_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    });
+
+    // Create a valid session directly (bypasses login)
+    let token = state.sessions.create_session("admin");
+
+    let app = build_router(Arc::clone(&state));
+
+    // POST /api/keys with session cookie but wrong Origin — expect 403
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/keys")
+                .header("content-type", "application/json")
+                .header("cookie", format!("mm_session={token}"))
+                .header("origin", "https://evil.example.org")
+                .body(Body::from(r#"{"name":"bad-key","scope":"ReadOnly"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_x_api_key_readonly_blocks_key_management() {
+    // A ReadOnly key passed via X-API-Key header must be rejected on admin routes.
+    let (state, _dir) = make_test_state_with_password("admin-password");
+
+    let ro_key = mallard_metrics::api::auth::generate_api_key();
+    state.api_keys.add_key(
+        "readonly-via-header",
+        &ro_key,
+        mallard_metrics::api::auth::ApiKeyScope::ReadOnly,
+    );
+
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/keys")
+                .header("content-type", "application/json")
+                .header("x-api-key", &ro_key)
+                .body(Body::from(r#"{"name":"sneaky","scope":"Admin"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_login_429_includes_retry_after_header() {
+    // When an IP is locked out, the 429 response must include a Retry-After header
+    // with a positive integer value indicating remaining lockout seconds.
+    let (state, _dir) = make_test_state_with_lockout("secure-pass");
+
+    // Exhaust all 3 attempts
+    for _ in 0..3 {
+        let app = build_router(Arc::clone(&state));
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.5.5.5")
+                .body(Body::from(r#"{"password":"wrong"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    // 4th request — must be 429 with Retry-After
+    let app = build_router(Arc::clone(&state));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.5.5.5")
+                .body(Body::from(r#"{"password":"wrong"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .expect("429 response must include Retry-After header");
+
+    let retry_secs: u64 = retry_after
+        .to_str()
+        .expect("Retry-After must be valid UTF-8")
+        .parse()
+        .expect("Retry-After must be a positive integer");
+
+    assert!(retry_secs >= 1, "Retry-After must be at least 1 second");
+}

@@ -107,6 +107,24 @@ impl LoginAttemptTracker {
         self.attempts.lock().remove(ip);
     }
 
+    /// Returns the remaining lockout duration in seconds for the IP, or `None` if not locked out.
+    pub fn remaining_lockout_secs(&self, ip: &str) -> Option<u64> {
+        if self.max_attempts == 0 {
+            return None;
+        }
+        let map = self.attempts.lock();
+        map.get(ip).and_then(|entry| {
+            entry.lockout_until.and_then(|until| {
+                let now = Instant::now();
+                if until > now {
+                    Some(until.saturating_duration_since(now).as_secs().max(1))
+                } else {
+                    None
+                }
+            })
+        })
+    }
+
     /// Remove stale entries to prevent memory growth.
     pub fn cleanup(&self) {
         let now = Instant::now();
@@ -470,15 +488,24 @@ pub async fn auth_login(
 
     // Brute-force check
     if !state.login_attempt_tracker.check(&ip) {
+        let remaining = state
+            .login_attempt_tracker
+            .remaining_lockout_secs(&ip)
+            .unwrap_or(1);
         tracing::warn!(
             ip_prefix = %anonymize_ip(&ip),
+            remaining_secs = remaining,
             "Login attempt from locked-out IP"
         );
-        return (
+        let mut response = (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({"error": "Too many failed login attempts. Try again later."})),
         )
             .into_response();
+        if let Ok(retry_val) = axum::http::HeaderValue::from_str(&remaining.to_string()) {
+            response.headers_mut().insert("retry-after", retry_val);
+        }
+        return response;
     }
 
     let hash_guard = state.admin_password_hash.lock();
@@ -1149,6 +1176,37 @@ mod tests {
         assert!(!tracker.check("192.168.1.1"));
         // IP-B should be unaffected
         assert!(tracker.check("192.168.1.2"));
+    }
+
+    #[test]
+    fn test_remaining_lockout_secs_returns_positive_when_locked() {
+        let tracker = LoginAttemptTracker::new(1, 300);
+        tracker.record_failure("10.0.0.7");
+        // IP should be locked out; remaining should be between 1 and 300
+        let remaining = tracker.remaining_lockout_secs("10.0.0.7");
+        assert!(
+            remaining.is_some(),
+            "remaining_lockout_secs should return Some when locked out"
+        );
+        let secs = remaining.unwrap();
+        assert!(
+            (1..=300).contains(&secs),
+            "remaining secs {secs} out of range"
+        );
+    }
+
+    #[test]
+    fn test_remaining_lockout_secs_none_when_not_locked() {
+        let tracker = LoginAttemptTracker::new(3, 300);
+        // No failures yet — not locked out
+        assert!(tracker.remaining_lockout_secs("10.0.0.8").is_none());
+    }
+
+    #[test]
+    fn test_remaining_lockout_secs_none_when_disabled() {
+        let tracker = LoginAttemptTracker::new(0, 300);
+        // Tracker disabled — remaining is always None
+        assert!(tracker.remaining_lockout_secs("10.0.0.9").is_none());
     }
 
     // CSRF validation tests

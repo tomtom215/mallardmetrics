@@ -86,3 +86,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-site token-bucket rate limiter (`ingest/ratelimit.rs`) for ingestion endpoint
 - Query benchmarks (core metrics, timeseries, breakdowns) added to Criterion suite
 - Prometheus metrics endpoint (`GET /metrics`) with `text/plain; version=0.0.4` format
+
+#### Phase 7: Security and Production Readiness
+
+- Brute-force protection: `LoginAttemptTracker` with per-IP lockout; returns 429 after configurable failures; `MALLARD_MAX_LOGIN_ATTEMPTS` and `MALLARD_LOGIN_LOCKOUT` env vars
+- Body size limit: `DefaultBodyLimit::max(65_536)` on ingestion routes; returns 413 on overflow
+- OWASP security headers middleware: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, `Content-Security-Policy` (HTML responses only)
+- HTTP timeout: `TimeoutLayer` with 30-second limit prevents Slowloris-style attacks
+- CSRF protection: `validate_csrf_origin()` enforced on all session-auth state-mutating routes
+- API key scope enforcement: `require_admin_auth` middleware returns 403 for `ReadOnly` keys on key management routes
+- `X-API-Key` header supported as alternative to `Authorization: Bearer` for API key auth
+- IP audit logging for all auth events (login failures, lockouts, setup, logout, key operations); IPs anonymized before logging
+- Prometheus counter `mallard_events_ingested_total` (`AtomicU64`) wired end-to-end through ingest handler
+- Config validation at startup: `Config::validate()` exits with error code 1 on invalid settings
+- `site_id` validation on all stats endpoints: rejects empty, >256 chars, or non-ASCII-alphanumeric values
+- Revoked API key garbage collection runs in a 15-minute background task
+- Dashboard export download buttons for CSV and JSON formats
+- Funnel chart division-by-zero guard in dashboard JavaScript
+- Local JS bundles (`preact.js` + `htm.js`) served via `rust-embed`; CDN dependency eliminated
