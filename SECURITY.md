@@ -116,7 +116,7 @@ Known bot User-Agents are automatically filtered from analytics when `MALLARD_FI
 | XSS | Input sanitization, control character removal, length limits |
 | Data exfiltration | No external network calls, embedded database, authenticated API access |
 | PII leakage | IP addresses never stored. Daily hash rotation. No cookies |
-| Brute force (login) | Argon2id hashing (inherently slow), configurable rate limiting |
+| Brute force (login) | Argon2id hashing (inherently slow), per-IP attempt counting with configurable lockout (`MALLARD_MAX_LOGIN_ATTEMPTS`, `MALLARD_LOGIN_LOCKOUT`) |
 | Brute force (API) | Per-site token-bucket rate limiting on ingestion |
 | Session hijacking | HttpOnly cookies, Secure flag with TLS, SameSite=Lax, 256-bit random tokens |
 | Unauthorized dashboard access | Argon2id password authentication, session-based access control |

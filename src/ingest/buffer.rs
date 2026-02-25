@@ -7,6 +7,9 @@ use std::sync::Arc;
 
 /// Represents a single analytics event ready for storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// UTM fields (`utm_source`, `utm_medium`, `utm_campaign`, etc.) intentionally
+// share the `utm_` prefix — this is the standardised naming for UTM parameters
+// and any rename would break compatibility with the Parquet schema.
 #[allow(clippy::struct_field_names)]
 pub struct Event {
     pub site_id: String,

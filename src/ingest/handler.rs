@@ -1,4 +1,4 @@
-use crate::api::auth::{ApiKeyStore, SessionStore};
+use crate::api::auth::{ApiKeyStore, LoginAttemptTracker, SessionStore};
 use crate::ingest::buffer::{Event, EventBuffer};
 use crate::ingest::geoip::GeoIpReader;
 use crate::ingest::useragent;
@@ -9,6 +9,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use chrono::Utc;
 use serde::Deserialize;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 /// UTM parameters tuple: (source, medium, campaign, content, term).
@@ -63,6 +64,10 @@ pub struct AppState {
     pub dashboard_origin: Option<String>,
     pub query_cache: crate::query::cache::QueryCache,
     pub rate_limiter: crate::ingest::ratelimit::RateLimiter,
+    /// Per-IP login attempt tracker for brute-force protection.
+    pub login_attempt_tracker: LoginAttemptTracker,
+    /// Running total of events successfully buffered since startup.
+    pub events_ingested_total: Arc<AtomicU64>,
 }
 
 /// POST /api/event — Ingestion endpoint.
@@ -173,7 +178,12 @@ pub async fn ingest_event(
     };
 
     match state.buffer.push(event) {
-        Ok(_) => StatusCode::ACCEPTED,
+        Ok(_) => {
+            state
+                .events_ingested_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            StatusCode::ACCEPTED
+        }
         Err(e) => {
             tracing::error!(error = %e, "Failed to buffer event");
             StatusCode::INTERNAL_SERVER_ERROR
