@@ -1861,3 +1861,56 @@ async fn test_x_api_key_readonly_blocks_key_management() {
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn test_login_429_includes_retry_after_header() {
+    // When an IP is locked out, the 429 response must include a Retry-After header
+    // with a positive integer value indicating remaining lockout seconds.
+    let (state, _dir) = make_test_state_with_lockout("secure-pass");
+
+    // Exhaust all 3 attempts
+    for _ in 0..3 {
+        let app = build_router(Arc::clone(&state));
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.5.5.5")
+                .body(Body::from(r#"{"password":"wrong"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    // 4th request — must be 429 with Retry-After
+    let app = build_router(Arc::clone(&state));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("content-type", "application/json")
+                .header("x-forwarded-for", "10.5.5.5")
+                .body(Body::from(r#"{"password":"wrong"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .expect("429 response must include Retry-After header");
+
+    let retry_secs: u64 = retry_after
+        .to_str()
+        .expect("Retry-After must be valid UTF-8")
+        .parse()
+        .expect("Retry-After must be a positive integer");
+
+    assert!(retry_secs >= 1, "Retry-After must be at least 1 second");
+}
