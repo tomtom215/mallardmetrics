@@ -369,3 +369,19 @@ cargo bench
 - Total: 226 tests, 0 failures, 0 ignored
 - 0 clippy warnings (`cargo clippy --all-targets`)
 - 0 formatting violations (`cargo fmt -- --check`)
+
+### Session 9: Documentation Audit — Stale Test Counts
+
+**Scope:** Cross-file documentation audit for consistency with the codebase state established in Sessions 5–8.
+
+**Documentation fixes (2 issues corrected):**
+- **`CONTRIBUTING.md` — stale test count** — Validation suite table listed "All 209 tests pass (166 unit + 43 integration)". Corrected to "226 tests pass (183 unit + 43 integration)" to match the actual test suite, which grew from 209 to 226 across Sessions 6–7 (13 new unit tests in Session 6, 4 new unit tests in Session 7).
+- **`ROADMAP.md` — stale test count** — Implementation Summary status overview listed "209 tests (166 unit + 43 integration)". Corrected to "226 tests (183 unit + 43 integration)".
+
+**Test results:**
+- 183 unit tests passing (`cargo test --lib`)
+- 43 integration tests passing (`cargo test --test ingest_test`)
+- Total: 226 tests, 0 failures, 0 ignored
+- 0 clippy warnings (`cargo clippy --all-targets`)
+- 0 formatting violations (`cargo fmt -- --check`)
+- Documentation builds without errors (`cargo doc --no-deps`)

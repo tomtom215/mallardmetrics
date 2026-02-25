@@ -29,7 +29,7 @@ This document tracks the implementation phases of Mallard Metrics, including com
 | Phase 5 | COMPLETE | Data retention, export, graceful shutdown, logging, health checks |
 | Phase 6 | COMPLETE | Query caching, rate limiting, benchmarks, Prometheus metrics |
 
-**Current test suite:** 209 tests (166 unit + 43 integration), 0 clippy warnings, 0 format violations.
+**Current test suite:** 226 tests (183 unit + 43 integration), 0 clippy warnings, 0 format violations.
 
 ---
 

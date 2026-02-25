@@ -126,7 +126,7 @@ All four commands must pass before submitting a PR:
 
 | Command | Requirement |
 |---|---|
-| `cargo test` | All 209 tests pass (166 unit + 43 integration) |
+| `cargo test` | All 226 tests pass (183 unit + 43 integration) |
 | `cargo clippy --all-targets` | Zero warnings (pedantic + nursery + cargo lints) |
 | `cargo fmt -- --check` | Zero formatting violations |
 | `cargo doc --no-deps` | Documentation builds without errors |
