@@ -51,6 +51,12 @@ pub struct Config {
     /// Duration in seconds to lock out an IP after exceeding max_login_attempts (default: 300).
     #[serde(default = "default_login_lockout_secs")]
     pub login_lockout_secs: u64,
+    /// Maximum number of cached query results (0 = unlimited, default: 10000).
+    #[serde(default = "default_cache_max_entries")]
+    pub cache_max_entries: usize,
+    /// Maximum concurrent analytics queries (0 = unlimited, default: 10).
+    #[serde(default = "default_max_concurrent_queries")]
+    pub max_concurrent_queries: usize,
 }
 
 fn default_host() -> String {
@@ -101,6 +107,14 @@ const fn default_login_lockout_secs() -> u64 {
     300
 }
 
+const fn default_cache_max_entries() -> usize {
+    10_000
+}
+
+const fn default_max_concurrent_queries() -> usize {
+    10
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -121,6 +135,8 @@ impl Default for Config {
             log_format: default_log_format(),
             max_login_attempts: default_max_login_attempts(),
             login_lockout_secs: default_login_lockout_secs(),
+            cache_max_entries: default_cache_max_entries(),
+            max_concurrent_queries: default_max_concurrent_queries(),
         }
     }
 }
@@ -223,6 +239,16 @@ impl Config {
         if let Ok(val) = std::env::var("MALLARD_LOGIN_LOCKOUT") {
             if let Ok(t) = val.parse() {
                 config.login_lockout_secs = t;
+            }
+        }
+        if let Ok(val) = std::env::var("MALLARD_CACHE_MAX_ENTRIES") {
+            if let Ok(n) = val.parse() {
+                config.cache_max_entries = n;
+            }
+        }
+        if let Ok(val) = std::env::var("MALLARD_MAX_CONCURRENT_QUERIES") {
+            if let Ok(n) = val.parse() {
+                config.max_concurrent_queries = n;
             }
         }
 

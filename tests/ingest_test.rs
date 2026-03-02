@@ -31,10 +31,15 @@ fn make_test_state() -> (Arc<AppState>, tempfile::TempDir) {
         api_keys: ApiKeyStore::new(),
         admin_password_hash: Mutex::new(None),
         dashboard_origin: None,
-        query_cache: mallard_metrics::query::cache::QueryCache::new(0),
+        query_cache: mallard_metrics::query::cache::QueryCache::new(0, 0),
         rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(0),
         login_attempt_tracker: mallard_metrics::api::auth::LoginAttemptTracker::new(0, 300),
         events_ingested_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        flush_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        rate_limit_rejections_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        login_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        metrics_token: None,
+        query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
     });
     (state, dir)
 }
@@ -366,10 +371,15 @@ fn make_test_state_with_sites(sites: Vec<String>) -> (Arc<AppState>, tempfile::T
         api_keys: ApiKeyStore::new(),
         admin_password_hash: Mutex::new(None),
         dashboard_origin: None,
-        query_cache: mallard_metrics::query::cache::QueryCache::new(0),
+        query_cache: mallard_metrics::query::cache::QueryCache::new(0, 0),
         rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(0),
         login_attempt_tracker: mallard_metrics::api::auth::LoginAttemptTracker::new(0, 300),
         events_ingested_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        flush_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        rate_limit_rejections_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        login_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        metrics_token: None,
+        query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
     });
     (state, dir)
 }
@@ -700,10 +710,15 @@ fn make_test_state_with_password(password: &str) -> (Arc<AppState>, tempfile::Te
         api_keys: ApiKeyStore::new(),
         admin_password_hash: Mutex::new(Some(hash)),
         dashboard_origin: None,
-        query_cache: mallard_metrics::query::cache::QueryCache::new(0),
+        query_cache: mallard_metrics::query::cache::QueryCache::new(0, 0),
         rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(0),
         login_attempt_tracker: mallard_metrics::api::auth::LoginAttemptTracker::new(0, 300),
         events_ingested_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        flush_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        rate_limit_rejections_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        login_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        metrics_token: None,
+        query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
     });
     (state, dir)
 }
@@ -1215,10 +1230,15 @@ async fn test_rate_limiting() {
         api_keys: ApiKeyStore::new(),
         admin_password_hash: Mutex::new(None),
         dashboard_origin: None,
-        query_cache: mallard_metrics::query::cache::QueryCache::new(0),
+        query_cache: mallard_metrics::query::cache::QueryCache::new(0, 0),
         rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(2),
         login_attempt_tracker: mallard_metrics::api::auth::LoginAttemptTracker::new(0, 300),
         events_ingested_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        flush_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        rate_limit_rejections_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        login_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        metrics_token: None,
+        query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
     });
 
     let payload = serde_json::json!({
@@ -1304,10 +1324,15 @@ fn make_test_state_with_lockout(password: &str) -> (Arc<AppState>, tempfile::Tem
         api_keys: ApiKeyStore::new(),
         admin_password_hash: Mutex::new(Some(hash)),
         dashboard_origin: None,
-        query_cache: mallard_metrics::query::cache::QueryCache::new(0),
+        query_cache: mallard_metrics::query::cache::QueryCache::new(0, 0),
         rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(0),
         login_attempt_tracker: mallard_metrics::api::auth::LoginAttemptTracker::new(3, 300),
         events_ingested_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        flush_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        rate_limit_rejections_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        login_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        metrics_token: None,
+        query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
     });
     (state, dir)
 }
@@ -1803,10 +1828,15 @@ async fn test_csrf_blocks_session_auth_key_creation() {
         api_keys: ApiKeyStore::new(),
         admin_password_hash: Mutex::new(Some(hash)),
         dashboard_origin: Some("https://analytics.example.com".to_string()),
-        query_cache: mallard_metrics::query::cache::QueryCache::new(0),
+        query_cache: mallard_metrics::query::cache::QueryCache::new(0, 0),
         rate_limiter: mallard_metrics::ingest::ratelimit::RateLimiter::new(0),
         login_attempt_tracker: mallard_metrics::api::auth::LoginAttemptTracker::new(0, 300),
         events_ingested_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        flush_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        rate_limit_rejections_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        login_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        metrics_token: None,
+        query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
     });
 
     // Create a valid session directly (bypasses login)

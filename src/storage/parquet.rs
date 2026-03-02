@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 /// ```text
 /// data/events/site_id=example.com/date=2024-01-15/0001.parquet
 /// ```
+#[derive(Clone)]
 pub struct ParquetStorage {
     base_dir: PathBuf,
 }

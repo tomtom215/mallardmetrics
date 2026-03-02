@@ -228,7 +228,7 @@ pub fn hash_api_key(key: &str) -> String {
 ///
 /// Always compares all bytes regardless of where the first mismatch occurs,
 /// preventing attackers from inferring hash prefixes via response timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -520,6 +520,9 @@ pub async fn auth_login(
     if !verify_password(&body.password, stored_hash) {
         drop(hash_guard);
         let fail_count = state.login_attempt_tracker.record_failure(&ip);
+        state
+            .login_failures_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
             ip_prefix = %anonymize_ip(&ip),
             fail_count,

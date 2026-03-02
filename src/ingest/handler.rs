@@ -68,6 +68,19 @@ pub struct AppState {
     pub login_attempt_tracker: LoginAttemptTracker,
     /// Running total of events successfully buffered since startup.
     pub events_ingested_total: Arc<AtomicU64>,
+    /// Running total of Parquet flush failures since startup.
+    pub flush_failures_total: Arc<AtomicU64>,
+    /// Running total of rate-limited ingest requests since startup.
+    pub rate_limit_rejections_total: Arc<AtomicU64>,
+    /// Running total of failed login attempts since startup.
+    pub login_failures_total: Arc<AtomicU64>,
+    /// Optional bearer token required to access the `/metrics` endpoint.
+    /// `None` means the endpoint is accessible without authentication.
+    pub metrics_token: Option<String>,
+    /// Semaphore limiting the number of concurrent expensive analytics queries.
+    /// A permit is acquired before entering `spawn_blocking` for stats endpoints.
+    /// Prevents a tight query loop from monopolising the single DuckDB connection.
+    pub query_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 /// POST /api/event — Ingestion endpoint.
@@ -112,6 +125,9 @@ pub async fn ingest_event(
 
     // Rate limiting per site (only reached for well-formed site IDs)
     if !state.rate_limiter.check(&payload.domain) {
+        state
+            .rate_limit_rejections_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return StatusCode::TOO_MANY_REQUESTS;
     }
 

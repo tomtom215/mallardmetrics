@@ -9,6 +9,8 @@ pub enum ApiError {
     NotFound(String),
     Internal(String),
     DatabaseError(duckdb::Error),
+    /// Returned (429) when the concurrent query semaphore is exhausted.
+    TooManyRequests(String),
 }
 
 impl std::fmt::Display for ApiError {
@@ -18,6 +20,7 @@ impl std::fmt::Display for ApiError {
             Self::NotFound(msg) => write!(f, "Not found: {msg}"),
             Self::Internal(msg) => write!(f, "Internal error: {msg}"),
             Self::DatabaseError(e) => write!(f, "Database error: {e}"),
+            Self::TooManyRequests(msg) => write!(f, "Too many requests: {msg}"),
         }
     }
 }
@@ -37,6 +40,7 @@ impl IntoResponse for ApiError {
                     "Internal server error".to_string(),
                 )
             }
+            Self::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
         };
 
         let body = serde_json::json!({ "error": message });
