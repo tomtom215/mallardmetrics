@@ -57,6 +57,10 @@ pub struct Config {
     /// Maximum concurrent analytics queries (0 = unlimited, default: 10).
     #[serde(default = "default_max_concurrent_queries")]
     pub max_concurrent_queries: usize,
+    /// Force the Secure flag on session cookies regardless of dashboard_origin.
+    /// Set to true when the server is deployed behind a TLS-terminating reverse proxy.
+    #[serde(default)]
+    pub secure_cookies: bool,
 }
 
 fn default_host() -> String {
@@ -137,6 +141,7 @@ impl Default for Config {
             login_lockout_secs: default_login_lockout_secs(),
             cache_max_entries: default_cache_max_entries(),
             max_concurrent_queries: default_max_concurrent_queries(),
+            secure_cookies: false,
         }
     }
 }
@@ -172,28 +177,35 @@ impl Config {
                 }
             });
 
+        // Helper: parse a numeric env var, logging a warning if the value is set
+        // but cannot be parsed.  A silent fallback to the default is confusing for
+        // operators because the configured value appears to be ignored.
+        macro_rules! parse_env_num {
+            ($var:literal, $field:expr, $ty:ty) => {
+                if let Ok(raw) = std::env::var($var) {
+                    match raw.parse::<$ty>() {
+                        Ok(v) => $field = v,
+                        Err(_) => tracing::warn!(
+                            env = $var,
+                            value = %raw,
+                            "Invalid value for env var; using existing value {}",
+                            $field
+                        ),
+                    }
+                }
+            };
+        }
+
         // Environment variable overrides
         if let Ok(host) = std::env::var("MALLARD_HOST") {
             config.host = host;
         }
-        if let Ok(port) = std::env::var("MALLARD_PORT") {
-            if let Ok(p) = port.parse() {
-                config.port = p;
-            }
-        }
+        parse_env_num!("MALLARD_PORT", config.port, u16);
         if let Ok(data_dir) = std::env::var("MALLARD_DATA_DIR") {
             config.data_dir = PathBuf::from(data_dir);
         }
-        if let Ok(count) = std::env::var("MALLARD_FLUSH_COUNT") {
-            if let Ok(c) = count.parse() {
-                config.flush_event_count = c;
-            }
-        }
-        if let Ok(interval) = std::env::var("MALLARD_FLUSH_INTERVAL") {
-            if let Ok(i) = interval.parse() {
-                config.flush_interval_secs = i;
-            }
-        }
+        parse_env_num!("MALLARD_FLUSH_COUNT", config.flush_event_count, usize);
+        parse_env_num!("MALLARD_FLUSH_INTERVAL", config.flush_interval_secs, u64);
         if let Ok(geoip) = std::env::var("MALLARD_GEOIP_DB") {
             config.geoip_db_path = Some(PathBuf::from(geoip));
         }
@@ -203,53 +215,28 @@ impl Config {
         if let Ok(val) = std::env::var("MALLARD_FILTER_BOTS") {
             config.filter_bots = val != "0" && val.to_lowercase() != "false";
         }
-        if let Ok(val) = std::env::var("MALLARD_RETENTION_DAYS") {
-            if let Ok(d) = val.parse() {
-                config.retention_days = d;
-            }
-        }
-        if let Ok(val) = std::env::var("MALLARD_SESSION_TTL") {
-            if let Ok(t) = val.parse() {
-                config.session_ttl_secs = t;
-            }
-        }
-        if let Ok(val) = std::env::var("MALLARD_SHUTDOWN_TIMEOUT") {
-            if let Ok(t) = val.parse() {
-                config.shutdown_timeout_secs = t;
-            }
-        }
-        if let Ok(val) = std::env::var("MALLARD_RATE_LIMIT") {
-            if let Ok(r) = val.parse() {
-                config.rate_limit_per_site = r;
-            }
-        }
-        if let Ok(val) = std::env::var("MALLARD_CACHE_TTL") {
-            if let Ok(t) = val.parse() {
-                config.cache_ttl_secs = t;
-            }
-        }
+        parse_env_num!("MALLARD_RETENTION_DAYS", config.retention_days, u32);
+        parse_env_num!("MALLARD_SESSION_TTL", config.session_ttl_secs, u64);
+        parse_env_num!(
+            "MALLARD_SHUTDOWN_TIMEOUT",
+            config.shutdown_timeout_secs,
+            u64
+        );
+        parse_env_num!("MALLARD_RATE_LIMIT", config.rate_limit_per_site, u32);
+        parse_env_num!("MALLARD_CACHE_TTL", config.cache_ttl_secs, u64);
         if let Ok(val) = std::env::var("MALLARD_LOG_FORMAT") {
             config.log_format = val;
         }
-        if let Ok(val) = std::env::var("MALLARD_MAX_LOGIN_ATTEMPTS") {
-            if let Ok(n) = val.parse() {
-                config.max_login_attempts = n;
-            }
-        }
-        if let Ok(val) = std::env::var("MALLARD_LOGIN_LOCKOUT") {
-            if let Ok(t) = val.parse() {
-                config.login_lockout_secs = t;
-            }
-        }
-        if let Ok(val) = std::env::var("MALLARD_CACHE_MAX_ENTRIES") {
-            if let Ok(n) = val.parse() {
-                config.cache_max_entries = n;
-            }
-        }
-        if let Ok(val) = std::env::var("MALLARD_MAX_CONCURRENT_QUERIES") {
-            if let Ok(n) = val.parse() {
-                config.max_concurrent_queries = n;
-            }
+        parse_env_num!("MALLARD_MAX_LOGIN_ATTEMPTS", config.max_login_attempts, u32);
+        parse_env_num!("MALLARD_LOGIN_LOCKOUT", config.login_lockout_secs, u64);
+        parse_env_num!("MALLARD_CACHE_MAX_ENTRIES", config.cache_max_entries, usize);
+        parse_env_num!(
+            "MALLARD_MAX_CONCURRENT_QUERIES",
+            config.max_concurrent_queries,
+            usize
+        );
+        if let Ok(val) = std::env::var("MALLARD_SECURE_COOKIES") {
+            config.secure_cookies = val != "0" && val.to_lowercase() != "false";
         }
 
         config
@@ -258,6 +245,16 @@ impl Config {
     /// Returns the path to the events directory.
     pub fn events_dir(&self) -> PathBuf {
         self.data_dir.join("events")
+    }
+
+    /// Returns the path to the DuckDB database file.
+    ///
+    /// Using a disk-based file instead of an in-memory database allows events
+    /// that have been buffered but not yet flushed to Parquet to survive a
+    /// process crash (SIGKILL).  The WAL file next to the database ensures
+    /// atomicity of each batch insert.
+    pub fn db_path(&self) -> PathBuf {
+        self.data_dir.join("mallard.duckdb")
     }
 
     /// Validate that configuration values are internally consistent.
@@ -421,6 +418,38 @@ session_ttl_secs = 3600
             ..Config::default()
         };
         assert_eq!(config.events_dir(), PathBuf::from("/var/mallard/events"));
+    }
+
+    #[test]
+    fn test_db_path() {
+        let config = Config {
+            data_dir: PathBuf::from("/var/mallard"),
+            ..Config::default()
+        };
+        assert_eq!(
+            config.db_path(),
+            PathBuf::from("/var/mallard/mallard.duckdb")
+        );
+    }
+
+    #[test]
+    fn test_secure_cookies_default_false() {
+        assert!(!Config::default().secure_cookies);
+    }
+
+    #[test]
+    fn test_warn_on_invalid_env_var_falls_back() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let orig = std::env::var("MALLARD_PORT").ok();
+        std::env::set_var("MALLARD_PORT", "not_a_number");
+        // Should not panic — should silently keep the default.
+        let config = Config::load(None);
+        // The default port (8000) must still be in use because the parse failed.
+        assert_eq!(config.port, 8000);
+        match orig {
+            Some(v) => std::env::set_var("MALLARD_PORT", v),
+            None => std::env::remove_var("MALLARD_PORT"),
+        }
     }
 
     #[test]

@@ -28,7 +28,7 @@ fn make_test_state() -> (Arc<AppState>, tempfile::TempDir) {
         geoip: GeoIpReader::open(None),
         filter_bots: false,
         sessions: SessionStore::new(3600),
-        api_keys: ApiKeyStore::new(),
+        api_keys: ApiKeyStore::default(),
         admin_password_hash: Mutex::new(None),
         dashboard_origin: None,
         query_cache: mallard_metrics::query::cache::QueryCache::new(0, 0),
@@ -40,6 +40,7 @@ fn make_test_state() -> (Arc<AppState>, tempfile::TempDir) {
         login_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         metrics_token: None,
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
+        secure_cookies: false,
     });
     (state, dir)
 }
@@ -368,7 +369,7 @@ fn make_test_state_with_sites(sites: Vec<String>) -> (Arc<AppState>, tempfile::T
         geoip: GeoIpReader::open(None),
         filter_bots: false,
         sessions: SessionStore::new(3600),
-        api_keys: ApiKeyStore::new(),
+        api_keys: ApiKeyStore::default(),
         admin_password_hash: Mutex::new(None),
         dashboard_origin: None,
         query_cache: mallard_metrics::query::cache::QueryCache::new(0, 0),
@@ -380,6 +381,7 @@ fn make_test_state_with_sites(sites: Vec<String>) -> (Arc<AppState>, tempfile::T
         login_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         metrics_token: None,
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
+        secure_cookies: false,
     });
     (state, dir)
 }
@@ -707,7 +709,7 @@ fn make_test_state_with_password(password: &str) -> (Arc<AppState>, tempfile::Te
         geoip: GeoIpReader::open(None),
         filter_bots: false,
         sessions: SessionStore::new(3600),
-        api_keys: ApiKeyStore::new(),
+        api_keys: ApiKeyStore::default(),
         admin_password_hash: Mutex::new(Some(hash)),
         dashboard_origin: None,
         query_cache: mallard_metrics::query::cache::QueryCache::new(0, 0),
@@ -719,6 +721,7 @@ fn make_test_state_with_password(password: &str) -> (Arc<AppState>, tempfile::Te
         login_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         metrics_token: None,
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
+        secure_cookies: false,
     });
     (state, dir)
 }
@@ -1227,7 +1230,7 @@ async fn test_rate_limiting() {
         geoip: GeoIpReader::open(None),
         filter_bots: false,
         sessions: SessionStore::new(3600),
-        api_keys: ApiKeyStore::new(),
+        api_keys: ApiKeyStore::default(),
         admin_password_hash: Mutex::new(None),
         dashboard_origin: None,
         query_cache: mallard_metrics::query::cache::QueryCache::new(0, 0),
@@ -1239,6 +1242,7 @@ async fn test_rate_limiting() {
         login_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         metrics_token: None,
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
+        secure_cookies: false,
     });
 
     let payload = serde_json::json!({
@@ -1321,7 +1325,7 @@ fn make_test_state_with_lockout(password: &str) -> (Arc<AppState>, tempfile::Tem
         geoip: GeoIpReader::open(None),
         filter_bots: false,
         sessions: SessionStore::new(3600),
-        api_keys: ApiKeyStore::new(),
+        api_keys: ApiKeyStore::default(),
         admin_password_hash: Mutex::new(Some(hash)),
         dashboard_origin: None,
         query_cache: mallard_metrics::query::cache::QueryCache::new(0, 0),
@@ -1333,6 +1337,7 @@ fn make_test_state_with_lockout(password: &str) -> (Arc<AppState>, tempfile::Tem
         login_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         metrics_token: None,
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
+        secure_cookies: false,
     });
     (state, dir)
 }
@@ -1825,7 +1830,7 @@ async fn test_csrf_blocks_session_auth_key_creation() {
         geoip: GeoIpReader::open(None),
         filter_bots: false,
         sessions: SessionStore::new(3600),
-        api_keys: ApiKeyStore::new(),
+        api_keys: ApiKeyStore::default(),
         admin_password_hash: Mutex::new(Some(hash)),
         dashboard_origin: Some("https://analytics.example.com".to_string()),
         query_cache: mallard_metrics::query::cache::QueryCache::new(0, 0),
@@ -1837,6 +1842,7 @@ async fn test_csrf_blocks_session_auth_key_creation() {
         login_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         metrics_token: None,
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
+        secure_cookies: false,
     });
 
     // Create a valid session directly (bypasses login)

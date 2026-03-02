@@ -51,8 +51,16 @@ async fn main() {
     // Ensure data directory exists
     std::fs::create_dir_all(config.events_dir()).expect("Failed to create data directory");
 
-    // Initialize DuckDB
-    let conn = Connection::open_in_memory().expect("Failed to open DuckDB");
+    // Initialize DuckDB using a disk-based file so that events buffered in the
+    // `events` table (not yet flushed to Parquet) survive a process crash.
+    // The WAL file written next to mallard.duckdb provides atomic batch inserts.
+    //
+    // NOTE: if the server crashes in the narrow window after `COPY TO` succeeds
+    // but before `DELETE FROM events` commits, those events may appear in both
+    // the DuckDB table and the Parquet file.  The events_all VIEW unions both
+    // tiers, so such events would be counted twice.  This is an acceptable
+    // trade-off for lightweight analytics; the probability is extremely low.
+    let conn = Connection::open(config.db_path()).expect("Failed to open DuckDB");
     storage::migrations::run_migrations(&conn).expect("Failed to run migrations");
 
     // Try to load the behavioral extension (non-fatal if unavailable)
@@ -105,7 +113,10 @@ async fn main() {
 
 fn build_app_state(config: &Config, buffer: EventBuffer, geoip: GeoIpReader) -> Arc<AppState> {
     let sessions = SessionStore::new(config.session_ttl_secs);
-    let api_keys = ApiKeyStore::new();
+    // Load API keys from disk so they survive server restarts.  Keys are
+    // written back to the same file on every add/revoke operation.
+    let api_keys_path = config.data_dir.join("api_keys.json");
+    let api_keys = ApiKeyStore::load_from_disk(api_keys_path);
     let query_cache =
         crate::query::cache::QueryCache::new(config.cache_ttl_secs, config.cache_max_entries);
     let rate_limiter = crate::ingest::ratelimit::RateLimiter::new(config.rate_limit_per_site);
@@ -194,6 +205,7 @@ fn build_app_state(config: &Config, buffer: EventBuffer, geoip: GeoIpReader) -> 
         login_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         metrics_token,
         query_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+        secure_cookies: config.secure_cookies,
     })
 }
 

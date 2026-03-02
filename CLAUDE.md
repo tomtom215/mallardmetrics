@@ -20,7 +20,7 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 # Build
 cargo build
 
-# Run all tests (302 total: 240 unit + 62 integration)
+# Run all tests (311 total: 249 unit + 62 integration)
 cargo test
 
 # Clippy (zero warnings required)
@@ -51,9 +51,9 @@ cargo bench
 
 | Metric | Value | Verified |
 |---|---|---|
-| Unit tests | 240 | `cargo test --lib` |
+| Unit tests | 249 | `cargo test --lib` |
 | Integration tests | 62 | `cargo test --test ingest_test` |
-| Total tests | 302 | `cargo test` |
+| Total tests | 311 | `cargo test` |
 | Clippy warnings | 0 | `cargo clippy --all-targets` |
 | Format violations | 0 | `cargo fmt -- --check` |
 | CI jobs | 12 | `.github/workflows/ci.yml` (10 jobs), `.github/workflows/pages.yml` (2 jobs) |
@@ -578,3 +578,49 @@ cargo bench
 - `test_security_headers_present` — OWASP headers present on API response
 - `test_cache_control_on_json_api_response` — no-store Cache-Control on JSON endpoints
 - `test_readiness_check` — /health/ready returns 200 when DB is reachable
+
+### Session 14: Production-Readiness Gap Remediation (Continued)
+
+**Scope:** 9 patchable gaps and 2 short-term architectural remediations identified by post-Session-13 audit.
+
+**Security / protocol fixes:**
+- **HSTS header (MEDIUM):** `Strict-Transport-Security: max-age=31536000; includeSubDomains` added to `add_security_headers()` in `server.rs`. Safe to send unconditionally — browsers only honour HSTS over HTTPS.
+- **Ingest 429 `Retry-After` (MEDIUM):** `add_security_headers` middleware injects `Retry-After: 1` on any 429 response that does not already carry the header (the login endpoint sets its own value based on the lockout period). No handler changes required.
+- **Cookie `Secure` flag (MEDIUM):** `secure_cookies: bool` added to `Config` (`MALLARD_SECURE_COOKIES` env var, default `false`) and `AppState`. `build_session_cookie` now takes a plain `bool` instead of inferring from `dashboard_origin`. Call sites compute `secure = state.secure_cookies || state.dashboard_origin.as_deref().is_some_and(|o| o.starts_with("https://"))`.
+- **`/robots.txt` (MEDIUM):** New route `GET /robots.txt` → `robots_txt()` handler returns `Disallow: /api/`, `/health`, `/metrics`.
+- **`/.well-known/security.txt` (LOW):** New route `GET /.well-known/security.txt` → `security_txt()` handler returns RFC 9116 policy with `Contact:` and `Expires:` fields.
+
+**Observability / DX fixes:**
+- **Request ID in tracing spans (MEDIUM):** Changed `map_response(add_request_id)` to `from_fn(request_id_middleware)`. New middleware wraps the handler in `tracing::info_span!("http_request", request_id = %id)` and instruments it with `.instrument(span)`, so all log lines emitted during the request carry the same `request_id` field.
+- **Silent env var parse failures (LOW):** Added `parse_env_num!` macro in `config.rs` that emits `tracing::warn!` when a numeric env var cannot be parsed, instead of silently falling back to the default.
+
+**Performance / correctness fixes:**
+- **Parquet VIEW re-creation skip (LOW):** `flush_events()` in `storage/parquet.rs` guards the `setup_query_view()` call with `if total_flushed > 0`, skipping the expensive glob VIEW re-creation when the flush cycle had no events to write.
+- **GET /api/event pixel tracking (LOW):** `GET /api/event` with query-string parameters now returns a 1×1 transparent GIF (43 bytes, `Content-Type: image/gif`). Accepts the same core parameters as POST (`d`, `n`, `u`, `referrer`, `screen_width`). Revenue and props deliberately excluded. Implemented via shared `process_pixel_event()` helper (fire-and-forget). `TRANSPARENT_GIF_1X1` constant moved to module level to satisfy `items_after_statements` clippy lint.
+
+**Architectural remediations:**
+- **DuckDB disk-based (SHORT-TERM):** `Connection::open_in_memory()` replaced with `Connection::open(config.db_path())` where `db_path()` returns `data_dir/mallard.duckdb`. Adds `db_path()` method to `Config`. DuckDB WAL ensures atomic batch inserts; hot-buffer events survive SIGKILL (previously lost on crash).
+- **ApiKeyStore disk persistence (SHORT-TERM):** `ApiKeyStore` gains `load_from_disk(path: PathBuf)` (loads existing keys from JSON, missing file → empty store) and a private `persist()` (serialise + atomic write). `add_key()` and `revoke_key()` both call `persist()` automatically. `StoredApiKey` gains `#[derive(serde::Serialize, serde::Deserialize)]`. API keys now survive server restarts without needing re-creation.
+
+**Code-quality fixes:**
+- `ApiKeyStore::new()` removed (was dead code in binary; callers converted to `ApiKeyStore::default()`). `Default` impl was already present.
+- `.map(String::from).unwrap_or_else(...)` → `.map_or_else(...)` in `request_id_middleware` (`clippy::map_unwrap_or`).
+
+**Test results (before → after):**
+- 240 → 249 unit tests passing (`cargo test --lib`)
+- 62 → 62 integration tests passing (`cargo test --test ingest_test`)
+- Total: 302 → 311 tests, 0 failures, 0 ignored
+- 0 clippy warnings (`cargo clippy --all-targets`)
+- 0 formatting violations (`cargo fmt -- --check`)
+
+**New unit tests added (9):**
+- `test_secure_cookies_default_false` — `MALLARD_SECURE_COOKIES` defaults to false
+- `test_secure_cookies_flag_overrides_http_origin` — `secure=true` overrides non-HTTPS origin
+- `test_db_path` — `db_path()` returns `data_dir/mallard.duckdb`
+- `test_warn_on_invalid_env_var_falls_back` — invalid env var → warn + keep default
+- `test_api_key_store_persistence_round_trip` — keys written/loaded from disk correctly
+- `test_robots_txt` — `/robots.txt` returns correct body
+- `test_security_txt` — `/.well-known/security.txt` returns Contact + Expires fields
+- `test_pixel_track_returns_gif` — GET /api/event returns 43-byte GIF with `image/gif` content-type
+- `test_hsts_header_present` — HSTS header present with correct `max-age`
+- `test_retry_after_present_on_query_semaphore_429` — 429 response includes `Retry-After`
