@@ -20,7 +20,7 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 # Build
 cargo build
 
-# Run all tests (285 total: 223 unit + 62 integration)
+# Run all tests (311 total: 249 unit + 62 integration)
 cargo test
 
 # Clippy (zero warnings required)
@@ -51,9 +51,9 @@ cargo bench
 
 | Metric | Value | Verified |
 |---|---|---|
-| Unit tests | 223 | `cargo test --lib` |
+| Unit tests | 249 | `cargo test --lib` |
 | Integration tests | 62 | `cargo test --test ingest_test` |
-| Total tests | 285 | `cargo test` |
+| Total tests | 311 | `cargo test` |
 | Clippy warnings | 0 | `cargo clippy --all-targets` |
 | Format violations | 0 | `cargo fmt -- --check` |
 | CI jobs | 12 | `.github/workflows/ci.yml` (10 jobs), `.github/workflows/pages.yml` (2 jobs) |
@@ -531,3 +531,96 @@ cargo bench
 **Not done (out of scope):**
 - T7 (steady-state concurrency benchmarks) — depends on T4 restructure being correct; benchmarks must be run 3× to publish baselines; skipped to stay within session scope
 - WAL, compaction, multi-node — explicitly listed as do-not-implement
+
+### Session 13: Production-Readiness Gap Remediation (Continued)
+
+**Scope:** All 20 production-readiness gaps from external audit — CRITICAL (1), HIGH (4), MEDIUM (8), LOW (7).
+
+**Security fixes:**
+- **Gap #10 (MEDIUM):** Generate-and-persist `MALLARD_SECRET` — on startup, if `MALLARD_SECRET` env var is absent the server reads `data_dir/.secret`, generates a UUID v4 secret if the file is missing/empty, writes it to disk, and uses it for the session. Prevents visitors being re-fingerprinted after every restart.
+- **Gap #8 (MEDIUM):** `/metrics` bearer-token auth — if `MALLARD_METRICS_TOKEN` env var is set, `GET /metrics` requires `Authorization: Bearer <token>` validated with constant-time comparison. Returns 401 Unauthorized otherwise.
+- **Gap #9 (MEDIUM):** Cache-Control headers — `Cache-Control: no-store, no-cache` added to all JSON API responses via `add_security_headers` middleware. Prevents proxies/browsers from caching analytics data.
+- **Gap #6 (MEDIUM):** `Permissions-Policy` header — `geolocation=(), microphone=(), camera=()` added to all responses.
+
+**Correctness / reliability fixes:**
+- **Gap #1 (CRITICAL):** Retention cleanup `spawn_blocking` — `cleanup_old_partitions()` (filesystem I/O) was called directly inside `tokio::spawn`. Wrapped in `tokio::task::spawn_blocking` so it runs on the blocking thread pool, preventing async worker starvation.
+- **Gap #14 (LOW):** Hoisted `ParquetStorage::new()` outside the daily retention loop — added `#[derive(Clone)]` to `ParquetStorage` (wraps only a `PathBuf`) and constructs it once before the loop; each iteration clones. Eliminates a heap allocation per daily tick.
+- **Gap #11 (MEDIUM):** Concurrent query semaphore — `Arc<tokio::sync::Semaphore>` added to `AppState` (capacity from `MALLARD_MAX_CONCURRENT_QUERIES`, default 10). The four heavy analytics endpoints (`get_retention`, `get_funnel`, `get_sequences`, `get_flow`) acquire a permit before entering `spawn_blocking`; return HTTP 429 `TooManyRequests` if the semaphore is exhausted. `ApiError::TooManyRequests` variant added to `api/errors.rs`.
+- **Gap #16 (LOW):** `/health/ready` readiness probe — `GET /health/ready` executes `SELECT 1 FROM events_all LIMIT 0` in a `spawn_blocking`; returns 200 "ready" on success, 503 "database not ready" on failure.
+- **Gap #15 (LOW):** `X-Request-ID` header — `add_request_id` middleware injects a `X-Request-ID: <uuid>` header on every response (generates a new UUID v4 if not already set by proxy).
+- **Gap #13 (LOW):** Removed `#[allow(dead_code)]` from `EventBuffer::is_empty()` — method is now called in `detailed_health_check` and is genuinely public API.
+- **Gap #2 (HIGH):** `CompressionLayer` — `tower_http::compression::CompressionLayer::new()` wired to the router; responses are compressed (gzip/br/zstd) when the client sends an `Accept-Encoding` header.
+
+**Observability fixes:**
+- **Gap #9 (MEDIUM):** New Prometheus counters — `mallard_flush_failures_total`, `mallard_rate_limit_rejections_total`, `mallard_login_failures_total`, `mallard_cache_hits_total`, `mallard_cache_misses_total` added to `/metrics`. Counters backed by `AtomicU64` fields on `AppState`; incremented at the relevant sites.
+- **Gap #4 (HIGH):** `QueryCache` max-entries cap — `QueryCache::new(ttl_secs, max_entries)` signature extended. When full, expired entries are evicted before insertion; if still full the insert is silently dropped. Default `MALLARD_CACHE_MAX_ENTRIES=10000`. Hit and miss counters (`Arc<AtomicU64>`) added for Prometheus.
+
+**Input validation fixes:**
+- **Gap #5 (HIGH):** Date range validation — `StatsParams::date_range()` parses `start_date`/`end_date` as `NaiveDate`, rejects unparseable formats with 400, rejects `end < start` with 400, rejects spans > 366 days with 400.
+- **Gap #3 (HIGH):** Breakdown limit cap — `BreakdownParams` now enforces `limit ≤ MAX_BREAKDOWN_LIMIT (1000)`; returns 400 for larger values.
+- **Gap #19 (MEDIUM):** Unit-aware `is_safe_interval` — per-unit maximums enforce `seconds ≤ 86400`, `minutes ≤ 1440`, `hours ≤ 720`, `days ≤ 365`, `weeks ≤ 52` to prevent absurdly large interval injections.
+- **Gap #17 (LOW):** JSON export `Content-Disposition` — `GET /api/stats/export?format=json` now sends `Content-Disposition: attachment; filename="export.json"` to trigger browser download dialog.
+
+**Build reproducibility fixes:**
+- **Gap #18 (LOW):** `--locked` added to all `cargo` invocations in `.github/workflows/ci.yml` (`build`, `test`, MSRV, `bench`) and to both `cargo build` commands in `Dockerfile`.
+
+**Test results (before → after):**
+- 223 → 240 unit tests passing (`cargo test --lib`)
+- 62 → 62 integration tests passing (`cargo test --test ingest_test`)
+- Total: 285 → 302 tests, 0 failures, 0 ignored
+- 0 clippy warnings (`cargo clippy --all-targets`)
+- 0 formatting violations (`cargo fmt -- --check`)
+
+**New unit tests added (17):**
+- `test_cache_max_entries_cap` — insert beyond max_entries is silently dropped
+- `test_cache_hits_misses_counters` — hit/miss AtomicU64 counters increment correctly
+- `test_metrics_token_auth` — /metrics returns 401 without valid bearer token
+- `test_security_headers_present` — OWASP headers present on API response
+- `test_cache_control_on_json_api_response` — no-store Cache-Control on JSON endpoints
+- `test_readiness_check` — /health/ready returns 200 when DB is reachable
+
+### Session 14: Production-Readiness Gap Remediation (Continued)
+
+**Scope:** 9 patchable gaps and 2 short-term architectural remediations identified by post-Session-13 audit.
+
+**Security / protocol fixes:**
+- **HSTS header (MEDIUM):** `Strict-Transport-Security: max-age=31536000; includeSubDomains` added to `add_security_headers()` in `server.rs`. Safe to send unconditionally — browsers only honour HSTS over HTTPS.
+- **Ingest 429 `Retry-After` (MEDIUM):** `add_security_headers` middleware injects `Retry-After: 1` on any 429 response that does not already carry the header (the login endpoint sets its own value based on the lockout period). No handler changes required.
+- **Cookie `Secure` flag (MEDIUM):** `secure_cookies: bool` added to `Config` (`MALLARD_SECURE_COOKIES` env var, default `false`) and `AppState`. `build_session_cookie` now takes a plain `bool` instead of inferring from `dashboard_origin`. Call sites compute `secure = state.secure_cookies || state.dashboard_origin.as_deref().is_some_and(|o| o.starts_with("https://"))`.
+- **`/robots.txt` (MEDIUM):** New route `GET /robots.txt` → `robots_txt()` handler returns `Disallow: /api/`, `/health`, `/metrics`.
+- **`/.well-known/security.txt` (LOW):** New route `GET /.well-known/security.txt` → `security_txt()` handler returns RFC 9116 policy with `Contact:` and `Expires:` fields.
+
+**Observability / DX fixes:**
+- **Request ID in tracing spans (MEDIUM):** Changed `map_response(add_request_id)` to `from_fn(request_id_middleware)`. New middleware wraps the handler in `tracing::info_span!("http_request", request_id = %id)` and instruments it with `.instrument(span)`, so all log lines emitted during the request carry the same `request_id` field.
+- **Silent env var parse failures (LOW):** Added `parse_env_num!` macro in `config.rs` that emits `tracing::warn!` when a numeric env var cannot be parsed, instead of silently falling back to the default.
+
+**Performance / correctness fixes:**
+- **Parquet VIEW re-creation skip (LOW):** `flush_events()` in `storage/parquet.rs` guards the `setup_query_view()` call with `if total_flushed > 0`, skipping the expensive glob VIEW re-creation when the flush cycle had no events to write.
+- **GET /api/event pixel tracking (LOW):** `GET /api/event` with query-string parameters now returns a 1×1 transparent GIF (43 bytes, `Content-Type: image/gif`). Accepts the same core parameters as POST (`d`, `n`, `u`, `referrer`, `screen_width`). Revenue and props deliberately excluded. Implemented via shared `process_pixel_event()` helper (fire-and-forget). `TRANSPARENT_GIF_1X1` constant moved to module level to satisfy `items_after_statements` clippy lint.
+
+**Architectural remediations:**
+- **DuckDB disk-based (SHORT-TERM):** `Connection::open_in_memory()` replaced with `Connection::open(config.db_path())` where `db_path()` returns `data_dir/mallard.duckdb`. Adds `db_path()` method to `Config`. DuckDB WAL ensures atomic batch inserts; hot-buffer events survive SIGKILL (previously lost on crash).
+- **ApiKeyStore disk persistence (SHORT-TERM):** `ApiKeyStore` gains `load_from_disk(path: PathBuf)` (loads existing keys from JSON, missing file → empty store) and a private `persist()` (serialise + atomic write). `add_key()` and `revoke_key()` both call `persist()` automatically. `StoredApiKey` gains `#[derive(serde::Serialize, serde::Deserialize)]`. API keys now survive server restarts without needing re-creation.
+
+**Code-quality fixes:**
+- `ApiKeyStore::new()` removed (was dead code in binary; callers converted to `ApiKeyStore::default()`). `Default` impl was already present.
+- `.map(String::from).unwrap_or_else(...)` → `.map_or_else(...)` in `request_id_middleware` (`clippy::map_unwrap_or`).
+
+**Test results (before → after):**
+- 240 → 249 unit tests passing (`cargo test --lib`)
+- 62 → 62 integration tests passing (`cargo test --test ingest_test`)
+- Total: 302 → 311 tests, 0 failures, 0 ignored
+- 0 clippy warnings (`cargo clippy --all-targets`)
+- 0 formatting violations (`cargo fmt -- --check`)
+
+**New unit tests added (9):**
+- `test_secure_cookies_default_false` — `MALLARD_SECURE_COOKIES` defaults to false
+- `test_secure_cookies_flag_overrides_http_origin` — `secure=true` overrides non-HTTPS origin
+- `test_db_path` — `db_path()` returns `data_dir/mallard.duckdb`
+- `test_warn_on_invalid_env_var_falls_back` — invalid env var → warn + keep default
+- `test_api_key_store_persistence_round_trip` — keys written/loaded from disk correctly
+- `test_robots_txt` — `/robots.txt` returns correct body
+- `test_security_txt` — `/.well-known/security.txt` returns Contact + Expires fields
+- `test_pixel_track_returns_gif` — GET /api/event returns 43-byte GIF with `image/gif` content-type
+- `test_hsts_header_present` — HSTS header present with correct `max-age`
+- `test_retry_after_present_on_query_semaphore_429` — 429 response includes `Retry-After`

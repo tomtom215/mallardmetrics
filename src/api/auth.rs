@@ -228,7 +228,7 @@ pub fn hash_api_key(key: &str) -> String {
 ///
 /// Always compares all bytes regardless of where the first mismatch occurs,
 /// preventing attackers from inferring hash prefixes via response timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -248,7 +248,7 @@ pub enum ApiKeyScope {
 }
 
 /// Stored API key metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StoredApiKey {
     pub key_hash: String,
     pub name: String,
@@ -321,23 +321,81 @@ impl SessionStore {
     }
 }
 
-/// Thread-safe API key store.
+/// Thread-safe API key store with optional disk persistence.
+///
+/// When `persist_path` is set, any mutation (`add_key`, `revoke_key`) is
+/// immediately written to disk as a JSON array of `StoredApiKey` records.
+/// On startup the caller should use `ApiKeyStore::load_from_disk` to restore
+/// keys written by previous runs.
 #[derive(Clone)]
 pub struct ApiKeyStore {
     keys: Arc<Mutex<Vec<StoredApiKey>>>,
+    persist_path: Option<Arc<std::path::PathBuf>>,
 }
 
 impl Default for ApiKeyStore {
     fn default() -> Self {
         Self {
             keys: Arc::new(Mutex::new(Vec::new())),
+            persist_path: None,
         }
     }
 }
 
 impl ApiKeyStore {
-    pub fn new() -> Self {
-        Self::default()
+    /// Create a store that loads existing keys from `path` and persists
+    /// mutations back to the same file.  Missing file is treated as empty.
+    pub fn load_from_disk(path: std::path::PathBuf) -> Self {
+        let keys = match std::fs::read_to_string(&path) {
+            Ok(contents) => {
+                serde_json::from_str::<Vec<StoredApiKey>>(&contents).unwrap_or_else(|e| {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to parse api_keys.json; starting with empty key store"
+                    );
+                    Vec::new()
+                })
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Could not read api_keys.json; starting with empty key store"
+                );
+                Vec::new()
+            }
+        };
+        let count = keys.len();
+        if count > 0 {
+            tracing::info!(path = %path.display(), count, "Loaded API keys from disk");
+        }
+        Self {
+            keys: Arc::new(Mutex::new(keys)),
+            persist_path: Some(Arc::new(path)),
+        }
+    }
+
+    /// Persist current keys to disk.  Logs a warning on failure; never panics.
+    fn persist(&self) {
+        if let Some(path) = &self.persist_path {
+            let snapshot = self.keys.lock().clone();
+            match serde_json::to_string_pretty(&snapshot) {
+                Ok(json) => {
+                    if let Err(e) = std::fs::write(path.as_ref(), json) {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "Failed to persist API keys to disk"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to serialize API keys for persistence");
+                }
+            }
+        }
     }
 
     /// Store a new API key (hashed). Returns the key hash for identification.
@@ -351,6 +409,7 @@ impl ApiKeyStore {
             revoked: false,
         };
         self.keys.lock().push(stored);
+        self.persist();
         key_hash
     }
 
@@ -376,6 +435,9 @@ impl ApiKeyStore {
                 key.revoked = true;
                 true
             });
+        if found {
+            self.persist();
+        }
         found
     }
 
@@ -462,11 +524,12 @@ pub async fn auth_setup(
 
     // Create a session for the newly set-up admin
     let token = state.sessions.create_session("admin");
-    let cookie = build_session_cookie(
-        &token,
-        state.sessions.ttl_secs(),
-        state.dashboard_origin.as_ref(),
-    );
+    let secure = state.secure_cookies
+        || state
+            .dashboard_origin
+            .as_deref()
+            .is_some_and(|o| o.starts_with("https://"));
+    let cookie = build_session_cookie(&token, state.sessions.ttl_secs(), secure);
 
     (
         StatusCode::OK,
@@ -520,6 +583,9 @@ pub async fn auth_login(
     if !verify_password(&body.password, stored_hash) {
         drop(hash_guard);
         let fail_count = state.login_attempt_tracker.record_failure(&ip);
+        state
+            .login_failures_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
             ip_prefix = %anonymize_ip(&ip),
             fail_count,
@@ -538,11 +604,12 @@ pub async fn auth_login(
     let token = state.sessions.create_session("admin");
     tracing::info!(ip_prefix = %anonymize_ip(&ip), "Admin login successful");
 
-    let cookie = build_session_cookie(
-        &token,
-        state.sessions.ttl_secs(),
-        state.dashboard_origin.as_ref(),
-    );
+    let secure = state.secure_cookies
+        || state
+            .dashboard_origin
+            .as_deref()
+            .is_some_and(|o| o.starts_with("https://"));
+    let cookie = build_session_cookie(&token, state.sessions.ttl_secs(), secure);
 
     (
         StatusCode::OK,
@@ -881,8 +948,11 @@ fn extract_session_token(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Build a Set-Cookie header value for a session token.
-fn build_session_cookie(token: &str, ttl_secs: u64, dashboard_origin: Option<&String>) -> String {
-    let secure = dashboard_origin.is_some_and(|o| o.starts_with("https://"));
+///
+/// The `secure` flag should be `true` whenever the server is reachable only
+/// over HTTPS (set via `MALLARD_SECURE_COOKIES=true` or inferred from
+/// `dashboard_origin` starting with `https://`).
+fn build_session_cookie(token: &str, ttl_secs: u64, secure: bool) -> String {
     let mut cookie =
         format!("mm_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={ttl_secs}");
     if secure {
@@ -1034,7 +1104,7 @@ mod tests {
 
     #[test]
     fn test_api_key_store_add_and_validate() {
-        let store = ApiKeyStore::new();
+        let store = ApiKeyStore::default();
         let key = generate_api_key();
         store.add_key("test-key", &key, ApiKeyScope::ReadOnly);
         assert_eq!(store.validate_key(&key), Some(ApiKeyScope::ReadOnly));
@@ -1042,13 +1112,13 @@ mod tests {
 
     #[test]
     fn test_api_key_store_invalid_key() {
-        let store = ApiKeyStore::new();
+        let store = ApiKeyStore::default();
         assert!(store.validate_key("invalid-key").is_none());
     }
 
     #[test]
     fn test_api_key_store_revoke() {
-        let store = ApiKeyStore::new();
+        let store = ApiKeyStore::default();
         let key = generate_api_key();
         let key_hash = store.add_key("test-key", &key, ApiKeyScope::Admin);
         assert!(store.validate_key(&key).is_some());
@@ -1058,7 +1128,7 @@ mod tests {
 
     #[test]
     fn test_api_key_store_scope_distinction() {
-        let store = ApiKeyStore::new();
+        let store = ApiKeyStore::default();
         let readonly_key = generate_api_key();
         let admin_key = generate_api_key();
         store.add_key("read", &readonly_key, ApiKeyScope::ReadOnly);
@@ -1072,7 +1142,7 @@ mod tests {
 
     #[test]
     fn test_api_key_store_list() {
-        let store = ApiKeyStore::new();
+        let store = ApiKeyStore::default();
         let key = generate_api_key();
         store.add_key("my-key", &key, ApiKeyScope::ReadOnly);
         let keys = store.list_keys();
@@ -1094,41 +1164,27 @@ mod tests {
 
     // Session cookie Secure flag tests
     #[test]
-    fn test_session_cookie_includes_secure_for_https_origin() {
-        let cookie = build_session_cookie(
-            "token123",
-            3600,
-            Some(&"https://analytics.example.com".to_string()),
-        );
+    fn test_session_cookie_includes_secure_when_flag_is_true() {
+        let cookie = build_session_cookie("token123", 3600, true);
         assert!(
             cookie.contains("; Secure"),
-            "Cookie should include Secure flag for HTTPS origin"
+            "Cookie should include Secure flag when secure=true"
         );
     }
 
     #[test]
-    fn test_session_cookie_omits_secure_for_http_origin() {
-        let cookie =
-            build_session_cookie("token123", 3600, Some(&"http://localhost:8000".to_string()));
+    fn test_session_cookie_omits_secure_when_flag_is_false() {
+        let cookie = build_session_cookie("token123", 3600, false);
         assert!(
             !cookie.contains("; Secure"),
-            "Cookie must NOT include Secure flag for HTTP origin"
-        );
-    }
-
-    #[test]
-    fn test_session_cookie_omits_secure_with_no_origin() {
-        let cookie = build_session_cookie("token123", 3600, None);
-        assert!(
-            !cookie.contains("; Secure"),
-            "Cookie must NOT include Secure flag when no origin is configured"
+            "Cookie must NOT include Secure flag when secure=false"
         );
     }
 
     // ApiKeyStore cleanup_revoked tests
     #[test]
     fn test_api_key_store_cleanup_revoked() {
-        let store = ApiKeyStore::new();
+        let store = ApiKeyStore::default();
         let key1 = generate_api_key();
         let key2 = generate_api_key();
         let hash1 = store.add_key("key1", &key1, ApiKeyScope::ReadOnly);
@@ -1141,6 +1197,53 @@ mod tests {
         let remaining = store.list_keys();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].name, "key2");
+    }
+
+    #[test]
+    fn test_api_key_store_persistence_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api_keys.json");
+
+        // Write two keys to disk via the persisting store.
+        let store1 = ApiKeyStore::load_from_disk(path.clone());
+        let key_a = generate_api_key();
+        let key_b = generate_api_key();
+        store1.add_key("alpha", &key_a, ApiKeyScope::ReadOnly);
+        store1.add_key("beta", &key_b, ApiKeyScope::Admin);
+        assert!(
+            path.exists(),
+            "api_keys.json should be created after add_key"
+        );
+
+        // Load a fresh store from the same file — keys must be present.
+        let store2 = ApiKeyStore::load_from_disk(path.clone());
+        assert_eq!(
+            store2.validate_key(&key_a),
+            Some(ApiKeyScope::ReadOnly),
+            "key_a must survive a round-trip through disk"
+        );
+        assert_eq!(
+            store2.validate_key(&key_b),
+            Some(ApiKeyScope::Admin),
+            "key_b must survive a round-trip through disk"
+        );
+
+        // Revoke one key and reload — revoked key must not validate.
+        let hash_a = hash_api_key(&key_a);
+        store2.revoke_key(&hash_a);
+        let store3 = ApiKeyStore::load_from_disk(path);
+        assert!(
+            store3.validate_key(&key_a).is_none(),
+            "revoked key must not be valid after reload"
+        );
+    }
+
+    #[test]
+    fn test_secure_cookies_flag_overrides_http_origin() {
+        // Even with an HTTP dashboard_origin, secure_cookies=true forces Secure
+        // on the cookie, matching the behaviour needed behind a TLS proxy.
+        let cookie = build_session_cookie("tok", 3600, true);
+        assert!(cookie.contains("; Secure"));
     }
 
     // LoginAttemptTracker tests

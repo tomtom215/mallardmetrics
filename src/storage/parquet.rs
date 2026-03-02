@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 /// ```text
 /// data/events/site_id=example.com/date=2024-01-15/0001.parquet
 /// ```
+#[derive(Clone)]
 pub struct ParquetStorage {
     base_dir: PathBuf,
 }
@@ -122,9 +123,14 @@ impl ParquetStorage {
             .map_err(FlushError::Delete)?;
         }
 
-        // Refresh the query view so newly written Parquet files are included.
-        // Non-fatal: hot events remain visible through the events table.
-        let _ = crate::storage::schema::setup_query_view(conn, &self.base_dir);
+        // Only refresh the events_all view when new Parquet files were written.
+        // If nothing was flushed (partitions were empty or all were skipped) the
+        // glob-based view is already up-to-date and recreating it is wasteful —
+        // particularly at high flush-rates where the view would otherwise be
+        // recreated on every periodic tick even with no new data.
+        if total_flushed > 0 {
+            let _ = crate::storage::schema::setup_query_view(conn, &self.base_dir);
+        }
 
         Ok(total_flushed)
     }

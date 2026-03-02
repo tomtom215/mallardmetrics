@@ -68,6 +68,160 @@ pub struct AppState {
     pub login_attempt_tracker: LoginAttemptTracker,
     /// Running total of events successfully buffered since startup.
     pub events_ingested_total: Arc<AtomicU64>,
+    /// Running total of Parquet flush failures since startup.
+    pub flush_failures_total: Arc<AtomicU64>,
+    /// Running total of rate-limited ingest requests since startup.
+    pub rate_limit_rejections_total: Arc<AtomicU64>,
+    /// Running total of failed login attempts since startup.
+    pub login_failures_total: Arc<AtomicU64>,
+    /// Optional bearer token required to access the `/metrics` endpoint.
+    /// `None` means the endpoint is accessible without authentication.
+    pub metrics_token: Option<String>,
+    /// Semaphore limiting the number of concurrent expensive analytics queries.
+    /// A permit is acquired before entering `spawn_blocking` for stats endpoints.
+    /// Prevents a tight query loop from monopolising the single DuckDB connection.
+    pub query_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Force the `Secure` flag on session cookies.
+    /// Set via `MALLARD_SECURE_COOKIES=true` when behind a TLS-terminating proxy.
+    pub secure_cookies: bool,
+}
+
+/// Query parameters for the GET /api/event pixel-tracking endpoint.
+///
+/// Subset of `EventPayload` — props and revenue fields are omitted because
+/// they cannot be safely validated in a plain query string.
+#[derive(Debug, Deserialize)]
+pub struct PixelParams {
+    /// Site domain (e.g., "example.com")
+    #[serde(rename = "d")]
+    pub domain: String,
+    /// Event name (defaults to "pageview")
+    #[serde(rename = "n", default = "default_event_name")]
+    pub name: String,
+    /// Page URL pathname or full URL
+    #[serde(rename = "u")]
+    pub url: String,
+    /// Referrer URL
+    #[serde(rename = "r")]
+    pub referrer: Option<String>,
+    /// Screen width in pixels
+    #[serde(rename = "w")]
+    pub screen_width: Option<u32>,
+}
+
+fn default_event_name() -> String {
+    "pageview".to_string()
+}
+
+/// Shared event-processing logic called by both the POST and GET endpoints.
+///
+/// Validates the payload, applies rate limiting, builds an `Event`, and pushes
+/// it into the buffer.  Returns `false` if the event should be silently ignored
+/// (bot filtered, origin blocked, rate limited).
+pub async fn process_pixel_event(state: &Arc<AppState>, headers: &HeaderMap, params: PixelParams) {
+    // Convert PixelParams into the canonical EventPayload shape so we can
+    // call the same validation / enrichment path.
+    let payload = EventPayload {
+        domain: params.domain,
+        name: params.name,
+        url: params.url,
+        referrer: params.referrer,
+        screen_width: params.screen_width,
+        props: None,
+        revenue_amount: None,
+        revenue_currency: None,
+    };
+
+    // Reuse the same guard sequence as ingest_event: origin, basic validation,
+    // length, site_id char-set, rate limit, bot filter.
+    let origin = headers.get("origin").and_then(|v| v.to_str().ok());
+    if !crate::api::auth::validate_origin(origin, &state.allowed_sites) {
+        return;
+    }
+    if payload.domain.is_empty() || payload.name.is_empty() || payload.url.is_empty() {
+        return;
+    }
+    if payload.domain.len() > 256
+        || payload.name.len() > 256
+        || payload.url.len() > 2048
+        || payload.referrer.as_ref().is_some_and(|r| r.len() > 2048)
+    {
+        return;
+    }
+    if crate::api::stats::validate_site_id(&payload.domain).is_err() {
+        return;
+    }
+    if !state.rate_limiter.check(&payload.domain) {
+        state
+            .rate_limit_rejections_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+
+    let ip = extract_ip(headers);
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let parsed_ua = useragent::parse_user_agent(user_agent);
+    if state.filter_bots && parsed_ua.is_bot {
+        return;
+    }
+
+    let today = Utc::now().date_naive();
+    let salt = visitor_id::daily_salt(&state.secret, today);
+    let vid = visitor_id::generate_visitor_id(&ip, user_agent, &salt);
+    let (utm_source, utm_medium, utm_campaign, utm_content, utm_term) =
+        parse_utm_params(&payload.url);
+    let referrer_source = payload
+        .referrer
+        .as_deref()
+        .and_then(extract_referrer_source);
+    let geo_info = state.geoip.lookup(&ip);
+    let device_type = payload.screen_width.map(classify_device);
+    let pathname = sanitize_pathname(&payload.url);
+
+    let event = Event {
+        site_id: sanitize_string(&payload.domain, 256),
+        visitor_id: vid,
+        timestamp: Utc::now().naive_utc(),
+        event_name: sanitize_string(&payload.name, 256),
+        pathname,
+        hostname: Some(sanitize_string(&payload.domain, 256)),
+        referrer: payload
+            .referrer
+            .as_deref()
+            .map(|r| sanitize_string(r, 2048)),
+        referrer_source,
+        utm_source,
+        utm_medium,
+        utm_campaign,
+        utm_content,
+        utm_term,
+        browser: parsed_ua.browser,
+        browser_version: parsed_ua.browser_version,
+        os: parsed_ua.os,
+        os_version: parsed_ua.os_version,
+        device_type,
+        screen_size: payload.screen_width.map(|w| format!("{w}")),
+        country_code: geo_info.country_code,
+        region: geo_info.region,
+        city: geo_info.city,
+        props: None,
+        revenue_amount: None,
+        revenue_currency: None,
+    };
+
+    let state2 = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || state2.buffer.push(event)).await {
+        Ok(Ok(_)) => {
+            state
+                .events_ingested_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(Err(e)) => tracing::error!(error = %e, "Failed to buffer pixel event"),
+        Err(e) => tracing::error!(error = %e, "Pixel event buffer task panicked"),
+    }
 }
 
 /// POST /api/event — Ingestion endpoint.
@@ -112,6 +266,9 @@ pub async fn ingest_event(
 
     // Rate limiting per site (only reached for well-formed site IDs)
     if !state.rate_limiter.check(&payload.domain) {
+        state
+            .rate_limit_rejections_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return StatusCode::TOO_MANY_REQUESTS;
     }
 

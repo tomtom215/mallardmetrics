@@ -61,10 +61,39 @@ impl StatsParams {
         self.date_range()
     }
 
+    /// Maximum number of days allowed for a custom date range on stats endpoints.
+    const MAX_STATS_DAYS: i64 = 366;
+
     /// Resolve the start and end dates from the period or explicit params.
+    ///
+    /// When `start_date` and `end_date` are provided explicitly they are parsed as
+    /// `YYYY-MM-DD`, validated (`end >= start`), and capped at `MAX_STATS_DAYS` to
+    /// prevent unbounded partition scans.  Period-based requests are already bounded
+    /// by their fixed offsets (max 90 days).
     pub fn date_range(&self) -> Result<(String, String), ApiError> {
-        if let (Some(start), Some(end)) = (&self.start_date, &self.end_date) {
-            return Ok((start.clone(), end.clone()));
+        if let (Some(start_str), Some(end_str)) = (&self.start_date, &self.end_date) {
+            let start_date =
+                chrono::NaiveDate::parse_from_str(start_str, "%Y-%m-%d").map_err(|_| {
+                    ApiError::BadRequest("Invalid start_date format. Use YYYY-MM-DD.".to_string())
+                })?;
+            let end_date =
+                chrono::NaiveDate::parse_from_str(end_str, "%Y-%m-%d").map_err(|_| {
+                    ApiError::BadRequest("Invalid end_date format. Use YYYY-MM-DD.".to_string())
+                })?;
+            let days = (end_date - start_date).num_days();
+            if days < 0 {
+                return Err(ApiError::BadRequest(
+                    "end_date must be on or after start_date".to_string(),
+                ));
+            }
+            if days > Self::MAX_STATS_DAYS {
+                return Err(ApiError::BadRequest(format!(
+                    "Date range must not exceed {} days. \
+                     Use a shorter explicit range or the period parameter.",
+                    Self::MAX_STATS_DAYS
+                )));
+            }
+            return Ok((start_str.clone(), end_str.clone()));
         }
 
         let now = chrono::Utc::now().date_naive();
@@ -166,9 +195,20 @@ const fn default_limit() -> usize {
     10
 }
 
+/// Hard cap on the `limit` parameter for breakdown endpoints.
+///
+/// Prevents a request with `?limit=10000000` from fetching millions of rows and
+/// monopolising the single DuckDB connection for seconds.
+const MAX_BREAKDOWN_LIMIT: usize = 1000;
+
 impl BreakdownParams {
     fn date_range(&self) -> Result<(String, String), ApiError> {
         validate_site_id(&self.site_id)?;
+        if self.limit > MAX_BREAKDOWN_LIMIT {
+            return Err(ApiError::BadRequest(format!(
+                "limit must not exceed {MAX_BREAKDOWN_LIMIT}"
+            )));
+        }
         let stats_params = StatsParams {
             site_id: self.site_id.clone(),
             period: self.period.clone(),
@@ -428,6 +468,15 @@ pub async fn get_funnel(
         return Ok(Json(Vec::new()));
     }
 
+    // Limit concurrent heavy queries.  Clone the semaphore Arc so the permit
+    // does not borrow `state`, allowing `state` to be moved into the closure.
+    let semaphore = Arc::clone(&state.query_semaphore);
+    let _permit = semaphore.try_acquire().map_err(|_| {
+        ApiError::TooManyRequests(
+            "Too many concurrent queries. Please retry in a moment.".to_string(),
+        )
+    })?;
+
     let site_id = params.site_id.clone();
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.buffer.conn().lock();
@@ -440,6 +489,9 @@ pub async fn get_funnel(
 }
 
 /// Validate that an interval string is a safe, simple DuckDB interval.
+///
+/// Applies a unit-aware maximum so that pathologically large windows like
+/// "365 weeks" (≈7 years) are rejected while still allowing "52 weeks" (1 year).
 fn is_safe_interval(s: &str) -> bool {
     let parts: Vec<&str> = s.split_whitespace().collect();
     if parts.len() != 2 {
@@ -448,22 +500,19 @@ fn is_safe_interval(s: &str) -> bool {
     let Ok(n) = parts[0].parse::<u32>() else {
         return false;
     };
-    if n == 0 || n > 365 {
+    if n == 0 {
         return false;
     }
-    matches!(
-        parts[1],
-        "second"
-            | "seconds"
-            | "minute"
-            | "minutes"
-            | "hour"
-            | "hours"
-            | "day"
-            | "days"
-            | "week"
-            | "weeks"
-    )
+    // Per-unit maximums: all caps represent roughly 1 year worth of their unit.
+    let max_n: u32 = match parts[1] {
+        "second" | "seconds" => 86_400, // 1 day in seconds
+        "minute" | "minutes" => 1_440,  // 1 day in minutes
+        "hour" | "hours" => 720,        // 30 days in hours
+        "day" | "days" => 365,
+        "week" | "weeks" => 52,
+        _ => return false,
+    };
+    n <= max_n
 }
 
 /// Query parameters for the retention endpoint.
@@ -507,6 +556,15 @@ pub async fn get_retention(
             "weeks must be between 1 and 52".to_string(),
         ));
     }
+
+    // Limit concurrent heavy queries.  Clone the semaphore Arc so the permit
+    // does not borrow `state`, allowing `state` to be moved into the closure.
+    let semaphore = Arc::clone(&state.query_semaphore);
+    let _permit = semaphore.try_acquire().map_err(|_| {
+        ApiError::TooManyRequests(
+            "Too many concurrent queries. Please retry in a moment.".to_string(),
+        )
+    })?;
 
     let site_id = params.site_id.clone();
     let weeks = params.weeks;
@@ -572,6 +630,15 @@ pub async fn get_sequences(
         ));
     }
 
+    // Limit concurrent heavy queries. Clone the semaphore Arc so the permit
+    // does not borrow `state`, allowing `state` to be moved into the closure.
+    let semaphore = Arc::clone(&state.query_semaphore);
+    let _permit = semaphore.try_acquire().map_err(|_| {
+        ApiError::TooManyRequests(
+            "Too many concurrent queries. Please retry in a moment.".to_string(),
+        )
+    })?;
+
     let site_id = params.site_id.clone();
     let result = tokio::task::spawn_blocking(move || {
         let conn = state.buffer.conn().lock();
@@ -628,6 +695,15 @@ pub async fn get_flow(
     if params.page.is_empty() || params.page.len() > 256 {
         return Err(ApiError::BadRequest("Invalid page path".to_string()));
     }
+
+    // Limit concurrent heavy queries. Clone the semaphore Arc so the permit
+    // does not borrow `state`, allowing `state` to be moved into the closure.
+    let semaphore = Arc::clone(&state.query_semaphore);
+    let _permit = semaphore.try_acquire().map_err(|_| {
+        ApiError::TooManyRequests(
+            "Too many concurrent queries. Please retry in a moment.".to_string(),
+        )
+    })?;
 
     let site_id = params.site_id.clone();
     let page = params.page.clone();
@@ -779,7 +855,17 @@ pub async fn get_export(
         "json" => {
             let body = serde_json::to_string(&rows)
                 .map_err(|e| ApiError::Internal(format!("JSON serialization failed: {e}")))?;
-            Ok(([(header::CONTENT_TYPE, "application/json")], body).into_response())
+            Ok((
+                [
+                    (header::CONTENT_TYPE, "application/json"),
+                    (
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"export.json\"",
+                    ),
+                ],
+                body,
+            )
+                .into_response())
         }
         "csv" => {
             let mut csv = String::from("date,visitors,pageviews,top_page,top_source\n");

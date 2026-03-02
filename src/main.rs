@@ -51,8 +51,16 @@ async fn main() {
     // Ensure data directory exists
     std::fs::create_dir_all(config.events_dir()).expect("Failed to create data directory");
 
-    // Initialize DuckDB
-    let conn = Connection::open_in_memory().expect("Failed to open DuckDB");
+    // Initialize DuckDB using a disk-based file so that events buffered in the
+    // `events` table (not yet flushed to Parquet) survive a process crash.
+    // The WAL file written next to mallard.duckdb provides atomic batch inserts.
+    //
+    // NOTE: if the server crashes in the narrow window after `COPY TO` succeeds
+    // but before `DELETE FROM events` commits, those events may appear in both
+    // the DuckDB table and the Parquet file.  The events_all VIEW unions both
+    // tiers, so such events would be counted twice.  This is an acceptable
+    // trade-off for lightweight analytics; the probability is extremely low.
+    let conn = Connection::open(config.db_path()).expect("Failed to open DuckDB");
     storage::migrations::run_migrations(&conn).expect("Failed to run migrations");
 
     // Try to load the behavioral extension (non-fatal if unavailable)
@@ -105,8 +113,12 @@ async fn main() {
 
 fn build_app_state(config: &Config, buffer: EventBuffer, geoip: GeoIpReader) -> Arc<AppState> {
     let sessions = SessionStore::new(config.session_ttl_secs);
-    let api_keys = ApiKeyStore::new();
-    let query_cache = crate::query::cache::QueryCache::new(config.cache_ttl_secs);
+    // Load API keys from disk so they survive server restarts.  Keys are
+    // written back to the same file on every add/revoke operation.
+    let api_keys_path = config.data_dir.join("api_keys.json");
+    let api_keys = ApiKeyStore::load_from_disk(api_keys_path);
+    let query_cache =
+        crate::query::cache::QueryCache::new(config.cache_ttl_secs, config.cache_max_entries);
     let rate_limiter = crate::ingest::ratelimit::RateLimiter::new(config.rate_limit_per_site);
     let login_attempt_tracker = crate::api::auth::LoginAttemptTracker::new(
         config.max_login_attempts,
@@ -122,13 +134,61 @@ fn build_app_state(config: &Config, buffer: EventBuffer, geoip: GeoIpReader) -> 
             hash
         });
 
+    // Load or generate-and-persist the visitor-ID secret.
+    //
+    // MALLARD_SECRET (env var) takes highest priority.  If unset, we look for a
+    // previously-persisted secret at `data_dir/.secret`.  If that file does not
+    // exist we generate a fresh UUID, persist it, and emit an INFO log.
+    //
+    // This prevents the old behaviour where every restart silently generated a
+    // new random secret, permanently corrupting historical visitor deduplication.
+    let secret = std::env::var("MALLARD_SECRET").unwrap_or_else(|_| {
+        let secret_path = config.data_dir.join(".secret");
+        if let Ok(s) = std::fs::read_to_string(&secret_path) {
+            let s = s.trim().to_string();
+            if !s.is_empty() {
+                tracing::info!(path = %secret_path.display(), "Loaded persisted MALLARD_SECRET");
+                return s;
+            }
+        }
+        let secret = uuid::Uuid::new_v4().to_string();
+        match std::fs::write(&secret_path, &secret) {
+            Ok(()) => {
+                tracing::info!(
+                    path = %secret_path.display(),
+                    "Generated and persisted MALLARD_SECRET. \
+                     Set MALLARD_SECRET env var to use a custom value."
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Could not persist MALLARD_SECRET to disk. \
+                     Visitor IDs will change on next restart unless MALLARD_SECRET is set."
+                );
+            }
+        }
+        secret
+    });
+
+    let metrics_token = std::env::var("MALLARD_METRICS_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    if metrics_token.is_some() {
+        tracing::info!("Metrics endpoint protected by bearer token (MALLARD_METRICS_TOKEN)");
+    }
+
+    // Limit concurrent heavy analytics queries to prevent a tight query loop from
+    // monopolising the single DuckDB connection.  0 in config → unlimited.
+    let max_concurrent = if config.max_concurrent_queries == 0 {
+        usize::MAX
+    } else {
+        config.max_concurrent_queries
+    };
+
     Arc::new(AppState {
         buffer,
-        secret: std::env::var("MALLARD_SECRET").unwrap_or_else(|_| {
-            let secret = uuid::Uuid::new_v4().to_string();
-            tracing::warn!("No MALLARD_SECRET set, using random secret: {secret}. Set MALLARD_SECRET for deterministic visitor IDs across restarts.");
-            secret
-        }),
+        secret,
         allowed_sites: config.site_ids.clone(),
         geoip,
         filter_bots: config.filter_bots,
@@ -140,6 +200,12 @@ fn build_app_state(config: &Config, buffer: EventBuffer, geoip: GeoIpReader) -> 
         rate_limiter,
         login_attempt_tracker,
         events_ingested_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        flush_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        rate_limit_rejections_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        login_failures_total: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        metrics_token,
+        query_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+        secure_cookies: config.secure_cookies,
     })
 }
 
@@ -154,6 +220,7 @@ fn spawn_background_tasks(config: &Config, conn: &Arc<Mutex<Connection>>, state:
     let flush_conn = Arc::clone(conn);
     let flush_interval = config.flush_interval_secs;
     let events_dir = config.events_dir();
+    let flush_failures = Arc::clone(&state.flush_failures_total);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(flush_interval));
         loop {
@@ -172,31 +239,47 @@ fn spawn_background_tasks(config: &Config, conn: &Arc<Mutex<Connection>>, state:
                 }
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => {
+                    flush_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::error!(error = %e, "Periodic flush failed");
                 }
                 Err(e) => {
+                    flush_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::error!(error = %e, "Periodic flush task panicked");
                 }
             }
         }
     });
 
-    // Data retention cleanup task (runs daily)
+    // Data retention cleanup task (runs daily).
+    //
+    // `cleanup_old_partitions` calls `std::fs::read_dir` and `std::fs::remove_dir_all`
+    // (blocking syscalls).  Wrapping with `spawn_blocking` matches the flush-task
+    // pattern (L19) and prevents starving the async worker pool under load.
     if config.retention_days > 0 {
         let retention_events_dir = config.events_dir();
         let retention_days = config.retention_days;
+        // ParquetStorage is cheap to clone (just a PathBuf), but constructing it
+        // once outside the loop avoids a re-allocation on every daily iteration.
+        let retention_storage = ParquetStorage::new(&retention_events_dir);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
             loop {
                 interval.tick().await;
-                let storage = ParquetStorage::new(&retention_events_dir);
-                match storage.cleanup_old_partitions(retention_days) {
-                    Ok(0) => {}
-                    Ok(removed) => {
+                let storage = retention_storage.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    storage.cleanup_old_partitions(retention_days)
+                })
+                .await;
+                match result {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(removed)) => {
                         tracing::info!(removed, retention_days, "Data retention cleanup completed");
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         tracing::error!(error = %e, "Data retention cleanup failed");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Data retention cleanup task panicked");
                     }
                 }
             }

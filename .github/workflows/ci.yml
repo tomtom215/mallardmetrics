@@ -20,7 +20,7 @@ jobs:
         with:
           toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-      - run: cargo build --all-targets
+      - run: cargo build --locked --all-targets
 
   test:
     name: Test
@@ -31,8 +31,8 @@ jobs:
         with:
           toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-      - run: cargo test --all-targets
-      - run: cargo test --doc
+      - run: cargo test --locked --all-targets
+      - run: cargo test --locked --doc
 
   clippy:
     name: Clippy
@@ -79,7 +79,7 @@ jobs:
         with:
           toolchain: "1.93.0"
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-      - run: cargo build
+      - run: cargo build --locked
 
   bench:
     name: Benchmark Compilation
@@ -90,7 +90,7 @@ jobs:
         with:
           toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-      - run: cargo bench --no-run
+      - run: cargo bench --locked --no-run
 
   security:
     name: Security Audit
