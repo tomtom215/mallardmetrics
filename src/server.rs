@@ -323,6 +323,7 @@ async fn detailed_health_check(
         "buffer_empty": buffer_empty,
         "auth_configured": auth_configured,
         "geoip_loaded": geoip_loaded,
+        "behavioral_extension_loaded": state.behavioral_extension_loaded,
         "filter_bots": state.filter_bots,
         "cache_entries": state.query_cache.len(),
         "cache_empty": state.query_cache.is_empty(),
@@ -340,6 +341,7 @@ fn build_metrics_body(state: &AppState) -> String {
     let cache_entries = state.query_cache.len();
     let auth_configured = u8::from(state.admin_password_hash.lock().is_some());
     let geoip_loaded = u8::from(state.geoip.is_loaded());
+    let behavioral_ext = u8::from(state.behavioral_extension_loaded);
     let filter_bots = u8::from(state.filter_bots);
     let events_ingested = state.events_ingested_total.load(Ordering::Relaxed);
     let flush_failures = state.flush_failures_total.load(Ordering::Relaxed);
@@ -373,6 +375,12 @@ fn build_metrics_body(state: &AppState) -> String {
     );
     let _ = writeln!(out, "# TYPE mallard_geoip_loaded gauge");
     let _ = writeln!(out, "mallard_geoip_loaded {geoip_loaded}");
+    let _ = writeln!(
+        out,
+        "# HELP mallard_behavioral_extension Whether the DuckDB behavioral extension is loaded"
+    );
+    let _ = writeln!(out, "# TYPE mallard_behavioral_extension gauge");
+    let _ = writeln!(out, "mallard_behavioral_extension {behavioral_ext}");
     let _ = writeln!(
         out,
         "# HELP mallard_filter_bots Whether bot filtering is enabled"
@@ -494,6 +502,7 @@ mod tests {
             metrics_token: None,
             query_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             secure_cookies: false,
+            behavioral_extension_loaded: false,
         });
         (state, dir)
     }
@@ -579,6 +588,7 @@ mod tests {
             metrics_token: Some("secret-token".to_string()),
             query_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             secure_cookies: false,
+            behavioral_extension_loaded: false,
         });
         let _dir = dir;
 
@@ -993,6 +1003,7 @@ mod tests {
             metrics_token: None,
             query_semaphore: Arc::new(tokio::sync::Semaphore::new(0)), // 0 permits → always 429
             secure_cookies: false,
+            behavioral_extension_loaded: false,
         });
         let _dir = dir;
         let app = build_router(state);

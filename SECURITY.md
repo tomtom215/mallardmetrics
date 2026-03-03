@@ -49,27 +49,36 @@ We will acknowledge receipt within 48 hours and provide a timeline for a fix.
 
 - **Password hashing** -- Argon2id with default parameters (memory-hard, GPU-resistant)
 - **Session tokens** -- 256-bit cryptographic random tokens, stored as HttpOnly cookies
-- **Cookie attributes** -- HttpOnly, Secure (when behind TLS), SameSite=Lax
+- **Cookie attributes** -- HttpOnly, Secure (when `MALLARD_SECURE_COOKIES=true` or `dashboard_origin` starts with `https://`), SameSite=Strict
 - **Session expiration** -- Configurable TTL (default: 24 hours) via `MALLARD_SESSION_TTL`
 
 ### API Key Management
 
 - **Key format** -- `mm_` prefix followed by a cryptographic random string
-- **Storage** -- Keys are SHA-256 hashed at rest. Plaintext keys are shown only once at creation time
+- **Storage** -- Keys are SHA-256 hashed at rest. Plaintext keys are shown only once at creation time. Keys are persisted to `data/api_keys.json` and survive server restarts.
 - **Operations** -- Create, list, and revoke via `/api/keys` endpoints
-- **Scope** -- API keys provide read access to analytics endpoints
+- **Scopes** -- Two scopes available:
+  - `ReadOnly` — access to all `GET /api/stats/*` and export endpoints
+  - `Admin` — full access including creating, listing, and revoking API keys
+- **Comparison** -- Constant-time SHA-256 comparison prevents timing side-channel attacks
 
 ### Route Protection
 
 | Route Group | Authentication Required |
 |---|---|
-| `POST /api/event` | No (tracking script must work without auth) |
-| `GET /health`, `GET /health/detailed` | No |
-| `GET /metrics` | No |
-| `/auth/*` | No (these are the auth endpoints themselves) |
-| `GET /api/stats/*` | Yes (session cookie or API key) |
-| `/api/keys/*` | Yes (session cookie only) |
-| `GET /api/stats/export` | Yes (session cookie or API key) |
+| `POST /api/event` | No (tracking script must work without auth; Origin allowlist applies) |
+| `GET /api/event` | No (pixel tracking; same Origin allowlist applies) |
+| `GET /health`, `GET /health/ready`, `GET /health/detailed` | No |
+| `GET /metrics` | Optional — bearer token required when `MALLARD_METRICS_TOKEN` is set |
+| `GET /robots.txt`, `GET /.well-known/security.txt` | No |
+| `/api/auth/*` | No (these are the auth endpoints themselves) |
+| `GET /api/stats/*` | Yes — session cookie or any API key (ReadOnly or Admin) |
+| `GET /api/stats/export` | Yes — session cookie or any API key (ReadOnly or Admin) |
+| `GET /api/keys`, `POST /api/keys`, `DELETE /api/keys/*` | Yes — session cookie or Admin-scoped API key |
+
+### CSRF Protection
+
+State-mutating endpoints authenticated via session cookie validate the `Origin` or `Referer` header against `dashboard_origin`. Requests with a mismatched or absent origin receive `403 Forbidden`. Set `MALLARD_DASHBOARD_ORIGIN` in production to enable CSRF protection.
 
 ### CORS Policy
 
@@ -118,7 +127,10 @@ Known bot User-Agents are automatically filtered from analytics when `MALLARD_FI
 | PII leakage | IP addresses never stored. Daily hash rotation. No cookies |
 | Brute force (login) | Argon2id hashing (inherently slow), per-IP attempt counting with configurable lockout (`MALLARD_MAX_LOGIN_ATTEMPTS`, `MALLARD_LOGIN_LOCKOUT`) |
 | Brute force (API) | Per-site token-bucket rate limiting on ingestion |
-| Session hijacking | HttpOnly cookies, Secure flag with TLS, SameSite=Lax, 256-bit random tokens |
+| Session hijacking | HttpOnly cookies, Secure flag with TLS, SameSite=Strict, 256-bit random tokens |
+| CSRF | Origin/Referer header validation on all state-mutating session-authenticated endpoints |
+| Clickjacking | `X-Frame-Options: DENY` and `Content-Security-Policy` headers |
+| Protocol downgrade | `Strict-Transport-Security` (HSTS) with 1-year max-age |
 | Unauthorized dashboard access | Argon2id password authentication, session-based access control |
 | Unauthorized API access | API key authentication with SHA-256 hashed storage |
 | Data tampering | Parquet files are append-only per partition. Dashboard access is read-only for API keys |

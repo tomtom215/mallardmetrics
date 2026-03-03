@@ -624,3 +624,29 @@ cargo bench
 - `test_pixel_track_returns_gif` — GET /api/event returns 43-byte GIF with `image/gif` content-type
 - `test_hsts_header_present` — HSTS header present with correct `max-age`
 - `test_retry_after_present_on_query_semaphore_429` — 429 response includes `Retry-After`
+
+### Session 15: Comprehensive Documentation Audit & Observability Wiring
+
+**Scope:** Full documentation audit (all markdown files, all GitHub Pages docs pages, README, SECURITY.md, CONTRIBUTING.md, CLAUDE.md, ROADMAP.md), code wiring for behavioral extension observability, and correctness fixes found during audit.
+
+**Code changes:**
+- **`behavioral_extension_loaded` field wired end-to-end** — Added `behavioral_extension_loaded: bool` to `AppState` (in `handler.rs`). Captures the `Ok`/`Err` result of `load_behavioral_extension()` at startup in `main.rs` and propagates it through `build_app_state()`. Exposed in:
+  - `GET /health/detailed` JSON response: `"behavioral_extension_loaded": true/false`
+  - `GET /metrics` Prometheus gauge: `mallard_behavioral_extension 1/0` (with `# HELP` and `# TYPE` lines)
+  - All test fixtures updated (`make_test_state()` in `server.rs`; 6 `AppState` literals in `tests/ingest_test.rs`)
+
+**Documentation fixes (15 issues):**
+- **`docs/src/api-reference/index.md`** — Added `GET /api/event` pixel tracking to unauthenticated endpoints list; added `GET /health/ready`; added `GET /robots.txt` and `GET /.well-known/security.txt`; corrected `/metrics` to note optional bearer token; expanded HTTP status codes table (added 404, 413, 503); updated Sections to reflect all endpoints.
+- **`docs/src/architecture.md`** — Fixed diagram: `DuckDB (in-memory)` → `DuckDB (disk-based)`; corrected Hot Tier description to reflect disk-based persistence (`data/mallard.duckdb`, WAL durability); corrected restart behavior (DuckDB reopens file rather than starting with empty table).
+- **`docs/src/security.md`** — Added `Permissions-Policy`, `Strict-Transport-Security` (HSTS), `Cache-Control`, and `X-Request-ID` to security headers table.
+- **`SECURITY.md`** — Fixed `SameSite=Lax` → `SameSite=Strict`; added `MALLARD_SECURE_COOKIES` note; added `Secure` flag inference logic. Replaced single-scope API key description with full two-scope table (`ReadOnly`, `Admin`) and noted disk persistence. Expanded Route Protection table: added `GET /api/event`, `GET /health/ready`, `/robots.txt`, `/.well-known/security.txt`, corrected `/metrics` conditional auth, corrected `/api/keys/*` to list Admin key as valid auth. Added CSRF Protection subsection. Expanded Threat Model table: added CSRF, Clickjacking, Protocol Downgrade mitigations; fixed SameSite value in Session Hijacking row.
+- **`docs/src/deployment.md`** — Added `MALLARD_SECURE_COOKIES=true` and `MALLARD_METRICS_TOKEN` to production checklist, Docker run command, Docker Compose environment, and `.env` example. Added `dashboard_origin` checklist item. Added full "Health and Readiness Probes" section with Kubernetes liveness/readiness probe YAML and Docker Compose health check example. Added "After-Proxy Configuration" subsection.
+- **`README.md`** — Fixed architecture diagram: `DuckDB (embedded)` → `DuckDB (disk-based)`; added `mallard.duckdb` filename annotation.
+
+**Test results:**
+- 249 unit tests passing (`cargo test --lib`)
+- 62 integration tests passing (`cargo test --test ingest_test`)
+- Total: 311 tests, 0 failures, 0 ignored
+- 0 clippy warnings (`cargo clippy --all-targets`)
+- 0 formatting violations (`cargo fmt -- --check`)
+- Documentation builds without errors (`cargo doc --no-deps`)

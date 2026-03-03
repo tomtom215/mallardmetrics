@@ -4,12 +4,16 @@
 
 Before going to production:
 
-- [ ] Set `MALLARD_SECRET` to a random 32+ character string (and keep it constant across restarts).
+- [ ] Set `MALLARD_SECRET` to a random 32+ character string and keep it constant across restarts.
 - [ ] Set `MALLARD_ADMIN_PASSWORD` to a strong password.
+- [ ] Set `MALLARD_SECURE_COOKIES=true` when behind a TLS-terminating reverse proxy so session cookies carry the `Secure` flag.
+- [ ] Set `MALLARD_METRICS_TOKEN` to a secret token if the `/metrics` endpoint is publicly reachable.
 - [ ] Configure a TLS-terminating reverse proxy (nginx, Caddy, Traefik).
-- [ ] Mount a persistent volume for `data_dir`.
+- [ ] Mount a persistent volume for `data_dir` (contains `mallard.duckdb` and Parquet files).
 - [ ] Set `site_ids` to restrict event ingestion to your domains.
 - [ ] Configure `retention_days` to match your data retention policy.
+- [ ] Set `dashboard_origin` to your dashboard URL to enable CSRF protection.
+- [ ] Use `/health/ready` as your container or load-balancer readiness probe.
 
 ---
 
@@ -25,6 +29,8 @@ docker run -d \
   -v mallard-data:/data \
   -e MALLARD_SECRET=your-random-32-char-secret \
   -e MALLARD_ADMIN_PASSWORD=your-dashboard-password \
+  -e MALLARD_SECURE_COOKIES=true \
+  -e MALLARD_METRICS_TOKEN=your-prometheus-token \
   ghcr.io/tomtom215/mallard-metrics
 ```
 
@@ -60,6 +66,8 @@ services:
     environment:
       MALLARD_SECRET: "${MALLARD_SECRET}"
       MALLARD_ADMIN_PASSWORD: "${MALLARD_ADMIN_PASSWORD}"
+      MALLARD_SECURE_COOKIES: "true"
+      MALLARD_METRICS_TOKEN: "${MALLARD_METRICS_TOKEN}"
       MALLARD_LOG_FORMAT: "json"
 
 volumes:
@@ -71,6 +79,7 @@ Create a `.env` file (do not commit to source control):
 ```bash
 MALLARD_SECRET=your-random-32-char-secret
 MALLARD_ADMIN_PASSWORD=your-dashboard-password
+MALLARD_METRICS_TOKEN=your-prometheus-bearer-token
 ```
 
 Start:
@@ -116,6 +125,58 @@ analytics.example.com {
 ```
 
 Caddy sets `X-Forwarded-For` automatically.
+
+### After-Proxy Configuration
+
+Once behind a TLS reverse proxy, set these environment variables:
+
+```bash
+# Enables Secure flag on session cookies
+MALLARD_SECURE_COOKIES=true
+
+# Restricts dashboard CORS and enables CSRF protection
+MALLARD_DASHBOARD_ORIGIN=https://analytics.example.com
+```
+
+---
+
+## Health and Readiness Probes
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Liveness probe — returns `ok` if the process is alive |
+| `GET /health/ready` | Readiness probe — queries DuckDB; returns 503 if the database is not ready |
+| `GET /health/detailed` | JSON health report — version, buffer, auth, GeoIP, behavioral extension, cache status |
+
+### Kubernetes Example
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 8000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8000
+  initialDelaySeconds: 10
+  periodSeconds: 15
+  failureThreshold: 3
+```
+
+### Docker Compose Health Check
+
+```yaml
+healthcheck:
+  test: ["CMD", "wget", "-qO-", "http://localhost:8000/health/ready"]
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: 15s
+```
 
 ---
 

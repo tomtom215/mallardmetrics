@@ -264,8 +264,8 @@ All `/api/stats/*`, `/api/keys/*`, and `/api/stats/export` endpoints require aut
                     |  In-Memory Event Buffer                   |
                     |    |  (flush: threshold / timer / SIGINT) |
                     |    v                                      |
-                    |  DuckDB (embedded) <-- behavioral ext    |
-                    |    |  hot: events table                   |
+                    |  DuckDB (disk-based) <-- behavioral ext  |
+                    |    |  hot: events table (mallard.duckdb)  |
                     |    |  COPY TO Parquet (ZSTD)              |
                     |    v                                      |
                     |  data/events/site_id=*/date=*/*.parquet  |

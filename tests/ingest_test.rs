@@ -41,6 +41,7 @@ fn make_test_state() -> (Arc<AppState>, tempfile::TempDir) {
         metrics_token: None,
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
         secure_cookies: false,
+        behavioral_extension_loaded: false,
     });
     (state, dir)
 }
@@ -382,6 +383,7 @@ fn make_test_state_with_sites(sites: Vec<String>) -> (Arc<AppState>, tempfile::T
         metrics_token: None,
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
         secure_cookies: false,
+        behavioral_extension_loaded: false,
     });
     (state, dir)
 }
@@ -722,6 +724,7 @@ fn make_test_state_with_password(password: &str) -> (Arc<AppState>, tempfile::Te
         metrics_token: None,
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
         secure_cookies: false,
+        behavioral_extension_loaded: false,
     });
     (state, dir)
 }
@@ -1243,6 +1246,7 @@ async fn test_rate_limiting() {
         metrics_token: None,
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
         secure_cookies: false,
+        behavioral_extension_loaded: false,
     });
 
     let payload = serde_json::json!({
@@ -1338,6 +1342,7 @@ fn make_test_state_with_lockout(password: &str) -> (Arc<AppState>, tempfile::Tem
         metrics_token: None,
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
         secure_cookies: false,
+        behavioral_extension_loaded: false,
     });
     (state, dir)
 }
@@ -1843,6 +1848,7 @@ async fn test_csrf_blocks_session_auth_key_creation() {
         metrics_token: None,
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
         secure_cookies: false,
+        behavioral_extension_loaded: false,
     });
 
     // Create a valid session directly (bypasses login)
