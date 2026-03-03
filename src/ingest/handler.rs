@@ -84,6 +84,9 @@ pub struct AppState {
     /// Force the `Secure` flag on session cookies.
     /// Set via `MALLARD_SECURE_COOKIES=true` when behind a TLS-terminating proxy.
     pub secure_cookies: bool,
+    /// Whether the DuckDB `behavioral` extension was successfully loaded at startup.
+    /// Exposed in `/health/detailed` and the Prometheus `/metrics` endpoint.
+    pub behavioral_extension_loaded: bool,
 }
 
 /// Query parameters for the GET /api/event pixel-tracking endpoint.

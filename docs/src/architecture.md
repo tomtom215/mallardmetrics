@@ -22,8 +22,8 @@ Browser / Client
  │                   ┌──────────────────────┘        │
  │                   ▼                               │
  │  ┌────────────────────────┐                       │
- │  │   DuckDB (in-memory)   │←──── read_parquet()   │
- │  │   events table (hot)   │       (cold tier)     │
+ │  │  DuckDB (disk-based)   │←──── read_parquet()   │
+ │  │  events table (hot)    │       (cold tier)     │
  │  └───────────┬────────────┘                       │
  │              │  COPY TO (flush)                   │
  │              ▼                                    │
@@ -44,12 +44,13 @@ Browser / Client
 
 ## Two-Tier Storage Model
 
-### Hot Tier — DuckDB in-memory events table
+### Hot Tier — DuckDB disk-based events table
 
-Events that have been received but not yet flushed are stored in the in-memory DuckDB `events` table. These events are immediately queryable.
+Events that have been received but not yet flushed are stored in the DuckDB `events` table inside a persistent database file (`data/mallard.duckdb`). These events are immediately queryable.
 
 - Flushed when: buffer count threshold is reached (`flush_event_count`), or the periodic interval fires (`flush_interval_secs`), or on graceful shutdown.
 - After flushing: events are written to Parquet files, then deleted from the `events` table.
+- The DuckDB file provides WAL-based durability: hot events survive a SIGKILL (crash), not just graceful SIGTERM.
 
 ### Cold Tier — Parquet files on disk
 
@@ -68,7 +69,7 @@ data/events/
         └── 0001.parquet
 ```
 
-Parquet files are the durability layer. On server restart, DuckDB starts with an empty in-memory table and the cold tier is brought back into scope via the `events_all` view.
+Parquet files are the primary durability layer for historical data. On server restart, DuckDB reopens `mallard.duckdb` (recovering any hot events not yet flushed), and the cold Parquet tier is brought back into scope via the `events_all` view.
 
 ### The `events_all` View
 

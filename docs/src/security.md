@@ -114,7 +114,7 @@ Configure using TOML fields `max_login_attempts` and `login_lockout_secs`, or th
 
 ## Security Headers
 
-All HTTP responses include these OWASP-recommended headers:
+All HTTP responses include these OWASP-recommended security headers:
 
 | Header | Value |
 |---|---|
@@ -122,6 +122,10 @@ All HTTP responses include these OWASP-recommended headers:
 | `X-Frame-Options` | `DENY` — prevents clickjacking via iframe embedding |
 | `Referrer-Policy` | `strict-origin-when-cross-origin` — limits referrer leakage |
 | `Content-Security-Policy` | HTML responses only — restricts scripts and resources to same origin |
+| `Permissions-Policy` | `geolocation=(), microphone=(), camera=()` — disables browser feature APIs |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` — instructs browsers to enforce HTTPS for 1 year |
+| `Cache-Control` | `no-store, no-cache` — JSON API responses only; prevents analytics data from being cached by proxies or browsers |
+| `X-Request-ID` | Unique UUID per request — injected by the server and propagated through tracing spans for log correlation |
 
 ---
 

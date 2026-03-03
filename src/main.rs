@@ -64,13 +64,19 @@ async fn main() {
     storage::migrations::run_migrations(&conn).expect("Failed to run migrations");
 
     // Try to load the behavioral extension (non-fatal if unavailable)
-    match storage::schema::load_behavioral_extension(&conn) {
-        Ok(()) => tracing::info!("Behavioral extension loaded"),
-        Err(e) => tracing::warn!(
-            error = %e,
-            "Behavioral extension not available; behavioral analytics features will be disabled"
-        ),
-    }
+    let behavioral_extension_loaded = match storage::schema::load_behavioral_extension(&conn) {
+        Ok(()) => {
+            tracing::info!("Behavioral extension loaded");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Behavioral extension not available; behavioral analytics features will be disabled"
+            );
+            false
+        }
+    };
 
     // Create the events_all view that unions the hot events table with persisted
     // Parquet files on disk.  This makes historical data queryable immediately,
@@ -90,7 +96,7 @@ async fn main() {
     // Initialize GeoIP reader (gracefully degrades if .mmdb not available)
     let geoip = GeoIpReader::open(config.geoip_db_path.as_deref());
 
-    let state = build_app_state(&config, buffer, geoip);
+    let state = build_app_state(&config, buffer, geoip, behavioral_extension_loaded);
 
     // Spawn background tasks
     spawn_background_tasks(&config, &conn, &state);
@@ -111,7 +117,12 @@ async fn main() {
         .expect("Server error");
 }
 
-fn build_app_state(config: &Config, buffer: EventBuffer, geoip: GeoIpReader) -> Arc<AppState> {
+fn build_app_state(
+    config: &Config,
+    buffer: EventBuffer,
+    geoip: GeoIpReader,
+    behavioral_extension_loaded: bool,
+) -> Arc<AppState> {
     let sessions = SessionStore::new(config.session_ttl_secs);
     // Load API keys from disk so they survive server restarts.  Keys are
     // written back to the same file on every add/revoke operation.
@@ -206,6 +217,7 @@ fn build_app_state(config: &Config, buffer: EventBuffer, geoip: GeoIpReader) -> 
         metrics_token,
         query_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
         secure_cookies: config.secure_cookies,
+        behavioral_extension_loaded,
     })
 }
 
