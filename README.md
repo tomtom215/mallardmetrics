@@ -10,7 +10,7 @@
 [![Privacy](https://img.shields.io/badge/privacy-no_cookies-teal?style=flat-square)](#privacy-by-design)
 [![Docs](https://img.shields.io/badge/docs-GitHub_Pages-navy?style=flat-square)](https://tomtom215.github.io/mallardmetrics)
 
-A lightweight, GDPR/CCPA-compliant alternative to Plausible Analytics. Runs entirely on your infrastructure — no third-party services, no cookies, no consent banners required.
+A lightweight, privacy-respecting alternative to Plausible Analytics. Runs entirely on your infrastructure — no third-party services, no cookies, no persistent IP storage. See [PRIVACY.md](PRIVACY.md) for the complete data-processing architecture and operator compliance guidance.
 
 ---
 
@@ -35,10 +35,10 @@ A lightweight, GDPR/CCPA-compliant alternative to Plausible Analytics. Runs enti
 
 ### Privacy by Design
 
-- **No cookies** — Visitor identification uses a daily-rotating HMAC-SHA256 hash of IP + User-Agent + daily salt
-- **No PII storage** — IP addresses are used only for hashing and GeoIP lookup, then immediately discarded
-- **Daily salt rotation** — Visitor IDs change every 24 hours, preventing long-term tracking
-- **GDPR/CCPA compliant** — No personal data stored, no consent banner required
+- **No cookies** — Visitor identification uses a daily-rotating HMAC-SHA256 hash of IP + User-Agent + daily salt; no cookies are set and no browser storage is accessed
+- **No persistent IP storage** — IP addresses are processed ephemerally in RAM (for GeoIP lookup and visitor ID derivation) and never written to disk or logs
+- **Daily salt rotation** — Visitor IDs change every 24 hours; the same IP + User-Agent produces a different hash on different days, preventing cross-day tracking
+- **Pseudonymous, not anonymous** — Stored visitor IDs are HMAC-SHA256 hashes; pseudonymous data is still personal data under GDPR Recital 26. Geographic data (country, region, city) derived from IP is stored. See [PRIVACY.md](PRIVACY.md) for the full analysis and operator obligations.
 
 ### Single Binary Deployment
 
@@ -453,6 +453,7 @@ Country-level resolution works without GeoIP. The system degrades gracefully if 
 | Document | Description |
 |---|---|
 | **[GitHub Pages](https://tomtom215.github.io/mallardmetrics)** | Full documentation site — API reference, architecture, deployment, security |
+| [PRIVACY.md](PRIVACY.md) | Data-processing architecture, GDPR/ePrivacy/CCPA analysis, operator compliance obligations |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup, workflow, code standards, PR checklist |
 | [SECURITY.md](SECURITY.md) | Security model, privacy guarantees, threat model, vulnerability reporting |
 | [CHANGELOG.md](CHANGELOG.md) | Version history following Keep a Changelog format |
