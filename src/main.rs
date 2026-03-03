@@ -117,6 +117,7 @@ async fn main() {
         .expect("Server error");
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_app_state(
     config: &Config,
     buffer: EventBuffer,
@@ -197,6 +198,21 @@ fn build_app_state(
         config.max_concurrent_queries
     };
 
+    if config.gdpr_mode {
+        tracing::info!(
+            "GDPR mode enabled: strip_referrer_query, round_timestamps, \
+             suppress_browser_version, suppress_os_version, suppress_screen_size active; \
+             geoip_precision={:?}",
+            config.geoip_precision
+        );
+        if config.retention_days == 0 {
+            tracing::warn!(
+                "GDPR mode is enabled but retention_days is 0 (unlimited). \
+                 Consider setting MALLARD_RETENTION_DAYS=30 for GDPR Art. 5(1)(e) storage limitation."
+            );
+        }
+    }
+
     Arc::new(AppState {
         buffer,
         secret,
@@ -218,6 +234,14 @@ fn build_app_state(
         query_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
         secure_cookies: config.secure_cookies,
         behavioral_extension_loaded,
+        strip_referrer_query: config.strip_referrer_query,
+        round_timestamps: config.round_timestamps,
+        suppress_visitor_id: config.suppress_visitor_id,
+        suppress_browser_version: config.suppress_browser_version,
+        suppress_os_version: config.suppress_os_version,
+        suppress_screen_size: config.suppress_screen_size,
+        geoip_precision: config.geoip_precision.clone(),
+        events_dir: config.events_dir(),
     })
 }
 

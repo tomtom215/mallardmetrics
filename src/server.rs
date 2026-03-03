@@ -34,11 +34,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/auth/logout", post(auth::auth_logout))
         .route("/auth/status", get(auth::auth_status));
 
-    // API key management routes — require admin scope + CSRF protection
+    // API key management and GDPR data management routes — require admin scope + CSRF protection
     let key_routes = Router::new()
         .route("/keys", post(auth::create_api_key))
         .route("/keys", get(auth::list_api_keys))
         .route("/keys/{key_hash}", delete(auth::revoke_api_key_handler))
+        // GDPR right-to-erasure endpoint: permanently deletes analytics data for a
+        // site + date range from both DuckDB and on-disk Parquet partitions.
+        .route("/gdpr/erase", delete(stats::gdpr_erase))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_admin_auth,
@@ -489,6 +492,7 @@ mod tests {
         let storage = ParquetStorage::new(dir.path());
         let conn = Arc::new(Mutex::new(conn));
         let buffer = EventBuffer::new(1000, conn, storage);
+        let events_dir = dir.path().to_path_buf();
         let state = Arc::new(AppState {
             buffer,
             secret: "test-secret".to_string(),
@@ -510,6 +514,14 @@ mod tests {
             query_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             secure_cookies: false,
             behavioral_extension_loaded: false,
+            strip_referrer_query: false,
+            round_timestamps: false,
+            suppress_visitor_id: false,
+            suppress_browser_version: false,
+            suppress_os_version: false,
+            suppress_screen_size: false,
+            geoip_precision: "city".to_string(),
+            events_dir,
         });
         (state, dir)
     }
@@ -596,6 +608,14 @@ mod tests {
             query_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             secure_cookies: false,
             behavioral_extension_loaded: false,
+            strip_referrer_query: false,
+            round_timestamps: false,
+            suppress_visitor_id: false,
+            suppress_browser_version: false,
+            suppress_os_version: false,
+            suppress_screen_size: false,
+            geoip_precision: "city".to_string(),
+            events_dir: dir.path().to_path_buf(),
         });
         let _dir = dir;
 
@@ -1015,6 +1035,14 @@ mod tests {
             query_semaphore: Arc::new(tokio::sync::Semaphore::new(0)), // 0 permits → always 429
             secure_cookies: false,
             behavioral_extension_loaded: false,
+            strip_referrer_query: false,
+            round_timestamps: false,
+            suppress_visitor_id: false,
+            suppress_browser_version: false,
+            suppress_os_version: false,
+            suppress_screen_size: false,
+            geoip_precision: "city".to_string(),
+            events_dir: dir.path().to_path_buf(),
         });
         let _dir = dir;
         let app = build_router(state);

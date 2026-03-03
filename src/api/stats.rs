@@ -5,6 +5,7 @@ use axum::extract::{Query, State};
 use axum::http::header;
 use axum::response::IntoResponse;
 use axum::Json;
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 use std::sync::Arc;
@@ -896,6 +897,153 @@ pub async fn get_export(
             "Invalid format: '{other}'. Use 'csv' or 'json'."
         ))),
     }
+}
+
+/// Query parameters for the GDPR data erasure endpoint.
+#[derive(Debug, Deserialize)]
+pub struct GdprEraseParams {
+    /// Site ID to erase data for (must pass the same validation as stats endpoints).
+    pub site_id: String,
+    /// Start date (inclusive), YYYY-MM-DD.
+    pub start_date: String,
+    /// End date (inclusive), YYYY-MM-DD.
+    pub end_date: String,
+}
+
+/// DELETE /api/gdpr/erase — GDPR right-to-erasure endpoint.
+///
+/// Permanently deletes all analytics data for `site_id` between `start_date` and
+/// `end_date` (inclusive) from both the DuckDB hot table and the on-disk Parquet
+/// partitions.  The `events_all` view is refreshed after the deletion so that
+/// subsequent queries immediately reflect the erasure.
+///
+/// **Requires admin authentication.**
+///
+/// # Limitations
+///
+/// Because visitor IDs are pseudonymous hashes — not names or email addresses — it is
+/// not possible to identify which stored rows correspond to a specific natural person.
+/// This endpoint therefore operates on a **site + date-range** basis, which is the
+/// granularity operators can reasonably act on in response to a GDPR Art. 17 request.
+/// Operators should document this limitation in their privacy notice.
+pub async fn gdpr_erase(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<GdprEraseParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    validate_site_id(&params.site_id)?;
+
+    let start_date = NaiveDate::parse_from_str(&params.start_date, "%Y-%m-%d")
+        .map_err(|_| ApiError::BadRequest("Invalid start_date. Use YYYY-MM-DD.".to_string()))?;
+    let end_date = NaiveDate::parse_from_str(&params.end_date, "%Y-%m-%d")
+        .map_err(|_| ApiError::BadRequest("Invalid end_date. Use YYYY-MM-DD.".to_string()))?;
+    if end_date < start_date {
+        return Err(ApiError::BadRequest(
+            "end_date must be on or after start_date".to_string(),
+        ));
+    }
+    let days = (end_date - start_date).num_days();
+    if days > 366 {
+        return Err(ApiError::BadRequest(
+            "Date range must not exceed 366 days".to_string(),
+        ));
+    }
+
+    let site_id = params.site_id.clone();
+    let start_str = params.start_date.clone();
+    let end_str = params.end_date.clone();
+    let events_dir = state.events_dir.clone();
+    let conn = state.buffer.conn().clone();
+
+    let (db_records_deleted, parquet_partitions_deleted) =
+        tokio::task::spawn_blocking(move || -> Result<(i64, u64), duckdb::Error> {
+            // Step 1: SQL deletions — hold the DuckDB lock only for these two queries.
+            let db_count: i64 = {
+                let guard = conn.lock();
+                let count: i64 = guard
+                    .query_row(
+                        "SELECT COUNT(*) FROM events \
+                         WHERE site_id = ? \
+                         AND STRFTIME(CAST(timestamp AS DATE), '%Y-%m-%d') BETWEEN ? AND ?",
+                        duckdb::params![site_id, start_str, end_str],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(0);
+                guard.execute(
+                    "DELETE FROM events \
+                     WHERE site_id = ? \
+                     AND STRFTIME(CAST(timestamp AS DATE), '%Y-%m-%d') BETWEEN ? AND ?",
+                    duckdb::params![site_id, start_str, end_str],
+                )?;
+                // `guard` is dropped here, releasing the DuckDB mutex before the
+                // (potentially slow) filesystem operations below.
+                count
+            };
+
+            // Step 2: Remove on-disk Parquet partition directories for the date range.
+            //
+            // Partition layout: {events_dir}/site_id={site_id}/date={YYYY-MM-DD}/
+            // Because data is partitioned by both site_id and date, removing a date
+            // directory deletes only that site's data for that day — other sites are
+            // unaffected.
+            let mut parquet_removed: u64 = 0;
+            let mut current = start_date;
+            while current <= end_date {
+                let date_str = current.format("%Y-%m-%d").to_string();
+                let partition_dir = events_dir
+                    .join(format!("site_id={site_id}"))
+                    .join(format!("date={date_str}"));
+                if partition_dir.exists() {
+                    match std::fs::remove_dir_all(&partition_dir) {
+                        Ok(()) => {
+                            parquet_removed += 1;
+                            tracing::info!(
+                                site_id = %site_id,
+                                date = %date_str,
+                                "GDPR erasure: removed Parquet partition"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                site_id = %site_id,
+                                date = %date_str,
+                                error = %e,
+                                "GDPR erasure: failed to remove Parquet partition"
+                            );
+                        }
+                    }
+                }
+                current = match current.succ_opt() {
+                    Some(d) => d,
+                    None => break,
+                };
+            }
+
+            // Step 3: Refresh the events_all VIEW — re-acquire the lock for this brief op.
+            crate::storage::schema::setup_query_view(&conn.lock(), &events_dir)?;
+
+            Ok((db_count, parquet_removed))
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("Erasure task panicked: {e}")))?
+        .map_err(ApiError::DatabaseError)?;
+
+    tracing::warn!(
+        site_id = %params.site_id,
+        start_date = %params.start_date,
+        end_date = %params.end_date,
+        db_records_deleted,
+        parquet_partitions_deleted,
+        "GDPR erasure completed"
+    );
+
+    Ok(Json(serde_json::json!({
+        "status": "erased",
+        "site_id": params.site_id,
+        "start_date": params.start_date,
+        "end_date": params.end_date,
+        "db_records_deleted": db_records_deleted,
+        "parquet_partitions_deleted": parquet_partitions_deleted,
+    })))
 }
 
 /// Escape a CSV field to prevent CSV injection attacks.

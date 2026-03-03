@@ -349,6 +349,114 @@ pre-loaded synthetic data without deploying the tracking script to GitHub Pages 
 
 ---
 
+## GDPR-Friendly Deployment Mode
+
+Mallard Metrics provides two deployment profiles:
+
+| Profile | Target | Core metric impact | Regulatory posture |
+|---|---|---|---|
+| **Standard** (default) | Maximum analytics depth | Full unique-visitor counting, city-level geo, browser versions | Operator must complete LIA + privacy notice |
+| **GDPR-Friendly** (`gdpr_mode = true`) | Reduced fingerprinting surface | Daily unique visitors still tracked; geo limited to country; versions suppressed | Substantially reduced data processing scope; supports legitimate interests or consent-based deployments |
+
+### Activating GDPR-Friendly Mode
+
+The easiest path is the `gdpr_mode` convenience flag. Set either in your TOML config:
+
+```toml
+gdpr_mode = true
+retention_days = 30   # GDPR Art. 5(1)(e) storage limitation — recommended
+```
+
+Or via environment variables:
+
+```bash
+MALLARD_GDPR_MODE=true
+MALLARD_RETENTION_DAYS=30
+```
+
+When `gdpr_mode = true`, the following transformations are applied **at ingestion time**:
+
+| Setting | Effect | Privacy impact |
+|---|---|---|
+| `strip_referrer_query = true` | Strips `?query` and `#fragment` from referrer URLs before storing | Prevents leaking search terms (e.g. `?q=medical+condition`) |
+| `round_timestamps = true` | Timestamps stored at hour precision (e.g. `2024-03-15T14:00:00`) | Reduces fingerprinting via timing correlation |
+| `suppress_browser_version = true` | Stores browser name only (`Chrome`, not `Chrome 120.0`) | Reduces UA-based fingerprinting |
+| `suppress_os_version = true` | Stores OS name only (`Windows`, not `Windows 10.0`) | Reduces UA-based fingerprinting |
+| `suppress_screen_size = true` | Omits screen width and device type entirely | Eliminates screen-size fingerprinting vector |
+| `geoip_precision = "country"` | Stores country code only; region and city set to NULL | City/region are more identifying than country |
+
+### Fine-Grained Privacy Controls
+
+Individual flags can be set without enabling the full `gdpr_mode` bundle:
+
+```toml
+# Example: strip referrer queries and limit geo, but keep browser/OS versions
+strip_referrer_query = true
+geoip_precision = "country"
+retention_days = 30
+```
+
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `gdpr_mode` | `MALLARD_GDPR_MODE` | `false` | Enable the GDPR-friendly bundle (forces all flags below on) |
+| `strip_referrer_query` | `MALLARD_STRIP_REFERRER_QUERY` | `false` | Strip `?query` and `#fragment` from referrer URLs |
+| `round_timestamps` | `MALLARD_ROUND_TIMESTAMPS` | `false` | Round timestamps to nearest hour |
+| `suppress_visitor_id` | `MALLARD_SUPPRESS_VISITOR_ID` | `false` | Replace HMAC visitor ID with random UUID per request (breaks unique-visitor counting) |
+| `suppress_browser_version` | `MALLARD_SUPPRESS_BROWSER_VERSION` | `false` | Store browser name only |
+| `suppress_os_version` | `MALLARD_SUPPRESS_OS_VERSION` | `false` | Store OS name only |
+| `suppress_screen_size` | `MALLARD_SUPPRESS_SCREEN_SIZE` | `false` | Omit screen_size and device_type |
+| `geoip_precision` | `MALLARD_GEOIP_PRECISION` | `"city"` | `"city"`, `"region"`, `"country"`, or `"none"` |
+
+### Special case: `suppress_visitor_id`
+
+This flag is **not** activated by `gdpr_mode` because it eliminates the unique-visitor metric
+entirely. When enabled, each request receives a fresh random UUID instead of the HMAC-derived
+hash, making cross-request linkability impossible. Tradeoff: "unique visitors" becomes
+an approximation of page-load count, not actual visitor deduplication.
+
+Enable explicitly only if your legal analysis concludes that even the daily-rotating
+pseudonymous ID constitutes unacceptable processing risk:
+
+```bash
+MALLARD_SUPPRESS_VISITOR_ID=true
+```
+
+### GDPR Right to Erasure (Art. 17) — Data Erasure API
+
+Mallard Metrics provides an admin-authenticated endpoint to permanently delete analytics data:
+
+```http
+DELETE /api/gdpr/erase?site_id=example.com&start_date=2024-01-01&end_date=2024-01-31
+Authorization: Bearer <admin-api-key>
+```
+
+This endpoint:
+1. Deletes all matching rows from the DuckDB hot-events table
+2. Removes the on-disk Parquet partition directories for the site + date range
+   (partition layout: `data/events/site_id={site_id}/date={date}/`)
+3. Refreshes the `events_all` VIEW so subsequent queries reflect the deletion
+
+Response:
+
+```json
+{
+  "status": "erased",
+  "site_id": "example.com",
+  "start_date": "2024-01-01",
+  "end_date": "2024-01-31",
+  "db_records_deleted": 1247,
+  "parquet_partitions_deleted": 31
+}
+```
+
+**Limitation:** Because visitor IDs are pseudonymous hashes (not names or email addresses),
+it is not possible to identify which stored rows correspond to a specific natural person
+without the original IP address and User-Agent string. Art. 17 erasure therefore operates
+on the **site + date-range** granularity — the finest granularity operators can act on
+when responding to a GDPR erasure request. Document this limitation in your privacy notice.
+
+---
+
 ## What Operators Must Do
 
 This section summarises the minimum obligations for a legally compliant deployment.
@@ -368,7 +476,8 @@ This section summarises the minimum obligations for a legally compliant deployme
 
 ### Configuration
 
-- [ ] Set `MALLARD_RETENTION_DAYS` to the shortest period that meets your analytics needs
+- [ ] Set `MALLARD_RETENTION_DAYS` to the shortest period that meets your analytics needs (30 days recommended for EU deployments)
+- [ ] Consider enabling `MALLARD_GDPR_MODE=true` for EU/EEA deployments
 - [ ] Do not collect custom `props` containing PII (names, emails, user IDs that are direct
   identifiers) without explicit legal basis and privacy notice disclosure
 - [ ] Enable `MALLARD_SECURE_COOKIES=true` in production (TLS deployments)
@@ -376,7 +485,7 @@ This section summarises the minimum obligations for a legally compliant deployme
 
 ### Ongoing
 
-- [ ] Maintain a process for responding to data subject rights requests
+- [ ] Maintain a process for responding to data subject rights requests (use `DELETE /api/gdpr/erase` for Art. 17 erasure requests)
 - [ ] Monitor applicable supervisory authority guidance for updates to cookie-free analytics
   interpretations
 - [ ] Review retention periods periodically
@@ -401,18 +510,24 @@ The following activities are **not performed** by Mallard Metrics, regardless of
 
 ## Comparison with Other Analytics Tools
 
-| Feature | Mallard Metrics | Google Analytics 4 | Plausible Analytics | Fathom Analytics |
-|---|---|---|---|---|
-| Self-hosted | Yes | No | Yes (paid) / No (cloud) | No |
-| Cookies set | No | Yes (session + persistent) | No | No |
-| IP stored | No | Yes (anonymised) | No | No |
-| Raw UA stored | No | Yes | No | No |
-| Geo stored | Country/region/city | Country/region/city | Country only | Country only |
-| Visitor ID type | Daily-rotating HMAC hash | Persistent cookie-based | Daily-rotating hash | Daily-rotating hash |
-| GDPR applicability | Yes (pseudonymous data) | Yes (personal data) | Yes (pseudonymous data) | Yes (pseudonymous data) |
-| Consent needed (ePrivacy) | No (no terminal storage access) | Yes (cookies) | No | No |
-| Consent needed (GDPR) | Depends on lawful basis | Yes (or other basis) | Depends on lawful basis | Depends on lawful basis |
-| Data controller | You (self-hosted operator) | Google | Plausible or you | Fathom |
+| Feature | Mallard Metrics (Standard) | Mallard Metrics (GDPR Mode) | Google Analytics 4 | Plausible Analytics | Fathom Analytics |
+|---|---|---|---|---|---|
+| Self-hosted | Yes | Yes | No | Yes (paid) / No (cloud) | No |
+| Cookies set | No | No | Yes (session + persistent) | No | No |
+| IP stored | No | No | Yes (anonymised) | No | No |
+| Raw UA stored | No | No | Yes | No | No |
+| Browser version stored | Yes | No | Yes | Yes | Yes |
+| OS version stored | Yes | No | Yes | Yes | Yes |
+| Screen size stored | Yes | No | Yes | No | No |
+| Geo stored | Country/region/city | Country only | Country/region/city | Country only | Country only |
+| Referrer query stored | Yes | No | Yes | No | No |
+| Timestamp precision | Millisecond | Hour | Millisecond | Day | Day |
+| Visitor ID type | Daily-rotating HMAC hash | Daily-rotating HMAC hash | Persistent cookie-based | Daily-rotating hash | Daily-rotating hash |
+| Data erasure API | Yes (site + date range) | Yes (site + date range) | No (Google-controlled) | No | No |
+| GDPR applicability | Yes (pseudonymous data) | Yes (reduced scope) | Yes (personal data) | Yes (pseudonymous data) | Yes (pseudonymous data) |
+| Consent needed (ePrivacy) | No (no terminal storage access) | No | Yes (cookies) | No | No |
+| Consent needed (GDPR) | Depends on lawful basis | More defensible under LI | Yes (or other basis) | Depends on lawful basis | Depends on lawful basis |
+| Data controller | You (self-hosted operator) | You (self-hosted operator) | Google | Plausible or you | Fathom |
 
 ---
 

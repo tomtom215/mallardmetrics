@@ -21,6 +21,7 @@ fn make_test_state() -> (Arc<AppState>, tempfile::TempDir) {
     let storage = ParquetStorage::new(dir.path());
     let conn = Arc::new(Mutex::new(conn));
     let buffer = EventBuffer::new(1000, conn, storage);
+    let events_dir = dir.path().to_path_buf();
     let state = Arc::new(AppState {
         buffer,
         secret: "test-secret-integration".to_string(),
@@ -42,6 +43,14 @@ fn make_test_state() -> (Arc<AppState>, tempfile::TempDir) {
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
         secure_cookies: false,
         behavioral_extension_loaded: false,
+        strip_referrer_query: false,
+        round_timestamps: false,
+        suppress_visitor_id: false,
+        suppress_browser_version: false,
+        suppress_os_version: false,
+        suppress_screen_size: false,
+        geoip_precision: "city".to_string(),
+        events_dir,
     });
     (state, dir)
 }
@@ -363,6 +372,7 @@ fn make_test_state_with_sites(sites: Vec<String>) -> (Arc<AppState>, tempfile::T
     let storage = ParquetStorage::new(dir.path());
     let conn = Arc::new(Mutex::new(conn));
     let buffer = EventBuffer::new(1000, conn, storage);
+    let events_dir = dir.path().to_path_buf();
     let state = Arc::new(AppState {
         buffer,
         secret: "test-secret-integration".to_string(),
@@ -384,6 +394,14 @@ fn make_test_state_with_sites(sites: Vec<String>) -> (Arc<AppState>, tempfile::T
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
         secure_cookies: false,
         behavioral_extension_loaded: false,
+        strip_referrer_query: false,
+        round_timestamps: false,
+        suppress_visitor_id: false,
+        suppress_browser_version: false,
+        suppress_os_version: false,
+        suppress_screen_size: false,
+        geoip_precision: "city".to_string(),
+        events_dir,
     });
     (state, dir)
 }
@@ -704,6 +722,7 @@ fn make_test_state_with_password(password: &str) -> (Arc<AppState>, tempfile::Te
     let conn = Arc::new(Mutex::new(conn));
     let buffer = EventBuffer::new(1000, conn, storage);
     let hash = mallard_metrics::api::auth::hash_password(password).unwrap();
+    let events_dir = dir.path().to_path_buf();
     let state = Arc::new(AppState {
         buffer,
         secret: "test-secret-integration".to_string(),
@@ -725,6 +744,14 @@ fn make_test_state_with_password(password: &str) -> (Arc<AppState>, tempfile::Te
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
         secure_cookies: false,
         behavioral_extension_loaded: false,
+        strip_referrer_query: false,
+        round_timestamps: false,
+        suppress_visitor_id: false,
+        suppress_browser_version: false,
+        suppress_os_version: false,
+        suppress_screen_size: false,
+        geoip_precision: "city".to_string(),
+        events_dir,
     });
     (state, dir)
 }
@@ -1247,6 +1274,14 @@ async fn test_rate_limiting() {
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
         secure_cookies: false,
         behavioral_extension_loaded: false,
+        strip_referrer_query: false,
+        round_timestamps: false,
+        suppress_visitor_id: false,
+        suppress_browser_version: false,
+        suppress_os_version: false,
+        suppress_screen_size: false,
+        geoip_precision: "city".to_string(),
+        events_dir: dir.path().to_path_buf(),
     });
 
     let payload = serde_json::json!({
@@ -1322,6 +1357,7 @@ fn make_test_state_with_lockout(password: &str) -> (Arc<AppState>, tempfile::Tem
     let conn = Arc::new(Mutex::new(conn));
     let buffer = EventBuffer::new(1000, conn, storage);
     let hash = mallard_metrics::api::auth::hash_password(password).unwrap();
+    let events_dir = dir.path().to_path_buf();
     let state = Arc::new(AppState {
         buffer,
         secret: "test-secret".to_string(),
@@ -1343,6 +1379,14 @@ fn make_test_state_with_lockout(password: &str) -> (Arc<AppState>, tempfile::Tem
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
         secure_cookies: false,
         behavioral_extension_loaded: false,
+        strip_referrer_query: false,
+        round_timestamps: false,
+        suppress_visitor_id: false,
+        suppress_browser_version: false,
+        suppress_os_version: false,
+        suppress_screen_size: false,
+        geoip_precision: "city".to_string(),
+        events_dir,
     });
     (state, dir)
 }
@@ -1849,6 +1893,14 @@ async fn test_csrf_blocks_session_auth_key_creation() {
         query_semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(10)),
         secure_cookies: false,
         behavioral_extension_loaded: false,
+        strip_referrer_query: false,
+        round_timestamps: false,
+        suppress_visitor_id: false,
+        suppress_browser_version: false,
+        suppress_os_version: false,
+        suppress_screen_size: false,
+        geoip_precision: "city".to_string(),
+        events_dir: dir.path().to_path_buf(),
     });
 
     // Create a valid session directly (bypasses login)
@@ -1984,4 +2036,262 @@ async fn test_ingest_rejects_invalid_site_id_chars() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// --- GDPR erasure endpoint integration tests ---
+
+#[tokio::test]
+async fn test_gdpr_erase_requires_auth() {
+    // DELETE /api/gdpr/erase without auth must return 401.
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/gdpr/erase?site_id=mysite.com&start_date=2024-01-01&end_date=2024-01-31")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_gdpr_erase_returns_ok_for_empty_date_range() {
+    // Authenticated erase over a date range with no data should return 200 with 0 counts.
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let token = state.sessions.create_session("admin");
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/gdpr/erase?site_id=mysite.com&start_date=2024-01-01&end_date=2024-01-31")
+                .header("cookie", format!("mm_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "erased");
+    assert_eq!(json["site_id"], "mysite.com");
+    assert_eq!(json["start_date"], "2024-01-01");
+    assert_eq!(json["end_date"], "2024-01-31");
+    assert_eq!(json["db_records_deleted"], 0);
+    assert_eq!(json["parquet_partitions_deleted"], 0);
+}
+
+#[tokio::test]
+async fn test_gdpr_erase_deletes_hot_events() {
+    // Insert events into the hot DuckDB table, then erase them via the endpoint.
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let token = state.sessions.create_session("admin");
+    let app = build_router(Arc::clone(&state));
+
+    // Ingest two events for the target site on today's date.
+    for _ in 0..2 {
+        let payload = serde_json::json!({
+            "d": "erase-test.com",
+            "n": "pageview",
+            "u": "https://erase-test.com/"
+        });
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/event")
+                    .header("content-type", "application/json")
+                    .header("user-agent", "Mozilla/5.0 Chrome/120.0")
+                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Erase across a 1-year range that covers today.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/gdpr/erase?site_id=erase-test.com&start_date=2020-01-01&end_date=2030-12-31")
+                .header("cookie", format!("mm_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // The 10-year range exceeds 366 days, so this must be rejected.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_gdpr_erase_deletes_within_366_days() {
+    // Insert events and erase within a valid date range covering today.
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let token = state.sessions.create_session("admin");
+    let app = build_router(Arc::clone(&state));
+
+    // Ingest two events for the target site.
+    for _ in 0..2 {
+        let payload = serde_json::json!({
+            "d": "erase-valid.com",
+            "n": "pageview",
+            "u": "https://erase-valid.com/"
+        });
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/event")
+                    .header("content-type", "application/json")
+                    .header("user-agent", "Mozilla/5.0 Chrome/120.0")
+                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // Erase within 366-day limit using 2025 calendar year.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/gdpr/erase?site_id=erase-valid.com&start_date=2025-01-01&end_date=2025-12-31")
+                .header("cookie", format!("mm_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "erased");
+}
+
+#[tokio::test]
+async fn test_gdpr_erase_rejects_invalid_site_id() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let token = state.sessions.create_session("admin");
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/gdpr/erase?site_id=bad%20site&start_date=2024-01-01&end_date=2024-01-31")
+                .header("cookie", format!("mm_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_gdpr_erase_rejects_invalid_dates() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let token = state.sessions.create_session("admin");
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/gdpr/erase?site_id=mysite.com&start_date=not-a-date&end_date=2024-01-31")
+                .header("cookie", format!("mm_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_gdpr_erase_rejects_end_before_start() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let token = state.sessions.create_session("admin");
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/gdpr/erase?site_id=mysite.com&start_date=2024-06-01&end_date=2024-01-01")
+                .header("cookie", format!("mm_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_gdpr_erase_rejects_range_over_366_days() {
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let token = state.sessions.create_session("admin");
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/gdpr/erase?site_id=mysite.com&start_date=2020-01-01&end_date=2030-12-31")
+                .header("cookie", format!("mm_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // 10-year range exceeds 366 days — must be rejected.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_gdpr_erase_accessible_via_admin_api_key() {
+    // Admin API key (X-API-Key header) should be accepted by the GDPR erase endpoint.
+    let (state, _dir) = make_test_state_with_password("admin-password");
+    let key = mallard_metrics::api::auth::generate_api_key();
+    state.api_keys.add_key(
+        "admin-key",
+        &key,
+        mallard_metrics::api::auth::ApiKeyScope::Admin,
+    );
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/gdpr/erase?site_id=mysite.com&start_date=2024-01-01&end_date=2024-01-31")
+                .header("x-api-key", &key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
 }

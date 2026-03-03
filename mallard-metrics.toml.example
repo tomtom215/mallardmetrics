@@ -49,9 +49,54 @@ cache_ttl_secs = 60
 # Log output format: "text" or "json"
 log_format = "text"
 
-# Environment variables (not set via TOML):
+
+# ─── GDPR-Friendly Deployment ────────────────────────────────────────────────
+#
+# Enable "GDPR mode" as a single toggle that activates a bundle of privacy-
+# preserving settings.  Each flag can also be set independently for fine-
+# grained control.  See PRIVACY.md for a full explanation of the tradeoffs.
+#
+# gdpr_mode = false
+#
+#   When true, forces the following settings:
+#     strip_referrer_query = true
+#     round_timestamps     = true
+#     suppress_browser_version = true
+#     suppress_os_version  = true
+#     suppress_screen_size = true
+#     geoip_precision (promotes "city" → "country")
+#
+# Fine-grained privacy flags (all default to false):
+#
+# strip_referrer_query = false   # Strip ?query and #fragment from stored referrers
+# round_timestamps     = false   # Round event timestamps to the nearest hour
+# suppress_visitor_id  = false   # Replace HMAC visitor hash with per-request UUID
+#                                # WARNING: breaks unique-visitor counting
+# suppress_browser_version = false  # Store browser name only, not version
+# suppress_os_version  = false   # Store OS name only, not version
+# suppress_screen_size = false   # Omit screen width and device type
+#
+# GeoIP precision ladder (city > region > country > none):
+# geoip_precision = "city"       # Options: "city", "region", "country", "none"
+#
+# Example — GDPR-friendly preset (recommended for EU deployments):
+#
+# [privacy]
+# gdpr_mode       = true
+# retention_days  = 30           # Art. 5(1)(e) storage limitation
+# geoip_precision = "country"    # (redundant when gdpr_mode = true, shown for clarity)
+
+# ─── Environment variables (not set via TOML) ────────────────────────────────
 # MALLARD_SECRET           — HMAC secret for visitor ID hashing (required for production)
 # MALLARD_ADMIN_PASSWORD   — Admin password for dashboard authentication
 # MALLARD_MAX_LOGIN_ATTEMPTS — Override max_login_attempts at runtime
 # MALLARD_LOGIN_LOCKOUT      — Override login_lockout_secs at runtime
+# MALLARD_GDPR_MODE          — Enable GDPR-friendly preset ("true" / "false")
+# MALLARD_STRIP_REFERRER_QUERY — Strip referrer query strings ("true" / "false")
+# MALLARD_ROUND_TIMESTAMPS   — Round timestamps to the hour ("true" / "false")
+# MALLARD_SUPPRESS_VISITOR_ID — Replace HMAC visitor ID with random UUID ("true" / "false")
+# MALLARD_SUPPRESS_BROWSER_VERSION — Store browser name only ("true" / "false")
+# MALLARD_SUPPRESS_OS_VERSION — Store OS name only ("true" / "false")
+# MALLARD_SUPPRESS_SCREEN_SIZE — Omit screen size and device type ("true" / "false")
+# MALLARD_GEOIP_PRECISION    — GeoIP precision level: "city", "region", "country", "none"
 # RUST_LOG                 — Log level filter (e.g., "mallard_metrics=debug,tower_http=info")

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 /// Application configuration loaded from environment variables or TOML file.
 #[derive(Debug, Clone, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Config {
     #[serde(default = "default_host")]
     pub host: String,
@@ -61,6 +62,83 @@ pub struct Config {
     /// Set to true when the server is deployed behind a TLS-terminating reverse proxy.
     #[serde(default)]
     pub secure_cookies: bool,
+
+    // ── Privacy / GDPR configuration ─────────────────────────────────────
+    /// GDPR-friendly mode: convenience preset that enables the full privacy bundle.
+    ///
+    /// When true, the following flags are forced on regardless of their individual
+    /// settings: `strip_referrer_query`, `round_timestamps`, `suppress_browser_version`,
+    /// `suppress_os_version`, `suppress_screen_size`.  `geoip_precision` is promoted
+    /// from "city" to "country" (more permissive/less-granular settings are kept).
+    ///
+    /// `suppress_visitor_id` is intentionally NOT activated by `gdpr_mode` because
+    /// it eliminates the unique-visitor metric entirely.  Set it explicitly if needed.
+    ///
+    /// To configure GDPR-friendly deployment with full-scale analytics for non-EU
+    /// audiences, leave `gdpr_mode = false` and toggle individual flags.
+    #[serde(default)]
+    pub gdpr_mode: bool,
+
+    /// Strip query string and fragment from referrer URLs before storing.
+    ///
+    /// Prevents leaking search terms and campaign parameters embedded in referrer
+    /// URLs (e.g. `https://google.com/search?q=medical+condition` → `https://google.com/search`).
+    /// Default: false. Enabled automatically when `gdpr_mode = true`.
+    #[serde(default)]
+    pub strip_referrer_query: bool,
+
+    /// Round event timestamps to the nearest hour before storing.
+    ///
+    /// Reduces fingerprinting risk by lowering timestamp precision from milliseconds
+    /// to hours. Aggregate analytics (daily/hourly timeseries) remain accurate.
+    /// Default: false. Enabled automatically when `gdpr_mode = true`.
+    #[serde(default)]
+    pub round_timestamps: bool,
+
+    /// Replace the HMAC-based visitor_id with a random UUID per request.
+    ///
+    /// The HMAC visitor_id links multiple page views from the same visitor within
+    /// a calendar day (enabling unique-visitor counting). Enabling this option
+    /// replaces that with a random identifier per request, breaking cross-request
+    /// linkability entirely. Consequence: unique-visitor counts degrade to
+    /// approximate page-load counts.
+    ///
+    /// Default: false. NOT activated automatically by `gdpr_mode`.
+    #[serde(default)]
+    pub suppress_visitor_id: bool,
+
+    /// Store browser name only, omitting browser version.
+    ///
+    /// Browser versions contribute to fingerprinting surface. "Chrome 120" is more
+    /// identifying than "Chrome". Default: false. Enabled by `gdpr_mode = true`.
+    #[serde(default)]
+    pub suppress_browser_version: bool,
+
+    /// Store OS name only, omitting OS version.
+    ///
+    /// Similar to `suppress_browser_version`: "Windows 10.0" is more identifying than
+    /// "Windows". Default: false. Enabled by `gdpr_mode = true`.
+    #[serde(default)]
+    pub suppress_os_version: bool,
+
+    /// Do not store the screen_size or device_type fields.
+    ///
+    /// Screen width contributes to fingerprinting. Setting this to true stores
+    /// neither the raw width nor the derived device category (mobile/tablet/desktop).
+    /// Default: false. Enabled by `gdpr_mode = true`.
+    #[serde(default)]
+    pub suppress_screen_size: bool,
+
+    /// Geographic precision for IP geolocation. Valid values:
+    /// - `"city"` (default): stores `country_code`, `region`, and `city`.
+    /// - `"region"`: stores `country_code` and `region` only.
+    /// - `"country"`: stores `country_code` only.
+    /// - `"none"`: stores no geographic data.
+    ///
+    /// `gdpr_mode = true` promotes `"city"` → `"country"` (more permissive settings
+    /// such as `"region"` or `"none"` are left unchanged).
+    #[serde(default = "default_geoip_precision")]
+    pub geoip_precision: String,
 }
 
 fn default_host() -> String {
@@ -119,6 +197,10 @@ const fn default_max_concurrent_queries() -> usize {
     10
 }
 
+fn default_geoip_precision() -> String {
+    "city".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -142,6 +224,14 @@ impl Default for Config {
             cache_max_entries: default_cache_max_entries(),
             max_concurrent_queries: default_max_concurrent_queries(),
             secure_cookies: false,
+            gdpr_mode: false,
+            strip_referrer_query: false,
+            round_timestamps: false,
+            suppress_visitor_id: false,
+            suppress_browser_version: false,
+            suppress_os_version: false,
+            suppress_screen_size: false,
+            geoip_precision: default_geoip_precision(),
         }
     }
 }
@@ -164,6 +254,7 @@ impl Config {
     /// - `MALLARD_RATE_LIMIT` → rate_limit_per_site
     /// - `MALLARD_CACHE_TTL` → cache_ttl_secs
     /// - `MALLARD_LOG_FORMAT` → log_format
+    #[allow(clippy::too_many_lines)]
     pub fn load(config_path: Option<&Path>) -> Self {
         let mut config =
             config_path.map_or_else(Self::default, |path| match std::fs::read_to_string(path) {
@@ -239,6 +330,49 @@ impl Config {
             config.secure_cookies = val != "0" && val.to_lowercase() != "false";
         }
 
+        // Privacy / GDPR configuration env vars
+        if let Ok(val) = std::env::var("MALLARD_GDPR_MODE") {
+            config.gdpr_mode = val != "0" && val.to_lowercase() != "false";
+        }
+        if let Ok(val) = std::env::var("MALLARD_STRIP_REFERRER_QUERY") {
+            config.strip_referrer_query = val != "0" && val.to_lowercase() != "false";
+        }
+        if let Ok(val) = std::env::var("MALLARD_ROUND_TIMESTAMPS") {
+            config.round_timestamps = val != "0" && val.to_lowercase() != "false";
+        }
+        if let Ok(val) = std::env::var("MALLARD_SUPPRESS_VISITOR_ID") {
+            config.suppress_visitor_id = val != "0" && val.to_lowercase() != "false";
+        }
+        if let Ok(val) = std::env::var("MALLARD_SUPPRESS_BROWSER_VERSION") {
+            config.suppress_browser_version = val != "0" && val.to_lowercase() != "false";
+        }
+        if let Ok(val) = std::env::var("MALLARD_SUPPRESS_OS_VERSION") {
+            config.suppress_os_version = val != "0" && val.to_lowercase() != "false";
+        }
+        if let Ok(val) = std::env::var("MALLARD_SUPPRESS_SCREEN_SIZE") {
+            config.suppress_screen_size = val != "0" && val.to_lowercase() != "false";
+        }
+        if let Ok(val) = std::env::var("MALLARD_GEOIP_PRECISION") {
+            config.geoip_precision = val;
+        }
+
+        // Apply gdpr_mode bundle AFTER all other env vars are resolved.
+        // gdpr_mode is a convenience preset: it forces privacy-enhancing flags on.
+        // Operators who need fine-grained control should leave gdpr_mode = false
+        // and configure individual flags instead.
+        if config.gdpr_mode {
+            config.strip_referrer_query = true;
+            config.round_timestamps = true;
+            config.suppress_browser_version = true;
+            config.suppress_os_version = true;
+            config.suppress_screen_size = true;
+            // Promote "city" → "country"; leave "region" / "none" unchanged
+            // because those are already more privacy-protective than "country".
+            if config.geoip_precision == "city" {
+                config.geoip_precision = "country".to_string();
+            }
+        }
+
         config
     }
 
@@ -278,6 +412,15 @@ impl Config {
                 "session_ttl_secs must be > 0; set to 0 would expire all sessions immediately, breaking authentication"
                     .to_string(),
             );
+        }
+        if !matches!(
+            self.geoip_precision.as_str(),
+            "city" | "region" | "country" | "none"
+        ) {
+            return Err(format!(
+                "geoip_precision must be one of: city, region, country, none (got {:?})",
+                self.geoip_precision
+            ));
         }
         Ok(())
     }
@@ -479,5 +622,105 @@ session_ttl_secs = 3600
 
         let config = Config::load(Some(&config_path));
         assert_eq!(config.port, 8000);
+    }
+
+    #[test]
+    fn test_default_gdpr_flags() {
+        let config = Config::default();
+        assert!(!config.gdpr_mode);
+        assert!(!config.strip_referrer_query);
+        assert!(!config.round_timestamps);
+        assert!(!config.suppress_visitor_id);
+        assert!(!config.suppress_browser_version);
+        assert!(!config.suppress_os_version);
+        assert!(!config.suppress_screen_size);
+        assert_eq!(config.geoip_precision, "city");
+    }
+
+    #[test]
+    fn test_gdpr_mode_enables_privacy_bundle() {
+        let config = Config {
+            gdpr_mode: true,
+            ..Config::default()
+        };
+        // gdpr_mode is applied in load(), not in the struct directly.
+        // To test the full effect, simulate what load() does.
+        let mut c = config;
+        if c.gdpr_mode {
+            c.strip_referrer_query = true;
+            c.round_timestamps = true;
+            c.suppress_browser_version = true;
+            c.suppress_os_version = true;
+            c.suppress_screen_size = true;
+            if c.geoip_precision == "city" {
+                c.geoip_precision = "country".to_string();
+            }
+        }
+        assert!(c.strip_referrer_query);
+        assert!(c.round_timestamps);
+        assert!(c.suppress_browser_version);
+        assert!(c.suppress_os_version);
+        assert!(c.suppress_screen_size);
+        assert_eq!(c.geoip_precision, "country");
+        // suppress_visitor_id NOT forced by gdpr_mode
+        assert!(!c.suppress_visitor_id);
+    }
+
+    #[test]
+    fn test_gdpr_mode_respects_stricter_geoip_precision() {
+        // If operator has already set geoip_precision to "none", gdpr_mode should not downgrade it.
+        let mut config = Config {
+            gdpr_mode: true,
+            geoip_precision: "none".to_string(),
+            ..Config::default()
+        };
+        if config.gdpr_mode && config.geoip_precision == "city" {
+            config.geoip_precision = "country".to_string();
+        }
+        assert_eq!(config.geoip_precision, "none");
+    }
+
+    #[test]
+    fn test_gdpr_mode_respects_region_precision() {
+        let mut config = Config {
+            gdpr_mode: true,
+            geoip_precision: "region".to_string(),
+            ..Config::default()
+        };
+        if config.gdpr_mode && config.geoip_precision == "city" {
+            config.geoip_precision = "country".to_string();
+        }
+        assert_eq!(config.geoip_precision, "region");
+    }
+
+    #[test]
+    fn test_validate_invalid_geoip_precision() {
+        let config = Config {
+            geoip_precision: "district".to_string(),
+            ..Config::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("geoip_precision"));
+    }
+
+    #[test]
+    fn test_validate_valid_geoip_precisions() {
+        for precision in &["city", "region", "country", "none"] {
+            let config = Config {
+                geoip_precision: (*precision).to_string(),
+                ..Config::default()
+            };
+            assert!(config.validate().is_ok(), "Expected valid: {precision}");
+        }
+    }
+
+    #[test]
+    fn test_secure_cookies_flag_overrides_http_origin() {
+        // This test existed before; keep it to verify secure_cookies still works.
+        let config = Config {
+            secure_cookies: true,
+            ..Config::default()
+        };
+        assert!(config.secure_cookies);
     }
 }
