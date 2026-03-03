@@ -2,14 +2,14 @@
 
 ## Storage Layout
 
-Events are stored as date-partitioned, ZSTD-compressed Parquet files:
+Events are stored as date-partitioned, ZSTD-compressed Parquet files under `data_dir/events/`:
 
 ```
 data/events/
 ├── site_id=example.com/
 │   ├── date=2024-01-15/
-│   │   ├── 0001.parquet   # first flush for this day
-│   │   └── 0002.parquet   # second flush for this day
+│   │   ├── 0001.parquet   ← first flush for this day
+│   │   └── 0002.parquet   ← second flush for this day
 │   └── date=2024-01-16/
 │       └── 0001.parquet
 └── site_id=other.org/
@@ -17,36 +17,39 @@ data/events/
         └── 0001.parquet
 ```
 
-Each Parquet file contains one batch of flushed events for a specific site and date. Files are numbered sequentially within each partition.
+Each Parquet file contains one batch of flushed events for a specific site and date. Files are numbered sequentially within each partition. Parquet files are self-describing and can be read by any Parquet-compatible tool.
 
 ---
 
 ## Buffer and Flush Lifecycle
 
-```
-Events arrive → in-memory Vec<Event> buffer
-                    │
-         threshold or timer fires
-                    │
-                    ▼
-           INSERT INTO events table (DuckDB)
-                    │
-                    ▼
-         COPY TO Parquet file (ZSTD)
-                    │
-                    ▼
-         DELETE FROM events table
-                    │
-                    ▼
-         Refresh events_all view
+```mermaid
+flowchart TD
+    EVENT["Incoming Event\nPOST /api/event"]
+    EVENT --> BUF["In-Memory Buffer\nVec&lt;Event&gt;"]
+
+    BUF --> T1{"Count reached\nflush_event_count?"}
+    BUF --> T2{"Periodic timer\nevery flush_interval_secs?"}
+    BUF --> T3{"SIGINT or SIGTERM\ngraceful shutdown?"}
+
+    T1 -->|"Yes"| FLUSH
+    T2 -->|"Yes"| FLUSH
+    T3 -->|"Yes"| FLUSH
+
+    FLUSH["Flush — spawn_blocking\nDuckDB Appender API\nbatch column insert"]
+    FLUSH --> PARQUET["COPY TO Parquet\nZSTD compression\ndate-partitioned file"]
+    PARQUET --> DELETE["DELETE FROM events\nhot table cleared"]
+    DELETE --> VIEW["Refresh events_all VIEW\nglobed over new Parquet files"]
+    VIEW --> READY(["All data queryable\nevents_all VIEW\nhot union cold"])
 ```
 
-After a flush, the hot `events` table is cleared. The `events_all` view unions the (now-empty) hot table with the newly written Parquet files, keeping all data queryable.
+> **Failure safety:** If the Appender insertion fails, drained events are restored to the front of the buffer and the flush returns an error. No events are lost due to a failed flush attempt.
 
 **Flush triggers:**
+
 1. Event count reaches `flush_event_count` (default 1000).
-2. Periodic timer fires every `flush_interval_secs` (default 60 seconds).
-3. Graceful shutdown (bounded by `shutdown_timeout_secs`).
+2. Periodic timer fires every `flush_interval_secs` (default 60 seconds). Runs in `spawn_blocking` to avoid blocking the async runtime.
+3. Graceful shutdown — bounded by `shutdown_timeout_secs` (default 30 seconds).
 
 ---
 
@@ -67,16 +70,16 @@ To keep data indefinitely, set `retention_days = 0` (the default).
 
 ### GDPR Right to Erasure
 
-Mallard Metrics stores no PII (IP addresses are discarded after hashing, visitor IDs are pseudonymous and daily-rotating). There is no direct mechanism to delete a specific visitor's data because the visitor ID cannot be reverse-mapped to an individual.
+Mallard Metrics stores no PII (IP addresses are discarded after hashing; visitor IDs are pseudonymous and daily-rotating). There is no mechanism to delete a specific visitor's data because the visitor ID cannot be reverse-mapped to an individual.
 
 ---
 
-## Backup
+## Backup and Restore
 
-Parquet files are self-describing and can be read by any Parquet-compatible tool (DuckDB, Apache Spark, pandas, etc.). To back up:
+Parquet files are self-describing and portable. To back up:
 
 ```bash
-# Copy data directory to backup location
+# Sync data directory to a backup location
 rsync -a --checksum /data/events/ /backup/mallard-events/
 
 # Or with rclone to S3
@@ -89,37 +92,46 @@ To restore:
 rsync -a /backup/mallard-events/ /data/events/
 ```
 
-After restore, restart the Mallard Metrics server. The `events_all` view will automatically pick up the restored Parquet files.
+After restore, restart Mallard Metrics. The `events_all` VIEW automatically picks up all Parquet files on startup.
+
+> **Tip:** Include `data/mallard.duckdb` and `data/mallard.duckdb.wal` in your backups to preserve any hot (not yet flushed) events.
 
 ---
 
 ## Inspecting Data with DuckDB CLI
 
-You can query Parquet files directly with the DuckDB CLI:
+You can query Parquet files directly with the DuckDB CLI, independent of the Mallard Metrics server:
 
 ```bash
-# Install DuckDB CLI
-# https://duckdb.org/docs/installation/
-
 duckdb
 
--- Query all data for a site
+-- Daily visitor and pageview counts for a site
 SELECT
     CAST(timestamp AS DATE) AS date,
-    COUNT(DISTINCT visitor_id) AS visitors,
-    COUNT(*) FILTER (WHERE event_name = 'pageview') AS pageviews
+    COUNT(DISTINCT visitor_id)                            AS visitors,
+    COUNT(*) FILTER (WHERE event_name = 'pageview')       AS pageviews
 FROM read_parquet('data/events/site_id=example.com/**/*.parquet')
 GROUP BY date
-ORDER BY date;
+ORDER BY date DESC;
 
--- Top pages
+-- Top pages last 30 days
 SELECT pathname, COUNT(*) AS views
 FROM read_parquet('data/events/site_id=example.com/**/*.parquet')
 WHERE event_name = 'pageview'
-  AND CAST(timestamp AS DATE) >= '2024-01-01'
+  AND CAST(timestamp AS DATE) >= CURRENT_DATE - INTERVAL 30 DAYS
 GROUP BY pathname
 ORDER BY views DESC
 LIMIT 20;
+
+-- Revenue by product
+SELECT
+    json_extract_string(props, '$.product') AS product,
+    SUM(revenue_amount)                      AS total_revenue,
+    COUNT(*)                                 AS transactions
+FROM read_parquet('data/events/site_id=example.com/**/*.parquet')
+WHERE event_name = 'purchase'
+GROUP BY product
+ORDER BY total_revenue DESC;
 ```
 
 ---
@@ -152,6 +164,6 @@ The events table schema (also the Parquet file schema):
 | `country_code` | VARCHAR(2) | Yes | ISO 3166-1 alpha-2 country code |
 | `region` | VARCHAR | Yes | Region/state name |
 | `city` | VARCHAR | Yes | City name |
-| `props` | VARCHAR | Yes | Custom properties (JSON string) |
+| `props` | VARCHAR | Yes | Custom properties (JSON string, queryable via `json_extract`) |
 | `revenue_amount` | DECIMAL(12,2) | Yes | Revenue amount |
 | `revenue_currency` | VARCHAR(3) | Yes | ISO 4217 currency code |

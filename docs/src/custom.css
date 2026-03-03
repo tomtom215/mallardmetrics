@@ -1,58 +1,306 @@
-/* Mallard Metrics documentation custom styles */
+/* ================================================================
+   Mallard Metrics — Pond Depth Brand Theme
+   ================================================================
+   Palette:
+     Primary   deep teal   #0D7377
+     Mid teal              #14919B
+     Teal tint             #E0F2F1
+     Secondary midnight    #14213D
+     Navy mid              #2C3E50
+     Accent gold           #F5C842
+     Gold light            #FFF9E8
+   ================================================================ */
 
+/* ---- CSS Custom Properties ---- */
 :root {
-    --mallard-teal: #0f9488;
-    --mallard-teal-light: #14b8a6;
-    --mallard-navy: #1e3a5f;
+  /* Brand colours */
+  --mm-teal:        #0D7377;
+  --mm-teal-mid:    #14919B;
+  --mm-teal-light:  #E0F2F1;
+  --mm-teal-faint:  #F0FAFB;
+
+  --mm-navy:        #14213D;
+  --mm-navy-mid:    #2C3E50;
+  --mm-navy-light:  #EEF2F7;
+
+  --mm-gold:        #F5C842;
+  --mm-gold-mid:    #F9D96B;
+  --mm-gold-light:  #FFF9E8;
+  --mm-gold-dark:   #C9971A;
+
+  /* Neutrals */
+  --mm-white:       #FFFFFF;
+  --mm-off-white:   #F8FAFB;
+  --mm-gray-light:  #E4EAF0;
+  --mm-gray-mid:    #8FA3B1;
+  --mm-gray:        #5C6F7E;
+  --mm-border:      #D4DEE6;
+
+  /* Semantic */
+  --mm-text:        #2C3E50;
+  --mm-text-muted:  #5C6F7E;
+
+  /* Spacing */
+  --mm-radius-sm:   4px;
+  --mm-radius:      6px;
+  --mm-radius-lg:   10px;
 }
 
-/* Wider content area */
+/* ----------------------------------------------------------------
+   Layout
+   ---------------------------------------------------------------- */
 .content main {
-    max-width: 900px;
+  max-width: 920px;
 }
 
-/* Colored header accent */
+.content p {
+  line-height: 1.75;
+  color: var(--mm-text);
+}
+
+/* ----------------------------------------------------------------
+   Typography — Headers
+   ---------------------------------------------------------------- */
 h1 {
-    border-bottom: 3px solid var(--mallard-teal);
-    padding-bottom: 0.3em;
+  border-bottom: 3px solid var(--mm-teal);
+  padding-bottom: 0.4em;
+  color: var(--mm-navy);
+  font-weight: 700;
+  letter-spacing: -0.3px;
+  margin-top: 1.5em;
 }
 
-/* Table improvements */
+h2 {
+  border-bottom: 1px solid var(--mm-teal-light);
+  padding-bottom: 0.2em;
+  color: var(--mm-navy);
+  font-weight: 600;
+  margin-top: 2.25em;
+}
+
+h3 {
+  color: var(--mm-teal);
+  font-weight: 600;
+  margin-top: 1.75em;
+}
+
+h4 {
+  color: var(--mm-navy-mid);
+  font-weight: 600;
+  margin-top: 1.25em;
+}
+
+/* ----------------------------------------------------------------
+   Navigation / Sidebar
+   ---------------------------------------------------------------- */
+.menu-title {
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  color: var(--mm-teal) !important;
+  font-size: 1.05em;
+}
+
+.chapter li.chapter-item a {
+  padding: 4px 10px;
+  border-radius: var(--mm-radius-sm);
+  transition: color 0.15s ease, background 0.15s ease;
+}
+
+.chapter li.chapter-item a:hover {
+  color: var(--mm-teal) !important;
+  background: var(--mm-teal-faint);
+}
+
+.chapter li.chapter-item.expanded > a {
+  color: var(--mm-teal) !important;
+  font-weight: 600;
+}
+
+/* ----------------------------------------------------------------
+   Tables
+   ---------------------------------------------------------------- */
 table {
-    border-collapse: collapse;
-    width: 100%;
-    margin: 1em 0;
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1.25em 0;
+  border: 1px solid var(--mm-border);
+  border-radius: var(--mm-radius);
+  overflow: hidden;
+  font-size: 0.94em;
+  box-shadow: 0 1px 4px rgba(20, 33, 61, 0.06);
 }
 
 th {
-    background-color: var(--mallard-teal);
-    color: #fff;
-    text-align: left;
-    padding: 0.5em 0.75em;
+  background: var(--mm-navy);
+  color: var(--mm-white);
+  text-align: left;
+  padding: 0.6em 1em;
+  font-size: 0.82em;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
 }
 
 td {
-    padding: 0.45em 0.75em;
-    border-bottom: 1px solid #ddd;
+  padding: 0.52em 1em;
+  border-bottom: 1px solid var(--mm-border);
+  color: var(--mm-text);
 }
 
-/* Inline code */
+tr:last-child td {
+  border-bottom: none;
+}
+
+tr:nth-child(even) td {
+  background: var(--mm-off-white);
+}
+
+tr:hover td {
+  background: var(--mm-teal-faint);
+}
+
+/* ----------------------------------------------------------------
+   Inline code & code blocks
+   ---------------------------------------------------------------- */
 code {
-    font-size: 0.88em;
-    padding: 0.1em 0.3em;
-    border-radius: 3px;
+  font-size: 0.87em;
+  padding: 0.15em 0.4em;
+  border-radius: var(--mm-radius-sm);
+  background: var(--mm-teal-light);
+  color: var(--mm-navy);
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
 }
 
-/* Navbar brand */
-.menu-title {
-    font-weight: 700;
-    letter-spacing: 0.5px;
+pre {
+  border: 1px solid var(--mm-border);
+  border-left: 4px solid var(--mm-teal);
+  border-radius: var(--mm-radius);
+  overflow-x: auto;
 }
 
-/* Note/warning callouts */
+pre code {
+  background: none;
+  padding: 0;
+  color: inherit;
+  font-size: 0.88em;
+}
+
+/* ----------------------------------------------------------------
+   Blockquote / Callouts
+   ---------------------------------------------------------------- */
 blockquote {
-    border-left: 4px solid var(--mallard-teal);
-    padding: 0.5em 1em;
-    margin: 1em 0;
-    background: rgba(15, 148, 136, 0.07);
+  border-left: 4px solid var(--mm-teal);
+  background: var(--mm-teal-light);
+  padding: 0.8em 1.25em;
+  margin: 1.5em 0;
+  border-radius: 0 var(--mm-radius) var(--mm-radius) 0;
+  color: var(--mm-navy-mid);
+}
+
+blockquote p {
+  margin: 0;
+  line-height: 1.65;
+}
+
+blockquote p + p {
+  margin-top: 0.5em;
+}
+
+blockquote strong {
+  color: var(--mm-navy);
+}
+
+/* ----------------------------------------------------------------
+   Horizontal rules
+   ---------------------------------------------------------------- */
+hr {
+  border: none;
+  border-top: 2px solid var(--mm-teal-light);
+  margin: 2.25em 0;
+}
+
+/* ----------------------------------------------------------------
+   Links
+   ---------------------------------------------------------------- */
+a {
+  color: var(--mm-teal);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--mm-teal-mid);
+  text-decoration: underline;
+}
+
+/* ----------------------------------------------------------------
+   Lists
+   ---------------------------------------------------------------- */
+li {
+  line-height: 1.7;
+}
+
+/* ----------------------------------------------------------------
+   Mermaid diagram containers
+   ---------------------------------------------------------------- */
+.mermaid {
+  background: var(--mm-off-white);
+  border: 1px solid var(--mm-border);
+  border-radius: var(--mm-radius-lg);
+  padding: 1.75em 1.5em;
+  margin: 1.75em 0;
+  overflow-x: auto;
+  text-align: center;
+}
+
+.mermaid svg {
+  max-width: 100%;
+  height: auto;
+  display: inline-block;
+}
+
+/* ----------------------------------------------------------------
+   Checkboxes (task lists in .md)
+   ---------------------------------------------------------------- */
+input[type="checkbox"] {
+  margin-right: 0.5em;
+  accent-color: var(--mm-teal);
+}
+
+/* ----------------------------------------------------------------
+   Summary / search bar
+   ---------------------------------------------------------------- */
+#searchbar {
+  border: 1px solid var(--mm-border) !important;
+  border-radius: var(--mm-radius-sm) !important;
+}
+
+#searchbar:focus {
+  border-color: var(--mm-teal) !important;
+  box-shadow: 0 0 0 3px rgba(13, 115, 119, 0.15) !important;
+}
+
+/* ----------------------------------------------------------------
+   Top-of-page feature banner (used in index.md via blockquote)
+   ---------------------------------------------------------------- */
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+  margin: 1.5em 0;
+}
+
+/* ----------------------------------------------------------------
+   Print / accessibility tweaks
+   ---------------------------------------------------------------- */
+@media (prefers-reduced-motion: reduce) {
+  .chapter li.chapter-item a {
+    transition: none;
+  }
+}
+
+@media print {
+  .mermaid {
+    border: 1px solid #ccc;
+    background: white;
+  }
 }
