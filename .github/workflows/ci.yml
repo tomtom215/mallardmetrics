@@ -115,11 +115,13 @@ jobs:
           toolchain: "1.93.1"
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-      - uses: taiki-e/cargo-llvm-cov@88655648110d83d256f8c26bd201fd7135564cad # v0.8.4
+      # taiki-e/cargo-llvm-cov has no action.yml — it is a binary tool, not a
+      # GitHub Action.  Use taiki-e/install-action (the correct action) to
+      # install the binary, then invoke it as a shell command.
+      - uses: taiki-e/install-action@edba51d32f66935a112c0516fec65a13d420cbc6 # v2.68.17
         with:
-          all-features: true
-          lcov: true
-          output-path: lcov.info
+          tool: cargo-llvm-cov
+      - run: cargo llvm-cov --all-features --lcov --output-path lcov.info
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-report
