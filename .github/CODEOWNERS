@@ -1,0 +1,31 @@
+# Mallard Metrics — Code Owners
+#
+# These owners are automatically requested for review when a pull request
+# modifies the files listed below.
+#
+# Syntax: <pattern> <owner> [<owner> ...]
+# See: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner for everything not matched below
+* @tomtom215
+
+# Security-sensitive files require explicit owner review
+src/api/auth.rs                       @tomtom215
+src/ingest/visitor_id.rs              @tomtom215
+src/ingest/handler.rs                 @tomtom215
+src/server.rs                         @tomtom215
+SECURITY.md                           @tomtom215
+deny.toml                             @tomtom215
+
+# CI / deployment changes affect reproducibility and supply-chain security
+.github/workflows/                    @tomtom215
+Dockerfile                            @tomtom215
+deploy/                               @tomtom215
+
+# Storage layer — data integrity and durability
+src/storage/                          @tomtom215
+src/ingest/buffer.rs                  @tomtom215
+
+# Documentation site
+docs/                                 @tomtom215
+README.md                             @tomtom215

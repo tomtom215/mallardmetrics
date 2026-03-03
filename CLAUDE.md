@@ -650,3 +650,34 @@ cargo bench
 - 0 clippy warnings (`cargo clippy --all-targets`)
 - 0 formatting violations (`cargo fmt -- --check`)
 - Documentation builds without errors (`cargo doc --no-deps`)
+
+### Session 16: Zero-Compromise Enterprise Audit
+
+**Scope:** Full cross-file audit against source of truth (config.rs, server.rs, ci.yml) to find every gap preventing a portfolio-grade, fully auditable repository. Eight prior deploy bugs were fixed in a preceding commit; this session addresses the remaining gaps found during the comprehensive source review.
+
+**Security fixes:**
+- **HSTS `preload` directive missing (`src/server.rs`)** — `strict-transport-security` header was `max-age=31536000; includeSubDomains` without the `preload` directive. Added `; preload` to make the header eligible for browser HSTS preload lists (hstspreload.org). Updated `test_hsts_header_present` to also assert `preload` is present.
+- **`security.txt` placeholder contact (`src/server.rs`)** — `Contact:` field used `mailto:security@mallard-metrics.example` (a `.example` domain, not a real address) and the comment pointed to `mallard-metrics/mallard-metrics` (wrong repo). Fixed both: `Contact: https://github.com/tomtom215/mallardmetrics/security/advisories/new` (real GitHub private advisory form), correct repo URL in comment, and added a "Do NOT open a public issue" note consistent with SECURITY.md.
+- **`SECURITY.md` HSTS row** — Threat model table said "1-year max-age" only. Updated to document all three required directives: `max-age`, `includeSubDomains`, and `preload`.
+
+**CI improvements:**
+- **`dtolnay/rust-toolchain@stable` not SHA-pinned** — All six uses of `dtolnay/rust-toolchain` across all CI jobs were using the floating `@stable` tag. Pinned to `efa25f7f19611383d5b0ccf2d1c8914531636bf9` (verified SHA). SECURITY.md claimed "All GitHub Actions pinned to commit SHAs" which was false until this fix.
+- **`cargo install cargo-deny --locked` slow and unversioned** — Replaced with `EmbarkStudios/cargo-deny-action@3fd3802e88374d3fe9159b834c7714ec57d6c979` (v2.0.15, verified SHA). Pre-compiled action runs ~60s faster; also removes the unversioned binary install.
+- **`cargo install cargo-llvm-cov` slow and unversioned** — Replaced with `taiki-e/cargo-llvm-cov@88655648110d83d256f8c26bd201fd7135564cad` (v0.8.4, verified SHA). Pre-compiled action.
+- **Docker job had no image scanning** — Added `aquasecurity/trivy-action@97e0b3872f55f89b95b2f65b3dbab56962816478` (v0.34.2) to the `Docker Build & Scan` job. Scans for CRITICAL and HIGH CVEs in the built image; fails CI on findings. `ignore-unfixed: true` prevents noise from unpatched upstream vulnerabilities.
+
+**Repository community health files (all new):**
+- **`.github/ISSUE_TEMPLATE/bug_report.yml`** — Structured GitHub Issue Form for bug reports. Includes pre-flight checklist (no duplicates, not a security vuln, using latest version), deployment method selector, log attachment, and reproduction steps.
+- **`.github/ISSUE_TEMPLATE/feature_request.yml`** — Structured form for feature requests. Includes problem statement, proposed solution, alternatives considered, feature area selector, and contribution willingness.
+- **`.github/ISSUE_TEMPLATE/config.yml`** — Disables blank issues (`blank_issues_enabled: false`). Contact links route security vulnerabilities to the private advisory form, general questions to Discussions, and documentation to the Pages site.
+- **`.github/pull_request_template.md`** — PR checklist matching project standards: all tests pass, zero clippy, zero fmt, docs build, security checklist (SQL injection, path traversal, PII, panics), documentation updated, before/after evidence.
+- **`.github/CODEOWNERS`** — Code ownership assignments. Security-sensitive files (`auth.rs`, `visitor_id.rs`, `handler.rs`, `server.rs`, `SECURITY.md`, `deny.toml`), CI/deployment files, and storage layer all require `@tomtom215` review.
+- **`CODE_OF_CONDUCT.md`** — Contributor Covenant 2.1 with project-specific enforcement process (private GitHub discussion for reports) and a three-tier enforcement table (minor → warning, repeated → temp ban, severe → permanent ban).
+
+**Test results:**
+- 249 unit tests passing (`cargo test --lib`)
+- 62 integration tests passing (`cargo test --test ingest_test`)
+- Total: 311 tests, 0 failures, 0 ignored
+- 0 clippy warnings (`cargo clippy --all-targets`)
+- 0 formatting violations (`cargo fmt -- --check`)
+- Documentation builds without errors (`cargo doc --no-deps`)
