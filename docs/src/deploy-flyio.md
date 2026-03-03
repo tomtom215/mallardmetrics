@@ -152,18 +152,22 @@ primary_region = "ord"    # Chicago. See: fly platform regions
 
 [env]
   # Non-secret configuration — secrets go in fly secrets (see below)
-  MALLARD_DATA_DIR             = "/data"
-  MALLARD_HOST                 = "0.0.0.0"
-  MALLARD_PORT                 = "8080"
-  MALLARD_LOG_FORMAT           = "json"
-  MALLARD_FILTER_BOTS          = "true"
-  MALLARD_SECURE_COOKIES       = "true"
-  MALLARD_RETENTION_DAYS       = "365"
-  MALLARD_RATE_LIMIT_PER_SITE  = "200"
-  MALLARD_CACHE_TTL_SECS       = "300"
-  MALLARD_MAX_LOGIN_ATTEMPTS   = "5"
-  MALLARD_LOGIN_LOCKOUT        = "300"
-  RUST_LOG                     = "mallard_metrics=info,tower_http=warn"
+  # IMPORTANT: env var names must match config.rs exactly:
+  #   MALLARD_RATE_LIMIT  → config.rate_limit_per_site  (NOT _PER_SITE suffix)
+  #   MALLARD_CACHE_TTL   → config.cache_ttl_secs        (NOT _SECS suffix)
+  #   MALLARD_GEOIP_DB    → config.geoip_db_path          (NOT _PATH suffix)
+  MALLARD_DATA_DIR           = "/data"
+  MALLARD_HOST               = "0.0.0.0"
+  MALLARD_PORT               = "8080"
+  MALLARD_LOG_FORMAT         = "json"
+  MALLARD_FILTER_BOTS        = "true"
+  MALLARD_SECURE_COOKIES     = "true"
+  MALLARD_RETENTION_DAYS     = "365"
+  MALLARD_RATE_LIMIT         = "200"
+  MALLARD_CACHE_TTL          = "300"
+  MALLARD_MAX_LOGIN_ATTEMPTS = "5"
+  MALLARD_LOGIN_LOCKOUT      = "300"
+  RUST_LOG                   = "mallard_metrics=info,tower_http=warn"
 
 [http_service]
   internal_port       = 8080

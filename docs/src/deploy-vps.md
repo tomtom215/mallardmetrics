@@ -481,7 +481,7 @@ All configuration is in `deploy/.env`. The file is created by `setup.sh` from `d
 | `MALLARD_MAX_CONCURRENT_QUERIES` | `10` | DuckDB concurrency cap |
 | `MALLARD_MAX_LOGIN_ATTEMPTS` | `5` | Failed logins before IP lockout |
 | `MALLARD_LOGIN_LOCKOUT` | `300` | Lockout duration (seconds) |
-| `MALLARD_GEOIP_DB_PATH` | _(blank)_ | Path to MaxMind GeoLite2-City.mmdb |
+| `MALLARD_GEOIP_DB` | _(blank)_ | Path to MaxMind GeoLite2-City.mmdb (inside container) |
 
 After editing `.env`, restart the stack:
 
@@ -608,7 +608,7 @@ Mallard supports MaxMind GeoLite2-City for country/region/city resolution.
    ```
 4. Update `deploy/.env`:
    ```
-   MALLARD_GEOIP_DB_PATH=/data/GeoLite2-City.mmdb
+   MALLARD_GEOIP_DB=/data/GeoLite2-City.mmdb
    ```
 5. Restart Mallard:
    ```bash

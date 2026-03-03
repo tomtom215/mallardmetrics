@@ -303,7 +303,12 @@ else
         echo "${LUKS_NAME}  ${LUKS_IMAGE}  ${LUKS_KEYFILE}  luks,nofail" >> /etc/crypttab
     fi
     if ! grep -q "$DATA_DIR" /etc/fstab 2>/dev/null; then
-        echo "/dev/mapper/${LUKS_NAME}  ${DATA_DIR}  ext4  defaults,nofail,x-systemd.requires=dev-mapper-${LUKS_NAME}.device  0 0" >> /etc/fstab
+        # nofail: boot continues even if the LUKS device fails to appear.
+        # Systemd automatically orders the mount after the cryptsetup service
+        # via the device unit dependency — no x-systemd.requires needed.
+        # (x-systemd.requires with a literal hyphen would not match the
+        #  systemd-escaped unit name and would be silently ignored.)
+        echo "/dev/mapper/${LUKS_NAME}  ${DATA_DIR}  ext4  defaults,nofail  0 0" >> /etc/fstab
     fi
     ok "LUKS auto-mount configured via /etc/crypttab and /etc/fstab."
 fi

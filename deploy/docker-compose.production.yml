@@ -5,15 +5,16 @@
 # Usage:
 #   1. Copy deploy/.env.example → deploy/.env and fill in every value.
 #   2. Run deploy/setup.sh to provision the host (LUKS, firewall, Docker).
-#   3. From the deploy/ directory:
-#        docker compose -f docker-compose.production.yml up -d
+#   3. From the repo root:
+#        docker compose -f deploy/docker-compose.production.yml --env-file deploy/.env up -d
 #
 # Architecture:
-#   Internet → Caddy (TLS termination, reverse proxy)
-#            → mallard-metrics (analytics backend, no public port)
+#   Internet → caddy_external network → Caddy (TLS, reverse proxy)
+#                                     → proxy network (internal-only)
+#                                     → mallard-metrics (no internet access)
 #
 # Data is stored on the host at MALLARD_DATA_HOST_DIR (default: /srv/mallard/data).
-# Run setup.sh first — it mounts that path on a LUKS-encrypted container.
+# Run deploy/setup.sh first — it mounts that path on a LUKS-encrypted container.
 # =============================================================================
 
 name: mallard-production
@@ -35,19 +36,23 @@ services:
     container_name: mallard-caddy
     restart: unless-stopped
 
-    # Drop all Linux capabilities; re-add only what's needed to bind port 80/443.
+    # Drop all Linux capabilities; re-add only what's needed to bind 80/443.
     cap_drop: [ALL]
     cap_add: [NET_BIND_SERVICE]
 
     security_opt:
       - no-new-privileges:true
 
-    # Read-only root FS; Caddy needs /tmp for transient state.
+    # Read-only root FS. Caddy needs /tmp; /data and /config are named volumes.
     read_only: true
     tmpfs:
       - /tmp:size=32m,mode=1777
 
+    # Caddy is on BOTH networks:
+    #   caddy_external — faces the internet (ACME, incoming connections)
+    #   proxy          — reaches Mallard on the internal network
     networks:
+      - caddy_external
       - proxy
 
     ports:
@@ -63,9 +68,9 @@ services:
       - ${MALLARD_DATA_HOST_DIR:-/srv/mallard/data}/logs:/logs
 
     environment:
-      DOMAIN:                 ${DOMAIN}
-      ACME_EMAIL:             ${ACME_EMAIL}
-      CLOUDFLARE_API_TOKEN:   ${CLOUDFLARE_API_TOKEN}
+      DOMAIN:               ${DOMAIN}
+      ACME_EMAIL:           ${ACME_EMAIL}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
 
     logging:
       driver: "json-file"
@@ -83,7 +88,7 @@ services:
   # ── Mallard Metrics ────────────────────────────────────────────────────────
   # The analytics backend. Built from the repo root Dockerfile (FROM scratch,
   # statically linked musl binary). No port is published to the host — all
-  # traffic goes through Caddy via the internal `proxy` network.
+  # traffic goes through Caddy on the internal `proxy` network.
   mallard:
     build:
       context: ..
@@ -100,7 +105,9 @@ services:
     # The only writable path is /data (bind-mounted from the LUKS volume).
     read_only: true
 
-    # No ports exposed to the host — Caddy reaches it via the internal network.
+    # Mallard is ONLY on the internal network — it has no internet access.
+    # Caddy reaches it via the shared `proxy` network; the internet cannot
+    # reach Mallard directly even if Caddy is misconfigured.
     networks:
       - proxy
 
@@ -111,23 +118,27 @@ services:
         target: /data
 
     environment:
-      MALLARD_DATA_DIR:           /data
-      MALLARD_HOST:               0.0.0.0
-      MALLARD_PORT:               8000
+      MALLARD_DATA_DIR:  /data
+      MALLARD_HOST:      0.0.0.0
+      MALLARD_PORT:      8000
 
       # ---- Security (all required in production) ----
-      MALLARD_SECRET:             ${MALLARD_SECRET}
-      MALLARD_ADMIN_PASSWORD:     ${MALLARD_ADMIN_PASSWORD}
-      MALLARD_DASHBOARD_ORIGIN:   https://${DOMAIN}
-      MALLARD_SECURE_COOKIES:     "true"
-      MALLARD_METRICS_TOKEN:      ${MALLARD_METRICS_TOKEN}
+      MALLARD_SECRET:           ${MALLARD_SECRET}
+      MALLARD_ADMIN_PASSWORD:   ${MALLARD_ADMIN_PASSWORD}
+      MALLARD_DASHBOARD_ORIGIN: https://${DOMAIN}
+      MALLARD_SECURE_COOKIES:   "true"
+      MALLARD_METRICS_TOKEN:    ${MALLARD_METRICS_TOKEN}
 
       # ---- Behaviour ----
+      # IMPORTANT: env var names must match config.rs exactly.
+      # MALLARD_RATE_LIMIT       → config.rate_limit_per_site
+      # MALLARD_CACHE_TTL        → config.cache_ttl_secs
+      # MALLARD_GEOIP_DB         → config.geoip_db_path
       MALLARD_LOG_FORMAT:             json
       MALLARD_FILTER_BOTS:            "true"
       MALLARD_RETENTION_DAYS:         ${MALLARD_RETENTION_DAYS:-365}
-      MALLARD_RATE_LIMIT_PER_SITE:    ${MALLARD_RATE_LIMIT_PER_SITE:-200}
-      MALLARD_CACHE_TTL_SECS:         ${MALLARD_CACHE_TTL_SECS:-300}
+      MALLARD_RATE_LIMIT:             ${MALLARD_RATE_LIMIT:-200}
+      MALLARD_CACHE_TTL:              ${MALLARD_CACHE_TTL:-300}
       MALLARD_MAX_CONCURRENT_QUERIES: ${MALLARD_MAX_CONCURRENT_QUERIES:-10}
       MALLARD_MAX_LOGIN_ATTEMPTS:     ${MALLARD_MAX_LOGIN_ATTEMPTS:-5}
       MALLARD_LOGIN_LOCKOUT:          ${MALLARD_LOGIN_LOCKOUT:-300}
@@ -145,27 +156,36 @@ services:
     healthcheck:
       disable: true
 
-    depends_on:
-      caddy:
-        condition: service_healthy
+    # Mallard does not depend on Caddy — it starts independently and accepts
+    # connections as soon as it binds. Caddy's upstream health check marks
+    # Mallard as "up" once /health/ready returns 200.
+    # No depends_on here — either service can (re)start independently.
 
 # ---------------------------------------------------------------------------
 # Networks
 # ---------------------------------------------------------------------------
 networks:
+  # Caddy-facing external network: allows outbound internet (ACME, DNS checks).
+  # Only Caddy is on this network.
+  caddy_external:
+    driver: bridge
+    internal: false
+
+  # Internal-only network: Caddy ↔ Mallard communication.
+  # internal: true means Docker does NOT add a default route to the host's
+  # external interfaces, so Mallard cannot make outbound internet requests.
+  # This limits blast radius if the Mallard container is ever compromised.
   proxy:
     driver: bridge
-    # Keep the inter-service network internal — nothing reaches Mallard
-    # directly except Caddy.
-    internal: false   # Mallard needs outbound for GeoIP updates if configured.
+    internal: true
 
 # ---------------------------------------------------------------------------
 # Volumes
 # ---------------------------------------------------------------------------
 volumes:
   # Caddy uses these for ACME certificates and its internal config state.
-  # These are Docker-managed named volumes (not on the LUKS volume) because
-  # they don't contain user data and need to survive independent of mallard.
+  # Docker-managed named volumes (not on the LUKS data volume) so they survive
+  # independent of the mallard data lifecycle.
   caddy-data:
     driver: local
   caddy-config:
