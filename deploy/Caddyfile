@@ -1,0 +1,110 @@
+# =============================================================================
+# Mallard Metrics — Caddyfile
+# =============================================================================
+#
+# Environment variables (injected by Docker Compose from .env):
+#   DOMAIN                — analytics.example.com (or apex: example.com)
+#   ACME_EMAIL            — Let's Encrypt registration email
+#   CLOUDFLARE_API_TOKEN  — Cloudflare API token with Zone:DNS:Edit permission
+#
+# Caddy automatically obtains and renews a TLS certificate via the ACME DNS-01
+# challenge. DNS-01 does not require inbound port 80 and supports wildcard certs.
+# The Cloudflare token only needs permissions on the zone that DOMAIN belongs to.
+# =============================================================================
+
+# ── Global options ────────────────────────────────────────────────────────────
+{
+    # Let's Encrypt registration email (required for cert issuance)
+    email {$ACME_EMAIL}
+
+    # DNS-01 challenge via Cloudflare — works behind NAT, no port 80 needed
+    acme_dns cloudflare {$CLOUDFLARE_API_TOKEN}
+
+    # Uncomment to use Let's Encrypt STAGING during initial setup/testing.
+    # Rate limits are much higher on staging; switch to production once working.
+    # acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+
+    # OCSP stapling — reduces handshake latency
+    ocsp_stapling on
+
+    # Admin API disabled (not needed in production container)
+    admin off
+
+    # Serve HTTP/3 (QUIC) in addition to HTTP/1.1 and HTTP/2
+    servers {
+        protocols h1 h2 h3
+    }
+}
+
+# ── Security header snippet (reusable) ────────────────────────────────────────
+(security_headers) {
+    header {
+        # Strip upstream server identity
+        -Server
+        -X-Powered-By
+
+        # HSTS: 1 year, include subdomains, eligible for preload list
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+
+        # These are also set by Mallard; enforcing here at the proxy layer
+        # provides defence-in-depth if the backend ever changes.
+        X-Content-Type-Options    nosniff
+        X-Frame-Options           DENY
+        Referrer-Policy           strict-origin-when-cross-origin
+        Permissions-Policy        "geolocation=(), microphone=(), camera=()"
+
+        # Only allow scripts/styles/images from self (and inline — needed by Preact HTM)
+        # Adjust if you embed Mallard in an iframe from another domain.
+        Content-Security-Policy   "default-src 'self'; script-src 'self' 'unsafe-inline' cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';"
+
+        # Opt out of FLoC / Topics API
+        Permissions-Policy        "interest-cohort=()"
+    }
+}
+
+# ── Main site ─────────────────────────────────────────────────────────────────
+{$DOMAIN} {
+    import security_headers
+
+    # ── Reverse proxy to Mallard Metrics ──
+    reverse_proxy mallard:8000 {
+        # Active upstream health check — Caddy marks mallard down if this fails.
+        health_uri     /health/ready
+        health_interval 30s
+        health_timeout  5s
+        health_status   200
+
+        # Forward real client IP so Mallard's rate limiter and IP anonymisation
+        # work on the actual visitor address, not the Caddy container IP.
+        header_up X-Real-IP        {remote_host}
+        header_up X-Forwarded-For  {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-Host  {host}
+
+        # Remove hop-by-hop headers
+        header_up -X-Forwarded-Port
+
+        # Transport hardening
+        transport http {
+            # Keep-alive to backend (avoids TCP handshake per request)
+            keepalive 30s
+            # Cap individual request timeout to match Mallard's 30s limit
+            dial_timeout 5s
+            response_header_timeout 35s
+        }
+    }
+
+    # ── Access logging ─────────────────────────────────────────────────────
+    log {
+        output file /logs/caddy-access.log {
+            roll_size    50MiB
+            roll_keep    7
+            roll_keep_for 336h   # 14 days
+        }
+        format json
+        level  INFO
+
+        # Suppress noisy health-check log noise
+        except path /health/*
+    }
+}

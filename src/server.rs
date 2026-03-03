@@ -139,9 +139,11 @@ async fn add_security_headers(mut response: Response) -> Response {
     // HSTS: instruct browsers to enforce HTTPS for 1 year.
     // Safe to include on HTTP deployments — browsers only process this header
     // when received over HTTPS, so it is a no-op on plain HTTP.
+    // `preload` opts in to browser HSTS preload lists (hstspreload.org):
+    // requires max-age ≥ 31536000, includeSubDomains, and preload all present.
     headers.insert(
         "strict-transport-security",
-        HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        HeaderValue::from_static("max-age=31536000; includeSubDomains; preload"),
     );
     // Add Retry-After: 1 to any 429 response that does not already carry the
     // header (the login endpoint sets its own value based on the lockout period).
@@ -208,13 +210,18 @@ async fn robots_txt() -> impl axum::response::IntoResponse {
 }
 
 /// GET /.well-known/security.txt — RFC 9116 security vulnerability reporting policy.
+///
+/// Points to the GitHub private security advisory form, consistent with
+/// the process documented in SECURITY.md. Do NOT open a public issue for
+/// security vulnerabilities.
 async fn security_txt() -> impl axum::response::IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        "# Mallard Metrics security policy\n\
-         # To report a vulnerability, open an issue at:\n\
-         # https://github.com/mallard-metrics/mallard-metrics/issues\n\
-         Contact: mailto:security@mallard-metrics.example\n\
+        "# Mallard Metrics — security vulnerability reporting\n\
+         # Do NOT open a public GitHub issue for security vulnerabilities.\n\
+         # Use the private security advisory form linked below.\n\
+         # See also: SECURITY.md in the repository root.\n\
+         Contact: https://github.com/tomtom215/mallardmetrics/security/advisories/new\n\
          Expires: 2027-01-01T00:00:00.000Z\n\
          Preferred-Languages: en\n",
     )
@@ -970,6 +977,10 @@ mod tests {
             "HSTS must include max-age directive"
         );
         assert!(hsts.contains("includeSubDomains"));
+        assert!(
+            hsts.contains("preload"),
+            "HSTS must include preload for preload list eligibility"
+        );
     }
 
     #[tokio::test]

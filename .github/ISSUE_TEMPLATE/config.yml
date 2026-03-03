@@ -1,0 +1,17 @@
+blank_issues_enabled: false
+
+contact_links:
+  - name: Security Vulnerability
+    url: https://github.com/tomtom215/mallardmetrics/security/advisories/new
+    about: >
+      Do NOT open a public issue for security vulnerabilities.
+      Use the private security advisory form so we can coordinate
+      a responsible disclosure and patch before public disclosure.
+
+  - name: Documentation
+    url: https://tomtom215.github.io/mallardmetrics
+    about: Full API reference, deployment guides, and architecture documentation.
+
+  - name: Discussions
+    url: https://github.com/tomtom215/mallardmetrics/discussions
+    about: Questions, ideas, and general conversation about Mallard Metrics.

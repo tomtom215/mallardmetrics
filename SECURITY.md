@@ -130,7 +130,7 @@ Known bot User-Agents are automatically filtered from analytics when `MALLARD_FI
 | Session hijacking | HttpOnly cookies, Secure flag with TLS, SameSite=Strict, 256-bit random tokens |
 | CSRF | Origin/Referer header validation on all state-mutating session-authenticated endpoints |
 | Clickjacking | `X-Frame-Options: DENY` and `Content-Security-Policy` headers |
-| Protocol downgrade | `Strict-Transport-Security` (HSTS) with 1-year max-age |
+| Protocol downgrade | `Strict-Transport-Security` (HSTS) with 1-year `max-age`, `includeSubDomains`, and `preload` (eligible for browser preload lists via hstspreload.org) |
 | Unauthorized dashboard access | Argon2id password authentication, session-based access control |
 | Unauthorized API access | API key authentication with SHA-256 hashed storage |
 | Data tampering | Parquet files are append-only per partition. Dashboard access is read-only for API keys |

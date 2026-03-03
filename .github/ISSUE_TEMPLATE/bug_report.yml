@@ -1,0 +1,95 @@
+name: Bug Report
+description: Report a reproducible bug in Mallard Metrics
+title: "[Bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for taking the time to report a bug.
+
+        **Security vulnerabilities** must NOT be reported here.
+        Use the [private security advisory form](https://github.com/tomtom215/mallardmetrics/security/advisories/new) instead.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Pre-flight checklist
+      options:
+        - label: I searched existing issues and this is not a duplicate
+          required: true
+        - label: This is NOT a security vulnerability (use the private advisory form for those)
+          required: true
+        - label: I am using the latest release or the `main` branch
+          required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear and concise description of the bug.
+      placeholder: Describe the bug…
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps to reliably reproduce the issue.
+      placeholder: |
+        1. Start mallard-metrics with `MALLARD_ADMIN_PASSWORD=… cargo run`
+        2. Send a POST to /api/event with …
+        3. Observe …
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What should have happened?
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Mallard Metrics version
+      description: Output of `mallard-metrics --version` or the Docker image tag
+      placeholder: "0.1.0 / main@abc1234"
+    validations:
+      required: true
+
+  - type: input
+    id: rust
+    attributes:
+      label: Rust version (if building from source)
+      description: Output of `rustc --version`
+      placeholder: "rustc 1.93.1 (01f6ddf75 2026-02-11)"
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment method
+      options:
+        - Docker (`FROM scratch` image)
+        - Docker Compose
+        - Binary from source (`cargo build --release`)
+        - VPS via deploy/setup.sh
+        - Fly.io
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste relevant log output (set `MALLARD_LOG_FORMAT=json` for structured logs). Redact any secrets.
+      render: text
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Anything else that might help diagnose the issue (config, environment, OS, etc.)
