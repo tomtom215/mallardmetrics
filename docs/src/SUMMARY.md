@@ -26,6 +26,8 @@
 
 # Operations
 
-- [Deployment](deployment.md)
+- [Deployment Overview](deployment.md)
+  - [VPS Deployment Guide](deploy-vps.md)
+  - [Fly.io Deployment](deploy-flyio.md)
 - [Monitoring](monitoring.md)
 - [Data Management](data-management.md)

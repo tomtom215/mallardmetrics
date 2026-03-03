@@ -1,0 +1,172 @@
+# =============================================================================
+# Mallard Metrics — Production Docker Compose
+# =============================================================================
+#
+# Usage:
+#   1. Copy deploy/.env.example → deploy/.env and fill in every value.
+#   2. Run deploy/setup.sh to provision the host (LUKS, firewall, Docker).
+#   3. From the deploy/ directory:
+#        docker compose -f docker-compose.production.yml up -d
+#
+# Architecture:
+#   Internet → Caddy (TLS termination, reverse proxy)
+#            → mallard-metrics (analytics backend, no public port)
+#
+# Data is stored on the host at MALLARD_DATA_HOST_DIR (default: /srv/mallard/data).
+# Run setup.sh first — it mounts that path on a LUKS-encrypted container.
+# =============================================================================
+
+name: mallard-production
+
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
+services:
+
+  # ── Caddy ─────────────────────────────────────────────────────────────────
+  # Custom build that includes the Cloudflare DNS provider module so Caddy
+  # can complete the ACME DNS-01 challenge (required for wildcard certs and
+  # for servers behind NAT or with no inbound port 80).
+  caddy:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.caddy
+    image: mallard-caddy:latest
+    container_name: mallard-caddy
+    restart: unless-stopped
+
+    # Drop all Linux capabilities; re-add only what's needed to bind port 80/443.
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+
+    security_opt:
+      - no-new-privileges:true
+
+    # Read-only root FS; Caddy needs /tmp for transient state.
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+
+    networks:
+      - proxy
+
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3 / QUIC
+
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+      # Caddy access logs land beside mallard data so they rotate together.
+      - ${MALLARD_DATA_HOST_DIR:-/srv/mallard/data}/logs:/logs
+
+    environment:
+      DOMAIN:                 ${DOMAIN}
+      ACME_EMAIL:             ${ACME_EMAIL}
+      CLOUDFLARE_API_TOKEN:   ${CLOUDFLARE_API_TOKEN}
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+    healthcheck:
+      test: ["CMD", "caddy", "validate", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 10s
+
+  # ── Mallard Metrics ────────────────────────────────────────────────────────
+  # The analytics backend. Built from the repo root Dockerfile (FROM scratch,
+  # statically linked musl binary). No port is published to the host — all
+  # traffic goes through Caddy via the internal `proxy` network.
+  mallard:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: mallard-metrics:latest
+    container_name: mallard-metrics
+    restart: unless-stopped
+
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+    # FROM scratch has no shell, so read_only is effectively the default.
+    # The only writable path is /data (bind-mounted from the LUKS volume).
+    read_only: true
+
+    # No ports exposed to the host — Caddy reaches it via the internal network.
+    networks:
+      - proxy
+
+    volumes:
+      # Bind-mount the LUKS-decrypted directory. setup.sh creates and mounts it.
+      - type: bind
+        source: ${MALLARD_DATA_HOST_DIR:-/srv/mallard/data}
+        target: /data
+
+    environment:
+      MALLARD_DATA_DIR:           /data
+      MALLARD_HOST:               0.0.0.0
+      MALLARD_PORT:               8000
+
+      # ---- Security (all required in production) ----
+      MALLARD_SECRET:             ${MALLARD_SECRET}
+      MALLARD_ADMIN_PASSWORD:     ${MALLARD_ADMIN_PASSWORD}
+      MALLARD_DASHBOARD_ORIGIN:   https://${DOMAIN}
+      MALLARD_SECURE_COOKIES:     "true"
+      MALLARD_METRICS_TOKEN:      ${MALLARD_METRICS_TOKEN}
+
+      # ---- Behaviour ----
+      MALLARD_LOG_FORMAT:             json
+      MALLARD_FILTER_BOTS:            "true"
+      MALLARD_RETENTION_DAYS:         ${MALLARD_RETENTION_DAYS:-365}
+      MALLARD_RATE_LIMIT_PER_SITE:    ${MALLARD_RATE_LIMIT_PER_SITE:-200}
+      MALLARD_CACHE_TTL_SECS:         ${MALLARD_CACHE_TTL_SECS:-300}
+      MALLARD_MAX_CONCURRENT_QUERIES: ${MALLARD_MAX_CONCURRENT_QUERIES:-10}
+      MALLARD_MAX_LOGIN_ATTEMPTS:     ${MALLARD_MAX_LOGIN_ATTEMPTS:-5}
+      MALLARD_LOGIN_LOCKOUT:          ${MALLARD_LOGIN_LOCKOUT:-300}
+
+      RUST_LOG: "mallard_metrics=info,tower_http=warn"
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "7"
+
+    # FROM scratch has no executables for a shell-based health check.
+    # Caddy performs active health checks against /health/ready instead.
+    healthcheck:
+      disable: true
+
+    depends_on:
+      caddy:
+        condition: service_healthy
+
+# ---------------------------------------------------------------------------
+# Networks
+# ---------------------------------------------------------------------------
+networks:
+  proxy:
+    driver: bridge
+    # Keep the inter-service network internal — nothing reaches Mallard
+    # directly except Caddy.
+    internal: false   # Mallard needs outbound for GeoIP updates if configured.
+
+# ---------------------------------------------------------------------------
+# Volumes
+# ---------------------------------------------------------------------------
+volumes:
+  # Caddy uses these for ACME certificates and its internal config state.
+  # These are Docker-managed named volumes (not on the LUKS volume) because
+  # they don't contain user data and need to survive independent of mallard.
+  caddy-data:
+    driver: local
+  caddy-config:
+    driver: local
