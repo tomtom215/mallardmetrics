@@ -23,7 +23,7 @@ Built in Rust for predictable, low resource usage. The embedded DuckDB database 
 | Storage | Date-partitioned Parquet files (ZSTD-compressed) |
 | Frontend | Preact + HTM (no build step, embedded in binary) |
 | Deployment | Static musl binary, `FROM scratch` Docker image |
-| Tests | 311 passing (249 unit + 62 integration) |
+| Tests | 333 passing (262 unit + 71 integration) |
 
 ## Key Features
 
@@ -68,6 +68,7 @@ Built in Rust for predictable, low resource usage. The embedded DuckDB database 
 - **OWASP security headers** — Including HSTS, CSP, Permissions-Policy, and X-Request-ID.
 - **CSRF protection** — Origin/Referer validation on all state-mutating endpoints.
 - **Brute-force protection** — Per-IP login lockout with configurable threshold and lockout duration.
+- **GDPR-friendly mode** — Single `MALLARD_GDPR_MODE=true` toggle strips referrers, rounds timestamps, reduces GeoIP precision, and enables the Art. 17 data-erasure API.
 
 ## When Should You Use Mallard Metrics?
 
