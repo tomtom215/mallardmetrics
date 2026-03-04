@@ -15,6 +15,14 @@ Before going to production:
 - [ ] Set `dashboard_origin` to your dashboard URL to enable CSRF protection.
 - [ ] Use `/health/ready` as your container or load-balancer readiness probe.
 
+**EU / GDPR deployments — additional steps:**
+
+- [ ] Set `MALLARD_GDPR_MODE=true` (or enable individual flags) to reduce data collection surface.
+- [ ] Set `MALLARD_RETENTION_DAYS=30` (or your DPA-approved retention period) for Art. 5(1)(e) storage limitation compliance.
+- [ ] Set `MALLARD_GEOIP_PRECISION=country` (already forced by `gdpr_mode`; document it explicitly in your DPIA).
+- [ ] Document your legal basis for processing in a DPIA or privacy notice. See [PRIVACY.md](../../../PRIVACY.md) for the full analysis.
+- [ ] Use `DELETE /api/gdpr/erase?site_id=...&start_date=...&end_date=...` (Admin API key required) to honour Art. 17 erasure requests.
+
 ---
 
 ## Docker (Recommended)
@@ -229,6 +237,93 @@ docker run ... \
 If the file is missing or unreadable, country/region/city fields are stored as `NULL`. No error is raised.
 
 > **Note:** The MaxMind GeoLite2 database is updated monthly. Automate downloads with [geoipupdate](https://github.com/maxmind/geoipupdate).
+
+---
+
+## GDPR-Friendly Deployment
+
+Mallard Metrics provides a configurable privacy mode designed to reduce the data-collection surface to a level that makes aggregate analytics possible under GDPR Art. 6(1)(f) legitimate interests (no consent required) for many EU operators. Consult your legal team; requirements vary by context and member-state law.
+
+### Activate GDPR Mode
+
+The quickest path is the `MALLARD_GDPR_MODE=true` preset, which bundles the recommended privacy settings:
+
+```bash
+docker run -d \
+  --name mallard-metrics \
+  --restart unless-stopped \
+  -p 127.0.0.1:8000:8000 \
+  -v mallard-data:/data \
+  -e MALLARD_SECRET=your-random-32-char-secret \
+  -e MALLARD_ADMIN_PASSWORD=your-dashboard-password \
+  -e MALLARD_SECURE_COOKIES=true \
+  -e MALLARD_GDPR_MODE=true \
+  -e MALLARD_RETENTION_DAYS=30 \
+  ghcr.io/tomtom215/mallard-metrics
+```
+
+Or via TOML config:
+
+```toml
+gdpr_mode      = true
+retention_days = 30
+```
+
+### What GDPR Mode Does
+
+| Flag | Standard | GDPR Mode |
+|---|---|---|
+| Referrer stored as | Full URL (with query/fragment) | Path only — `?q=...` and `#...` stripped |
+| Timestamps | Millisecond precision | Rounded to nearest hour |
+| Browser info | Name + version | Name only (e.g. `"Chrome"`) |
+| OS info | Name + version | Name only (e.g. `"Windows"`) |
+| Screen / device | Stored | Omitted |
+| GeoIP | City-level | Country-level only |
+
+### Fine-Grained Privacy Flags
+
+Each setting can be controlled independently via environment variable or TOML key:
+
+| Env var | TOML key | Default | Effect |
+|---|---|---|---|
+| `MALLARD_GDPR_MODE` | `gdpr_mode` | `false` | Enable all flags below (except suppress_visitor_id) |
+| `MALLARD_STRIP_REFERRER_QUERY` | `strip_referrer_query` | `false` | Strip `?query` and `#fragment` from referrers |
+| `MALLARD_ROUND_TIMESTAMPS` | `round_timestamps` | `false` | Round timestamps to nearest hour |
+| `MALLARD_SUPPRESS_BROWSER_VERSION` | `suppress_browser_version` | `false` | Store browser name only |
+| `MALLARD_SUPPRESS_OS_VERSION` | `suppress_os_version` | `false` | Store OS name only |
+| `MALLARD_SUPPRESS_SCREEN_SIZE` | `suppress_screen_size` | `false` | Omit screen size and device type |
+| `MALLARD_GEOIP_PRECISION` | `geoip_precision` | `"city"` | `"city"` / `"region"` / `"country"` / `"none"` |
+| `MALLARD_SUPPRESS_VISITOR_ID` | `suppress_visitor_id` | `false` | Replace HMAC hash with random UUID per request (**breaks unique-visitor counting**) |
+
+> **Note on `suppress_visitor_id`:** This flag is intentionally *not* activated by `gdpr_mode` because it eliminates unique-visitor metrics entirely. The default HMAC-SHA256 visitor ID is pseudonymous personal data under GDPR Recital 26. Most operators can rely on Art. 6(1)(f) legitimate interests for aggregate analytics without suppressing visitor IDs.
+
+### Right to Erasure (Art. 17)
+
+Mallard Metrics supports data erasure requests via an authenticated API endpoint:
+
+```bash
+# Requires an Admin API key
+curl -X DELETE \
+  "https://analytics.example.com/api/gdpr/erase?site_id=mysite.com&start_date=2024-01-01&end_date=2024-12-31" \
+  -H "X-API-Key: mm_your_admin_key"
+```
+
+Response:
+
+```json
+{
+  "site_id": "mysite.com",
+  "start_date": "2024-01-01",
+  "end_date": "2024-12-31",
+  "db_events_deleted": 1423,
+  "parquet_partitions_removed": 8
+}
+```
+
+**Important limitations:**
+- Erasure is by site and date range, not by individual visitor ID (visitor IDs are pseudonymous hashes and cannot be reverse-mapped to individuals).
+- After erasure, the `events_all` VIEW is refreshed automatically.
+- Consider setting `MALLARD_RETENTION_DAYS=30` for automated data minimisation under Art. 5(1)(e) in place of manual erasure requests.
 
 ---
 

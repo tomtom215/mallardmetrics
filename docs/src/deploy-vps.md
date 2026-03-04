@@ -4,50 +4,6 @@
 
 ---
 
-## Table of Contents
-
-1. [Overview](#overview)
-2. [Architecture](#architecture)
-3. [Prerequisites](#prerequisites)
-   - [VPS requirements](#vps-requirements)
-   - [Domain and DNS](#domain-and-dns)
-   - [Cloudflare API token](#cloudflare-api-token)
-   - [SSH key access](#ssh-key-access)
-4. [One-Command Deployment](#one-command-deployment)
-5. [Step-by-Step Manual Deployment](#step-by-step-manual-deployment)
-   - [Step 1 — Provision the VPS](#step-1--provision-the-vps)
-   - [Step 2 — Clone the repository](#step-2--clone-the-repository)
-   - [Step 3 — Run setup.sh](#step-3--run-setupsh)
-   - [Step 4 — Verify deployment](#step-4--verify-deployment)
-6. [What setup.sh Does](#what-setupsh-does)
-7. [LUKS Encrypted Volume](#luks-encrypted-volume)
-   - [How it works](#how-it-works)
-   - [After reboot](#after-reboot)
-   - [Resizing the volume](#resizing-the-volume)
-8. [Caddy and TLS](#caddy-and-tls)
-   - [Cloudflare DNS challenge](#cloudflare-dns-challenge)
-   - [Certificate renewal](#certificate-renewal)
-   - [Custom domain configurations](#custom-domain-configurations)
-9. [Security Hardening](#security-hardening)
-   - [vps-audit integration](#vps-audit-integration)
-   - [SSH hardening](#ssh-hardening)
-   - [Firewall (UFW)](#firewall-ufw)
-   - [Kernel parameters](#kernel-parameters)
-10. [Configuration Reference](#configuration-reference)
-11. [Adding the Tracking Script](#adding-the-tracking-script)
-12. [Embedding the Dashboard in Docs](#embedding-the-dashboard-in-docs)
-13. [Post-Deployment Operations](#post-deployment-operations)
-    - [View logs](#view-logs)
-    - [Update Mallard Metrics](#update-mallard-metrics)
-    - [Backup and restore](#backup-and-restore)
-    - [GeoIP setup](#geoip-setup)
-14. [Monitoring](#monitoring)
-15. [Troubleshooting](#troubleshooting)
-16. [Frequently Asked Questions](#frequently-asked-questions)
-17. [Index](#index)
-
----
-
 ## Overview
 
 This guide deploys Mallard Metrics on a bare VPS using:

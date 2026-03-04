@@ -7,10 +7,29 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
-use chrono::Utc;
+use chrono::{DateTime, Timelike, Utc};
 use serde::Deserialize;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+
+/// Strip query string and fragment from a URL for privacy-preserving referrer storage.
+///
+/// `https://google.com/search?q=cancer+diagnosis#result` → `https://google.com/search`
+pub fn strip_url_query_and_fragment(url: &str) -> &str {
+    let url = url.split('?').next().unwrap_or(url);
+    url.split('#').next().unwrap_or(url)
+}
+
+/// Round a UTC datetime down to the start of its hour.
+///
+/// Reduces fingerprinting by lowering timestamp precision from milliseconds to hours.
+pub fn round_to_hour(dt: DateTime<Utc>) -> chrono::NaiveDateTime {
+    dt.with_minute(0)
+        .and_then(|t: DateTime<Utc>| t.with_second(0))
+        .and_then(|t: DateTime<Utc>| t.with_nanosecond(0))
+        .unwrap_or(dt)
+        .naive_utc()
+}
 
 /// UTM parameters tuple: (source, medium, campaign, content, term).
 type UtmParams = (
@@ -51,6 +70,7 @@ pub struct EventPayload {
 }
 
 /// Shared application state.
+#[allow(clippy::struct_excessive_bools)]
 pub struct AppState {
     pub buffer: EventBuffer,
     pub secret: String,
@@ -87,6 +107,24 @@ pub struct AppState {
     /// Whether the DuckDB `behavioral` extension was successfully loaded at startup.
     /// Exposed in `/health/detailed` and the Prometheus `/metrics` endpoint.
     pub behavioral_extension_loaded: bool,
+
+    // ── Privacy / GDPR configuration ─────────────────────────────────────
+    /// Strip query string and fragment from referrer URLs before storing.
+    pub strip_referrer_query: bool,
+    /// Round event timestamps to the nearest hour.
+    pub round_timestamps: bool,
+    /// Replace the HMAC visitor_id with a random UUID per request (breaks cross-request linking).
+    pub suppress_visitor_id: bool,
+    /// Omit browser version (store browser name only).
+    pub suppress_browser_version: bool,
+    /// Omit OS version (store OS name only).
+    pub suppress_os_version: bool,
+    /// Omit screen_size and device_type fields.
+    pub suppress_screen_size: bool,
+    /// GeoIP precision: "city" | "region" | "country" | "none".
+    pub geoip_precision: String,
+    /// Path to the events directory; needed by the GDPR erasure endpoint.
+    pub events_dir: std::path::PathBuf,
 }
 
 /// Query parameters for the GET /api/event pixel-tracking endpoint.
@@ -121,6 +159,7 @@ fn default_event_name() -> String {
 /// Validates the payload, applies rate limiting, builds an `Event`, and pushes
 /// it into the buffer.  Returns `false` if the event should be silently ignored
 /// (bot filtered, origin blocked, rate limited).
+#[allow(clippy::too_many_lines)]
 pub async fn process_pixel_event(state: &Arc<AppState>, headers: &HeaderMap, params: PixelParams) {
     // Convert PixelParams into the canonical EventPayload shape so we can
     // call the same validation / enrichment path.
@@ -173,7 +212,13 @@ pub async fn process_pixel_event(state: &Arc<AppState>, headers: &HeaderMap, par
 
     let today = Utc::now().date_naive();
     let salt = visitor_id::daily_salt(&state.secret, today);
-    let vid = visitor_id::generate_visitor_id(&ip, user_agent, &salt);
+    // Privacy: suppress_visitor_id replaces the deterministic HMAC with a random UUID
+    // so that no cross-request linkability is possible.
+    let vid = if state.suppress_visitor_id {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        visitor_id::generate_visitor_id(&ip, user_agent, &salt)
+    };
     let (utm_source, utm_medium, utm_campaign, utm_content, utm_term) =
         parse_utm_params(&payload.url);
     let referrer_source = payload
@@ -181,20 +226,58 @@ pub async fn process_pixel_event(state: &Arc<AppState>, headers: &HeaderMap, par
         .as_deref()
         .and_then(extract_referrer_source);
     let geo_info = state.geoip.lookup(&ip);
-    let device_type = payload.screen_width.map(classify_device);
+    // Privacy: apply geoip_precision — strip city/region fields as configured.
+    let (country_code, region, city) = match state.geoip_precision.as_str() {
+        "none" => (None, None, None),
+        "country" => (geo_info.country_code, None, None),
+        "region" => (geo_info.country_code, geo_info.region, None),
+        _ => (geo_info.country_code, geo_info.region, geo_info.city), // "city" (default)
+    };
+    // Privacy: suppress_screen_size omits both screen width and derived device type.
+    let (screen_size, device_type) = if state.suppress_screen_size {
+        (None, None)
+    } else {
+        (
+            payload.screen_width.map(|w| format!("{w}")),
+            payload.screen_width.map(classify_device),
+        )
+    };
     let pathname = sanitize_pathname(&payload.url);
+    // Privacy: round_timestamps reduces precision to the nearest hour.
+    let timestamp = if state.round_timestamps {
+        round_to_hour(Utc::now())
+    } else {
+        Utc::now().naive_utc()
+    };
+    // Privacy: strip_referrer_query removes query strings and fragments from referrer URLs.
+    let referrer = payload.referrer.as_deref().map(|r| {
+        let r = if state.strip_referrer_query {
+            strip_url_query_and_fragment(r)
+        } else {
+            r
+        };
+        sanitize_string(r, 2048)
+    });
+    // Privacy: suppress_browser_version / suppress_os_version reduce fingerprinting surface.
+    let browser_version = if state.suppress_browser_version {
+        None
+    } else {
+        parsed_ua.browser_version
+    };
+    let os_version = if state.suppress_os_version {
+        None
+    } else {
+        parsed_ua.os_version
+    };
 
     let event = Event {
         site_id: sanitize_string(&payload.domain, 256),
         visitor_id: vid,
-        timestamp: Utc::now().naive_utc(),
+        timestamp,
         event_name: sanitize_string(&payload.name, 256),
         pathname,
         hostname: Some(sanitize_string(&payload.domain, 256)),
-        referrer: payload
-            .referrer
-            .as_deref()
-            .map(|r| sanitize_string(r, 2048)),
+        referrer,
         referrer_source,
         utm_source,
         utm_medium,
@@ -202,14 +285,14 @@ pub async fn process_pixel_event(state: &Arc<AppState>, headers: &HeaderMap, par
         utm_content,
         utm_term,
         browser: parsed_ua.browser,
-        browser_version: parsed_ua.browser_version,
+        browser_version,
         os: parsed_ua.os,
-        os_version: parsed_ua.os_version,
+        os_version,
         device_type,
-        screen_size: payload.screen_width.map(|w| format!("{w}")),
-        country_code: geo_info.country_code,
-        region: geo_info.region,
-        city: geo_info.city,
+        screen_size,
+        country_code,
+        region,
+        city,
         props: None,
         revenue_amount: None,
         revenue_currency: None,
@@ -231,6 +314,7 @@ pub async fn process_pixel_event(state: &Arc<AppState>, headers: &HeaderMap, par
 ///
 /// Receives events from the tracking script, generates a privacy-safe visitor ID,
 /// and pushes the event into the buffer.
+#[allow(clippy::too_many_lines)]
 pub async fn ingest_event(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -292,13 +376,18 @@ pub async fn ingest_event(
 
     let today = Utc::now().date_naive();
     let salt = visitor_id::daily_salt(&state.secret, today);
-    let vid = visitor_id::generate_visitor_id(&ip, user_agent, &salt);
+    // Privacy: suppress_visitor_id replaces the deterministic HMAC with a random UUID.
+    let vid = if state.suppress_visitor_id {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        visitor_id::generate_visitor_id(&ip, user_agent, &salt)
+    };
 
     // Parse UTM parameters from URL
     let (utm_source, utm_medium, utm_campaign, utm_content, utm_term) =
         parse_utm_params(&payload.url);
 
-    // Parse referrer source
+    // Parse referrer source (extract before potential query-strip so the hostname is still present)
     let referrer_source = payload
         .referrer
         .as_deref()
@@ -306,24 +395,64 @@ pub async fn ingest_event(
 
     // Look up geographic information from IP (PRIVACY: IP used only for lookup, never stored)
     let geo_info = state.geoip.lookup(&ip);
+    // Privacy: apply geoip_precision — strip city/region fields as configured.
+    let (country_code, region, city) = match state.geoip_precision.as_str() {
+        "none" => (None, None, None),
+        "country" => (geo_info.country_code, None, None),
+        "region" => (geo_info.country_code, geo_info.region, None),
+        _ => (geo_info.country_code, geo_info.region, geo_info.city), // "city" (default)
+    };
 
-    // Determine device type from screen width
-    let device_type = payload.screen_width.map(classify_device);
+    // Privacy: suppress_screen_size omits both screen width and derived device type.
+    let (screen_size, device_type) = if state.suppress_screen_size {
+        (None, None)
+    } else {
+        (
+            payload.screen_width.map(|w| format!("{w}")),
+            payload.screen_width.map(classify_device),
+        )
+    };
 
     // Sanitize pathname
     let pathname = sanitize_pathname(&payload.url);
 
+    // Privacy: round_timestamps reduces precision to the nearest hour.
+    let timestamp = if state.round_timestamps {
+        round_to_hour(Utc::now())
+    } else {
+        Utc::now().naive_utc()
+    };
+
+    // Privacy: strip_referrer_query removes query strings and fragments from referrer URLs.
+    let referrer = payload.referrer.as_deref().map(|r| {
+        let r = if state.strip_referrer_query {
+            strip_url_query_and_fragment(r)
+        } else {
+            r
+        };
+        sanitize_string(r, 2048)
+    });
+
+    // Privacy: suppress_browser_version / suppress_os_version reduce fingerprinting surface.
+    let browser_version = if state.suppress_browser_version {
+        None
+    } else {
+        parsed_ua.browser_version
+    };
+    let os_version = if state.suppress_os_version {
+        None
+    } else {
+        parsed_ua.os_version
+    };
+
     let event = Event {
         site_id: sanitize_string(&payload.domain, 256),
         visitor_id: vid,
-        timestamp: Utc::now().naive_utc(),
+        timestamp,
         event_name: sanitize_string(&payload.name, 256),
         pathname,
         hostname: Some(sanitize_string(&payload.domain, 256)),
-        referrer: payload
-            .referrer
-            .as_deref()
-            .map(|r| sanitize_string(r, 2048)),
+        referrer,
         referrer_source,
         utm_source,
         utm_medium,
@@ -331,14 +460,14 @@ pub async fn ingest_event(
         utm_content,
         utm_term,
         browser: parsed_ua.browser,
-        browser_version: parsed_ua.browser_version,
+        browser_version,
         os: parsed_ua.os,
-        os_version: parsed_ua.os_version,
+        os_version,
         device_type,
-        screen_size: payload.screen_width.map(|w| format!("{w}")),
-        country_code: geo_info.country_code,
-        region: geo_info.region,
-        city: geo_info.city,
+        screen_size,
+        country_code,
+        region,
+        city,
         props: payload.props.as_deref().map(|p| sanitize_string(p, 4096)),
         revenue_amount: payload.revenue_amount,
         revenue_currency: payload
@@ -611,6 +740,57 @@ mod tests {
             sanitize_pathname("https://example.com/blog/post/123"),
             "/blog/post/123"
         );
+    }
+
+    #[test]
+    fn test_strip_url_query_and_fragment_query() {
+        assert_eq!(
+            strip_url_query_and_fragment("https://google.com/search?q=cancer+diagnosis"),
+            "https://google.com/search"
+        );
+    }
+
+    #[test]
+    fn test_strip_url_query_and_fragment_fragment() {
+        assert_eq!(
+            strip_url_query_and_fragment("https://example.com/page#section"),
+            "https://example.com/page"
+        );
+    }
+
+    #[test]
+    fn test_strip_url_query_and_fragment_both() {
+        assert_eq!(
+            strip_url_query_and_fragment("https://example.com/page?a=1#s"),
+            "https://example.com/page"
+        );
+    }
+
+    #[test]
+    fn test_strip_url_query_and_fragment_no_change() {
+        assert_eq!(
+            strip_url_query_and_fragment("https://example.com/page"),
+            "https://example.com/page"
+        );
+    }
+
+    #[test]
+    fn test_round_to_hour_truncates_minutes_seconds() {
+        let dt = chrono::DateTime::parse_from_rfc3339("2024-03-15T14:37:22Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let rounded = round_to_hour(dt);
+        assert_eq!(rounded.format("%H:%M:%S").to_string(), "14:00:00");
+        assert_eq!(rounded.format("%Y-%m-%d").to_string(), "2024-03-15");
+    }
+
+    #[test]
+    fn test_round_to_hour_on_exact_hour() {
+        let dt = chrono::DateTime::parse_from_rfc3339("2024-03-15T14:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let rounded = round_to_hour(dt);
+        assert_eq!(rounded.format("%H:%M:%S").to_string(), "14:00:00");
     }
 
     #[test]

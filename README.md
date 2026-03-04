@@ -58,6 +58,22 @@ A lightweight, privacy-respecting alternative to Plausible Analytics. Runs entir
 - **Sequence matching** — Behavioral pattern detection via `sequence_match()`
 - **Flow analysis** — Next-page navigation patterns via `sequence_next_node()`
 
+### GDPR-Friendly Deployment
+
+Mallard Metrics ships a first-class GDPR mode that reduces data collection to the minimum needed for aggregate analytics:
+
+| Setting | Standard | GDPR Mode |
+|---|---|---|
+| Visitor ID | HMAC-SHA256 pseudonymous hash | HMAC-SHA256 (suppress with `suppress_visitor_id`) |
+| Referrer | Full URL with query string | Path only — query and fragment stripped |
+| Timestamps | Millisecond precision | Rounded to nearest hour |
+| Browser info | Name + version | Name only |
+| OS info | Name + version | Name only |
+| Screen / device | Stored | Omitted |
+| GeoIP | City-level | Country-level only |
+
+Enable with a single environment variable (`MALLARD_GDPR_MODE=true`) or configure each flag independently. A `DELETE /api/gdpr/erase` endpoint supports GDPR Art. 17 right-to-erasure requests. See [PRIVACY.md](PRIVACY.md) for the full compliance analysis and operator obligations.
+
 ### Production Ready
 
 - **Argon2id authentication** — Password-protected dashboard with cryptographic session tokens
@@ -177,6 +193,14 @@ See [`mallard-metrics.toml.example`](mallard-metrics.toml.example) for a fully d
 | `MALLARD_RATE_LIMIT` | `0` | Max events/sec per site (0 = unlimited) |
 | `MALLARD_CACHE_TTL` | `60` | Query cache TTL in seconds |
 | `MALLARD_LOG_FORMAT` | `text` | Log format: `text` or `json` |
+| `MALLARD_GDPR_MODE` | `false` | Enable GDPR-friendly preset (see [PRIVACY.md](PRIVACY.md)) |
+| `MALLARD_STRIP_REFERRER_QUERY` | `false` | Strip `?query` and `#fragment` from stored referrers |
+| `MALLARD_ROUND_TIMESTAMPS` | `false` | Round event timestamps to the nearest hour |
+| `MALLARD_SUPPRESS_VISITOR_ID` | `false` | Replace HMAC visitor hash with per-request UUID (breaks unique-visitor counting) |
+| `MALLARD_SUPPRESS_BROWSER_VERSION` | `false` | Store browser name only, not version |
+| `MALLARD_SUPPRESS_OS_VERSION` | `false` | Store OS name only, not version |
+| `MALLARD_SUPPRESS_SCREEN_SIZE` | `false` | Omit screen width and device type |
+| `MALLARD_GEOIP_PRECISION` | `city` | GeoIP precision: `city`, `region`, `country`, or `none` |
 
 ---
 
@@ -246,6 +270,7 @@ All `/api/stats/*`, `/api/keys/*`, and `/api/stats/export` endpoints require aut
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/api/stats/export` | Export analytics data (`format=csv` or `format=json`) |
+| DELETE | `/api/gdpr/erase` | Erase all events for a site within a date range (Art. 17 erasure) |
 | POST | `/api/keys` | Create an API key |
 | GET | `/api/keys` | List all API keys |
 | DELETE | `/api/keys/{hash}` | Revoke an API key |

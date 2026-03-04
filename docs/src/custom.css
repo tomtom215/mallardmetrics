@@ -1,238 +1,125 @@
 /* ================================================================
-   Mallard Metrics — Pond Depth Brand Theme v2
-   ================================================================
-   Palette:
-     Teal dark    #0D7377   (primary brand)
-     Teal mid     #14919B
-     Teal light   #E0F2F1
-     Teal faint   #F0FAFB
-     Navy dark    #14213D   (sidebar, headings)
-     Navy mid     #2C3E50
-     Gold         #F5C842   (accent, active items)
-     Gold dark    #C9971A
+   Mallard Metrics — Documentation Theme
+   Two themes: navy (dark, default) and light.
+   Both themes share the same structure. Colors swap via CSS variables.
+
+   Brand accent:  teal #0D7377 (light) / #5CB8C4 (dark)
+   Sidebar:       #121827 (dark theme) / #14213D (light theme)
    ================================================================ */
-
-/* ----------------------------------------------------------------
-   CSS Custom Properties — Brand palette (always available)
-   ---------------------------------------------------------------- */
-:root {
-  --mm-teal:       #0D7377;
-  --mm-teal-mid:   #14919B;
-  --mm-teal-light: #E0F2F1;
-  --mm-teal-faint: #F0FAFB;
-
-  --mm-navy:       #14213D;
-  --mm-navy-mid:   #2C3E50;
-
-  --mm-gold:       #F5C842;
-  --mm-gold-dark:  #C9971A;
-
-  --mm-border:     #D4DEE6;
-
-  --mm-radius-sm:  4px;
-  --mm-radius:     6px;
-  --mm-radius-lg:  10px;
-}
 
 /* ================================================================
-   mdBook THEME VARIABLE OVERRIDES
-   Override per-theme so sidebar, links, tables, search all use
-   our brand palette automatically in every theme.
+   NAVY — Dark theme (default)
    ================================================================ */
-
-/* ---- Light theme ---- */
-.light {
-  --bg:                        #FFFFFF;
-  --fg:                        #2C3E50;
-  --sidebar-bg:                #14213D;
-  --sidebar-fg:                #bcc8d8;
-  --sidebar-non-existant:      #536a84;
-  --sidebar-active:            #F5C842;
-  --sidebar-spacer:            rgba(188, 200, 216, 0.12);
-  --scrollbar:                 rgba(188, 200, 216, 0.35);
-  --icons:                     #7896ae;
-  --icons-hover:               #E0F2F1;
-  --links:                     #0D7377;
-  --inline-code-color:         #0a5c60;
-  --theme-popup-bg:            #FFFFFF;
-  --theme-popup-border:        #D4DEE6;
-  --theme-hover:               #F0FAFB;
-  --quote-bg:                  #F0FAFB;
-  --quote-border:              #0D7377;
-  --table-border-color:        #D4DEE6;
-  --table-header-bg:           #14213D;
-  --table-alternate-bg:        #F8FAFB;
-  --searchbar-border-color:    #D4DEE6;
-  --searchbar-bg:              #FFFFFF;
-  --searchbar-fg:              #2C3E50;
-  --searchbar-shadow-color:    rgba(13, 115, 119, 0.18);
-  --searchresults-header-fg:   #2C3E50;
-  --searchresults-border-color: #D4DEE6;
-  --searchresults-li-bg:       #F0FAFB;
-  --search-mark-bg:            #F5C842;
-}
-
-/* ---- Navy (dark) theme ---- */
 .navy {
-  --bg:                        #181e2d;
-  --fg:                        #c5cfe0;
-  --sidebar-bg:                #0d1117;
-  --sidebar-fg:                #7a96b2;
-  --sidebar-non-existant:      #3a5268;
-  --sidebar-active:            #F5C842;
-  --sidebar-spacer:            rgba(122, 150, 178, 0.1);
-  --scrollbar:                 rgba(122, 150, 178, 0.28);
-  --icons:                     #7a96b2;
-  --icons-hover:               #4EC9D4;
-  --links:                     #4EC9D4;
-  --inline-code-color:         #7dd5db;
-  --theme-popup-bg:            #1e2638;
-  --theme-popup-border:        #2a3548;
-  --theme-hover:               #1e2638;
-  --quote-bg:                  rgba(78, 201, 212, 0.07);
-  --quote-border:              #4EC9D4;
-  --table-border-color:        #26334a;
-  --table-header-bg:           #0d1117;
-  --table-alternate-bg:        rgba(255, 255, 255, 0.025);
-  --searchbar-border-color:    #2a3548;
-  --searchbar-bg:              #1e2638;
-  --searchbar-fg:              #c5cfe0;
-  --searchbar-shadow-color:    rgba(78, 201, 212, 0.2);
-  --searchresults-header-fg:   #c5cfe0;
-  --searchresults-border-color: #2a3548;
-  --searchresults-li-bg:       #1e2638;
-  --search-mark-bg:            #C9971A;
-}
+  --bg:                         #1a2035;
+  --fg:                         #c8d4e4;
+  --sidebar-bg:                 #121827;
+  --sidebar-fg:                 #7a92a8;
+  --sidebar-non-existant:       #3a5068;
+  --sidebar-active:             #5cb8c4;
+  --sidebar-spacer:             rgba(122, 146, 168, 0.08);
+  --scrollbar:                  rgba(122, 146, 168, 0.25);
+  --icons:                      #7a92a8;
+  --icons-hover:                #5cb8c4;
+  --links:                      #5cb8c4;
+  --inline-code-color:          #7dd5db;
+  --theme-popup-bg:             #1f2842;
+  --theme-popup-border:         #2a3552;
+  --theme-hover:                #1f2842;
+  --quote-bg:                   rgba(92, 184, 196, 0.08);
+  --quote-border:               #5cb8c4;
+  --table-border-color:         #253047;
+  --table-header-bg:            #121827;
+  --table-alternate-bg:         rgba(255, 255, 255, 0.025);
+  --searchbar-border-color:     #2a3552;
+  --searchbar-bg:               #1f2842;
+  --searchbar-fg:               #c8d4e4;
+  --searchbar-shadow-color:     rgba(92, 184, 196, 0.18);
+  --searchresults-header-fg:    #c8d4e4;
+  --searchresults-border-color: #2a3552;
+  --searchresults-li-bg:        #1f2842;
+  --search-mark-bg:             #0d7377;
 
-/* ---- Coal (dark) theme ---- */
-.coal {
-  --bg:                        #1c1e22;
-  --fg:                        #c9cdd4;
-  --sidebar-bg:                #0f1114;
-  --sidebar-fg:                #7e8fa2;
-  --sidebar-non-existant:      #3a4758;
-  --sidebar-active:            #F5C842;
-  --sidebar-spacer:            rgba(126, 143, 162, 0.1);
-  --scrollbar:                 rgba(126, 143, 162, 0.28);
-  --icons:                     #7e8fa2;
-  --icons-hover:               #4EC9D4;
-  --links:                     #4EC9D4;
-  --inline-code-color:         #7dd5db;
-  --theme-popup-bg:            #242830;
-  --theme-popup-border:        #2e3440;
-  --theme-hover:               #242830;
-  --quote-bg:                  rgba(78, 201, 212, 0.07);
-  --quote-border:              #4EC9D4;
-  --table-border-color:        #2a3140;
-  --table-header-bg:           #0f1114;
-  --table-alternate-bg:        rgba(255, 255, 255, 0.025);
-  --searchbar-border-color:    #2e3440;
-  --searchbar-bg:              #242830;
-  --searchbar-fg:              #c9cdd4;
-  --searchbar-shadow-color:    rgba(78, 201, 212, 0.2);
-  --searchresults-header-fg:   #c9cdd4;
-  --searchresults-border-color: #2e3440;
-  --searchresults-li-bg:       #242830;
-  --search-mark-bg:            #C9971A;
-}
-
-/* ---- Ayu (dark) theme ---- */
-.ayu {
-  --bg:                        #0f1419;
-  --fg:                        #c5c5c5;
-  --sidebar-bg:                #080c12;
-  --sidebar-fg:                #708090;
-  --sidebar-non-existant:      #314050;
-  --sidebar-active:            #F5C842;
-  --sidebar-spacer:            rgba(112, 128, 144, 0.1);
-  --scrollbar:                 rgba(112, 128, 144, 0.28);
-  --icons:                     #708090;
-  --icons-hover:               #39bcd0;
-  --links:                     #39bcd0;
-  --inline-code-color:         #6be0e8;
-  --theme-popup-bg:            #1a2130;
-  --theme-popup-border:        #233040;
-  --theme-hover:               #1a2130;
-  --quote-bg:                  rgba(57, 188, 208, 0.07);
-  --quote-border:              #39bcd0;
-  --table-border-color:        #1e2a38;
-  --table-header-bg:           #080c12;
-  --table-alternate-bg:        rgba(255, 255, 255, 0.02);
-  --searchbar-border-color:    #233040;
-  --searchbar-bg:              #1a2130;
-  --searchbar-fg:              #c5c5c5;
-  --searchbar-shadow-color:    rgba(57, 188, 208, 0.2);
-  --searchresults-header-fg:   #c5c5c5;
-  --searchresults-border-color: #233040;
-  --searchresults-li-bg:       #1a2130;
-  --search-mark-bg:            #C9971A;
-}
-
-/* ---- Rust theme (light) ---- */
-.rust {
-  --bg:                        #FAFAF8;
-  --fg:                        #2C3E50;
-  --sidebar-bg:                #3b2f2f;
-  --sidebar-fg:                #d4c0a8;
-  --sidebar-non-existant:      #8a7060;
-  --sidebar-active:            #F5C842;
-  --links:                     #0D7377;
-  --inline-code-color:         #6e3020;
-  --quote-bg:                  #F5F0EA;
-  --quote-border:              #0D7377;
-  --table-border-color:        #DDD5C8;
-  --table-header-bg:           #3b2f2f;
-  --table-alternate-bg:        #F5F0EA;
-  --search-mark-bg:            #F5C842;
+  /* local vars */
+  --mm-accent:    #5cb8c4;
+  --mm-code-bg:   rgba(92, 184, 196, 0.1);
+  --mm-h1-border: #2a3d54;
+  --mm-h2-border: #253047;
+  --mm-hr:        #253047;
 }
 
 /* ================================================================
-   SIDEBAR
+   LIGHT theme
+   ================================================================ */
+.light {
+  --bg:                         #ffffff;
+  --fg:                         #2c3e50;
+  --sidebar-bg:                 #14213d;
+  --sidebar-fg:                 #b0c0d0;
+  --sidebar-non-existant:       #4a6080;
+  --sidebar-active:             #5cb8c4;
+  --sidebar-spacer:             rgba(176, 192, 208, 0.12);
+  --scrollbar:                  rgba(176, 192, 208, 0.35);
+  --icons:                      #6a8090;
+  --icons-hover:                #0d7377;
+  --links:                      #0d7377;
+  --inline-code-color:          #0a5259;
+  --theme-popup-bg:             #ffffff;
+  --theme-popup-border:         #d4dde6;
+  --theme-hover:                #f0f8fa;
+  --quote-bg:                   #eef7f8;
+  --quote-border:               #0d7377;
+  --table-border-color:         #d4dde6;
+  --table-header-bg:            #14213d;
+  --table-alternate-bg:         #f8fafb;
+  --searchbar-border-color:     #d4dde6;
+  --searchbar-bg:               #ffffff;
+  --searchbar-fg:               #2c3e50;
+  --searchbar-shadow-color:     rgba(13, 115, 119, 0.15);
+  --searchresults-header-fg:    #2c3e50;
+  --searchresults-border-color: #d4dde6;
+  --searchresults-li-bg:        #f0f8fa;
+  --search-mark-bg:             #b8e4e8;
+
+  /* local vars */
+  --mm-accent:    #0d7377;
+  --mm-code-bg:   rgba(13, 115, 119, 0.07);
+  --mm-h1-border: #d4dde6;
+  --mm-h2-border: #e4eaef;
+  --mm-hr:        #e4eaef;
+}
+
+/* ================================================================
+   SIDEBAR structure (applies to both themes via CSS vars)
    ================================================================ */
 
 .sidebar {
   border-right: 1px solid rgba(255, 255, 255, 0.04) !important;
 }
 
-.sidebar .sidebar-scrollbox {
-  padding: 10px 0;
-}
-
-/* Book title in sidebar */
-.menu-title {
-  color: var(--mm-gold) !important;
-  font-weight: 700;
-  letter-spacing: 0.4px;
-  font-size: 1.0em;
-  padding: 16px 16px 10px !important;
-}
-
-/* Section divider labels (--- in SUMMARY.md) */
+/* Section divider labels */
 .chapter li.part-title {
-  color: var(--sidebar-fg) !important;
-  font-size: 0.7em;
+  font-size: 0.68em;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 1.2px;
-  margin-top: 1.4em;
-  padding: 4px 16px 2px !important;
-  opacity: 0.55;
+  letter-spacing: 1.4px;
+  margin-top: 1.6em;
+  padding: 4px 16px 3px !important;
+  opacity: 0.5;
 }
 
 /* Nav links */
 .chapter li.chapter-item > a {
   padding: 5px 14px 5px 16px !important;
   border-left: 3px solid transparent;
-  border-radius: 0;
   font-size: 0.875em;
   transition: color 0.1s, background 0.1s;
 }
 
-/* Active / expanded page */
-.chapter li.chapter-item.active > a,
-.chapter li.chapter-item.expanded > a {
+/* Active page */
+.chapter li.chapter-item.active > a {
   color: var(--sidebar-active) !important;
-  background: rgba(245, 200, 66, 0.07);
+  background: rgba(92, 184, 196, 0.1);
   border-left-color: var(--sidebar-active);
 }
 
@@ -240,58 +127,40 @@
   background: rgba(255, 255, 255, 0.05);
 }
 
-/* Nested items (sub-pages) */
-.chapter li.chapter-item.chapter-item--expanded {
-  margin-left: 12px;
-}
-
 /* ================================================================
    LAYOUT
    ================================================================ */
 
 .content main {
-  max-width: 880px;
+  max-width: 860px;
 }
 
 .content p {
   line-height: 1.75;
-  color: var(--fg);
 }
 
 /* ================================================================
-   TYPOGRAPHY — HEADINGS
+   TYPOGRAPHY
    ================================================================ */
 
-h1, h2, h3, h4, h5, h6 {
-  color: var(--fg);
-}
-
 h1 {
-  border-bottom: 2px solid var(--mm-teal);
-  padding-bottom: 0.35em;
-  font-weight: 700;
-  letter-spacing: -0.4px;
+  border-bottom: 2px solid var(--mm-h1-border);
+  padding-bottom: 0.3em;
   margin-top: 1.5em;
+  font-weight: 700;
 }
 
 h2 {
-  border-bottom: 1px solid var(--table-border-color);
+  border-bottom: 1px solid var(--mm-h2-border);
   padding-bottom: 0.2em;
+  margin-top: 2em;
   font-weight: 600;
-  margin-top: 2.25em;
 }
 
 h3 {
+  color: var(--mm-accent);
   font-weight: 600;
-  margin-top: 1.75em;
-  color: var(--mm-teal);
-}
-
-/* In dark themes, use a lighter teal for h3 to maintain contrast */
-.navy h3,
-.coal h3,
-.ayu h3 {
-  color: #4EC9D4;
+  margin-top: 1.6em;
 }
 
 h4 {
@@ -304,7 +173,6 @@ h4 {
    ================================================================ */
 
 a {
-  color: var(--links);
   text-decoration: none;
 }
 
@@ -321,30 +189,28 @@ table {
   width: 100%;
   margin: 1.25em 0;
   border: 1px solid var(--table-border-color);
-  border-radius: var(--mm-radius);
+  border-radius: 6px;
   overflow: hidden;
   font-size: 0.9em;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
 }
 
 th {
   background: var(--table-header-bg);
-  color: #d8e4f0;
+  color: #c8d4e4;
   text-align: left;
-  padding: 0.62em 1em;
-  font-size: 0.79em;
+  padding: 0.6em 1em;
+  font-size: 0.78em;
   font-weight: 600;
-  letter-spacing: 0.6px;
+  letter-spacing: 0.5px;
   text-transform: uppercase;
 }
 
-/* Gold left-border accent on first column header */
 th:first-child {
-  border-left: 3px solid var(--mm-gold);
+  border-left: 3px solid var(--mm-accent);
 }
 
 td {
-  padding: 0.55em 1em;
+  padding: 0.5em 1em;
   border-bottom: 1px solid var(--table-border-color);
   color: var(--fg);
 }
@@ -357,43 +223,27 @@ tr:nth-child(even) td {
   background: var(--table-alternate-bg);
 }
 
-tr:hover td {
-  background: rgba(13, 115, 119, 0.05);
-}
-
-.navy tr:hover td,
-.coal tr:hover td,
-.ayu tr:hover td {
-  background: rgba(78, 201, 212, 0.05);
-}
-
 /* ================================================================
    INLINE CODE
    ================================================================ */
 
 code {
   font-size: 0.875em;
-  padding: 0.12em 0.42em;
-  border-radius: var(--mm-radius-sm);
-  background: rgba(13, 115, 119, 0.1);
+  padding: 0.1em 0.4em;
+  border-radius: 4px;
+  background: var(--mm-code-bg);
   color: var(--inline-code-color);
-  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
-}
-
-.navy code,
-.coal code,
-.ayu code {
-  background: rgba(78, 201, 212, 0.1);
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
 }
 
 /* ================================================================
-   CODE BLOCKS (pre)
+   CODE BLOCKS
    ================================================================ */
 
 pre {
-  border-radius: var(--mm-radius);
+  border-radius: 6px;
   border: 1px solid var(--table-border-color);
-  border-left: 3px solid var(--mm-teal);
+  border-left: 3px solid var(--mm-accent);
   overflow-x: auto;
 }
 
@@ -411,9 +261,9 @@ pre code {
 blockquote {
   border-left: 3px solid var(--quote-border);
   background: var(--quote-bg);
-  padding: 0.75em 1.2em;
+  padding: 0.8em 1.2em;
   margin: 1.5em 0;
-  border-radius: 0 var(--mm-radius) var(--mm-radius) 0;
+  border-radius: 0 6px 6px 0;
   color: var(--fg);
 }
 
@@ -432,8 +282,8 @@ blockquote p + p {
 
 hr {
   border: none;
-  border-top: 1px solid var(--table-border-color);
-  margin: 2.25em 0;
+  border-top: 1px solid var(--mm-hr);
+  margin: 2em 0;
 }
 
 /* ================================================================
@@ -445,15 +295,15 @@ li {
 }
 
 /* ================================================================
-   MERMAID DIAGRAM CONTAINERS
+   MERMAID DIAGRAMS
    ================================================================ */
 
 .mermaid {
-  background: var(--bg);
+  background: var(--theme-popup-bg);
   border: 1px solid var(--table-border-color);
-  border-radius: var(--mm-radius-lg);
-  padding: 1.75em 1.5em;
-  margin: 1.75em 0;
+  border-radius: 6px;
+  padding: 1.5em;
+  margin: 1.5em 0;
   overflow-x: auto;
   text-align: center;
 }
@@ -461,48 +311,20 @@ li {
 .mermaid svg {
   max-width: 100%;
   height: auto;
-  display: inline-block;
 }
 
 /* ================================================================
-   SEARCH BAR
+   SEARCH
    ================================================================ */
 
-#searchbar {
-  border: 1px solid var(--searchbar-border-color) !important;
-  border-radius: var(--mm-radius-sm) !important;
-  background: var(--searchbar-bg) !important;
-  color: var(--searchbar-fg) !important;
-}
-
 #searchbar:focus {
-  border-color: var(--mm-teal) !important;
+  border-color: var(--mm-accent) !important;
   box-shadow: 0 0 0 3px var(--searchbar-shadow-color) !important;
   outline: none !important;
 }
 
 /* ================================================================
-   FEATURE GRID (used in index.md)
-   ================================================================ */
-
-.feature-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 1rem;
-  margin: 1.5em 0;
-}
-
-/* ================================================================
-   CHECKBOXES (task lists)
-   ================================================================ */
-
-input[type="checkbox"] {
-  margin-right: 0.5em;
-  accent-color: var(--mm-teal);
-}
-
-/* ================================================================
-   ACCESSIBILITY — reduced motion
+   ACCESSIBILITY
    ================================================================ */
 
 @media (prefers-reduced-motion: reduce) {
@@ -518,6 +340,5 @@ input[type="checkbox"] {
 @media print {
   .mermaid {
     border: 1px solid #ccc;
-    background: white;
   }
 }

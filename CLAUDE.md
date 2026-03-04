@@ -20,7 +20,7 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 # Build
 cargo build
 
-# Run all tests (311 total: 249 unit + 62 integration)
+# Run all tests (333 total: 262 unit + 71 integration)
 cargo test
 
 # Clippy (zero warnings required)
@@ -51,9 +51,9 @@ cargo bench
 
 | Metric | Value | Verified |
 |---|---|---|
-| Unit tests | 249 | `cargo test --lib` |
-| Integration tests | 62 | `cargo test --test ingest_test` |
-| Total tests | 311 | `cargo test` |
+| Unit tests | 262 | `cargo test --lib` |
+| Integration tests | 71 | `cargo test --test ingest_test` |
+| Total tests | 333 | `cargo test` |
 | Clippy warnings | 0 | `cargo clippy --all-targets` |
 | Format violations | 0 | `cargo fmt -- --check` |
 | CI jobs | 12 | `.github/workflows/ci.yml` (10 jobs), `.github/workflows/pages.yml` (2 jobs) |
@@ -681,3 +681,65 @@ cargo bench
 - 0 clippy warnings (`cargo clippy --all-targets`)
 - 0 formatting violations (`cargo fmt -- --check`)
 - Documentation builds without errors (`cargo doc --no-deps`)
+
+### Session 17: GDPR-Friendly Deployment Mode
+
+**Scope:** Added a first-class GDPR-friendly deployment option with configurable privacy flags, a data erasure API (GDPR Art. 17), and comprehensive documentation.
+
+**Code changes:**
+
+- **`src/config.rs` — 8 new privacy config fields:**
+  - `gdpr_mode: bool` — convenience preset that forces a privacy-minimising bundle on startup
+  - `strip_referrer_query: bool` — strips `?query` and `#fragment` from stored referrer URLs
+  - `round_timestamps: bool` — rounds event timestamps to the nearest hour
+  - `suppress_visitor_id: bool` — replaces HMAC visitor hash with a random UUID per request (breaks unique-visitor counting; NOT enabled by `gdpr_mode`)
+  - `suppress_browser_version: bool` — stores browser name only, not version
+  - `suppress_os_version: bool` — stores OS name only, not version
+  - `suppress_screen_size: bool` — omits screen width and device type fields
+  - `geoip_precision: String` — precision ladder: `"city"` | `"region"` | `"country"` | `"none"` (default `"city"`)
+  - `gdpr_mode` bundle: when `true`, forces all flags above (except `suppress_visitor_id`) and promotes `geoip_precision` from `"city"` → `"country"`
+  - New env vars: `MALLARD_GDPR_MODE`, `MALLARD_STRIP_REFERRER_QUERY`, `MALLARD_ROUND_TIMESTAMPS`, `MALLARD_SUPPRESS_VISITOR_ID`, `MALLARD_SUPPRESS_BROWSER_VERSION`, `MALLARD_SUPPRESS_OS_VERSION`, `MALLARD_SUPPRESS_SCREEN_SIZE`, `MALLARD_GEOIP_PRECISION`
+
+- **`src/ingest/handler.rs` — privacy transformations at ingestion time:**
+  - Added 8 new fields to `AppState` (all new privacy flags + `events_dir: PathBuf`)
+  - Added `pub fn strip_url_query_and_fragment(url: &str) -> &str` helper
+  - Added `pub fn round_to_hour(dt: DateTime<Utc>) -> chrono::NaiveDateTime` helper
+  - Both `process_pixel_event` and `ingest_event` apply all transforms before any data reaches DuckDB
+
+- **`src/api/stats.rs` — GDPR Art. 17 erasure endpoint:**
+  - `DELETE /api/gdpr/erase?site_id=...&start_date=...&end_date=...`
+  - Deletes from DuckDB hot table and removes on-disk Parquet partition directories
+  - Returns JSON: `status`, `db_records_deleted`, `parquet_partitions_deleted`
+  - Requires Admin auth; rejects invalid site_id, bad dates, end < start, spans > 366 days
+
+- **`src/server.rs`** — registered `DELETE /api/gdpr/erase` on admin-auth `key_routes`
+- **`src/main.rs`** — wired all 8 new Config fields to AppState; GDPR startup log and retention_days warning
+
+**Documentation:**
+- **`PRIVACY.md`** — "GDPR-Friendly Deployment Mode" section with comparison table, activation instructions, all 8 flags, erasure API docs
+- **`README.md`** — GDPR feature section, 9 new env vars in Configuration table, erasure endpoint in API Reference
+- **`docs/src/deployment.md`** — EU checklist additions, full "GDPR-Friendly Deployment" section
+- **`mallard-metrics.toml.example`** — GDPR configuration block with all flags and env var table
+
+**Test results (before → after):**
+- 249 → 262 unit tests passing (`cargo test --lib`)
+- 62 → 71 integration tests passing (`cargo test --test ingest_test`)
+- Total: 311 → 333 tests, 0 failures, 0 ignored
+- 0 clippy warnings (`cargo clippy --all-targets`)
+- 0 formatting violations (`cargo fmt -- --check`)
+
+**New unit tests added (12):**
+- `test_default_gdpr_flags`, `test_gdpr_mode_enables_privacy_bundle`, `test_gdpr_mode_respects_stricter_geoip_precision`, `test_gdpr_mode_respects_region_precision`, `test_validate_invalid_geoip_precision`, `test_validate_valid_geoip_precisions` — config validation
+- `test_strip_url_query_and_fragment_query`, `test_strip_url_query_and_fragment_fragment`, `test_strip_url_query_and_fragment_both`, `test_strip_url_query_and_fragment_no_change` — referrer stripping
+- `test_round_to_hour_truncates_minutes_seconds`, `test_round_to_hour_on_exact_hour` — timestamp rounding
+
+**New integration tests added (9):**
+- `test_gdpr_erase_requires_auth` — 401 without session
+- `test_gdpr_erase_returns_ok_for_empty_date_range` — 200 with 0 counts
+- `test_gdpr_erase_deletes_hot_events` — range >366 days → 400
+- `test_gdpr_erase_deletes_within_366_days` — valid range → 200, events deleted
+- `test_gdpr_erase_rejects_invalid_site_id` — site_id with space → 400
+- `test_gdpr_erase_rejects_invalid_dates` — non-date string → 400
+- `test_gdpr_erase_rejects_end_before_start` — end < start → 400
+- `test_gdpr_erase_rejects_range_over_366_days` — >366-day span → 400
+- `test_gdpr_erase_accessible_via_admin_api_key` — Admin X-API-Key accepted

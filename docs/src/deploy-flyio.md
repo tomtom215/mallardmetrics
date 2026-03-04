@@ -4,32 +4,6 @@
 
 ---
 
-## Table of Contents
-
-1. [Overview](#overview)
-2. [Fly.io vs VPS: When to Choose Each](#flyio-vs-vps-when-to-choose-each)
-3. [Pricing and Allowances](#pricing-and-allowances)
-4. [Prerequisites](#prerequisites)
-5. [Initial Setup](#initial-setup)
-   - [Install flyctl](#install-flyctl)
-   - [Authenticate](#authenticate)
-6. [Configure the Application](#configure-the-application)
-   - [fly.toml](#flytoml)
-   - [Dockerfile note](#dockerfile-note)
-7. [Create a Persistent Volume](#create-a-persistent-volume)
-8. [Set Secrets](#set-secrets)
-9. [Deploy](#deploy)
-10. [Configure a Custom Domain](#configure-a-custom-domain)
-11. [Verify the Deployment](#verify-the-deployment)
-12. [Logs and Monitoring](#logs-and-monitoring)
-13. [Scaling and Regions](#scaling-and-regions)
-14. [Updating Mallard Metrics](#updating-mallard-metrics)
-15. [Backup and Restore](#backup-and-restore)
-16. [Troubleshooting](#troubleshooting)
-17. [Frequently Asked Questions](#frequently-asked-questions)
-
----
-
 ## Overview
 
 Fly.io runs your Docker image as a Firecracker micro-VM. Mallard Metrics deploys well because:
