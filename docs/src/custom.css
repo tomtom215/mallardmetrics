@@ -1,33 +1,100 @@
 /* ================================================================
    Mallard Metrics — Documentation Theme
-   Clean, professional styling layered on mdBook's default Light theme.
-   Brand palette: Teal (#0D7377), Navy (#14213D), neutral greys.
+   Two themes: navy (dark, default) and light.
+   Both themes share the same structure. Colors swap via CSS variables.
+
+   Brand accent:  teal #0D7377 (light) / #5CB8C4 (dark)
+   Sidebar:       #121827 (dark theme) / #14213D (light theme)
    ================================================================ */
 
-/* ----------------------------------------------------------------
-   CSS Custom Properties
-   ---------------------------------------------------------------- */
-:root {
-  --mm-teal:       #0D7377;
-  --mm-teal-mid:   #14919B;
-  --mm-teal-light: #E8F5F6;
-  --mm-navy:       #14213D;
-  --mm-navy-mid:   #2C3E50;
-  --mm-border:     #d0dae3;
-  --mm-radius:     6px;
+/* ================================================================
+   NAVY — Dark theme (default)
+   ================================================================ */
+.navy {
+  --bg:                         #1a2035;
+  --fg:                         #c8d4e4;
+  --sidebar-bg:                 #121827;
+  --sidebar-fg:                 #7a92a8;
+  --sidebar-non-existant:       #3a5068;
+  --sidebar-active:             #5cb8c4;
+  --sidebar-spacer:             rgba(122, 146, 168, 0.08);
+  --scrollbar:                  rgba(122, 146, 168, 0.25);
+  --icons:                      #7a92a8;
+  --icons-hover:                #5cb8c4;
+  --links:                      #5cb8c4;
+  --inline-code-color:          #7dd5db;
+  --theme-popup-bg:             #1f2842;
+  --theme-popup-border:         #2a3552;
+  --theme-hover:                #1f2842;
+  --quote-bg:                   rgba(92, 184, 196, 0.08);
+  --quote-border:               #5cb8c4;
+  --table-border-color:         #253047;
+  --table-header-bg:            #121827;
+  --table-alternate-bg:         rgba(255, 255, 255, 0.025);
+  --searchbar-border-color:     #2a3552;
+  --searchbar-bg:               #1f2842;
+  --searchbar-fg:               #c8d4e4;
+  --searchbar-shadow-color:     rgba(92, 184, 196, 0.18);
+  --searchresults-header-fg:    #c8d4e4;
+  --searchresults-border-color: #2a3552;
+  --searchresults-li-bg:        #1f2842;
+  --search-mark-bg:             #0d7377;
+
+  /* local vars */
+  --mm-accent:    #5cb8c4;
+  --mm-code-bg:   rgba(92, 184, 196, 0.1);
+  --mm-h1-border: #2a3d54;
+  --mm-h2-border: #253047;
+  --mm-hr:        #253047;
 }
 
 /* ================================================================
-   SIDEBAR — navy background with clean neutral text
+   LIGHT theme
+   ================================================================ */
+.light {
+  --bg:                         #ffffff;
+  --fg:                         #2c3e50;
+  --sidebar-bg:                 #14213d;
+  --sidebar-fg:                 #b0c0d0;
+  --sidebar-non-existant:       #4a6080;
+  --sidebar-active:             #5cb8c4;
+  --sidebar-spacer:             rgba(176, 192, 208, 0.12);
+  --scrollbar:                  rgba(176, 192, 208, 0.35);
+  --icons:                      #6a8090;
+  --icons-hover:                #0d7377;
+  --links:                      #0d7377;
+  --inline-code-color:          #0a5259;
+  --theme-popup-bg:             #ffffff;
+  --theme-popup-border:         #d4dde6;
+  --theme-hover:                #f0f8fa;
+  --quote-bg:                   #eef7f8;
+  --quote-border:               #0d7377;
+  --table-border-color:         #d4dde6;
+  --table-header-bg:            #14213d;
+  --table-alternate-bg:         #f8fafb;
+  --searchbar-border-color:     #d4dde6;
+  --searchbar-bg:               #ffffff;
+  --searchbar-fg:               #2c3e50;
+  --searchbar-shadow-color:     rgba(13, 115, 119, 0.15);
+  --searchresults-header-fg:    #2c3e50;
+  --searchresults-border-color: #d4dde6;
+  --searchresults-li-bg:        #f0f8fa;
+  --search-mark-bg:             #b8e4e8;
+
+  /* local vars */
+  --mm-accent:    #0d7377;
+  --mm-code-bg:   rgba(13, 115, 119, 0.07);
+  --mm-h1-border: #d4dde6;
+  --mm-h2-border: #e4eaef;
+  --mm-hr:        #e4eaef;
+}
+
+/* ================================================================
+   SIDEBAR structure (applies to both themes via CSS vars)
    ================================================================ */
 
-/* Override sidebar background in the light theme */
-.light {
-  --sidebar-bg:     #14213D;
-  --sidebar-fg:     #b8c8d8;
-  --sidebar-active: #4EC9D4;
-  --links:          #0D7377;
-  --table-header-bg: #14213D;
+.sidebar {
+  border-right: 1px solid rgba(255, 255, 255, 0.04) !important;
 }
 
 /* Section divider labels */
@@ -52,12 +119,12 @@
 /* Active page */
 .chapter li.chapter-item.active > a {
   color: var(--sidebar-active) !important;
-  background: rgba(78, 201, 212, 0.1);
+  background: rgba(92, 184, 196, 0.1);
   border-left-color: var(--sidebar-active);
 }
 
 .chapter li.chapter-item > a:hover {
-  background: rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.05);
 }
 
 /* ================================================================
@@ -68,28 +135,37 @@
   max-width: 860px;
 }
 
+.content p {
+  line-height: 1.75;
+}
+
 /* ================================================================
    TYPOGRAPHY
    ================================================================ */
 
 h1 {
-  border-bottom: 2px solid var(--mm-teal);
+  border-bottom: 2px solid var(--mm-h1-border);
   padding-bottom: 0.3em;
   margin-top: 1.5em;
   font-weight: 700;
 }
 
 h2 {
-  border-bottom: 1px solid var(--mm-border);
+  border-bottom: 1px solid var(--mm-h2-border);
   padding-bottom: 0.2em;
   margin-top: 2em;
   font-weight: 600;
 }
 
 h3 {
-  color: var(--mm-teal);
+  color: var(--mm-accent);
   font-weight: 600;
   margin-top: 1.6em;
+}
+
+h4 {
+  font-weight: 600;
+  margin-top: 1.25em;
 }
 
 /* ================================================================
@@ -112,16 +188,15 @@ table {
   border-collapse: collapse;
   width: 100%;
   margin: 1.25em 0;
-  border: 1px solid var(--mm-border);
-  border-radius: var(--mm-radius);
+  border: 1px solid var(--table-border-color);
+  border-radius: 6px;
   overflow: hidden;
   font-size: 0.9em;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
 }
 
 th {
-  background: var(--table-header-bg, #14213D);
-  color: #d0dde8;
+  background: var(--table-header-bg);
+  color: #c8d4e4;
   text-align: left;
   padding: 0.6em 1em;
   font-size: 0.78em;
@@ -131,12 +206,13 @@ th {
 }
 
 th:first-child {
-  border-left: 3px solid var(--mm-teal);
+  border-left: 3px solid var(--mm-accent);
 }
 
 td {
   padding: 0.5em 1em;
-  border-bottom: 1px solid var(--mm-border);
+  border-bottom: 1px solid var(--table-border-color);
+  color: var(--fg);
 }
 
 tr:last-child td {
@@ -144,7 +220,7 @@ tr:last-child td {
 }
 
 tr:nth-child(even) td {
-  background: rgba(13, 115, 119, 0.04);
+  background: var(--table-alternate-bg);
 }
 
 /* ================================================================
@@ -155,8 +231,8 @@ code {
   font-size: 0.875em;
   padding: 0.1em 0.4em;
   border-radius: 4px;
-  background: var(--mm-teal-light);
-  color: #0a5259;
+  background: var(--mm-code-bg);
+  color: var(--inline-code-color);
   font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
 }
 
@@ -165,9 +241,9 @@ code {
    ================================================================ */
 
 pre {
-  border-radius: var(--mm-radius);
-  border: 1px solid var(--mm-border);
-  border-left: 3px solid var(--mm-teal);
+  border-radius: 6px;
+  border: 1px solid var(--table-border-color);
+  border-left: 3px solid var(--mm-accent);
   overflow-x: auto;
 }
 
@@ -179,16 +255,16 @@ pre code {
 }
 
 /* ================================================================
-   BLOCKQUOTES / CALLOUT NOTES
+   BLOCKQUOTES / CALLOUTS
    ================================================================ */
 
 blockquote {
-  border-left: 3px solid var(--mm-teal);
-  background: var(--mm-teal-light);
+  border-left: 3px solid var(--quote-border);
+  background: var(--quote-bg);
   padding: 0.8em 1.2em;
   margin: 1.5em 0;
-  border-radius: 0 var(--mm-radius) var(--mm-radius) 0;
-  color: var(--mm-navy-mid);
+  border-radius: 0 6px 6px 0;
+  color: var(--fg);
 }
 
 blockquote p {
@@ -206,7 +282,7 @@ blockquote p + p {
 
 hr {
   border: none;
-  border-top: 1px solid var(--mm-border);
+  border-top: 1px solid var(--mm-hr);
   margin: 2em 0;
 }
 
@@ -223,9 +299,9 @@ li {
    ================================================================ */
 
 .mermaid {
-  background: #f8fafb;
-  border: 1px solid var(--mm-border);
-  border-radius: var(--mm-radius);
+  background: var(--theme-popup-bg);
+  border: 1px solid var(--table-border-color);
+  border-radius: 6px;
   padding: 1.5em;
   margin: 1.5em 0;
   overflow-x: auto;
@@ -242,9 +318,19 @@ li {
    ================================================================ */
 
 #searchbar:focus {
-  border-color: var(--mm-teal) !important;
-  box-shadow: 0 0 0 3px rgba(13, 115, 119, 0.15) !important;
+  border-color: var(--mm-accent) !important;
+  box-shadow: 0 0 0 3px var(--searchbar-shadow-color) !important;
   outline: none !important;
+}
+
+/* ================================================================
+   ACCESSIBILITY
+   ================================================================ */
+
+@media (prefers-reduced-motion: reduce) {
+  .chapter li.chapter-item > a {
+    transition: none;
+  }
 }
 
 /* ================================================================
