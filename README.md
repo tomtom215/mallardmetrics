@@ -5,7 +5,7 @@
 
 [![Tests](https://img.shields.io/badge/tests-311_passing-brightgreen?style=flat-square)](#development)
 [![Rust](https://img.shields.io/badge/rust-1.93%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
-[![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
 [![Clippy](https://img.shields.io/badge/clippy-0_warnings-brightgreen?style=flat-square)](#development)
 [![Privacy](https://img.shields.io/badge/privacy-no_cookies-teal?style=flat-square)](#privacy-by-design)
 [![Docs](https://img.shields.io/badge/docs-GitHub_Pages-navy?style=flat-square)](https://tomtom215.github.io/mallardmetrics)
@@ -492,4 +492,6 @@ Country-level resolution works without GeoIP. The system degrades gracefully if 
 
 ## License
 
-MIT
+AGPL-3.0 — see [LICENSE](LICENSE) for the full text.
+
+Mallard Metrics is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, version 3.
