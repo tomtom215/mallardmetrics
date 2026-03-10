@@ -1,6 +1,6 @@
 # Configuration
 
-Mallard Metrics is configured through a TOML file and two environment variables. All settings have sensible defaults; you can start without any configuration file.
+Mallard Metrics is configured through a TOML file and environment variables. All settings have sensible defaults; you can start without any configuration file.
 
 ## Loading Configuration
 

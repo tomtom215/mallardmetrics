@@ -39,7 +39,7 @@ flowchart TD
     FLUSH["Flush — spawn_blocking\nDuckDB Appender API\nbatch column insert"]
     FLUSH --> PARQUET["COPY TO Parquet\nZSTD compression\ndate-partitioned file"]
     PARQUET --> DELETE["DELETE FROM events\nhot table cleared"]
-    DELETE --> VIEW["Refresh events_all VIEW\nglobed over new Parquet files"]
+    DELETE --> VIEW["Refresh events_all VIEW\nglobbed over new Parquet files"]
     VIEW --> READY(["All data queryable\nevents_all VIEW\nhot union cold"])
 ```
 

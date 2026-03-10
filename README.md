@@ -469,7 +469,7 @@ server {
 2. Download the GeoLite2-City database (`.mmdb` format)
 3. Set `MALLARD_GEOIP_DB=/path/to/GeoLite2-City.mmdb`
 
-Country-level resolution works without GeoIP. The system degrades gracefully if the file is missing.
+If the GeoIP database is missing, country/region/city fields are stored as `NULL`. The system degrades gracefully — no errors are raised.
 
 ---
 

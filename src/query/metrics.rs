@@ -33,11 +33,10 @@ pub fn query_core_metrics(
 
     // avg_visit_duration_secs requires the behavioral extension (sessionize).
     // Gracefully return 0.0 if the extension is not loaded.
-    let avg_visit_duration_secs = super::sessions::query_session_metrics(
-        conn, site_id, start_date, end_date,
-    )
-    .map(|s| s.avg_session_duration_secs)
-    .unwrap_or(0.0);
+    let avg_visit_duration_secs =
+        super::sessions::query_session_metrics(conn, site_id, start_date, end_date)
+            .map(|s| s.avg_session_duration_secs)
+            .unwrap_or(0.0);
 
     Ok(CoreMetrics {
         unique_visitors,

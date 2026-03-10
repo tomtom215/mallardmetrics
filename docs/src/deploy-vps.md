@@ -476,22 +476,11 @@ Simply paste the `<script>` tag into your `mdBook` layout template or into indiv
 
 ---
 
-## Embedding the Dashboard in Docs
+## Accessing the Dashboard Remotely
 
-To show live analytics in your GitHub Pages documentation:
+The dashboard is served at the root URL of your Mallard Metrics instance (e.g. `https://analytics.example.com`). It requires authentication when `MALLARD_ADMIN_PASSWORD` is set.
 
-```html
-<!-- In a markdown file or HTML template -->
-<iframe
-  src="https://analytics.example.com"
-  width="100%"
-  height="800"
-  style="border: none; border-radius: 8px;"
-  title="Mallard Metrics Dashboard">
-</iframe>
-```
-
-> **Note:** The dashboard requires authentication. For a public-facing embed, consider creating a read-only API key and building a custom view, or setting up a dedicated public stats endpoint in `api/stats.rs`.
+> **Note:** The server sets `X-Frame-Options: DENY` to prevent clickjacking, so the dashboard cannot be embedded in an iframe. Access it directly in a browser tab instead.
 
 ---
 
