@@ -134,7 +134,7 @@
         mirrorActors:  false,
       },
       er:            { layoutDirection: 'TB' },
-      securityLevel: 'loose',
+      securityLevel: 'strict',
     });
 
     /* Convert <pre><code class="language-mermaid">…</code></pre> → <div class="mermaid"> */
@@ -155,7 +155,7 @@
   /* ---- Load mermaid.js from CDN ---- */
   function loadMermaid() {
     var s = document.createElement('script');
-    s.src   = 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js';
+    s.src   = 'https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.min.js';
     s.async = true;
     s.onload = function () {
       if (document.readyState === 'loading') {

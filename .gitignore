@@ -1,4 +1,10 @@
 /target
 /data
 *.parquet
+*.duckdb
+*.duckdb.wal
 .env
+.secret
+*.mmdb
+lcov.info
+docs/book/

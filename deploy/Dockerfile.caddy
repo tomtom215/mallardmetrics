@@ -5,13 +5,13 @@
 # Build:  docker build -f deploy/Dockerfile.caddy -t mallard-caddy .
 # Or let docker compose build handle it (see docker-compose.production.yml).
 
-FROM caddy:2-builder AS builder
+FROM caddy:2.9-builder AS builder
 
 RUN xcaddy build \
     --with github.com/caddy-dns/cloudflare
 
 # Use Alpine final image so Caddy's standard tooling (caddy validate, etc.)
 # is available for health checks. The binary above is statically linked.
-FROM caddy:2-alpine
+FROM caddy:2.9-alpine
 
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
