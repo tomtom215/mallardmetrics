@@ -210,7 +210,7 @@ docker compose -f deploy/docker-compose.production.yml logs caddy | grep -i cert
 # Test the health endpoint (replace with your domain)
 curl -s https://analytics.example.com/health/ready
 
-# Expected: {"status":"ready"}
+# Expected: ready
 ```
 
 Open `https://<your-domain>` in a browser. You should see the Mallard Metrics dashboard login page.
@@ -432,8 +432,8 @@ All configuration is in `deploy/.env`. The file is created by `setup.sh` from `d
 |---|---|---|
 | `DOMAIN` | _(required)_ | Hostname Caddy serves |
 | `MALLARD_RETENTION_DAYS` | `365` | Delete Parquet partitions older than N days |
-| `MALLARD_RATE_LIMIT_PER_SITE` | `200` | Max events/sec per site_id |
-| `MALLARD_CACHE_TTL_SECS` | `300` | Query result cache TTL (seconds) |
+| `MALLARD_RATE_LIMIT` | `0` (unlimited) | Max events/sec per site_id |
+| `MALLARD_CACHE_TTL` | `60` | Query result cache TTL (seconds) |
 | `MALLARD_MAX_CONCURRENT_QUERIES` | `10` | DuckDB concurrency cap |
 | `MALLARD_MAX_LOGIN_ATTEMPTS` | `5` | Failed logins before IP lockout |
 | `MALLARD_LOGIN_LOCKOUT` | `300` | Lockout duration (seconds) |
@@ -476,22 +476,11 @@ Simply paste the `<script>` tag into your `mdBook` layout template or into indiv
 
 ---
 
-## Embedding the Dashboard in Docs
+## Accessing the Dashboard Remotely
 
-To show live analytics in your GitHub Pages documentation:
+The dashboard is served at the root URL of your Mallard Metrics instance (e.g. `https://analytics.example.com`). It requires authentication when `MALLARD_ADMIN_PASSWORD` is set.
 
-```html
-<!-- In a markdown file or HTML template -->
-<iframe
-  src="https://analytics.example.com"
-  width="100%"
-  height="800"
-  style="border: none; border-radius: 8px;"
-  title="Mallard Metrics Dashboard">
-</iframe>
-```
-
-> **Note:** The dashboard requires authentication. For a public-facing embed, consider creating a read-only API key and building a custom view, or setting up a dedicated public stats endpoint in `api/stats.rs`.
+> **Note:** The server sets `X-Frame-Options: DENY` to prevent clickjacking, so the dashboard cannot be embedded in an iframe. Access it directly in a browser tab instead.
 
 ---
 
@@ -603,13 +592,15 @@ curl -s https://analytics.example.com/health/detailed | jq .
 Example response:
 ```json
 {
-  "status": "healthy",
+  "status": "ok",
   "version": "0.1.0",
-  "buffer_size": 0,
+  "buffered_events": 0,
   "auth_configured": true,
   "geoip_loaded": false,
-  "cache_enabled": true,
-  "behavioral_extension_loaded": true
+  "behavioral_extension_loaded": true,
+  "filter_bots": true,
+  "cache_entries": 0,
+  "cache_empty": true
 }
 ```
 

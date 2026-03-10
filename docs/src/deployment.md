@@ -177,13 +177,11 @@ readinessProbe:
 
 ### Docker Compose Health Check
 
-```yaml
-healthcheck:
-  test: ["CMD", "wget", "-qO-", "http://localhost:8000/health/ready"]
-  interval: 30s
-  timeout: 5s
-  retries: 3
-  start_period: 15s
+The `FROM scratch` image has no shell or utilities (`wget`, `curl`). Use Docker's `HEALTHCHECK` with an external check from the host, or rely on your reverse proxy or orchestrator's health probes:
+
+```bash
+# External health check from the host
+curl -sf http://localhost:8000/health/ready || exit 1
 ```
 
 ---

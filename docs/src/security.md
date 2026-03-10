@@ -51,10 +51,12 @@ Properties of this approach:
 
 ### GDPR/CCPA Compliance
 
-Because Mallard Metrics stores no personal data:
-- No cookie consent banner is required.
-- No data subject access or deletion requests need to be processed.
-- No data processor agreements are needed with third parties (there are none).
+Mallard Metrics stores pseudonymous visitor IDs (daily-rotating HMAC-SHA256 hashes), which are personal data under GDPR Recital 26. Operators must establish a lawful basis for processing — typically Art. 6(1)(f) legitimate interests for aggregate analytics, especially when combined with [GDPR mode](../deployment.md#gdpr-friendly-deployment). See [PRIVACY.md](../../../PRIVACY.md) for the full legal analysis, DPIA guidance, and operator obligations.
+
+Key points:
+- **No cookies are set** for tracking — no ePrivacy consent banner is needed for the tracking script itself.
+- **Data subject erasure** is supported via `DELETE /api/gdpr/erase` (Admin API key required).
+- **No third-party data sharing** — all processing is first-party, no data processor agreements needed.
 
 ---
 
@@ -148,8 +150,8 @@ All HTTP responses include these OWASP-recommended security headers:
 | `X-Frame-Options` | `DENY` | Prevents clickjacking via iframe embedding |
 | `Referrer-Policy` | `strict-origin-when-cross-origin` | Limits referrer leakage |
 | `Content-Security-Policy` | HTML responses only | Restricts scripts and resources to same origin |
-| `Permissions-Policy` | `geolocation=(), microphone=(), camera=()` | Disables browser feature APIs |
-| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` | Instructs browsers to enforce HTTPS for 1 year |
+| `Permissions-Policy` | `geolocation=(), microphone=(), camera=(), interest-cohort=()` | Disables browser feature APIs and FLoC/Topics |
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains; preload` | Instructs browsers to enforce HTTPS for 1 year; eligible for preload lists |
 | `Cache-Control` | `no-store, no-cache` | JSON API responses only; prevents analytics data caching |
 | `X-Request-ID` | UUID per request | Injected by the server, propagated through tracing spans for log correlation |
 

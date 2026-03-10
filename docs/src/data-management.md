@@ -39,7 +39,7 @@ flowchart TD
     FLUSH["Flush — spawn_blocking\nDuckDB Appender API\nbatch column insert"]
     FLUSH --> PARQUET["COPY TO Parquet\nZSTD compression\ndate-partitioned file"]
     PARQUET --> DELETE["DELETE FROM events\nhot table cleared"]
-    DELETE --> VIEW["Refresh events_all VIEW\nglobed over new Parquet files"]
+    DELETE --> VIEW["Refresh events_all VIEW\nglobbed over new Parquet files"]
     VIEW --> READY(["All data queryable\nevents_all VIEW\nhot union cold"])
 ```
 
@@ -70,7 +70,7 @@ To keep data indefinitely, set `retention_days = 0` (the default).
 
 ### GDPR Right to Erasure
 
-Mallard Metrics stores no PII (IP addresses are discarded after hashing; visitor IDs are pseudonymous and daily-rotating). There is no mechanism to delete a specific visitor's data because the visitor ID cannot be reverse-mapped to an individual.
+Mallard Metrics provides an admin-authenticated `DELETE /api/gdpr/erase` endpoint to permanently delete analytics data for a given `site_id` within a date range. Because visitor IDs are pseudonymous daily-rotating HMAC hashes that cannot be reverse-mapped to individuals, erasure operates at the **site + date-range** granularity — the finest granularity available without the original IP address and User-Agent. See [PRIVACY.md](../../../PRIVACY.md) for the full analysis and operator obligations.
 
 ---
 

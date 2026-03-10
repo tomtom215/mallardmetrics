@@ -918,19 +918,9 @@ fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
     get_auth_info(state, headers) != AuthInfo::None
 }
 
-/// Extract the client IP address from request headers.
-///
-/// Checks `X-Forwarded-For` first (proxy/load-balancer), then `X-Real-IP`,
-/// falling back to "unknown" when no IP header is present.
+/// Re-export of the shared IP extraction helper.
 fn extract_client_ip(headers: &HeaderMap) -> String {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(',').next())
-        .map(str::trim)
-        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
-        .unwrap_or("unknown")
-        .to_string()
+    crate::ingest::handler::extract_ip(headers)
 }
 
 /// Extract session token from cookie header.

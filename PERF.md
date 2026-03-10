@@ -158,10 +158,11 @@ Every performance claim must include:
 
 ## Optimization History
 
-No optimizations with measured results have been documented yet. When optimizations are made, each entry will include:
+### Row-by-row INSERT → DuckDB Appender API (Session 12)
 
-- **What changed** -- Description of the optimization
-- **Before** -- Criterion measurement with CI
-- **After** -- Criterion measurement with CI
-- **Commit** -- Single-commit reference
-- **Verdict** -- Accepted/rejected based on non-overlapping confidence intervals
+- **What changed** -- Replaced `for event in &events { conn.execute(...) }` loop with DuckDB's Appender API (`conn.appender("events")` + `appender.append_row()` + `appender.flush()`), which uses columnar batch insertion bypassing per-row SQL parsing overhead.
+- **Before** -- Baselines invalidated by cold-start contamination (setup was inside `b.iter()`); see Superseded Baselines above.
+- **After** -- New baselines established after fixing the benchmark harness (setup moved outside `b.iter()`). See Current Baseline section.
+- **Verdict** -- Accepted. The Appender API is the recommended DuckDB batch-insert path and also enabled the event-restoration-on-failure safety guarantee.
+
+When future optimizations are made, each entry will include before/after Criterion measurements with CIs and a single-commit reference.

@@ -73,11 +73,16 @@ pub fn setup_query_view(conn: &Connection, parquet_dir: &Path) -> Result<(), duc
     // Attempt the union view first.  DuckDB ≥1.2 returns zero rows for an
     // unmatched glob, but older patch-level builds may raise an error; we
     // handle both cases by falling back to the events-only view.
+    // hive_partitioning=false is required because the Parquet files already
+    // contain site_id/timestamp columns; the Hive-style directory names
+    // (site_id=.../date=...) are for human navigation and retention cleanup
+    // only. With hive_partitioning=true (the default), DuckDB would add
+    // duplicate site_id/date columns from the path, breaking the UNION ALL.
     let union_sql = format!(
         "CREATE OR REPLACE VIEW events_all AS \
          SELECT * FROM events \
          UNION ALL \
-         SELECT * FROM read_parquet('{escaped_glob}', union_by_name=true)"
+         SELECT * FROM read_parquet('{escaped_glob}', union_by_name=true, hive_partitioning=false)"
     );
 
     if conn.execute_batch(&union_sql).is_ok() {

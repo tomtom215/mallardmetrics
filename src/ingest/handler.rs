@@ -500,7 +500,7 @@ pub async fn ingest_event(
 }
 
 /// Extract client IP from headers, checking X-Forwarded-For first.
-fn extract_ip(headers: &HeaderMap) -> String {
+pub fn extract_ip(headers: &HeaderMap) -> String {
     headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())

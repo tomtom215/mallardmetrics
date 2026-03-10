@@ -51,14 +51,11 @@
         X-Content-Type-Options    nosniff
         X-Frame-Options           DENY
         Referrer-Policy           strict-origin-when-cross-origin
-        Permissions-Policy        "geolocation=(), microphone=(), camera=()"
+        Permissions-Policy        "geolocation=(), microphone=(), camera=(), interest-cohort=()"
 
         # Only allow scripts/styles/images from self (and inline — needed by Preact HTM)
         # Adjust if you embed Mallard in an iframe from another domain.
-        Content-Security-Policy   "default-src 'self'; script-src 'self' 'unsafe-inline' cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';"
-
-        # Opt out of FLoC / Topics API
-        Permissions-Policy        "interest-cohort=()"
+        Content-Security-Policy   "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';"
     }
 }
 

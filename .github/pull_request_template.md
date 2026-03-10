@@ -29,7 +29,7 @@ cargo fmt -- --check
 cargo doc --no-deps
 ```
 
-- [ ] All 311+ tests pass (`cargo test`)
+- [ ] All 333+ tests pass (`cargo test`)
 - [ ] Zero clippy warnings (`cargo clippy --all-targets -- -D warnings`)
 - [ ] Zero formatting violations (`cargo fmt -- --check`)
 - [ ] Documentation builds without errors (`cargo doc --no-deps`)

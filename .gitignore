@@ -1,4 +1,13 @@
 /target
 /data
 *.parquet
+*.duckdb
+*.duckdb.wal
 .env
+.secret
+*.mmdb
+lcov.info
+docs/book/
+node_modules/
+package.json
+package-lock.json

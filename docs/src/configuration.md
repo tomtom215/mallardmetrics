@@ -1,6 +1,6 @@
 # Configuration
 
-Mallard Metrics is configured through a TOML file and two environment variables. All settings have sensible defaults; you can start without any configuration file.
+Mallard Metrics is configured through a TOML file and environment variables. All settings have sensible defaults; you can start without any configuration file.
 
 ## Loading Configuration
 
@@ -23,6 +23,14 @@ These two values are secrets and must not be stored in files committed to source
 | `MALLARD_MAX_LOGIN_ATTEMPTS` | Optional | Override `max_login_attempts` at runtime. |
 | `MALLARD_LOGIN_LOCKOUT` | Optional | Override `login_lockout_secs` at runtime. |
 | `MALLARD_LOG_FORMAT` | Optional | Set to `json` for structured JSON log output. Omit or set to any other value for human-readable text logs. |
+| `MALLARD_SECURE_COOKIES` | Optional | Set to `true` to add the `Secure` flag to session cookies (required behind TLS). |
+| `MALLARD_METRICS_TOKEN` | Optional | Bearer token protecting the `/metrics` endpoint. |
+| `MALLARD_GEOIP_DB` | Optional | Path to MaxMind GeoLite2-City `.mmdb` file. |
+| `MALLARD_DASHBOARD_ORIGIN` | Optional | Restrict dashboard CORS and enable CSRF protection. |
+| `MALLARD_MAX_CONCURRENT_QUERIES` | Optional | Max concurrent analytical queries (default 10). Returns 429 when exhausted. |
+| `MALLARD_CACHE_MAX_ENTRIES` | Optional | Max query cache entries (default 10000). |
+| `MALLARD_GDPR_MODE` | Optional | Enable GDPR-friendly preset (see [PRIVACY.md](../../../PRIVACY.md)). |
+| `MALLARD_GEOIP_PRECISION` | Optional | GeoIP precision: `city`, `region`, `country`, or `none`. |
 
 ## TOML Configuration Reference
 
