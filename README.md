@@ -3,7 +3,7 @@
 > **Self-hosted, privacy-focused web analytics powered by DuckDB and the `behavioral` extension.**
 > Single binary. Single process. Zero external dependencies.
 
-[![Tests](https://img.shields.io/badge/tests-311_passing-brightgreen?style=flat-square)](#development)
+[![Tests](https://img.shields.io/badge/tests-333_passing-brightgreen?style=flat-square)](#development)
 [![Rust](https://img.shields.io/badge/rust-1.93%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
 [![Clippy](https://img.shields.io/badge/clippy-0_warnings-brightgreen?style=flat-square)](#development)
@@ -394,7 +394,7 @@ The dashboard is a single-page application built with Preact + HTM, embedded dir
 # Build
 cargo build
 
-# Run all tests (311 total: 249 unit + 62 integration)
+# Run all tests (333 total: 262 unit + 71 integration)
 cargo test
 
 # Clippy (zero warnings required)
@@ -417,7 +417,7 @@ cargo bench
 
 - **Zero clippy warnings** — pedantic, nursery, and cargo lint groups enabled
 - **Zero formatting violations** — enforced via `cargo fmt`
-- **All 311 tests pass** — no ignored tests
+- **All 333 tests pass** — no ignored tests
 - **Documentation builds without errors**
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow.

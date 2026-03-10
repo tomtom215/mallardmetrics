@@ -316,7 +316,7 @@ fly checks list --app mallard-metrics-YOURNAME
 
 # Quick smoke test
 curl -s https://mallard-metrics-YOURNAME.fly.dev/health/ready
-# Expected: {"status":"ready"}
+# Expected: ready
 
 # View all available endpoints
 curl -s https://mallard-metrics-YOURNAME.fly.dev/health/detailed | jq .

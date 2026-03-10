@@ -31,7 +31,7 @@ This document tracks the implementation phases of Mallard Metrics, including com
 | Phase 6 | COMPLETE | Query caching, rate limiting, benchmarks, Prometheus metrics |
 | Phase 7 | COMPLETE | Security hardening, brute-force protection, scope enforcement, production readiness |
 
-**Current test suite:** 285 tests (223 unit + 62 integration), 0 clippy warnings, 0 format violations.
+**Current test suite:** 333 tests (262 unit + 71 integration), 0 clippy warnings, 0 format violations.
 
 ---
 
@@ -157,7 +157,6 @@ All 5 advanced analytics views added to the dashboard.
 
 These are identified as potential future work but are not currently planned. They depend on real-world production usage data and should only be pursued when actual need is demonstrated.
 
-- **Write-ahead log (WAL)** -- If buffer data loss on crash becomes a concern beyond what graceful shutdown handles
 - **Parquet compaction** -- Merge many small Parquet files per partition into fewer large ones for query performance
 - **Connection pooling** -- If concurrent query load requires it (currently single connection behind Mutex)
 - **Multi-node deployment** -- Only if single-process cannot handle the load (DuckDB is very fast for analytical workloads)
@@ -178,6 +177,7 @@ Phase 3: Advanced analytics (behavioral extension features)
 Phase 4: Security hardening (auth, GeoIP, CORS, bot filtering)
 Phase 5: Operational maturity (retention, export, shutdown, logging)
 Phase 6: Performance at scale (caching, rate limiting, metrics)
+Phase 7: Production readiness (brute-force, CSRF, scope enforcement, GDPR)
 ```
 
 ### Critical Path (completed)

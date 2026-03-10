@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Referrer source detection (Google, Bing, Twitter, Facebook, Reddit, etc.)
 - UTM parameter extraction
 - Input validation and sanitization
-- CI pipeline with 10 jobs (build, test, clippy, fmt, docs, MSRV, bench, security, coverage, docker)
+- CI pipeline (build, test, clippy, fmt, docs, MSRV, bench, security, coverage, docker)
 - Criterion.rs benchmark suite for ingestion throughput and Parquet flush
 - Dockerfile (multi-stage, `FROM scratch`)
 - `docker-compose.yml` with persistent storage
@@ -104,3 +104,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Dashboard export download buttons for CSV and JSON formats
 - Funnel chart division-by-zero guard in dashboard JavaScript
 - Local JS bundles (`preact.js` + `htm.js`) served via `rust-embed`; CDN dependency eliminated
+
+#### Correctness and Reliability
+
+- Fixed event data loss on flush failure: drained events are restored to the buffer if DuckDB insertion fails
+- Fixed blocking I/O in `tokio::spawn` periodic flush: wrapped in `spawn_blocking` to avoid async worker starvation
+- Replaced row-by-row `INSERT` with DuckDB Appender API for batch columnar insertion
+- Fixed `next_file_path` O(n) stat loop: replaced with single `read_dir` call
+- Unified `site_id` validation between ingest and stats endpoints
+- Fixed Parquet query gap: `events_all` VIEW unions hot DuckDB table with cold Parquet files
+- Fixed `shutdown_timeout_secs` enforcement: flush wrapped in `tokio::time::timeout`
+- Fixed `validate_origin` prefix-bypass vulnerability (`example.com.evil.com` no longer matches `example.com`)
+- DuckDB disk-based storage: `Connection::open(data_dir/mallard.duckdb)` replaces in-memory; WAL ensures crash durability
+- API key store disk persistence: keys survive server restarts via JSON serialization
+
+#### Production Infrastructure
+
+- HSTS header with `max-age`, `includeSubDomains`, and `preload` directives
+- `Retry-After` header on all 429 responses
+- Cookie `Secure` flag configurable via `MALLARD_SECURE_COOKIES`
+- `GET /robots.txt` and `GET /.well-known/security.txt` endpoints
+- `X-Request-ID` header with tracing span integration for log correlation
+- Concurrent query semaphore (`MALLARD_MAX_CONCURRENT_QUERIES`, default 10)
+- `GET /health/ready` readiness probe (queries DuckDB; returns 503 if not ready)
+- `CompressionLayer` for gzip/br/zstd response compression
+- `Cache-Control: no-store, no-cache` on all JSON API responses
+- `Permissions-Policy` header (geolocation, microphone, camera disabled)
+- `GET /api/event` pixel tracking (1x1 transparent GIF)
+- Auto-generated `MALLARD_SECRET` persisted to `data_dir/.secret`
+- `/metrics` optional bearer-token auth via `MALLARD_METRICS_TOKEN`
+- Query cache max-entries cap (`MALLARD_CACHE_MAX_ENTRIES`, default 10000)
+- Date range validation (max 366 days, end >= start)
+- Breakdown limit cap (max 1000)
+- `--locked` flag on all CI `cargo` invocations
+- Trivy container image scanning in CI
+- `Strict-Transport-Security` preload directive
+- `security.txt` with real GitHub advisory contact URL
+- SHA-pinned `dtolnay/rust-toolchain` in CI
+- `cargo-deny-action` and `cargo-llvm-cov` pre-compiled CI actions
+
+#### GDPR-Friendly Deployment
+
+- `MALLARD_GDPR_MODE` convenience preset for privacy-minimising configuration
+- `strip_referrer_query`: strip `?query` and `#fragment` from stored referrers
+- `round_timestamps`: round event timestamps to nearest hour
+- `suppress_visitor_id`: replace HMAC hash with random UUID per request
+- `suppress_browser_version` / `suppress_os_version`: store name only
+- `suppress_screen_size`: omit screen width and device type
+- `geoip_precision`: configurable ladder (`city`, `region`, `country`, `none`)
+- `DELETE /api/gdpr/erase` endpoint for GDPR Art. 17 right-to-erasure requests
+
+#### Documentation
+
+- GitHub Pages documentation site (mdBook) with 13 pages
+- `deploy-flyio.md`: complete Fly.io deployment guide
+- `deploy-vps.md`: complete VPS deployment guide with LUKS, Caddy, and vps-audit
+- `PRIVACY.md`: GDPR/ePrivacy/CCPA analysis with legal citations
+- `PERF.md`: benchmark framework and baselines
+- `LESSONS.md`: 21 development lessons learned
+- `SECURITY.md`: security model, threat model, and vulnerability reporting
+- GitHub issue templates (bug report, feature request)
+- Pull request template with security checklist
+- `CODEOWNERS` file
+- `CODE_OF_CONDUCT.md` (Contributor Covenant 2.1)
+
+#### Property-Based and Benchmark Testing
+
+- 7 proptest property tests (visitor_id, ratelimit, cache)
+- Criterion benchmark suite restructured: setup moved outside `b.iter()`
+- Prometheus counters for flush failures, rate limit rejections, login failures, cache hits/misses
