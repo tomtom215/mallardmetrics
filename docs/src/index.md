@@ -12,6 +12,8 @@ Mallard Metrics is a lightweight, GDPR/CCPA-compliant alternative to cloud analy
 
 Built in Rust for predictable, low resource usage. The embedded DuckDB database — combined with the `behavioral` extension — provides SQL-native behavioral analytics: funnels, retention cohorts, session analysis, sequence matching, and flow analysis. No third-party services involved.
 
+![Mallard Metrics Dashboard](dashboard-screenshot.png)
+
 ## Core Properties
 
 | Property | Value |
