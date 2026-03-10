@@ -351,6 +351,8 @@ flowchart TD
 
 The dashboard is a single-page application built with Preact + HTM, embedded directly in the binary via `rust-embed`. No build step or Node.js required.
 
+![Mallard Metrics Dashboard](docs/src/dashboard-screenshot.png)
+
 **Views include:**
 
 - Visitor and pageview counts with period selector
