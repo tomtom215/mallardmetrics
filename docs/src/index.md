@@ -18,7 +18,7 @@ Built in Rust for predictable, low resource usage. The embedded DuckDB database 
 
 | Property | Value |
 |---|---|
-| Language | Rust (MSRV 1.93.0) |
+| Language | Rust (MSRV 1.94.0) |
 | Web framework | Axum 0.8.x |
 | Database | DuckDB (disk-based, embedded, in-process) |
 | Analytics | `behavioral` extension (loaded at runtime) |

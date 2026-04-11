@@ -2,7 +2,7 @@
 name = "mallard-metrics"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.93.0"
+rust-version = "1.94.0"
 description = "Self-hosted, privacy-focused web analytics powered by DuckDB and the behavioral extension"
 license = "AGPL-3.0"
 repository = "https://github.com/tomtom215/mallardmetrics"
@@ -12,9 +12,9 @@ categories = ["web-programming", "database"]
 
 [dependencies]
 axum = { version = "0.8.8", features = ["macros"] }
-duckdb = { version = "1.4.4", features = ["bundled", "parquet"] }
-hmac = "0.12"
-sha2 = "0.10"
+duckdb = { version = "1.10501.0", features = ["bundled", "parquet"] }
+hmac = "0.13"
+sha2 = "0.11"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -28,15 +28,14 @@ hex = "0.4"
 parking_lot = "0.12"
 rust-embed = { version = "8.11", features = ["compression"] }
 mime_guess = "2"
-toml = "0.8"
+toml = "1.1"
 maxminddb = "0.27"
 argon2 = "0.5"
-rand = "0.9"
+rand = "0.10"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-proptest = "1.10"
-reqwest = { version = "0.12", features = ["json"] }
+criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1.11"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

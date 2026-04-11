@@ -22,7 +22,7 @@ Thank you for your interest in contributing to Mallard Metrics. This document co
 
 ### Prerequisites
 
-- **Rust 1.93.0+** -- The `rust-toolchain.toml` file will install the correct version automatically via `rustup`
+- **Rust 1.94.0+** -- The `rust-toolchain.toml` file will install the correct version automatically via `rustup`
 - **Git**
 - **Disk space** -- DuckDB's bundled compilation produces large build artifacts (~27GB in debug mode). Run `cargo clean` between major rebuilds if space is constrained.
 

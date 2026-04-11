@@ -4,7 +4,7 @@
 > Single binary. Single process. Zero external dependencies.
 
 [![Tests](https://img.shields.io/badge/tests-333_passing-brightgreen?style=flat-square)](#development)
-[![Rust](https://img.shields.io/badge/rust-1.93%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.94%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
 [![Clippy](https://img.shields.io/badge/clippy-0_warnings-brightgreen?style=flat-square)](#development)
 [![Privacy](https://img.shields.io/badge/privacy-no_cookies-teal?style=flat-square)](#privacy-by-design)
@@ -115,7 +115,7 @@ The default `docker-compose.yml` includes persistent storage, restart policy, an
 ### From Source
 
 ```bash
-# Requires Rust 1.93.0+ (set automatically via rust-toolchain.toml)
+# Requires Rust 1.94.0+ (set automatically via rust-toolchain.toml)
 cargo build --release
 ./target/release/mallard-metrics
 ```
@@ -371,9 +371,9 @@ The dashboard is a single-page application built with Preact + HTM, embedded dir
 
 | Component | Technology | Version |
 |---|---|---|
-| Language | Rust | 1.93.0 (MSRV) |
+| Language | Rust | 1.94.0 (MSRV) |
 | Web Framework | Axum | 0.8 |
-| Database | DuckDB (disk-based, embedded) | 1.4.4 |
+| Database | DuckDB (disk-based, embedded) | 1.5.x (crate 1.10501.0) |
 | Analytics Engine | `behavioral` extension | runtime-loaded |
 | Storage Format | Parquet (ZSTD compressed) | date-partitioned |
 | Frontend | Preact + HTM | no build step |
@@ -387,7 +387,7 @@ The dashboard is a single-page application built with Preact + HTM, embedded dir
 
 ### Prerequisites
 
-- Rust 1.93.0+ (managed automatically via `rust-toolchain.toml`)
+- Rust 1.94.0+ (managed automatically via `rust-toolchain.toml`)
 - Git
 
 ### Build and Test

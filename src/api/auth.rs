@@ -183,7 +183,7 @@ pub fn validate_origin(origin: Option<&str>, allowed_sites: &[String]) -> bool {
 
 /// Hash a password using Argon2id (OWASP recommended).
 pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
-    use rand::Rng;
+    use rand::RngExt;
     let salt_bytes: [u8; 16] = rand::rng().random();
     let salt = SaltString::encode_b64(&salt_bytes)?;
     let argon2 = Argon2::default();
@@ -204,14 +204,14 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
 
 /// Generate a cryptographically random session token (256 bits).
 pub fn generate_session_token() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let token_bytes: [u8; 32] = rand::rng().random();
     hex::encode(token_bytes)
 }
 
 /// Generate a cryptographically random API key (256 bits).
 pub fn generate_api_key() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let key_bytes: [u8; 32] = rand::rng().random();
     format!("mm_{}", hex::encode(key_bytes))
 }
