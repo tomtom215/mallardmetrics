@@ -56,7 +56,7 @@ cargo bench
 | Total tests | 333 | `cargo test` |
 | Clippy warnings | 0 | `cargo clippy --all-targets` |
 | Format violations | 0 | `cargo fmt -- --check` |
-| CI jobs | 12 | `.github/workflows/ci.yml` (10 jobs), `.github/workflows/pages.yml` (2 jobs) |
+| CI jobs | 18 | `.github/workflows/ci.yml` (10 jobs), `.github/workflows/pages.yml` (2 jobs), `.github/workflows/release.yml` (6 jobs) |
 
 ## Module Map
 

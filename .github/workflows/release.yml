@@ -1,0 +1,492 @@
+# Release pipeline for Mallard Metrics
+#
+# Triggered by pushing a semver tag:
+#   git tag -a v0.2.0 -m "Release v0.2.0" && git push origin v0.2.0
+#
+# Job dependency graph:
+#
+#   validate ──┬──► ci (matrix) ──┬──► build-binaries (matrix) ──┬──► docker-image ────┬──► github-release
+#              └──► security ────┘                               └────────────────────┘
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"     # stable:      v1.2.3
+      - "v[0-9]+.[0-9]+.[0-9]+-*"   # pre-release: v1.2.3-alpha.1
+
+# Prevent concurrent releases for the same ref.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Minimal default — individual jobs escalate only what they need.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: "-D warnings"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+# ── Job 1: Validate tag & extract metadata ────────────────────────────────────
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version:       ${{ steps.meta.outputs.version }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Extract version metadata
+        id: meta
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+
+          echo "::group::Tag metadata"
+          printf 'Tag:        %s\n' "$TAG"
+          printf 'Version:    %s\n' "$VERSION"
+
+          SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?(\+[A-Za-z0-9.]+)?$'
+          if [[ ! "$VERSION" =~ $SEMVER_RE ]]; then
+            echo "::error::Tag '$TAG' is not a valid semantic version."
+            echo "Expected format: vX.Y.Z  or  vX.Y.Z-pre.1"
+            exit 1
+          fi
+
+          if [[ "$VERSION" =~ - ]]; then
+            IS_PRE=true
+          else
+            IS_PRE=false
+          fi
+
+          printf 'Pre-release: %s\n' "$IS_PRE"
+          echo "::endgroup::"
+
+          echo "version=$VERSION"       >> "$GITHUB_OUTPUT"
+          echo "is_prerelease=$IS_PRE"  >> "$GITHUB_OUTPUT"
+
+      - name: Verify Cargo.toml version matches tag
+        shell: bash
+        run: |
+          TAG_VER="${{ steps.meta.outputs.version }}"
+          CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+
+          echo "::group::Version consistency"
+          printf 'Tag version:   %s\n' "$TAG_VER"
+          printf 'Cargo version: %s\n' "$CARGO_VER"
+          echo "::endgroup::"
+
+          if [[ "$CARGO_VER" != "$TAG_VER" ]]; then
+            echo "::error file=Cargo.toml::Cargo.toml version ($CARGO_VER) != tag ($TAG_VER)."
+            echo "Update Cargo.toml to match the tag before releasing."
+            exit 1
+          fi
+          echo "::notice::Cargo.toml version matches tag: $TAG_VER"
+
+      - name: Verify CHANGELOG entry exists
+        shell: bash
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+
+          if ! grep -qE "^## \[$VERSION\]" CHANGELOG.md; then
+            echo "::error file=CHANGELOG.md::No '## [$VERSION]' entry in CHANGELOG.md."
+            echo "Add release notes before tagging."
+            exit 1
+          fi
+          echo "::notice::CHANGELOG.md entry found for v$VERSION"
+
+# ── Job 2: Full CI gate (parallel matrix) ─────────────────────────────────────
+  ci:
+    name: CI / ${{ matrix.name }}
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: "test"
+            command: cargo test --locked --all-targets
+          - name: "clippy"
+            components: clippy
+            command: cargo clippy --all-targets -- -D warnings
+          - name: "fmt"
+            components: rustfmt
+            command: cargo fmt -- --check
+          - name: "doc"
+            command: cargo doc --no-deps
+            rustdocflags: "-D warnings"
+          - name: "MSRV 1.94"
+            toolchain: "1.94.0"
+            command: cargo build --locked
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: ${{ matrix.toolchain || '1.94.1' }}
+          components: ${{ matrix.components || '' }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: ${{ matrix.name }}
+        run: ${{ matrix.command }}
+        env:
+          RUSTDOCFLAGS: ${{ matrix.rustdocflags || '' }}
+
+# ── Job 3: Security audit ─────────────────────────────────────────────────────
+  security:
+    name: Security audit (cargo-deny)
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: EmbarkStudios/cargo-deny-action@82eb9f621fbc699dd0918f3ea06864c14cc84246 # v2
+        with:
+          command: check
+          arguments: --all-features
+
+# ── Job 4: Build release binaries (cross-platform matrix) ─────────────────────
+  build-binaries:
+    name: Build / ${{ matrix.target }}
+    needs: [ci, security]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: mallard-metrics-x86_64-unknown-linux-musl.tar.gz
+            docker_arch: amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: mallard-metrics-aarch64-unknown-linux-musl.tar.gz
+            cross: true
+            docker_arch: arm64
+          - target: x86_64-apple-darwin
+            os: macos-13
+            archive: mallard-metrics-x86_64-apple-darwin.tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-14
+            archive: mallard-metrics-aarch64-apple-darwin.tar.gz
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: "1.94.1"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.target }}
+
+      # Linux x86_64: install musl toolchain for static linking
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Linux aarch64: install cross for ARM cross-compilation
+      - name: Install cross
+        if: matrix.cross
+        shell: bash
+        run: cargo install cross --locked
+
+      # Native build (x86_64-linux, macOS targets)
+      - name: Build (native)
+        if: "!matrix.cross"
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      # Cross-compiled build (aarch64-linux)
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --locked --release --target ${{ matrix.target }}
+
+      - name: Create archive
+        shell: bash
+        run: |
+          BINARY="target/${{ matrix.target }}/release/mallard-metrics"
+          ARCHIVE="${{ matrix.archive }}"
+
+          echo "::group::Binary details"
+          ls -lh "$BINARY"
+          file "$BINARY"
+          echo "::endgroup::"
+
+          tar czf "$ARCHIVE" -C "target/${{ matrix.target }}/release" mallard-metrics
+
+          # sha256sum on Linux, shasum on macOS
+          if command -v sha256sum &>/dev/null; then
+            sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          else
+            shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          fi
+
+          echo "::notice::Archive created: $ARCHIVE ($(du -h "$ARCHIVE" | cut -f1))"
+
+      - name: Upload binary archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            ${{ matrix.archive }}
+            ${{ matrix.archive }}.sha256
+          retention-days: 90
+          if-no-files-found: error
+
+      # Upload raw Linux binaries for Docker image assembly
+      - name: Upload Docker binary
+        if: matrix.docker_arch
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: docker-bin-${{ matrix.docker_arch }}
+          path: target/${{ matrix.target }}/release/mallard-metrics
+          retention-days: 1
+          if-no-files-found: error
+
+# ── Job 5: Multi-arch Docker image ────────────────────────────────────────────
+  docker-image:
+    name: Docker image (GHCR)
+    needs: [validate, build-binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Download linux/amd64 binary
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: docker-bin-amd64
+          path: dist/amd64
+
+      - name: Download linux/arm64 binary
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: docker-bin-arm64
+          path: dist/arm64
+
+      - name: Prepare binaries
+        run: |
+          chmod +x dist/amd64/mallard-metrics dist/arm64/mallard-metrics
+          echo "::group::Binary verification"
+          file dist/amd64/mallard-metrics
+          file dist/arm64/mallard-metrics
+          ls -lh dist/*/mallard-metrics
+          echo "::endgroup::"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+
+      - name: Set up QEMU (for multi-arch manifest)
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4.0.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=
+
+      # Inline Dockerfile using pre-built static binaries.
+      # No compilation happens here — just copies the correct binary for each
+      # target platform into a FROM scratch image.
+      - name: Write release Dockerfile
+        run: |
+          cat > Dockerfile.release <<'EOF'
+          FROM scratch
+          ARG TARGETARCH
+          COPY dist/${TARGETARCH}/mallard-metrics /mallard-metrics
+          EXPOSE 8000
+          VOLUME ["/data"]
+          ENTRYPOINT ["/mallard-metrics"]
+          EOF
+          sed -i 's/^          //' Dockerfile.release
+
+      - name: Build and push multi-arch image
+        id: push
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Attest Docker image provenance (SLSA)
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate step summary
+        shell: bash
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          {
+            echo "## Docker image published"
+            echo ""
+            echo "| Property | Value |"
+            echo "|----------|-------|"
+            echo "| Registry | \`ghcr.io/${{ github.repository }}\` |"
+            echo "| Version  | \`${VERSION}\` |"
+            echo "| Digest   | \`${{ steps.push.outputs.digest }}\` |"
+            echo "| Platforms | \`linux/amd64\`, \`linux/arm64\` |"
+            echo ""
+            echo "### Pull commands"
+            echo "\`\`\`bash"
+            echo "docker pull ghcr.io/${{ github.repository }}:${VERSION}"
+            echo "docker pull ghcr.io/${{ github.repository }}:latest"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# ── Job 6: Create GitHub release with all artifacts ───────────────────────────
+  github-release:
+    name: Create GitHub release
+    needs: [validate, build-binaries, docker-image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Download all binary archives
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          path: release-artifacts/
+          pattern: mallard-metrics-*
+          merge-multiple: true
+
+      - name: Generate consolidated checksums
+        shell: bash
+        run: |
+          cd release-artifacts
+          echo "::group::Release artifacts"
+          ls -lh
+          echo "::endgroup::"
+
+          # Combine per-archive checksums and verify
+          cat ./*.sha256 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          echo "::notice::All checksums verified"
+
+      - name: Extract CHANGELOG section for this version
+        id: notes
+        shell: bash
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+
+          echo "::group::Extracting release notes for v$VERSION"
+
+          awk "
+            /^## \[$VERSION\]/ { found=1; next }
+            found && /^## \[/  { exit }
+            found              { print }
+          " CHANGELOG.md > release_notes.md
+
+          if [[ ! -s release_notes.md ]]; then
+            echo "::error::Empty release notes extracted for $VERSION"
+            echo "Ensure CHANGELOG.md has a non-empty ## [$VERSION] section."
+            exit 1
+          fi
+
+          echo "Release notes preview:"
+          cat release_notes.md
+          echo "::endgroup::"
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          VERSION="${{ needs.validate.outputs.version }}"
+          IS_PRE="${{ needs.validate.outputs.is_prerelease }}"
+          TAG="v${VERSION}"
+          DIGEST="${{ needs.docker-image.outputs.digest || 'n/a' }}"
+
+          PRE_FLAG=""
+          [[ "$IS_PRE" == "true" ]] && PRE_FLAG="--prerelease"
+
+          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${TAG}"
+
+          # Append Docker pull instructions to release notes
+          {
+            echo ""
+            echo "---"
+            echo ""
+            echo "### Docker"
+            echo ""
+            echo "\`\`\`bash"
+            echo "docker pull ghcr.io/${{ github.repository }}:${VERSION}"
+            echo "\`\`\`"
+            echo ""
+            echo "Platforms: \`linux/amd64\`, \`linux/arm64\`"
+            echo ""
+            echo "### Checksums"
+            echo ""
+            echo "\`\`\`"
+            cat release-artifacts/SHA256SUMS
+            echo "\`\`\`"
+          } >> release_notes.md
+
+          # Idempotent: if a release already exists, update it in place
+          if gh release view "$TAG" &>/dev/null; then
+            echo "::warning::Release ${TAG} already exists — updating it."
+            echo "::group::Updating GitHub release ${TAG}"
+            gh release edit "$TAG" \
+              $PRE_FLAG \
+              --title "Mallard Metrics ${TAG}" \
+              --notes-file release_notes.md
+
+            gh release upload "$TAG" \
+              --clobber \
+              release-artifacts/mallard-metrics-*.tar.gz \
+              release-artifacts/SHA256SUMS
+            echo "::endgroup::"
+            echo "::notice::GitHub release updated: $RELEASE_URL"
+          else
+            echo "::group::Creating GitHub release ${TAG}"
+            gh release create "$TAG" \
+              $PRE_FLAG \
+              --title "Mallard Metrics ${TAG}" \
+              --notes-file release_notes.md \
+              release-artifacts/mallard-metrics-*.tar.gz \
+              release-artifacts/SHA256SUMS
+            echo "::endgroup::"
+            echo "::notice::GitHub release created: $RELEASE_URL"
+          fi
+
+          # ── Step summary ──────────────────────────────────────────────────
+          {
+            echo "## Release v${VERSION}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Pre-release | \`${IS_PRE}\` |"
+            echo "| GitHub Release | [v${VERSION}](${RELEASE_URL}) |"
+            echo "| Docker | \`ghcr.io/${{ github.repository }}:${VERSION}\` |"
+            echo ""
+            echo "### Artifacts"
+            echo "\`\`\`"
+            ls -lh release-artifacts/mallard-metrics-*.tar.gz
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
