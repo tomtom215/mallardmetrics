@@ -96,7 +96,7 @@ mod tests {
         insert_pageview(&conn, "v2", "2024-01-15 11:00:00", "/");
         // Without behavioral extension, this will fail gracefully
         let result = query_session_metrics(&conn, "test.com", "2024-01-01", "2024-02-01");
-        // We expect an error without the extension; the API handler wraps with unwrap_or
+        // Without the behavioral extension, an error is expected; the API handler uses unwrap_or.
         if let Ok(metrics) = result {
             assert!(metrics.total_sessions > 0);
         }

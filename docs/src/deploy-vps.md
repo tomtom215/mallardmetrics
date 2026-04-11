@@ -464,9 +464,9 @@ Replace `analytics.example.com` with your deployment domain and `example.com` wi
 **Custom events:**
 ```javascript
 window.mallard('Purchase', {
-  revenue: '49.99',
+  revenue: 49.99,
   currency: 'USD',
-  props: JSON.stringify({ plan: 'pro' })
+  props: { plan: 'pro' }
 });
 ```
 
@@ -769,7 +769,6 @@ Use the Prometheus `/metrics` endpoint as a data source. For detailed analytics 
 | Cloudflare API token | [Cloudflare API token](#cloudflare-api-token) |
 | Configuration | [Configuration Reference](#configuration-reference) |
 | crypttab | [After reboot](#after-reboot) |
-| Dashboard embed | [Embedding the Dashboard in Docs](#embedding-the-dashboard-in-docs) |
 | DNS-01 challenge | [Cloudflare DNS challenge](#cloudflare-dns-challenge) |
 | Docker Compose | [One-Command Deployment](#one-command-deployment) |
 | fail2ban | [SSH hardening](#ssh-hardening) |

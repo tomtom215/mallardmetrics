@@ -84,7 +84,7 @@ impl LoginAttemptTracker {
                 entry.lockout_until = Some(Instant::now() + Duration::from_secs(self.lockout_secs));
             }
             let fc = entry.fail_count;
-            // NLL: entry borrow ends here; explicitly drop the guard before tracing.
+            // Drop the guard before tracing to release the mutex.
             drop(map);
             fc
         };

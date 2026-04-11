@@ -98,7 +98,7 @@ mallardmetrics/
 
 ### Before Starting
 
-1. Read `CLAUDE.md` for project context, module map, and session protocol
+1. Read `DEVELOPMENT.md` for project context and module map
 2. Read `LESSONS.md` for pitfalls and proven patterns
 3. Establish a baseline by running the full validation suite:
 
@@ -150,7 +150,7 @@ Run `cargo fmt` before every commit. The CI pipeline will reject improperly form
 - The only exceptions are:
   - Column names from fixed enums (not user input)
   - Internal values from previous query results
-- See `LESSONS.md` L12 for background
+- See `LESSONS.md` for background on SQL safety
 
 ### Error Handling
 
@@ -198,12 +198,12 @@ cargo bench --no-run
   - Error cases (invalid input, missing dependencies)
 - Integration tests go in `tests/ingest_test.rs` and test the full HTTP path: JSON request -> handler -> buffer -> DuckDB -> HTTP response
 - Use `tower::ServiceExt::oneshot()` for testing Axum routers without starting a real server
-- Test against real DuckDB output, not hand-written expectations (see `LESSONS.md` L5)
+- Test against real DuckDB output, not hand-written expectations (see `LESSONS.md`)
 - Use `tempfile::TempDir` for test isolation -- never write to shared directories
 
 ### Test Counts
 
-When adding tests, update the test count in `CLAUDE.md` by running:
+When adding tests, update the test count in `DEVELOPMENT.md` by running:
 
 ```bash
 # Count unit tests
@@ -270,7 +270,7 @@ Before submitting your PR, verify every item:
 - [ ] No SQL injection vectors introduced (parameterized queries used)
 - [ ] No PII stored (IP addresses only for hashing/GeoIP, then discarded)
 - [ ] CHANGELOG.md updated with your changes
-- [ ] Documentation updated if applicable (README.md, CLAUDE.md)
+- [ ] Documentation updated if applicable (README.md, DEVELOPMENT.md)
 
 ---
 

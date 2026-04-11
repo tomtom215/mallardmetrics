@@ -17,10 +17,8 @@ pub fn generate_visitor_id(ip: &str, user_agent: &str, daily_salt: &str) -> Stri
     hex::encode(result.into_bytes())
 }
 
-/// Generates the daily salt for a given date.
-///
-/// In production, this should use a persistent secret combined with the date.
-/// The secret should be loaded from configuration, not hardcoded.
+/// Generates the daily salt for a given date by combining the persistent
+/// `MALLARD_SECRET` with the date via HMAC-SHA256.
 pub fn daily_salt(secret: &str, date: chrono::NaiveDate) -> String {
     let input = format!("{secret}:{date}");
     let mut mac =

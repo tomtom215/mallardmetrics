@@ -493,7 +493,7 @@ If the GeoIP database is missing, country/region/city fields are stored as `NULL
 | [ROADMAP.md](ROADMAP.md) | Implementation phases, completed work, and future plans |
 | [PERF.md](PERF.md) | Benchmark framework, methodology, and measured baselines |
 | [LESSONS.md](LESSONS.md) | 21 development lessons learned, organized by category |
-| [CLAUDE.md](CLAUDE.md) | AI session protocol, module map, and development log |
+| [DEVELOPMENT.md](DEVELOPMENT.md) | Module map, build commands, and development guidelines |
 | [mallard-metrics.toml.example](mallard-metrics.toml.example) | Annotated configuration template |
 
 ---

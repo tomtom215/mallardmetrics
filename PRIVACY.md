@@ -572,5 +572,6 @@ All legal citations below refer to publicly available primary sources.
 
 ---
 
-*This document was last reviewed on 2026-03-03. Privacy law evolves; operators should verify
-currency of regulatory guidance before relying on it.*
+*This document describes the project's privacy model as implemented in the source
+code. Privacy law evolves; operators should verify current regulatory guidance
+before relying on it for compliance.*

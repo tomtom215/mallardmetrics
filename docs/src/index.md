@@ -34,7 +34,7 @@ Built in Rust for predictable, low resource usage. The embedded DuckDB database 
 - **No cookies** — Visitor identification uses a daily-rotating HMAC-SHA256 hash of `IP + User-Agent + daily salt`.
 - **No PII storage** — IP addresses are hashed and discarded; they are never written to disk.
 - **Daily salt rotation** — Visitor IDs change every 24 hours, preventing long-term tracking.
-- **GDPR/CCPA compliant** — No personal data stored. No consent banner required.
+- **Privacy-preserving** — Pseudonymous visitor IDs; no cookies; no raw IP storage. See [Security & Privacy](security.md) for details.
 
 ### Single Binary Deployment
 
