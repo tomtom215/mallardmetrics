@@ -10,10 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Table of Contents
 
 - [Unreleased](#unreleased)
+- [0.1.0](#010---2026-04-11)
 
 ---
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-04-11
 
 ### Added
 
