@@ -27,7 +27,7 @@ Once embedded, the script automatically fires a `pageview` event on every page l
 |---|---|
 | `pathname` | `window.location.pathname + search + hash` |
 | `referrer` | `document.referrer` |
-| `screen_size` | `window.innerWidth + 'x' + window.innerHeight` |
+| `screen_width` | `window.innerWidth` (viewport width in pixels) |
 | User-Agent | Sent in request header, parsed server-side |
 | UTM parameters | Extracted from URL query string |
 

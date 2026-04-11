@@ -12,8 +12,8 @@ Query results for `/api/stats/main` and `/api/stats/timeseries` are cached per `
 |---|---|---|
 | `site_id` | string | Required. The site to query. |
 | `period` | string | Optional. One of `day`, `today`, `7d`, `30d`, `90d`. Defaults to `30d`. |
-| `start_date` | string | Optional. Explicit start date (`YYYY-MM-DD`). Overrides `period`. |
-| `end_date` | string | Optional. Explicit end date (`YYYY-MM-DD`, exclusive). Overrides `period`. |
+| `start_date` | string | Optional. Explicit start date (`YYYY-MM-DD`). Both `start_date` and `end_date` must be provided together; a lone date is ignored. Overrides `period`. |
+| `end_date` | string | Optional. Explicit end date (`YYYY-MM-DD`, exclusive). Maximum range: 366 days. |
 
 ### `site_id` Validation
 
@@ -94,7 +94,7 @@ Returns visitor and pageview counts grouped by a single dimension.
 
 | Parameter | Type | Description |
 |---|---|---|
-| `limit` | integer | Maximum rows to return. Default 10. |
+| `limit` | integer | Maximum rows to return. Default 10, maximum 1000. Returns 400 if exceeded. |
 
 ### Response
 

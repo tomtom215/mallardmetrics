@@ -180,7 +180,7 @@ See [`mallard-metrics.toml.example`](mallard-metrics.toml.example) for a fully d
 | `MALLARD_HOST` | `0.0.0.0` | Server bind address |
 | `MALLARD_PORT` | `8000` | Server listen port |
 | `MALLARD_DATA_DIR` | `data` | Directory for Parquet data and DuckDB file |
-| `MALLARD_SECRET` | (random) | HMAC key for visitor ID hashing. **Set for production** to persist visitor IDs across restarts |
+| `MALLARD_SECRET` | (auto-generated) | HMAC key for visitor ID hashing. Auto-generated and persisted to `data_dir/.secret` on first run. **Set explicitly for production** |
 | `MALLARD_ADMIN_PASSWORD` | (none) | Admin password for dashboard authentication |
 | `MALLARD_SECURE_COOKIES` | `false` | Enable `Secure` flag on session cookies (required when behind TLS) |
 | `MALLARD_METRICS_TOKEN` | (none) | Bearer token protecting the `/metrics` endpoint |
@@ -192,6 +192,12 @@ See [`mallard-metrics.toml.example`](mallard-metrics.toml.example) for a fully d
 | `MALLARD_RETENTION_DAYS` | `0` | Auto-delete data older than N days (0 = unlimited) |
 | `MALLARD_RATE_LIMIT` | `0` | Max events/sec per site (0 = unlimited) |
 | `MALLARD_CACHE_TTL` | `60` | Query cache TTL in seconds |
+| `MALLARD_CACHE_MAX_ENTRIES` | `10000` | Maximum cached query results (0 = unlimited) |
+| `MALLARD_MAX_CONCURRENT_QUERIES` | `10` | Maximum concurrent analytics queries (0 = unlimited); excess returns 429 |
+| `MALLARD_SESSION_TTL` | `86400` | Dashboard session TTL in seconds (24 hours) |
+| `MALLARD_SHUTDOWN_TIMEOUT` | `30` | Graceful shutdown timeout in seconds |
+| `MALLARD_MAX_LOGIN_ATTEMPTS` | `5` | Failed login attempts per IP before lockout (0 = disabled) |
+| `MALLARD_LOGIN_LOCKOUT` | `300` | Lockout duration in seconds after exceeding max login attempts |
 | `MALLARD_LOG_FORMAT` | `text` | Log format: `text` or `json` |
 | `MALLARD_GDPR_MODE` | `false` | Enable GDPR-friendly preset (see [PRIVACY.md](PRIVACY.md)) |
 | `MALLARD_STRIP_REFERRER_QUERY` | `false` | Strip `?query` and `#fragment` from stored referrers |

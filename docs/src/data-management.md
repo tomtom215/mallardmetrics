@@ -160,7 +160,7 @@ The events table schema (also the Parquet file schema):
 | `os` | VARCHAR | Yes | Operating system name |
 | `os_version` | VARCHAR | Yes | OS version string |
 | `device_type` | VARCHAR | Yes | `desktop`, `mobile`, or `tablet` |
-| `screen_size` | VARCHAR | Yes | Screen dimensions (e.g. `1920x1080`) |
+| `screen_size` | VARCHAR | Yes | Screen viewport width in pixels (e.g. `1920`) |
 | `country_code` | VARCHAR(2) | Yes | ISO 3166-1 alpha-2 country code |
 | `region` | VARCHAR | Yes | Region/state name |
 | `city` | VARCHAR | Yes | City name |

@@ -64,7 +64,7 @@ DuckDB or Parquet.** The relevant code is in `src/ingest/handler.rs` and
 | `os` | String (optional) | `Windows` | Until partition deleted |
 | `os_version` | String (optional) | `10.0` | Until partition deleted |
 | `device_type` | String (optional) | `desktop` | Until partition deleted |
-| `screen_size` | String (optional) | `1920x1080` | Until partition deleted |
+| `screen_size` | String (optional) | `1920` | Until partition deleted |
 | `country_code` | String (optional) | `DE` | Until partition deleted |
 | `region` | String (optional) | `Bavaria` | Until partition deleted |
 | `city` | String (optional) | `Munich` | Until partition deleted |

@@ -101,7 +101,7 @@ docker compose logs -f
 
 ## Behind a Reverse Proxy
 
-Mallard Metrics binds to `127.0.0.1:8000` by default when run locally. Configure your reverse proxy to forward requests.
+Mallard Metrics binds to `0.0.0.0:8000` by default (all interfaces). Set `MALLARD_HOST=127.0.0.1` to restrict to localhost when behind a reverse proxy.
 
 ### nginx
 
@@ -313,8 +313,8 @@ Response:
   "site_id": "mysite.com",
   "start_date": "2024-01-01",
   "end_date": "2024-12-31",
-  "db_events_deleted": 1423,
-  "parquet_partitions_removed": 8
+  "db_records_deleted": 1423,
+  "parquet_partitions_deleted": 8
 }
 ```
 
@@ -331,7 +331,7 @@ Mallard Metrics handles `SIGINT` (Ctrl+C) and `SIGTERM` (Docker stop, systemd st
 
 1. The server stops accepting new connections.
 2. In-flight requests are completed.
-3. Buffered events are flushed to Parquet.
+3. Buffered events are flushed to DuckDB (persisted via WAL).
 
 The flush is bounded by `shutdown_timeout_secs` (default 30). If flushing takes longer, a warning is logged and the process exits.
 

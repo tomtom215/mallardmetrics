@@ -84,12 +84,12 @@ mallardmetrics/
 │   └── ingest_test.rs           -- Integration tests (71 tests)
 ├── benches/
 │   └── ingest_bench.rs          -- Criterion.rs benchmarks
-├── dashboard/assets/            -- Frontend SPA files
+├── src/dashboard/assets/        -- Frontend SPA files (embedded via rust-embed)
 ├── tracking/script.js           -- Tracking script (<1KB)
 ├── mallard-metrics.toml.example -- Configuration template
 ├── Dockerfile                   -- Multi-stage, FROM scratch
 ├── docker-compose.yml           -- Production-ready compose file
-└── .github/workflows/ci.yml    -- CI pipeline (12 jobs)
+└── .github/workflows/ci.yml    -- CI pipeline (8 jobs: 5 matrix + 3 standalone)
 ```
 
 ---
@@ -217,7 +217,7 @@ cargo test --test ingest_test 2>&1 | grep "test result"
 
 ## Benchmark Protocol
 
-Benchmarks use Criterion.rs 0.5 and live in `benches/ingest_bench.rs`.
+Benchmarks use Criterion.rs 0.8 and live in `benches/ingest_bench.rs`.
 
 ### Rules
 

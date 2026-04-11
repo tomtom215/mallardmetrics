@@ -78,7 +78,7 @@ When `MALLARD_SECURE_COOKIES=true` is set (required when behind a TLS reverse pr
 
 | Property | Value |
 |---|---|
-| Entropy | 128 bits of randomness |
+| Entropy | 256 bits of randomness |
 | Prefix | `mm_` — easy to identify in logs and secret scanners |
 | Storage | SHA-256 hash stored in a JSON file in `data_dir/`. Plaintext returned only at creation. |
 | Comparison | Constant-time equality to prevent timing side-channel attacks |
@@ -150,7 +150,7 @@ All HTTP responses include these OWASP-recommended security headers:
 | `X-Frame-Options` | `DENY` | Prevents clickjacking via iframe embedding |
 | `Referrer-Policy` | `strict-origin-when-cross-origin` | Limits referrer leakage |
 | `Content-Security-Policy` | HTML responses only | Restricts scripts and resources to same origin |
-| `Permissions-Policy` | `geolocation=(), microphone=(), camera=(), interest-cohort=()` | Disables browser feature APIs and FLoC/Topics |
+| `Permissions-Policy` | `geolocation=(), microphone=(), camera=()` | Disables browser feature APIs |
 | `Strict-Transport-Security` | `max-age=31536000; includeSubDomains; preload` | Instructs browsers to enforce HTTPS for 1 year; eligible for preload lists |
 | `Cache-Control` | `no-store, no-cache` | JSON API responses only; prevents analytics data caching |
 | `X-Request-ID` | UUID per request | Injected by the server, propagated through tracing spans for log correlation |
