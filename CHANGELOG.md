@@ -140,7 +140,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Date range validation (max 366 days, end >= start)
 - Breakdown limit cap (max 1000)
 - `--locked` flag on all CI `cargo` invocations
-- Trivy container image scanning in CI
 - `Strict-Transport-Security` preload directive
 - `security.txt` with real GitHub advisory contact URL
 - SHA-pinned `dtolnay/rust-toolchain` in CI

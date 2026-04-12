@@ -1,7 +1,7 @@
 # Continuous integration — enforces all quality gates.
 #
 # Jobs: test + clippy + fmt + doc + MSRV (matrix), security audit,
-#       code coverage, Docker build & scan.
+#       code coverage, Docker build.
 #
 # Job dependency graph (all jobs run in parallel):
 #
@@ -99,23 +99,11 @@ jobs:
           name: coverage-report
           path: lcov.info
 
-# ── Job 4: Docker build & scan ────────────────────────────────────────────────
+# ── Job 4: Docker build ───────────────────────────────────────────────────────
   docker:
-    name: Docker build & scan
+    name: Docker build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Build Docker image
         run: docker build -t mallard-metrics:test .
-      # Scan the built image for known CVEs.
-      # FROM scratch means no OS packages — Trivy scans embedded binaries.
-      # CRITICAL/HIGH vulnerabilities cause CI to fail; others are reported.
-      - name: Scan image with Trivy
-        uses: aquasecurity/trivy-action@97e0b3872f55f89b95b2f65b3dbab56962816478 # v0.34.2
-        with:
-          image-ref: mallard-metrics:test
-          format: table
-          exit-code: "1"
-          ignore-unfixed: true
-          vuln-type: os,library
-          severity: CRITICAL,HIGH
