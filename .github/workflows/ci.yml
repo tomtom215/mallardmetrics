@@ -1,7 +1,7 @@
 # Continuous integration — enforces all quality gates.
 #
 # Jobs: test + clippy + fmt + doc + MSRV (matrix), security audit,
-#       code coverage, Docker build.
+#       code coverage, Docker build, release-build smoke test.
 #
 # Job dependency graph (all jobs run in parallel):
 #
@@ -9,6 +9,8 @@
 #   security
 #   coverage
 #   docker
+#   release-build  # catches target-specific build failures (e.g. musl C++
+#                  # toolchain) before they slip into the release workflow.
 
 name: CI
 
@@ -33,7 +35,6 @@ env:
   RUST_BACKTRACE: 1
   RUSTFLAGS: "-D warnings"
   RUSTDOCFLAGS: "-D warnings"
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 # ── Job 1: Lint, test, and compile (parallel matrix) ──────────────────────────
 jobs:
@@ -58,7 +59,7 @@ jobs:
             toolchain: "1.94.0"
             command: cargo build --locked
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
         with:
           toolchain: ${{ matrix.toolchain || '1.94.1' }}
@@ -72,7 +73,7 @@ jobs:
     name: Security audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: EmbarkStudios/cargo-deny-action@82eb9f621fbc699dd0918f3ea06864c14cc84246 # v2
         with:
           log-level: warn
@@ -84,7 +85,7 @@ jobs:
     name: Code coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
         with:
           toolchain: "1.94.1"
@@ -94,7 +95,7 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - run: cargo llvm-cov --all-features --lcov --output-path lcov.info
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-report
           path: lcov.info
@@ -104,6 +105,38 @@ jobs:
     name: Docker build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Build Docker image
         run: docker build -t mallard-metrics:test .
+
+# ── Job 5: Release build smoke test ───────────────────────────────────────────
+#
+# Exercises the same cross-compilation path the release workflow uses so that
+# target-specific build breakage (e.g. a missing musl C++ toolchain for
+# `libduckdb-sys`) is caught on every push — not on the first release tag.
+#
+# Runs both musl targets via `cross`, matching release.yml exactly.  The
+# aarch64 leg is the slow one; x86_64 is fast and catches the vast majority of
+# issues, so we mark the matrix `fail-fast: false` to get full coverage.
+  release-build:
+    name: Release build / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: "1.94.1"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-${{ matrix.target }}
+      - name: Install cross
+        run: cargo install cross --locked
+      - name: Build release (cross)
+        run: cross build --locked --release --target ${{ matrix.target }}

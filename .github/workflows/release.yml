@@ -29,7 +29,6 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUSTFLAGS: "-D warnings"
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 # ── Job 1: Validate tag & extract metadata ────────────────────────────────────
 jobs:
@@ -40,25 +39,29 @@ jobs:
       version:       ${{ steps.meta.outputs.version }}
       is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Extract version metadata
         id: meta
         shell: bash
         run: |
           TAG="${GITHUB_REF_NAME}"
-          VERSION="${TAG#v}"
 
           echo "::group::Tag metadata"
           printf 'Tag:        %s\n' "$TAG"
-          printf 'Version:    %s\n' "$VERSION"
 
-          SEMVER_RE='^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?(\+[A-Za-z0-9.]+)?$'
-          if [[ ! "$VERSION" =~ $SEMVER_RE ]]; then
+          # Validate the tag itself (not the stripped version) so that a
+          # non-`v`-prefixed tag like "1.2.3" is rejected even if a future
+          # trigger change (workflow_dispatch, etc.) bypasses the tag filter.
+          TAG_RE='^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?(\+[A-Za-z0-9.]+)?$'
+          if [[ ! "$TAG" =~ $TAG_RE ]]; then
             echo "::error::Tag '$TAG' is not a valid semantic version."
             echo "Expected format: vX.Y.Z  or  vX.Y.Z-pre.1"
             exit 1
           fi
+
+          VERSION="${TAG#v}"
+          printf 'Version:    %s\n' "$VERSION"
 
           if [[ "$VERSION" =~ - ]]; then
             IS_PRE=true
@@ -126,7 +129,7 @@ jobs:
             toolchain: "1.94.0"
             command: cargo build --locked
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
         with:
           toolchain: ${{ matrix.toolchain || '1.94.1' }}
@@ -143,7 +146,7 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: EmbarkStudios/cargo-deny-action@82eb9f621fbc699dd0918f3ea06864c14cc84246 # v2
         with:
           command: check
@@ -161,20 +164,27 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             archive: mallard-metrics-x86_64-unknown-linux-musl.tar.gz
+            cross: true
             docker_arch: amd64
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             archive: mallard-metrics-aarch64-unknown-linux-musl.tar.gz
             cross: true
             docker_arch: arm64
+          # Both Darwin builds run on macos-14 (Apple Silicon).  The aarch64
+          # build is native; the x86_64 build cross-compiles using Apple's
+          # system clang + universal SDK, which `cc-rs` and `cargo` drive
+          # automatically from `--target x86_64-apple-darwin`.  This replaces
+          # the previous `macos-13` Intel runner, which GitHub has deprecated
+          # (`macos-13-us-default` is no longer available).
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-14
             archive: mallard-metrics-x86_64-apple-darwin.tar.gz
           - target: aarch64-apple-darwin
             os: macos-14
             archive: mallard-metrics-aarch64-apple-darwin.tar.gz
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
         with:
           toolchain: "1.94.1"
@@ -183,12 +193,11 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Linux x86_64: install musl toolchain for static linking
-      - name: Install musl tools
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
-
-      # Linux aarch64: install cross for ARM cross-compilation
+      # Install `cross` for Linux targets.  We use cross for BOTH musl targets
+      # (x86_64 and aarch64) because libduckdb-sys compiles bundled C++ via
+      # `cc-rs`, which requires a full `*-linux-musl-g++` toolchain — not
+      # provided by Ubuntu's `musl-tools` apt package.  The cross Docker images
+      # ship a complete musl C/C++ toolchain, so a single path handles both.
       - name: Install cross
         if: matrix.cross
         shell: bash
@@ -227,7 +236,7 @@ jobs:
           echo "::notice::Archive created: $ARCHIVE ($(du -h "$ARCHIVE" | cut -f1))"
 
       - name: Upload binary archive
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ matrix.archive }}
           path: |
@@ -239,7 +248,7 @@ jobs:
       # Upload raw Linux binaries for Docker image assembly
       - name: Upload Docker binary
         if: matrix.docker_arch
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: docker-bin-${{ matrix.docker_arch }}
           path: target/${{ matrix.target }}/release/mallard-metrics
@@ -251,22 +260,26 @@ jobs:
     name: Docker image (GHCR)
     needs: [validate, build-binaries]
     runs-on: ubuntu-latest
+    # Expose the immutable image digest to downstream jobs (github-release
+    # embeds it in release notes for verifiable pulls).
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     permissions:
       contents: read
       packages: write
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download linux/amd64 binary
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: docker-bin-amd64
           path: dist/amd64
 
       - name: Download linux/arm64 binary
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: docker-bin-arm64
           path: dist/arm64
@@ -366,10 +379,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download all binary archives
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: release-artifacts/
           pattern: mallard-metrics-*
@@ -420,7 +433,8 @@ jobs:
           VERSION="${{ needs.validate.outputs.version }}"
           IS_PRE="${{ needs.validate.outputs.is_prerelease }}"
           TAG="v${VERSION}"
-          DIGEST="${{ needs.docker-image.outputs.digest || 'n/a' }}"
+          DIGEST="${{ needs.docker-image.outputs.digest }}"
+          [[ -z "$DIGEST" ]] && DIGEST="n/a"
 
           PRE_FLAG=""
           [[ "$IS_PRE" == "true" ]] && PRE_FLAG="--prerelease"
@@ -439,6 +453,12 @@ jobs:
             echo "\`\`\`"
             echo ""
             echo "Platforms: \`linux/amd64\`, \`linux/arm64\`"
+            echo ""
+            echo "Immutable digest (pin this in production):"
+            echo ""
+            echo "\`\`\`"
+            echo "ghcr.io/${{ github.repository }}@${DIGEST}"
+            echo "\`\`\`"
             echo ""
             echo "### Checksums"
             echo ""
@@ -484,6 +504,7 @@ jobs:
             echo "| Pre-release | \`${IS_PRE}\` |"
             echo "| GitHub Release | [v${VERSION}](${RELEASE_URL}) |"
             echo "| Docker | \`ghcr.io/${{ github.repository }}:${VERSION}\` |"
+            echo "| Digest | \`${DIGEST}\` |"
             echo ""
             echo "### Artifacts"
             echo "\`\`\`"

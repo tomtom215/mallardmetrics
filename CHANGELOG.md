@@ -16,6 +16,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Release workflow: `docker-image` job now exposes the image digest as a job
+  output (`docker-image.outputs.digest`), and the `github-release` job
+  references it in both the release notes body and the step summary.
+  Previously the `DIGEST` shell variable read from an undefined output and
+  was unused — release notes silently rendered without the immutable
+  `ghcr.io/…@sha256:…` pin. Found by running `actionlint` with `shellcheck`
+  integration (flagged as "property 'digest' is not defined" + SC2034).
+- Release workflow: tag validator now regex-checks the raw tag (requiring the
+  `v` prefix) instead of the stripped version string. The old check would
+  accept a bare `1.2.3` tag if a future trigger bypassed the `on.push.tags`
+  filter; the new check enforces `vX.Y.Z[-pre][+build]` defence-in-depth.
+- Release workflow: x86_64-unknown-linux-musl build now uses `cross` instead of
+  host `musl-tools`. The bundled `libduckdb-sys` build script compiles C++ via
+  `cc-rs` and requires a full `x86_64-linux-musl-g++` toolchain, which the
+  Ubuntu `musl-tools` package does not provide. The cross Docker images ship a
+  complete musl C/C++ toolchain and handle both musl targets uniformly.
+- Release workflow: x86_64-apple-darwin build no longer targets the
+  deprecated `macos-13` runner image (the `macos-13-us-default` label is no
+  longer available). Both Darwin targets now build on `macos-14` (Apple
+  Silicon); the Intel build cross-compiles natively via Apple's system clang
+  and universal SDK, which `cc-rs` and `cargo` drive automatically.
+
+### Changed
+
+- CI: added a `release-build` smoke-test job that cross-compiles both musl
+  targets on every push, so target-specific build failures are caught before
+  they can slip through to a release tag.
+- All workflows: pinned action versions bumped to Node.js 24 runtimes to
+  silence upstream Node 20 deprecation notices — `actions/checkout` v4.3.1 →
+  v6.0.2, `actions/upload-artifact` v4.6.2 → v7.0.1, `actions/download-artifact`
+  v4.1.8 → v7.0.0 (deliberately staying on v7 to avoid v8's hash-validation
+  and no-auto-unzip breaking changes), `actions/upload-pages-artifact` v4.0.0
+  → v5.0.0, `actions/deploy-pages` v4.0.5 → v5.0.0. The now-redundant
+  `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` env var was removed from all three
+  workflows.
+
 ## [0.1.0] - 2026-04-11
 
 ### Added
