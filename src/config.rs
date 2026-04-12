@@ -22,7 +22,7 @@ pub struct Config {
     #[serde(default)]
     pub geoip_db_path: Option<PathBuf>,
     /// Dashboard origin for CORS restrictions on stats/dashboard routes.
-    /// If not set, stats routes allow same-origin only.
+    /// If not set, stats routes allow all origins.
     #[serde(default)]
     pub dashboard_origin: Option<String>,
     /// Whether to filter bot traffic from analytics (default: true).

@@ -127,7 +127,7 @@ impl EventBuffer {
         {
             let mut appender = conn.appender("events").map_err(|e| {
                 // Restore events on Appender creation failure.
-                // Inner block tightens the MutexGuard drop point (L15).
+                // Inner block tightens the MutexGuard drop point.
                 {
                     let mut buf = self.events.lock();
                     let mut restored = events.clone();

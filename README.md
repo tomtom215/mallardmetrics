@@ -4,7 +4,7 @@
 > Single binary. Single process. Zero external dependencies.
 
 [![Tests](https://img.shields.io/badge/tests-333_passing-brightgreen?style=flat-square)](#development)
-[![Rust](https://img.shields.io/badge/rust-1.93%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.94%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
 [![Clippy](https://img.shields.io/badge/clippy-0_warnings-brightgreen?style=flat-square)](#development)
 [![Privacy](https://img.shields.io/badge/privacy-no_cookies-teal?style=flat-square)](#privacy-by-design)
@@ -115,7 +115,7 @@ The default `docker-compose.yml` includes persistent storage, restart policy, an
 ### From Source
 
 ```bash
-# Requires Rust 1.93.0+ (set automatically via rust-toolchain.toml)
+# Requires Rust 1.94.0+ (set automatically via rust-toolchain.toml)
 cargo build --release
 ./target/release/mallard-metrics
 ```
@@ -180,7 +180,7 @@ See [`mallard-metrics.toml.example`](mallard-metrics.toml.example) for a fully d
 | `MALLARD_HOST` | `0.0.0.0` | Server bind address |
 | `MALLARD_PORT` | `8000` | Server listen port |
 | `MALLARD_DATA_DIR` | `data` | Directory for Parquet data and DuckDB file |
-| `MALLARD_SECRET` | (random) | HMAC key for visitor ID hashing. **Set for production** to persist visitor IDs across restarts |
+| `MALLARD_SECRET` | (auto-generated) | HMAC key for visitor ID hashing. Auto-generated and persisted to `data_dir/.secret` on first run. **Set explicitly for production** |
 | `MALLARD_ADMIN_PASSWORD` | (none) | Admin password for dashboard authentication |
 | `MALLARD_SECURE_COOKIES` | `false` | Enable `Secure` flag on session cookies (required when behind TLS) |
 | `MALLARD_METRICS_TOKEN` | (none) | Bearer token protecting the `/metrics` endpoint |
@@ -192,6 +192,12 @@ See [`mallard-metrics.toml.example`](mallard-metrics.toml.example) for a fully d
 | `MALLARD_RETENTION_DAYS` | `0` | Auto-delete data older than N days (0 = unlimited) |
 | `MALLARD_RATE_LIMIT` | `0` | Max events/sec per site (0 = unlimited) |
 | `MALLARD_CACHE_TTL` | `60` | Query cache TTL in seconds |
+| `MALLARD_CACHE_MAX_ENTRIES` | `10000` | Maximum cached query results (0 = unlimited) |
+| `MALLARD_MAX_CONCURRENT_QUERIES` | `10` | Maximum concurrent analytics queries (0 = unlimited); excess returns 429 |
+| `MALLARD_SESSION_TTL` | `86400` | Dashboard session TTL in seconds (24 hours) |
+| `MALLARD_SHUTDOWN_TIMEOUT` | `30` | Graceful shutdown timeout in seconds |
+| `MALLARD_MAX_LOGIN_ATTEMPTS` | `5` | Failed login attempts per IP before lockout (0 = disabled) |
+| `MALLARD_LOGIN_LOCKOUT` | `300` | Lockout duration in seconds after exceeding max login attempts |
 | `MALLARD_LOG_FORMAT` | `text` | Log format: `text` or `json` |
 | `MALLARD_GDPR_MODE` | `false` | Enable GDPR-friendly preset (see [PRIVACY.md](PRIVACY.md)) |
 | `MALLARD_STRIP_REFERRER_QUERY` | `false` | Strip `?query` and `#fragment` from stored referrers |
@@ -371,9 +377,9 @@ The dashboard is a single-page application built with Preact + HTM, embedded dir
 
 | Component | Technology | Version |
 |---|---|---|
-| Language | Rust | 1.93.0 (MSRV) |
+| Language | Rust | 1.94.0 (MSRV) |
 | Web Framework | Axum | 0.8 |
-| Database | DuckDB (disk-based, embedded) | 1.4.4 |
+| Database | DuckDB (disk-based, embedded) | 1.5.x (crate 1.10501.0) |
 | Analytics Engine | `behavioral` extension | runtime-loaded |
 | Storage Format | Parquet (ZSTD compressed) | date-partitioned |
 | Frontend | Preact + HTM | no build step |
@@ -387,7 +393,7 @@ The dashboard is a single-page application built with Preact + HTM, embedded dir
 
 ### Prerequisites
 
-- Rust 1.93.0+ (managed automatically via `rust-toolchain.toml`)
+- Rust 1.94.0+ (managed automatically via `rust-toolchain.toml`)
 - Git
 
 ### Build and Test
@@ -487,7 +493,7 @@ If the GeoIP database is missing, country/region/city fields are stored as `NULL
 | [ROADMAP.md](ROADMAP.md) | Implementation phases, completed work, and future plans |
 | [PERF.md](PERF.md) | Benchmark framework, methodology, and measured baselines |
 | [LESSONS.md](LESSONS.md) | 21 development lessons learned, organized by category |
-| [CLAUDE.md](CLAUDE.md) | AI session protocol, module map, and development log |
+| [DEVELOPMENT.md](DEVELOPMENT.md) | Module map, build commands, and development guidelines |
 | [mallard-metrics.toml.example](mallard-metrics.toml.example) | Annotated configuration template |
 
 ---

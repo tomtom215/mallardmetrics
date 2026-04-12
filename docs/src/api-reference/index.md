@@ -14,6 +14,7 @@ Most `/api/stats/*` and `/api/keys/*` endpoints require authentication. Provide 
 
 1. **Session cookie** — Set after `POST /api/auth/login`. Sent automatically by browsers.
 2. **Bearer token** — An API key in the `Authorization: Bearer mm_...` header.
+3. **X-API-Key header** — An API key in the `X-API-Key: mm_...` header.
 
 Endpoints that do not require authentication:
 - `POST /api/event` — Event ingestion (uses `Origin` allowlist instead).
@@ -42,14 +43,17 @@ Errors are returned as JSON objects:
 
 | Code | Meaning |
 |---|---|
+| 200 | Success |
 | 202 | Event accepted (ingestion only) |
 | 400 | Bad request — missing or invalid parameters |
 | 401 | Unauthenticated — no valid session or API key |
 | 403 | Forbidden — origin not in allowlist, or CSRF check failed |
 | 404 | Not found |
+| 408 | Request timeout (30-second server-side limit) |
+| 409 | Conflict — resource already exists (e.g. password already set) |
 | 413 | Request body too large (limit: 64 KB on ingestion routes) |
 | 422 | Unprocessable — JSON validation failed |
-| 429 | Rate limited — includes `Retry-After` header |
+| 429 | Rate limited or concurrent query limit — includes `Retry-After` header |
 | 503 | Service unavailable — database not ready |
 | 500 | Internal server error |
 

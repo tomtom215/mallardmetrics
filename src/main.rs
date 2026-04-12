@@ -55,7 +55,7 @@ async fn main() {
     // `events` table (not yet flushed to Parquet) survive a process crash.
     // The WAL file written next to mallard.duckdb provides atomic batch inserts.
     //
-    // NOTE: if the server crashes in the narrow window after `COPY TO` succeeds
+    // If the server crashes in the narrow window after `COPY TO` succeeds
     // but before `DELETE FROM events` commits, those events may appear in both
     // the DuckDB table and the Parquet file.  The events_all VIEW unions both
     // tiers, so such events would be counted twice.  This is an acceptable
@@ -290,7 +290,7 @@ fn spawn_background_tasks(config: &Config, conn: &Arc<Mutex<Connection>>, state:
     //
     // `cleanup_old_partitions` calls `std::fs::read_dir` and `std::fs::remove_dir_all`
     // (blocking syscalls).  Wrapping with `spawn_blocking` matches the flush-task
-    // pattern (L19) and prevents starving the async worker pool under load.
+    // pattern and prevents starving the async worker pool under load.
     if config.retention_days > 0 {
         let retention_events_dir = config.events_dir();
         let retention_days = config.retention_days;

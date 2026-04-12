@@ -46,7 +46,7 @@ cargo doc --no-deps
 
 ## Documentation
 
-- [ ] CLAUDE.md updated with changes and verified test counts
+- [ ] DEVELOPMENT.md updated with changes and verified test counts
 - [ ] LESSONS.md updated if a new lesson was learned
 - [ ] Public-facing docs updated (README, docs/src/) if behaviour changed
 - [ ] CHANGELOG.md entry added

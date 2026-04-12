@@ -136,7 +136,7 @@ fn detect_os(ua: &str) -> Option<String> {
     if ua.contains("Windows") {
         Some("Windows".to_string())
     } else if ua.contains("iPhone") || ua.contains("iPad") || ua.contains("iOS") {
-        // Check iOS before macOS since iPhone UAs contain "Mac OS X" (L7)
+        // Check iOS before macOS since iPhone UAs contain "Mac OS X"
         Some("iOS".to_string())
     } else if ua.contains("Mac OS X") || ua.contains("macOS") {
         Some("macOS".to_string())
@@ -155,7 +155,7 @@ fn detect_os_version(ua: &str) -> Option<String> {
     if ua.contains("Windows NT") {
         extract_version_after(ua, "Windows NT ")
     } else if ua.contains("iPhone OS") {
-        // Check iPhone OS before Mac OS X since iPhone UAs contain both (L7)
+        // Check iPhone OS before Mac OS X since iPhone UAs contain both
         extract_version_after(ua, "iPhone OS ").map(|v| v.replace('_', "."))
     } else if ua.contains("Mac OS X") {
         extract_version_after(ua, "Mac OS X ").map(|v| v.replace('_', "."))
@@ -321,7 +321,7 @@ mod tests {
 
     #[test]
     fn test_iphone_mac_os_x_edge_case() {
-        // L7: iPhone UA strings contain "Mac OS X" — must detect iOS, not macOS
+        // iPhone UA strings contain "Mac OS X" — must detect iOS, not macOS
         let ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2_1 like Mac OS X) AppleWebKit/605.1.15";
         let parsed = parse_user_agent(ua);
         assert_eq!(parsed.os.as_deref(), Some("iOS"));

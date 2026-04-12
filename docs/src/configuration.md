@@ -18,7 +18,7 @@ These two values are secrets and must not be stored in files committed to source
 
 | Variable | Required | Description |
 |---|---|---|
-| `MALLARD_SECRET` | Recommended | 32+ character random string used as HMAC key for visitor ID hashing. If unset, a random value is generated on each start (visitor IDs will change across restarts). |
+| `MALLARD_SECRET` | Recommended | HMAC key for visitor ID hashing. If unset, a UUID is auto-generated on first start and persisted to `data_dir/.secret` (survives restarts). Set explicitly in production for portability across hosts. |
 | `MALLARD_ADMIN_PASSWORD` | Recommended | Dashboard password. If unset, the dashboard is unauthenticated. |
 | `MALLARD_MAX_LOGIN_ATTEMPTS` | Optional | Override `max_login_attempts` at runtime. |
 | `MALLARD_LOGIN_LOCKOUT` | Optional | Override `login_lockout_secs` at runtime. |
@@ -31,6 +31,23 @@ These two values are secrets and must not be stored in files committed to source
 | `MALLARD_CACHE_MAX_ENTRIES` | Optional | Max query cache entries (default 10000). |
 | `MALLARD_GDPR_MODE` | Optional | Enable GDPR-friendly preset (see [PRIVACY.md](../../../PRIVACY.md)). |
 | `MALLARD_GEOIP_PRECISION` | Optional | GeoIP precision: `city`, `region`, `country`, or `none`. |
+| `MALLARD_HOST` | Optional | Server bind address (default `0.0.0.0`). |
+| `MALLARD_PORT` | Optional | Server listen port (default `8000`). |
+| `MALLARD_DATA_DIR` | Optional | Data directory for Parquet files and DuckDB (default `data`). |
+| `MALLARD_FLUSH_COUNT` | Optional | Events buffered before flushing to disk (default `1000`). |
+| `MALLARD_FLUSH_INTERVAL` | Optional | Seconds between periodic buffer flushes (default `60`). |
+| `MALLARD_FILTER_BOTS` | Optional | Filter known bot User-Agents (default `true`). |
+| `MALLARD_RETENTION_DAYS` | Optional | Auto-delete data older than N days; 0 = unlimited (default `0`). |
+| `MALLARD_SESSION_TTL` | Optional | Dashboard session TTL in seconds (default `86400`). |
+| `MALLARD_SHUTDOWN_TIMEOUT` | Optional | Graceful shutdown timeout in seconds (default `30`). |
+| `MALLARD_RATE_LIMIT` | Optional | Max events/sec per site; 0 = unlimited (default `0`). |
+| `MALLARD_CACHE_TTL` | Optional | Query cache TTL in seconds (default `60`). |
+| `MALLARD_STRIP_REFERRER_QUERY` | Optional | Strip query/fragment from stored referrers (default `false`). |
+| `MALLARD_ROUND_TIMESTAMPS` | Optional | Round timestamps to the nearest hour (default `false`). |
+| `MALLARD_SUPPRESS_VISITOR_ID` | Optional | Replace HMAC hash with per-request UUID (default `false`). |
+| `MALLARD_SUPPRESS_BROWSER_VERSION` | Optional | Store browser name only (default `false`). |
+| `MALLARD_SUPPRESS_OS_VERSION` | Optional | Store OS name only (default `false`). |
+| `MALLARD_SUPPRESS_SCREEN_SIZE` | Optional | Omit screen width and device type (default `false`). |
 
 ## TOML Configuration Reference
 
@@ -85,6 +102,26 @@ cache_ttl_secs = 60
 
 # Log format: "text" (default) or "json"
 log_format = "text"
+
+# Query cache max entries (0 = unlimited, default: 10000)
+cache_max_entries = 10000
+
+# Max concurrent analytics queries (0 = unlimited, default: 10)
+# Excess requests receive HTTP 429
+max_concurrent_queries = 10
+
+# Cookie Secure flag (set to true when behind TLS)
+secure_cookies = false
+
+# ── GDPR / Privacy Flags ──────────────────────────────────────────────
+# gdpr_mode = false            # convenience preset — enables all flags below
+# strip_referrer_query = false  # strip ?query and #fragment from referrers
+# round_timestamps = false      # round timestamps to the nearest hour
+# suppress_visitor_id = false   # replace HMAC hash with per-request UUID
+# suppress_browser_version = false
+# suppress_os_version = false
+# suppress_screen_size = false
+# geoip_precision = "city"      # city | region | country | none
 ```
 
 ## Configuration Field Details

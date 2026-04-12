@@ -22,7 +22,7 @@ Thank you for your interest in contributing to Mallard Metrics. This document co
 
 ### Prerequisites
 
-- **Rust 1.93.0+** -- The `rust-toolchain.toml` file will install the correct version automatically via `rustup`
+- **Rust 1.94.0+** -- The `rust-toolchain.toml` file will install the correct version automatically via `rustup`
 - **Git**
 - **Disk space** -- DuckDB's bundled compilation produces large build artifacts (~27GB in debug mode). Run `cargo clean` between major rebuilds if space is constrained.
 
@@ -84,12 +84,12 @@ mallardmetrics/
 │   └── ingest_test.rs           -- Integration tests (71 tests)
 ├── benches/
 │   └── ingest_bench.rs          -- Criterion.rs benchmarks
-├── dashboard/assets/            -- Frontend SPA files
+├── src/dashboard/assets/        -- Frontend SPA files (embedded via rust-embed)
 ├── tracking/script.js           -- Tracking script (<1KB)
 ├── mallard-metrics.toml.example -- Configuration template
 ├── Dockerfile                   -- Multi-stage, FROM scratch
 ├── docker-compose.yml           -- Production-ready compose file
-└── .github/workflows/ci.yml    -- CI pipeline (12 jobs)
+└── .github/workflows/ci.yml    -- CI pipeline (8 jobs: 5 matrix + 3 standalone)
 ```
 
 ---
@@ -98,7 +98,7 @@ mallardmetrics/
 
 ### Before Starting
 
-1. Read `CLAUDE.md` for project context, module map, and session protocol
+1. Read `DEVELOPMENT.md` for project context and module map
 2. Read `LESSONS.md` for pitfalls and proven patterns
 3. Establish a baseline by running the full validation suite:
 
@@ -150,7 +150,7 @@ Run `cargo fmt` before every commit. The CI pipeline will reject improperly form
 - The only exceptions are:
   - Column names from fixed enums (not user input)
   - Internal values from previous query results
-- See `LESSONS.md` L12 for background
+- See `LESSONS.md` for background on SQL safety
 
 ### Error Handling
 
@@ -198,12 +198,12 @@ cargo bench --no-run
   - Error cases (invalid input, missing dependencies)
 - Integration tests go in `tests/ingest_test.rs` and test the full HTTP path: JSON request -> handler -> buffer -> DuckDB -> HTTP response
 - Use `tower::ServiceExt::oneshot()` for testing Axum routers without starting a real server
-- Test against real DuckDB output, not hand-written expectations (see `LESSONS.md` L5)
+- Test against real DuckDB output, not hand-written expectations (see `LESSONS.md`)
 - Use `tempfile::TempDir` for test isolation -- never write to shared directories
 
 ### Test Counts
 
-When adding tests, update the test count in `CLAUDE.md` by running:
+When adding tests, update the test count in `DEVELOPMENT.md` by running:
 
 ```bash
 # Count unit tests
@@ -217,7 +217,7 @@ cargo test --test ingest_test 2>&1 | grep "test result"
 
 ## Benchmark Protocol
 
-Benchmarks use Criterion.rs 0.5 and live in `benches/ingest_bench.rs`.
+Benchmarks use Criterion.rs 0.8 and live in `benches/ingest_bench.rs`.
 
 ### Rules
 
@@ -270,7 +270,7 @@ Before submitting your PR, verify every item:
 - [ ] No SQL injection vectors introduced (parameterized queries used)
 - [ ] No PII stored (IP addresses only for hashing/GeoIP, then discarded)
 - [ ] CHANGELOG.md updated with your changes
-- [ ] Documentation updated if applicable (README.md, CLAUDE.md)
+- [ ] Documentation updated if applicable (README.md, DEVELOPMENT.md)
 
 ---
 

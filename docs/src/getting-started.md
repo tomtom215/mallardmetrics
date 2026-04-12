@@ -4,7 +4,7 @@ This guide gets Mallard Metrics running and collecting events in a few minutes.
 
 ## Prerequisites
 
-- Docker (recommended), or a Linux/macOS host with Rust 1.93+ for building from source.
+- Docker (recommended), or a Linux/macOS host with Rust 1.94+ for building from source.
 - A web property you want to track.
 
 ---

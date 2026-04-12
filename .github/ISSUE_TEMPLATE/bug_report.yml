@@ -66,7 +66,7 @@ body:
     attributes:
       label: Rust version (if building from source)
       description: Output of `rustc --version`
-      placeholder: "rustc 1.93.1 (01f6ddf75 2026-02-11)"
+      placeholder: "rustc 1.94.1 (e408947bf 2026-03-25)"
 
   - type: dropdown
     id: deployment

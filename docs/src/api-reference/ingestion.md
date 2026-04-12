@@ -25,7 +25,7 @@ Records a single analytics event. This endpoint is called by the tracking script
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `d` | string | Yes | Domain / site identifier. Must be non-empty. |
+| `d` | string | Yes | Domain / site identifier. Max 256 chars; alphanumeric plus `.`, `-`, `_`, `:` only. |
 | `n` | string | Yes | Event name (e.g. `"pageview"`, `"signup"`, `"purchase"`). |
 | `u` | string | Yes | Full URL of the page where the event occurred. |
 | `r` | string | No | Referrer URL. |
@@ -46,10 +46,49 @@ The response body is empty. `202` means the event was accepted into the buffer. 
 
 | Condition | Status |
 |---|---|
-| Missing required field (`d`, `n`, or `u`) | 422 Unprocessable |
-| Empty `d` (site ID) | 400 Bad Request |
+| Missing required field (`d`, `n`, or `u`) | 422 Unprocessable Entity |
+| Empty `d`, `n`, or `u` | 400 Bad Request |
+| `d` contains invalid characters or exceeds 256 chars | 400 Bad Request |
+| Field exceeds length limit (`n` > 256, `u` > 2048, `r` > 2048, `p` > 4096) | 400 Bad Request |
+| Request body exceeds 64 KB | 413 Payload Too Large |
 | `Origin` header does not match `site_ids` | 403 Forbidden |
 | Rate limit exceeded for this `site_id` | 429 Too Many Requests |
+
+---
+
+## `GET /api/event`
+
+Pixel-tracking endpoint for environments where JavaScript is unavailable (email, AMP pages, RSS readers). Returns a 1x1 transparent GIF (43 bytes, `Content-Type: image/gif`).
+
+**Authentication:** None required.
+
+### Query Parameters
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `d` | string | Yes | Domain / site identifier. |
+| `n` | string | No | Event name (defaults to `"pageview"`). |
+| `u` | string | Yes | Full URL of the page. |
+| `r` | string | No | Referrer URL. |
+| `w` | number | No | Screen width in pixels. |
+
+Revenue (`ra`, `rc`) and custom properties (`p`) are not supported on the GET endpoint.
+
+### Response
+
+```
+HTTP/1.1 200 OK
+Content-Type: image/gif
+Content-Length: 43
+```
+
+### Usage
+
+```html
+<img src="https://analytics.example.com/api/event?d=example.com&u=https://example.com/page" width="1" height="1" alt="">
+```
+
+---
 
 ### Bot Filtering
 

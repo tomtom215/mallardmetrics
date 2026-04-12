@@ -1,3 +1,7 @@
+# Deploy documentation to GitHub Pages via mdBook.
+#
+# Triggered on push to main or manual dispatch.
+
 name: Deploy Documentation
 
 on:
@@ -14,12 +18,15 @@ concurrency:
   group: "pages"
   cancel-in-progress: false
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build:
     name: Build documentation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
       - name: Install mdBook
         run: |

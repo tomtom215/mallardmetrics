@@ -1,13 +1,38 @@
+# Build artifacts
 /target
+docs/book/
+
+# Runtime data
 /data
 *.parquet
 *.duckdb
 *.duckdb.wal
-.env
 .secret
-*.mmdb
 lcov.info
-docs/book/
+
+# Secrets
+.env
+
+# GeoIP database (download separately)
+*.mmdb
+
+# Node.js (not used in build, but prevents accidental commits)
 node_modules/
 package.json
 package-lock.json
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+
+# Log files
+*.log

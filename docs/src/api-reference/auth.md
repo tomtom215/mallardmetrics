@@ -16,11 +16,17 @@ Sets the admin password for the first time. Returns `409 Conflict` if a password
 **No authentication required.**
 
 ```json
-// Request
+// Request — password must be at least 8 characters
 {"password": "your-secure-password"}
 
 // Response 200 — also sets HttpOnly, SameSite=Strict cookie mm_session
 {"token": "<session-token>"}
+
+// Response 400 — password too short
+{"error": "Password must be at least 8 characters"}
+
+// Response 409 — password already configured
+{"error": "Admin password already configured"}
 ```
 
 Passwords are hashed with Argon2id before storage. The plaintext password is never persisted.
@@ -40,9 +46,15 @@ Authenticates with the admin password and creates a session.
 // Response 200 — sets HttpOnly, SameSite=Strict cookie mm_session
 {"token": "<session-token>"}
 
+// Response 400 — no password configured yet
+{"error": "No admin password configured. Use /api/auth/setup first."}
+
+// Response 401 — wrong password
+{"error": "Invalid password"}
+
 // Response 429 — Too Many Requests (IP locked out after max failed attempts)
 // Retry-After header contains the remaining lockout seconds
-{"error": "Too many login attempts. Try again later."}
+{"error": "Too many failed login attempts. Try again later."}
 ```
 
 Sessions are stored in memory and expire after `session_ttl_secs` (default 24 hours). Sessions are cleared on server restart.
@@ -55,7 +67,7 @@ Sessions are stored in memory and expire after `session_ttl_secs` (default 24 ho
 
 Invalidates the current session.
 
-**Session cookie required.**
+**No authentication required.** If a valid session cookie is present, it is invalidated. Otherwise the endpoint is a no-op (always returns 200).
 
 ```json
 // Response 200 — clears mm_session cookie
@@ -170,4 +182,4 @@ curl "https://your-instance.com/api/stats/main?site_id=example.com&period=30d" \
   -H "X-API-Key: mm_abc123..."
 ```
 
-Both headers are accepted on all stats and admin endpoints. `ReadOnly` keys can access stats endpoints; key management endpoints (`POST /api/keys`, `DELETE /api/keys/{hash}`) require an `Admin`-scoped key.
+Both headers are accepted on all stats and admin endpoints. `ReadOnly` keys can access stats endpoints; all key management endpoints (`GET /api/keys`, `POST /api/keys`, `DELETE /api/keys/{hash}`) require an `Admin`-scoped key.

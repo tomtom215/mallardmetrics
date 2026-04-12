@@ -162,7 +162,7 @@ data/events/
 flowchart TD
     subgraph CREDS["Credentials at Rest"]
         HASH["Admin Password\nArgon2id hash PHC defaults\nmemory-only at runtime"]
-        KEYS["API Keys\nmm_ prefix plus 128-bit random\nSHA-256 hash on disk\nJSON file in data_dir"]
+        KEYS["API Keys\nmm_ prefix plus 256-bit random\nSHA-256 hash on disk\nJSON file in data_dir"]
         SESS["Session Tokens\n256-bit OS CSPRNG\nHashMap with TTL expiry\nHttpOnly SameSite=Strict"]
     end
 

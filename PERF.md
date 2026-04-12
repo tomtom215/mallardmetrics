@@ -18,7 +18,7 @@ This document describes the benchmark framework, methodology, and performance ch
 
 | Property | Value |
 |---|---|
-| Tool | Criterion.rs 0.5 with HTML reports |
+| Tool | Criterion.rs 0.8 with HTML reports |
 | Location | `benches/ingest_bench.rs` |
 | Sample size | 100 per benchmark |
 | Confidence interval | 95% |
@@ -55,7 +55,7 @@ HTML reports are generated in `target/criterion/` after each run.
 
 | Property | Value |
 |---|---|
-| `rustc` | 1.93.1 (01f6ddf75 2026-02-11) |
+| `rustc` | 1.94.1 (e408947bf 2026-03-25) |
 | Platform | Linux 4.4.0 x86\_64 |
 | CPU | Intel GenuineIntel, 2.1 GHz, 8192 KB L2 cache, 16 cores |
 | Memory | 21 GiB |
@@ -69,11 +69,11 @@ HTML reports are generated in `target/criterion/` after each run.
 
 #### `ingest_throughput` — Buffer push (event → in-memory buffer)
 
-> **SUPERSEDED — Session 12.** These baselines are invalid. DuckDB connection setup and schema
+> **SUPERSEDED — the Appender API migration.** These baselines are invalid. DuckDB connection setup and schema
 > initialisation ran INSIDE `b.iter()`, so the ~500 ms cold-start dominated every sample.
 > The near-flat scaling from 100 → 1 000 events (17 ms vs 19 ms) is the diagnostic signal:
 > the fixed cold-start cost completely masked the variable push cost. The benchmarks have been
-> restructured in Session 12 (setup outside `b.iter()`). New steady-state baselines must be
+> restructured in v0.1.0 (setup outside `b.iter()`). New steady-state baselines must be
 > measured in a future session.
 
 | Benchmark | Run 1 mean | Run 2 mean | Run 3 mean | **Canonical (median run 95% CI)** |
@@ -86,10 +86,10 @@ HTML reports are generated in `target/criterion/` after each run.
 
 #### `parquet_flush` — Buffer flush to Parquet file
 
-> **SUPERSEDED — Session 12.** Same cold-start contamination as `ingest_throughput`. Each
+> **SUPERSEDED — the Appender API migration.** Same cold-start contamination as `ingest_throughput`. Each
 > iteration created a fresh DuckDB connection and ran ~1000 row-by-row INSERTs before
 > timing the Parquet flush. The 6 s/iter cost was dominated by the row-by-row INSERT loop
-> (replaced with DuckDB Appender API in Session 12) and DuckDB cold-start, not by COPY TO Parquet.
+> (replaced with DuckDB Appender API in v0.1.0) and DuckDB cold-start, not by COPY TO Parquet.
 > Benchmarks restructured with `iter_batched`; new baselines needed.
 
 | Benchmark | Run 1 (95% CI) | Run 2 | Run 3 | **Canonical** |
@@ -133,7 +133,7 @@ cargo bench
 | Event buffer push | O(1) amortized | `Vec` push with pre-allocated capacity |
 | Buffer flush (DuckDB insert) | O(n) | DuckDB Appender API — columnar batch insert, no per-row SQL parse |
 | Parquet write | O(n) | DuckDB `COPY TO` with ZSTD compression |
-| Next Parquet file path | O(k) | `read_dir` scan of k existing files in partition — one syscall. Was O(k) stat syscalls (one per file); fixed Session 12. |
+| Next Parquet file path | O(k) | `read_dir` scan of k existing files in partition — one syscall. Was O(k) stat syscalls (one per file); fixed in v0.1.0. |
 | Visitor ID hash | O(len(IP) + len(UA)) | HMAC-SHA256, constant-time comparison |
 | Daily salt generation | O(1) | HMAC-SHA256 of fixed-size date input |
 | Unique visitors query | O(n) | `COUNT(DISTINCT)` scan over partition |
@@ -158,7 +158,7 @@ Every performance claim must include:
 
 ## Optimization History
 
-### Row-by-row INSERT → DuckDB Appender API (Session 12)
+### Row-by-row INSERT → DuckDB Appender API
 
 - **What changed** -- Replaced `for event in &events { conn.execute(...) }` loop with DuckDB's Appender API (`conn.appender("events")` + `appender.append_row()` + `appender.flush()`), which uses columnar batch insertion bypassing per-row SQL parsing overhead.
 - **Before** -- Baselines invalidated by cold-start contamination (setup was inside `b.iter()`); see Superseded Baselines above.

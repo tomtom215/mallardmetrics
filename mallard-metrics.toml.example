@@ -49,6 +49,15 @@ cache_ttl_secs = 60
 # Log output format: "text" or "json"
 log_format = "text"
 
+# Query cache max entries (0 = unlimited)
+cache_max_entries = 10000
+
+# Max concurrent analytics queries (0 = unlimited, excess returns HTTP 429)
+max_concurrent_queries = 10
+
+# Cookie Secure flag — set to true when behind TLS
+secure_cookies = false
+
 
 # ─── GDPR-Friendly Deployment ────────────────────────────────────────────────
 #
@@ -87,8 +96,10 @@ log_format = "text"
 # geoip_precision = "country"    # (redundant when gdpr_mode = true, shown for clarity)
 
 # ─── Environment variables (not set via TOML) ────────────────────────────────
-# MALLARD_SECRET           — HMAC secret for visitor ID hashing (required for production)
+# MALLARD_SECRET           — HMAC secret for visitor ID hashing (auto-persisted to data_dir/.secret)
 # MALLARD_ADMIN_PASSWORD   — Admin password for dashboard authentication
+# MALLARD_METRICS_TOKEN    — Bearer token protecting the /metrics endpoint
+# MALLARD_SECURE_COOKIES   — Enable Secure flag on session cookies ("true" / "false")
 # MALLARD_MAX_LOGIN_ATTEMPTS — Override max_login_attempts at runtime
 # MALLARD_LOGIN_LOCKOUT      — Override login_lockout_secs at runtime
 # MALLARD_GDPR_MODE          — Enable GDPR-friendly preset ("true" / "false")

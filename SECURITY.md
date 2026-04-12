@@ -33,7 +33,7 @@ We will acknowledge receipt within 48 hours and provide a timeline for a fix.
 | No PII storage | IP addresses are used only for hashing and GeoIP lookup, then immediately discarded. They are never written to disk, database, or logs |
 | Daily salt rotation | Visitor IDs change every day, preventing long-term tracking |
 | No external network calls | DuckDB is embedded. No analytics data leaves the server except via the authenticated dashboard API |
-| GDPR/CCPA compliant by design | No personal data is stored. No consent banner required |
+| Privacy-preserving design | Pseudonymous visitor IDs only; no cookies; no raw IP storage. See [PRIVACY.md](PRIVACY.md) for the full GDPR/CCPA analysis |
 
 ### Data Protection
 

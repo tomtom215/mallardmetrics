@@ -64,7 +64,7 @@ DuckDB or Parquet.** The relevant code is in `src/ingest/handler.rs` and
 | `os` | String (optional) | `Windows` | Until partition deleted |
 | `os_version` | String (optional) | `10.0` | Until partition deleted |
 | `device_type` | String (optional) | `desktop` | Until partition deleted |
-| `screen_size` | String (optional) | `1920x1080` | Until partition deleted |
+| `screen_size` | String (optional) | `1920` | Until partition deleted |
 | `country_code` | String (optional) | `DE` | Until partition deleted |
 | `region` | String (optional) | `Bavaria` | Until partition deleted |
 | `city` | String (optional) | `Munich` | Until partition deleted |
@@ -572,5 +572,6 @@ All legal citations below refer to publicly available primary sources.
 
 ---
 
-*This document was last reviewed on 2026-03-03. Privacy law evolves; operators should verify
-currency of regulatory guidance before relying on it.*
+*This document describes the project's privacy model as implemented in the source
+code. Privacy law evolves; operators should verify current regulatory guidance
+before relying on it for compliance.*
