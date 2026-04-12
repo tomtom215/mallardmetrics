@@ -1,7 +1,7 @@
 # Continuous integration — enforces all quality gates.
 #
 # Jobs: test + clippy + fmt + doc + MSRV (matrix), security audit,
-#       code coverage, Docker build.
+#       code coverage, Docker build, release-build smoke test.
 #
 # Job dependency graph (all jobs run in parallel):
 #
@@ -9,6 +9,8 @@
 #   security
 #   coverage
 #   docker
+#   release-build  # catches target-specific build failures (e.g. musl C++
+#                  # toolchain) before they slip into the release workflow.
 
 name: CI
 
@@ -107,3 +109,35 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Build Docker image
         run: docker build -t mallard-metrics:test .
+
+# ── Job 5: Release build smoke test ───────────────────────────────────────────
+#
+# Exercises the same cross-compilation path the release workflow uses so that
+# target-specific build breakage (e.g. a missing musl C++ toolchain for
+# `libduckdb-sys`) is caught on every push — not on the first release tag.
+#
+# Runs both musl targets via `cross`, matching release.yml exactly.  The
+# aarch64 leg is the slow one; x86_64 is fast and catches the vast majority of
+# issues, so we mark the matrix `fail-fast: false` to get full coverage.
+  release-build:
+    name: Release build / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: "1.94.1"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-${{ matrix.target }}
+      - name: Install cross
+        run: cargo install cross --locked
+      - name: Build release (cross)
+        run: cross build --locked --release --target ${{ matrix.target }}

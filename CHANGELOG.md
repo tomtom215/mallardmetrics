@@ -16,6 +16,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Release workflow: x86_64-unknown-linux-musl build now uses `cross` instead of
+  host `musl-tools`. The bundled `libduckdb-sys` build script compiles C++ via
+  `cc-rs` and requires a full `x86_64-linux-musl-g++` toolchain, which the
+  Ubuntu `musl-tools` package does not provide. The cross Docker images ship a
+  complete musl C/C++ toolchain and handle both musl targets uniformly.
+
+### Changed
+
+- CI: added a `release-build` smoke-test job that cross-compiles both musl
+  targets on every push, so target-specific build failures are caught before
+  they can slip through to a release tag.
+
 ## [0.1.0] - 2026-04-11
 
 ### Added
