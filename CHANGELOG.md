@@ -23,12 +23,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cc-rs` and requires a full `x86_64-linux-musl-g++` toolchain, which the
   Ubuntu `musl-tools` package does not provide. The cross Docker images ship a
   complete musl C/C++ toolchain and handle both musl targets uniformly.
+- Release workflow: x86_64-apple-darwin build no longer targets the
+  deprecated `macos-13` runner image (the `macos-13-us-default` label is no
+  longer available). Both Darwin targets now build on `macos-14` (Apple
+  Silicon); the Intel build cross-compiles natively via Apple's system clang
+  and universal SDK, which `cc-rs` and `cargo` drive automatically.
 
 ### Changed
 
 - CI: added a `release-build` smoke-test job that cross-compiles both musl
   targets on every push, so target-specific build failures are caught before
   they can slip through to a release tag.
+- All workflows: pinned action versions bumped to Node.js 24 runtimes to
+  silence upstream Node 20 deprecation notices — `actions/checkout` v4.3.1 →
+  v6.0.2, `actions/upload-artifact` v4.6.2 → v7.0.1, `actions/download-artifact`
+  v4.1.8 → v7.0.0 (deliberately staying on v7 to avoid v8's hash-validation
+  and no-auto-unzip breaking changes), `actions/upload-pages-artifact` v4.0.0
+  → v5.0.0, `actions/deploy-pages` v4.0.5 → v5.0.0. The now-redundant
+  `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24` env var was removed from all three
+  workflows.
 
 ## [0.1.0] - 2026-04-11
 
