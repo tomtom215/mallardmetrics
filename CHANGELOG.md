@@ -18,6 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Release workflow: `docker-image` job now exposes the image digest as a job
+  output (`docker-image.outputs.digest`), and the `github-release` job
+  references it in both the release notes body and the step summary.
+  Previously the `DIGEST` shell variable read from an undefined output and
+  was unused — release notes silently rendered without the immutable
+  `ghcr.io/…@sha256:…` pin. Found by running `actionlint` with `shellcheck`
+  integration (flagged as "property 'digest' is not defined" + SC2034).
+- Release workflow: tag validator now regex-checks the raw tag (requiring the
+  `v` prefix) instead of the stripped version string. The old check would
+  accept a bare `1.2.3` tag if a future trigger bypassed the `on.push.tags`
+  filter; the new check enforces `vX.Y.Z[-pre][+build]` defence-in-depth.
 - Release workflow: x86_64-unknown-linux-musl build now uses `cross` instead of
   host `musl-tools`. The bundled `libduckdb-sys` build script compiles C++ via
   `cc-rs` and requires a full `x86_64-linux-musl-g++` toolchain, which the
