@@ -2,8 +2,8 @@ use crate::api::errors::ApiError;
 use crate::ingest::handler::AppState;
 use crate::query::cache::{CacheKey, cache_key};
 use crate::query::{
-    breakdowns, events, export, flow, funnel, metrics, realtime, retention, revenue, sequences,
-    timeseries,
+    Filter, UNKNOWN_VALUE, breakdowns, events, export, flow, funnel, metrics, realtime, retention,
+    revenue, sequences, timeseries,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::header;
@@ -37,10 +37,126 @@ pub struct StatsParams {
     pub end_date: Option<String>,
     /// Rows to return, where the endpoint returns a list.
     pub limit: Option<usize>,
+    /// Segment filters, e.g. `browsers==Chrome;countries!=US`.
+    pub filters: Option<String>,
 }
 
 fn default_period() -> String {
     "30d".to_string()
+}
+
+/// A canonical, order-independent rendering of a filter set for cache keys.
+///
+/// Derived from the *parsed* filters rather than the raw string, so two
+/// spellings of the same segment share a cache entry, and sorted so the order
+/// they were written in does not matter. Two different segments cannot collide:
+/// the cache key that consumes this is itself length-prefixed.
+pub fn filters_cache_key(filters: &[Filter]) -> String {
+    let mut parts: Vec<String> = filters
+        .iter()
+        .map(|f| {
+            format!(
+                "{}{}{}",
+                f.dimension.slug(),
+                if f.negated { "!=" } else { "==" },
+                f.value
+            )
+        })
+        .collect();
+    parts.sort_unstable();
+    parts.dedup();
+    parts.join(";")
+}
+
+/// Maximum filters accepted on one request.
+///
+/// Each filter adds a predicate and a bound parameter; a request carrying
+/// hundreds would be a way to make the server build pathological SQL.
+pub const MAX_FILTERS: usize = 12;
+
+/// Maximum length of one filter value.
+pub const MAX_FILTER_VALUE_LEN: usize = 512;
+
+/// Parse the `filters` query parameter.
+///
+/// Format: `dimension==value` or `dimension!=value`, joined with `;`.
+/// Dimension names are the breakdown slugs, so a dashboard can turn a breakdown
+/// row into a filter without a second vocabulary. The value `(unknown)` is what
+/// a breakdown displays for `NULL`, and matches `NULL` here for the same reason.
+///
+/// `;` separates filters and `,` does not, because values legitimately contain
+/// commas — a UTM campaign or a page title, for instance.
+///
+/// # Errors
+///
+/// Returns `400` for an unknown dimension, a dimension that cannot be filtered,
+/// a missing operator, an empty value, or too many filters.
+pub fn parse_filters(raw: &str) -> Result<Vec<Filter>, ApiError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut filters = Vec::new();
+    for part in trimmed.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        // `!=` is checked first: `==` would otherwise never be reached for it,
+        // and splitting on `=` alone would mangle both.
+        let (name, negated, value) = if let Some((n, v)) = part.split_once("!=") {
+            (n, true, v)
+        } else if let Some((n, v)) = part.split_once("==") {
+            (n, false, v)
+        } else {
+            return Err(ApiError::BadRequest(format!(
+                "Invalid filter {part:?}. Use 'dimension==value' or 'dimension!=value'."
+            )));
+        };
+
+        let name = name.trim();
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(ApiError::BadRequest(format!(
+                "Filter {name:?} has no value. Use '{name}=={UNKNOWN_VALUE}' to \
+                 match events where it was not recorded."
+            )));
+        }
+        if value.len() > MAX_FILTER_VALUE_LEN {
+            return Err(ApiError::BadRequest(format!(
+                "Filter value for {name:?} exceeds {MAX_FILTER_VALUE_LEN} characters"
+            )));
+        }
+
+        let Some(dimension) = breakdowns::Dimension::from_slug(name) else {
+            return Err(ApiError::BadRequest(format!(
+                "Unknown filter dimension {name:?}. Available: {}",
+                breakdowns::Dimension::SLUGS.join(", ")
+            )));
+        };
+        if !Filter::is_filterable(dimension) {
+            return Err(ApiError::BadRequest(format!(
+                "{name:?} cannot be filtered on: entry and exit pages are derived \
+                 from a session rather than stored on an event, so there is no \
+                 per-event value to match. Filter on 'pages' instead."
+            )));
+        }
+
+        filters.push(Filter {
+            dimension,
+            negated,
+            value: value.to_string(),
+        });
+    }
+
+    if filters.len() > MAX_FILTERS {
+        return Err(ApiError::BadRequest(format!(
+            "At most {MAX_FILTERS} filters are accepted (got {})",
+            filters.len()
+        )));
+    }
+    Ok(filters)
 }
 
 /// Validate a `site_id`.
@@ -280,8 +396,16 @@ pub async fn get_main_stats(
     Query(params): Query<StatsParams>,
 ) -> Result<Json<metrics::CoreMetrics>, ApiError> {
     let range = params.validated()?;
-    let scope = state.scope(&params.site_id, &range.start, &range.end);
-    let key = cache_key("main", &params.site_id, &[&range.start, &range.end]);
+    let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
+    let filter_key = filters_cache_key(&filters);
+    let scope = state
+        .scope(&params.site_id, &range.start, &range.end)
+        .with_filters(filters);
+    let key = cache_key(
+        "main",
+        &params.site_id,
+        &[&range.start, &range.end, &filter_key],
+    );
     cached_query(&state, key, move |conn| {
         metrics::query_core_metrics(conn, &scope)
     })
@@ -294,8 +418,16 @@ pub async fn get_sessions(
     Query(params): Query<StatsParams>,
 ) -> Result<Json<metrics::SessionMetrics>, ApiError> {
     let range = params.validated()?;
-    let scope = state.scope(&params.site_id, &range.start, &range.end);
-    let key = cache_key("sessions", &params.site_id, &[&range.start, &range.end]);
+    let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
+    let filter_key = filters_cache_key(&filters);
+    let scope = state
+        .scope(&params.site_id, &range.start, &range.end)
+        .with_filters(filters);
+    let key = cache_key(
+        "sessions",
+        &params.site_id,
+        &[&range.start, &range.end, &filter_key],
+    );
     cached_query(&state, key, move |conn| {
         metrics::query_session_metrics(conn, &scope)
     })
@@ -310,11 +442,20 @@ pub async fn get_timeseries(
 ) -> Result<Json<Vec<timeseries::TimeBucket>>, ApiError> {
     let range = params.validated()?;
     let granularity = timeseries::Granularity::for_span_days(range.days);
-    let scope = state.scope(&params.site_id, &range.start, &range.end);
+    let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
+    let filter_key = filters_cache_key(&filters);
+    let scope = state
+        .scope(&params.site_id, &range.start, &range.end)
+        .with_filters(filters);
     let key = cache_key(
         "ts",
         &params.site_id,
-        &[&range.start, &range.end, &format!("{granularity:?}")],
+        &[
+            &range.start,
+            &range.end,
+            &format!("{granularity:?}"),
+            &filter_key,
+        ],
     );
     cached_query(&state, key, move |conn| {
         timeseries::query_timeseries(conn, &scope, granularity)
@@ -349,11 +490,21 @@ pub async fn get_breakdown(
         ));
     }
 
-    let scope = state.scope(&params.site_id, &range.start, &range.end);
+    let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
+    let filter_key = filters_cache_key(&filters);
+    let scope = state
+        .scope(&params.site_id, &range.start, &range.end)
+        .with_filters(filters);
     let key = cache_key(
         "bd",
         &params.site_id,
-        &[&dimension, &range.start, &range.end, &limit.to_string()],
+        &[
+            &dimension,
+            &range.start,
+            &range.end,
+            &limit.to_string(),
+            &filter_key,
+        ],
     );
     cached_query(&state, key, move |conn| {
         breakdowns::query_breakdown(conn, &scope, dim, limit)
@@ -383,8 +534,16 @@ pub async fn get_revenue(
     Query(params): Query<StatsParams>,
 ) -> Result<Json<revenue::RevenueReport>, ApiError> {
     let range = params.validated()?;
-    let scope = state.scope(&params.site_id, &range.start, &range.end);
-    let key = cache_key("revenue", &params.site_id, &[&range.start, &range.end]);
+    let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
+    let filter_key = filters_cache_key(&filters);
+    let scope = state
+        .scope(&params.site_id, &range.start, &range.end)
+        .with_filters(filters);
+    let key = cache_key(
+        "revenue",
+        &params.site_id,
+        &[&range.start, &range.end, &filter_key],
+    );
     cached_query(&state, key, move |conn| {
         revenue::query_revenue(conn, &scope)
     })
@@ -397,8 +556,16 @@ pub async fn get_goals(
     Query(params): Query<StatsParams>,
 ) -> Result<Json<Vec<events::GoalConversion>>, ApiError> {
     let range = params.validated()?;
-    let scope = state.scope(&params.site_id, &range.start, &range.end);
-    let key = cache_key("goals", &params.site_id, &[&range.start, &range.end]);
+    let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
+    let filter_key = filters_cache_key(&filters);
+    let scope = state
+        .scope(&params.site_id, &range.start, &range.end)
+        .with_filters(filters);
+    let key = cache_key(
+        "goals",
+        &params.site_id,
+        &[&range.start, &range.end, &filter_key],
+    );
     cached_query(&state, key, move |conn| events::query_goals(conn, &scope)).await
 }
 
@@ -408,8 +575,16 @@ pub async fn get_property_keys(
     Query(params): Query<StatsParams>,
 ) -> Result<Json<Vec<String>>, ApiError> {
     let range = params.validated()?;
-    let scope = state.scope(&params.site_id, &range.start, &range.end);
-    let key = cache_key("propkeys", &params.site_id, &[&range.start, &range.end]);
+    let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
+    let filter_key = filters_cache_key(&filters);
+    let scope = state
+        .scope(&params.site_id, &range.start, &range.end)
+        .with_filters(filters);
+    let key = cache_key(
+        "propkeys",
+        &params.site_id,
+        &[&range.start, &range.end, &filter_key],
+    );
     cached_query(&state, key, move |conn| {
         events::query_property_keys(conn, &scope)
     })
@@ -428,6 +603,8 @@ pub struct PropertyParams {
     pub key: String,
     /// Restrict to one event name.
     pub event: Option<String>,
+    /// Segment filters, e.g. `browsers==Chrome;countries!=US`.
+    pub filters: Option<String>,
 }
 
 /// GET /api/stats/property-values — one custom property, broken down by value.
@@ -441,6 +618,7 @@ pub async fn get_property_values(
         start_date: params.start_date.clone(),
         end_date: params.end_date.clone(),
         limit: None,
+        filters: params.filters.clone(),
     };
     let range = common.validated()?;
 
@@ -457,7 +635,11 @@ pub async fn get_property_values(
         ));
     }
 
-    let scope = state.scope(&params.site_id, &range.start, &range.end);
+    let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
+    let filter_key = filters_cache_key(&filters);
+    let scope = state
+        .scope(&params.site_id, &range.start, &range.end)
+        .with_filters(filters);
     let key_name = params.key.clone();
     let event = params.event.clone();
     let cache = cache_key(
@@ -468,6 +650,7 @@ pub async fn get_property_values(
             &range.end,
             &params.key,
             params.event.as_deref().unwrap_or("*"),
+            &filter_key,
         ],
     );
     cached_query(&state, cache, move |conn| {
@@ -493,6 +676,8 @@ pub struct FunnelParams {
     /// Comma-separated `window_funnel` modes.
     #[serde(default)]
     pub modes: String,
+    /// Segment filters, e.g. `browsers==Chrome;countries!=US`.
+    pub filters: Option<String>,
 }
 
 fn default_window() -> String {
@@ -576,6 +761,7 @@ pub async fn get_funnel(
         start_date: params.start_date.clone(),
         end_date: params.end_date.clone(),
         limit: None,
+        filters: params.filters.clone(),
     };
     let range = common.validated()?;
 
@@ -599,11 +785,22 @@ pub async fn get_funnel(
         return Err(ApiError::behavioral_required("Funnel analysis"));
     }
 
-    let scope = state.scope(&params.site_id, &range.start, &range.end);
+    let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
+    let filter_key = filters_cache_key(&filters);
+    let scope = state
+        .scope(&params.site_id, &range.start, &range.end)
+        .with_filters(filters);
     let key = cache_key(
         "funnel",
         &params.site_id,
-        &[&range.start, &range.end, &window, &modes, &params.steps],
+        &[
+            &range.start,
+            &range.end,
+            &window,
+            &modes,
+            &params.steps,
+            &filter_key,
+        ],
     );
     cached_query(&state, key, move |conn| {
         let refs: Vec<&str> = steps.iter().map(String::as_str).collect();
@@ -623,6 +820,8 @@ pub struct RetentionParams {
     pub end_date: Option<String>,
     #[serde(default = "default_num_weeks")]
     pub weeks: u32,
+    /// Segment filters, e.g. `browsers==Chrome;countries!=US`.
+    pub filters: Option<String>,
 }
 
 const fn default_num_weeks() -> u32 {
@@ -650,6 +849,7 @@ pub async fn get_retention(
         start_date: params.start_date.clone(),
         end_date: params.end_date.clone(),
         limit: None,
+        filters: params.filters.clone(),
     };
     let range = common.validated()?;
 
@@ -683,12 +883,16 @@ pub async fn get_retention(
         )
     });
 
-    let scope = state.scope(&params.site_id, &range.start, &range.end);
+    let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
+    let filter_key = filters_cache_key(&filters);
+    let scope = state
+        .scope(&params.site_id, &range.start, &range.end)
+        .with_filters(filters);
     let weeks = params.weeks;
     let key = cache_key(
         "retention",
         &params.site_id,
-        &[&range.start, &range.end, &weeks.to_string()],
+        &[&range.start, &range.end, &weeks.to_string(), &filter_key],
     );
     let cohorts: Json<Vec<retention::RetentionCohort>> = cached_query(&state, key, move |conn| {
         retention::query_retention(conn, &scope, weeks)
@@ -713,6 +917,8 @@ pub struct SequenceParams {
     pub end_date: Option<String>,
     /// Comma-separated steps, each `page:<path>` or `event:<name>`.
     pub steps: String,
+    /// Segment filters, e.g. `browsers==Chrome;countries!=US`.
+    pub filters: Option<String>,
 }
 
 /// GET /api/stats/sequences — ordered pattern matching over event streams.
@@ -726,6 +932,7 @@ pub async fn get_sequences(
         start_date: params.start_date.clone(),
         end_date: params.end_date.clone(),
         limit: None,
+        filters: params.filters.clone(),
     };
     let range = common.validated()?;
 
@@ -739,11 +946,15 @@ pub async fn get_sequences(
         return Err(ApiError::behavioral_required("Sequence analysis"));
     }
 
-    let scope = state.scope(&params.site_id, &range.start, &range.end);
+    let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
+    let filter_key = filters_cache_key(&filters);
+    let scope = state
+        .scope(&params.site_id, &range.start, &range.end)
+        .with_filters(filters);
     let key = cache_key(
         "seq",
         &params.site_id,
-        &[&range.start, &range.end, &params.steps],
+        &[&range.start, &range.end, &params.steps, &filter_key],
     );
     cached_query(&state, key, move |conn| {
         let refs: Vec<&str> = steps.iter().map(String::as_str).collect();
@@ -767,6 +978,8 @@ pub struct FlowParams {
     #[serde(default = "default_direction")]
     pub direction: String,
     pub limit: Option<usize>,
+    /// Segment filters, e.g. `browsers==Chrome;countries!=US`.
+    pub filters: Option<String>,
 }
 
 fn default_direction() -> String {
@@ -784,6 +997,7 @@ pub async fn get_flow(
         start_date: params.start_date.clone(),
         end_date: params.end_date.clone(),
         limit: params.limit,
+        filters: params.filters.clone(),
     };
     let range = common.validated()?;
     let limit = common.limit_or(flow::DEFAULT_LIMIT, flow::MAX_LIMIT)?;
@@ -801,7 +1015,11 @@ pub async fn get_flow(
         return Err(ApiError::behavioral_required("Flow analysis"));
     }
 
-    let scope = state.scope(&params.site_id, &range.start, &range.end);
+    let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
+    let filter_key = filters_cache_key(&filters);
+    let scope = state
+        .scope(&params.site_id, &range.start, &range.end)
+        .with_filters(filters);
     let page = params.page.clone();
     let key = cache_key(
         "flow",
@@ -812,6 +1030,7 @@ pub async fn get_flow(
             &params.page,
             &params.direction,
             &limit.to_string(),
+            &filter_key,
         ],
     );
     cached_query(&state, key, move |conn| {
@@ -838,6 +1057,8 @@ pub struct ExportParams {
     #[serde(default = "default_export_kind")]
     pub kind: String,
     pub limit: Option<usize>,
+    /// Segment filters, e.g. `browsers==Chrome;countries!=US`.
+    pub filters: Option<String>,
 }
 
 fn default_export_format() -> String {
@@ -859,6 +1080,7 @@ pub async fn get_export(
         start_date: params.start_date.clone(),
         end_date: params.end_date.clone(),
         limit: params.limit,
+        filters: params.filters.clone(),
     };
     let range = common.validated()?;
 
@@ -875,7 +1097,11 @@ pub async fn get_export(
         ))
     })?;
 
-    let scope = state.scope(&params.site_id, &range.start, &range.end);
+    // Exports are not cached — they are large and read once — so no cache key.
+    let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
+    let scope = state
+        .scope(&params.site_id, &range.start, &range.end)
+        .with_filters(filters);
 
     let (body, filename) = match kind {
         export::ExportKind::Daily => {
@@ -1040,6 +1266,123 @@ pub async fn gdpr_erase(
 mod tests {
     use super::*;
 
+    // ── Segment filters ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_filters_accepts_equality_and_inequality() {
+        let filters = parse_filters("browsers==Chrome;countries!=US").unwrap();
+        assert_eq!(filters.len(), 2);
+        assert_eq!(filters[0].dimension, breakdowns::Dimension::Browser);
+        assert!(!filters[0].negated);
+        assert_eq!(filters[0].value, "Chrome");
+        assert_eq!(filters[1].dimension, breakdowns::Dimension::CountryCode);
+        assert!(filters[1].negated);
+        assert_eq!(filters[1].value, "US");
+    }
+
+    #[test]
+    fn test_parse_filters_treats_commas_as_part_of_the_value() {
+        // `;` separates filters precisely so a campaign name can contain a comma.
+        let filters = parse_filters("utm-campaigns==spring,sale-2024").unwrap();
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].value, "spring,sale-2024");
+    }
+
+    #[test]
+    fn test_parse_filters_does_not_split_a_negation_on_the_equals() {
+        // `!=` must be found before `==`, or `a!=b` parses as dimension `a!`.
+        let filters = parse_filters("pages!=/admin").unwrap();
+        assert_eq!(filters[0].dimension, breakdowns::Dimension::Page);
+        assert!(filters[0].negated);
+        assert_eq!(filters[0].value, "/admin");
+    }
+
+    #[test]
+    fn test_parse_filters_is_empty_for_absent_or_blank_input() {
+        assert!(parse_filters("").unwrap().is_empty());
+        assert!(parse_filters("   ").unwrap().is_empty());
+        assert!(parse_filters(";;").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_parse_filters_trims_whitespace_around_both_sides() {
+        let filters = parse_filters(" browsers == Chrome ; os != Linux ").unwrap();
+        assert_eq!(filters[0].value, "Chrome");
+        assert_eq!(filters[1].value, "Linux");
+    }
+
+    #[test]
+    fn test_parse_filters_accepts_the_unknown_sentinel() {
+        let filters = parse_filters(&format!("browsers=={UNKNOWN_VALUE}")).unwrap();
+        assert_eq!(filters[0].value, UNKNOWN_VALUE);
+    }
+
+    #[test]
+    fn test_parse_filters_rejects_malformed_input() {
+        for bad in [
+            "browsers",        // no operator
+            "browsers=Chrome", // single '='
+            "browsers==",      // empty value
+            "==Chrome",        // no dimension
+            "nonexistent==x",  // unknown dimension
+            "entry-pages==/",  // session-derived, not a column
+            "exit-pages!=/",
+        ] {
+            assert!(
+                parse_filters(bad).is_err(),
+                "{bad:?} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_filters_error_messages_name_the_problem() {
+        let err = parse_filters("nonexistent==x").unwrap_err().to_string();
+        assert!(err.contains("nonexistent"), "{err}");
+        assert!(
+            err.contains("browsers"),
+            "the error should list what is valid: {err}"
+        );
+
+        let err = parse_filters("entry-pages==/").unwrap_err().to_string();
+        assert!(err.contains("session"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_filters_bounds_count_and_value_length() {
+        let many = (0..=MAX_FILTERS)
+            .map(|i| format!("pages==/p{i}"))
+            .collect::<Vec<_>>()
+            .join(";");
+        assert!(parse_filters(&many).is_err());
+
+        let long = format!("pages=={}", "x".repeat(MAX_FILTER_VALUE_LEN + 1));
+        assert!(parse_filters(&long).is_err());
+        let at_limit = format!("pages=={}", "x".repeat(MAX_FILTER_VALUE_LEN));
+        assert!(parse_filters(&at_limit).is_ok());
+    }
+
+    #[test]
+    fn test_filters_cache_key_is_order_independent() {
+        let a = parse_filters("browsers==Chrome;countries==DE").unwrap();
+        let b = parse_filters("countries==DE;browsers==Chrome").unwrap();
+        assert_eq!(filters_cache_key(&a), filters_cache_key(&b));
+    }
+
+    #[test]
+    fn test_filters_cache_key_separates_different_segments() {
+        let unfiltered = filters_cache_key(&[]);
+        let chrome = filters_cache_key(&parse_filters("browsers==Chrome").unwrap());
+        let not_chrome = filters_cache_key(&parse_filters("browsers!=Chrome").unwrap());
+        let firefox = filters_cache_key(&parse_filters("browsers==Firefox").unwrap());
+        let keys = [&unfiltered, &chrome, &not_chrome, &firefox];
+        for (i, x) in keys.iter().enumerate() {
+            for y in keys.iter().skip(i + 1) {
+                assert_ne!(x, y, "two different segments share a cache key");
+            }
+        }
+    }
+
     fn params(period: &str) -> StatsParams {
         StatsParams {
             site_id: "test.com".to_string(),
@@ -1047,6 +1390,7 @@ mod tests {
             start_date: None,
             end_date: None,
             limit: None,
+            filters: None,
         }
     }
 

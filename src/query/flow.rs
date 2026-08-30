@@ -87,29 +87,20 @@ pub fn query_flow(
          GROUP BY next_page
          ORDER BY visitors DESC, next_page
          LIMIT {limit}",
-        where_clause = QueryScope::where_clause()
+        where_clause = scope.where_clause()
     );
 
     let mut stmt = conn.prepare(&sql)?;
     // The scope parameters appear twice: once for each WHERE clause.
+    let bound: Vec<&str> = scope.params().into_iter().chain(scope.params()).collect();
     let rows = stmt
-        .query_map(
-            duckdb::params![
-                scope.site_id,
-                scope.start,
-                scope.end,
-                scope.site_id,
-                scope.start,
-                scope.end
-            ],
-            |row| {
-                Ok(FlowNode {
-                    next_page: row.get(0)?,
-                    visitors: row.get(1)?,
-                    share: row.get(2)?,
-                })
-            },
-        )?
+        .query_map(duckdb::params_from_iter(bound), |row| {
+            Ok(FlowNode {
+                next_page: row.get(0)?,
+                visitors: row.get(1)?,
+                share: row.get(2)?,
+            })
+        })?
         .filter_map(Result::ok)
         .collect();
     Ok(rows)

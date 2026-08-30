@@ -88,7 +88,7 @@ mallardmetrics/
 │   └── dashboard/
 │       └── mod.rs               -- Embedded Preact+HTM SPA
 ├── tests/
-│   └── ingest_test.rs           -- Integration tests (62 tests)
+│   └── ingest_test.rs           -- Integration tests (66 tests)
 ├── benches/
 │   └── ingest_bench.rs          -- Criterion.rs benchmarks
 ├── src/dashboard/assets/        -- Frontend SPA files (embedded via rust-embed)
@@ -140,7 +140,7 @@ All four commands must pass before submitting a PR:
 
 | Command | Requirement |
 |---|---|
-| `cargo test --all-targets` | All 551 tests pass (489 unit + 62 integration) |
+| `cargo test --all-targets` | All 581 tests pass (515 unit + 66 integration) |
 | `cargo clippy --all-targets --all-features -- -D warnings` | Zero warnings (pedantic + nursery + cargo lints) |
 | `cargo fmt -- --check` | Zero formatting violations |
 | `cargo doc --no-deps` | Documentation builds without errors |

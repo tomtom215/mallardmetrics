@@ -23,6 +23,7 @@ Core functionality is complete and production-ready:
 - Visitors, pageviews, events, visits, bounce rate, visit duration
 - Twenty breakdown dimensions, covering every column the ingest path populates
 - Gap-filled time series, realtime activity, goals, custom properties, revenue
+- Segment filters on every report, over any of the twenty dimensions
 - Behavioral analytics: cumulative funnels with ordering modes, per-visitor
   retention cohorts, session metrics, sequence matching, forward/backward flow
 - Daily and raw event exports as CSV or JSON
@@ -75,7 +76,9 @@ Potential directions, not committed work. Each depends on demonstrated need.
 
 - **Alerting** — thresholds and anomaly detection on traffic or conversions.
 - **Scheduled reports** — periodic summaries by email or webhook.
-- **Saved segments** — named filters reusable across every report.
+- **Saved segments** — naming and storing a filter set, so it can be recalled
+  rather than rebuilt. The filters themselves now exist; what is missing is
+  persistence and a name.
 - **UTM-aware attribution models** — first-touch and last-touch, rather than the
   per-event attribution available today.
 - **Alternative auth backends** — OIDC or SAML for organisations that need it.
@@ -96,7 +99,7 @@ Potential directions, not committed work. Each depends on demonstrated need.
 Every release must pass the full validation suite before tagging:
 
 ```bash
-cargo test --all-targets   # all 551 tests pass
+cargo test --all-targets   # all 581 tests pass
 cargo clippy --all-targets --all-features -- -D warnings   # zero warnings
 cargo fmt -- --check       # zero format violations
 cargo doc --no-deps        # docs build cleanly

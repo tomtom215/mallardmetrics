@@ -103,7 +103,7 @@ fn query_base_counts(conn: &Connection, scope: &QueryScope) -> Result<BaseCounts
                 COUNT(*) FILTER (WHERE event_name = 'pageview'),
                 COUNT(*)
          FROM events_all WHERE {}",
-        QueryScope::where_clause()
+        scope.where_clause()
     );
     let mut stmt = conn.prepare(&sql)?;
     stmt.query_row(duckdb::params_from_iter(scope.params()), |row| {
@@ -165,7 +165,7 @@ fn session_aggregate_sql(scope: &QueryScope) -> String {
                 COALESCE(AVG(duration_secs), 0.0),
                 COALESCE(AVG(page_count), 0.0)
          FROM per_session",
-        where_clause = QueryScope::where_clause()
+        where_clause = scope.where_clause()
     )
 }
 

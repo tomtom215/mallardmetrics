@@ -69,7 +69,7 @@ pub fn query_timeseries(
     scope: &QueryScope,
     granularity: Granularity,
 ) -> Result<Vec<TimeBucket>, duckdb::Error> {
-    let sql = timeseries_sql(granularity);
+    let sql = timeseries_sql(granularity, scope);
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(duckdb::params_from_iter(timeseries_params(scope)), |row| {
@@ -85,7 +85,8 @@ pub fn query_timeseries(
 }
 
 /// SQL for the gap-filled time series. Split out so it can be unit-tested.
-fn timeseries_sql(granularity: Granularity) -> String {
+fn timeseries_sql(granularity: Granularity, scope: &QueryScope) -> String {
+    let filters = scope.filter_clause();
     let trunc = granularity.trunc_unit();
     let fmt = granularity.format_str();
     let step = granularity.step_interval();
@@ -114,7 +115,7 @@ fn timeseries_sql(granularity: Granularity) -> String {
              FROM events_all
              WHERE site_id = ?
                AND timestamp >= (SELECT lo FROM bounds)
-               AND timestamp <  (SELECT hi FROM bounds)
+               AND timestamp <  (SELECT hi FROM bounds){filters}
              GROUP BY 1
          )
          SELECT STRFTIME(spine.bucket_ts, '{fmt}'),
@@ -125,12 +126,17 @@ fn timeseries_sql(granularity: Granularity) -> String {
     )
 }
 
-/// Bind order for [`timeseries_sql`]: start, end, then site_id.
+/// Bind order for [`timeseries_sql`]: start, end, site_id, then filter values.
 ///
 /// The spine CTE needs the bounds before the aggregate needs the site, so this
 /// query's parameter order differs from [`QueryScope::params`].
-fn timeseries_params(scope: &QueryScope) -> [&str; 3] {
-    [&scope.start, &scope.end, &scope.site_id]
+fn timeseries_params(scope: &QueryScope) -> Vec<&str> {
+    let mut out = Vec::with_capacity(3 + scope.filters.len());
+    out.push(scope.start.as_str());
+    out.push(scope.end.as_str());
+    out.push(scope.site_id.as_str());
+    out.extend(scope.filter_params());
+    out
 }
 
 #[cfg(test)]
@@ -280,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_sql_uses_only_bound_parameters() {
-        let sql = timeseries_sql(Granularity::Day);
+        let sql = timeseries_sql(Granularity::Day, &scope("2024-01-01", "2024-02-01"));
         assert_eq!(sql.matches('?').count(), 3);
     }
 }

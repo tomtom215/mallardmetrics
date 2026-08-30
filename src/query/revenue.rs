@@ -74,7 +74,7 @@ fn query_by_currency(
          WHERE {} AND revenue_amount IS NOT NULL
          GROUP BY currency
          ORDER BY total DESC, currency",
-        QueryScope::where_clause()
+        scope.where_clause()
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -118,7 +118,7 @@ fn query_by_dimension(
          GROUP BY value, currency
          ORDER BY total DESC, value
          LIMIT {TOP_N}",
-        QueryScope::where_clause()
+        scope.where_clause()
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt

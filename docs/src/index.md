@@ -25,7 +25,7 @@ Built in Rust for predictable, low resource usage. The embedded DuckDB database 
 | Storage | DuckDB hot table plus date-partitioned Parquet (ZSTD-compressed) |
 | Frontend | Preact + HTM (no build step, embedded in binary) |
 | Deployment | Static musl binary, `FROM scratch` Docker image |
-| Tests | 551 passing (489 unit + 62 integration) |
+| Tests | 581 passing (515 unit + 66 integration) |
 
 ## Key Features
 
@@ -47,14 +47,19 @@ Built in Rust for predictable, low resource usage. The embedded DuckDB database 
 
 | Category | Capabilities |
 |---|---|
-| Core metrics | Unique visitors, pageviews, bounce rate, pages/session |
-| Breakdowns | Pages, referrers, browsers, OS, devices, countries |
-| Time-series | Hourly and daily aggregations |
-| Funnel analysis | Multi-step conversion funnels via `window_funnel()` |
-| Retention cohorts | Weekly retention grids via `retention()` |
-| Session analytics | Duration, depth via `sessionize()` |
+| Core metrics | Unique visitors, pageviews, events, visits, bounce rate, visit duration |
+| Breakdowns | Twenty dimensions — every column the ingest path populates |
+| Segment filters | Narrow any report to `browsers==Chrome;countries!=US` |
+| Time-series | Gap-filled hourly and daily aggregations |
+| Realtime | Current visitors, top pages and sources, per-minute series |
+| Goals and properties | Conversion rates per custom event, and their properties |
+| Revenue | Totals per currency, event and page |
+| Funnel analysis | Cumulative conversion funnels via `window_funnel()` |
+| Retention cohorts | Per-visitor weekly cohorts via `retention()` |
+| Session analytics | Duration, depth, bounce rate via `sessionize()` |
 | Sequence matching | Behavioral patterns via `sequence_match()` |
-| Flow analysis | Next-page navigation via `sequence_next_node()` |
+| Flow analysis | Forward and backward navigation via `sequence_next_node()` |
+| Export | Daily rollups or raw events, as CSV or JSON |
 
 ### Production Ready
 

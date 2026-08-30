@@ -90,7 +90,7 @@ pub fn query_funnel(
         return Ok(Vec::new());
     }
 
-    let sql = funnel_sql(window_interval, modes, steps);
+    let sql = funnel_sql(scope, window_interval, modes, steps);
     let mut stmt = conn.prepare(&sql)?;
     let raw: Vec<(u32, u64)> = stmt
         .query_map(duckdb::params_from_iter(scope.params()), |row| {
@@ -134,7 +134,7 @@ fn to_report(raw: &[(u32, u64)]) -> Vec<FunnelStep> {
 }
 
 /// SQL for the cumulative funnel. Split out so it can be unit-tested.
-fn funnel_sql(window_interval: &str, modes: &str, steps: &[&str]) -> String {
+fn funnel_sql(scope: &QueryScope, window_interval: &str, modes: &str, steps: &[&str]) -> String {
     let step_conditions = steps.join(", ");
     let n = steps.len();
     // `window_funnel(window [, mode], timestamp, cond, ...)`: the mode argument
@@ -162,7 +162,7 @@ fn funnel_sql(window_interval: &str, modes: &str, steps: &[&str]) -> String {
          LEFT JOIN per_visitor pv ON TRUE
          GROUP BY s.step
          ORDER BY s.step",
-        where_clause = QueryScope::where_clause()
+        where_clause = scope.where_clause()
     )
 }
 
@@ -345,15 +345,20 @@ mod tests {
     fn test_sql_omits_the_mode_argument_when_empty() {
         // window_funnel's mode is positional; passing an empty string would be
         // read as the timestamp argument.
-        let sql = funnel_sql("1 day", "", STEPS);
+        let sql = funnel_sql(&scope("2024-01-01", "2024-02-01"), "1 day", "", STEPS);
         assert!(sql.contains("window_funnel(INTERVAL '1 day', timestamp,"));
-        let with_mode = funnel_sql("1 day", "strict_order", STEPS);
+        let with_mode = funnel_sql(
+            &scope("2024-01-01", "2024-02-01"),
+            "1 day",
+            "strict_order",
+            STEPS,
+        );
         assert!(with_mode.contains("window_funnel(INTERVAL '1 day', 'strict_order', timestamp,"));
     }
 
     #[test]
     fn test_sql_uses_bound_parameters_for_scope() {
-        let sql = funnel_sql("1 day", "", STEPS);
+        let sql = funnel_sql(&scope("2024-01-01", "2024-02-01"), "1 day", "", STEPS);
         assert_eq!(sql.matches('?').count(), 3);
     }
 

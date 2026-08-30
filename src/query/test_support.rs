@@ -137,3 +137,18 @@ pub fn insert_pageview(conn: &Connection, visitor: &str, timestamp: &str, pathna
 pub fn scope(start: &str, end: &str) -> QueryScope {
     QueryScope::new("test.com", start, end, "30 minutes")
 }
+
+/// A scope narrowed by one filter, written the way the API spells it.
+///
+/// # Panics
+///
+/// Panics if `spec` is not a valid filter, which is a bug in the test.
+pub fn filtered_scope(start: &str, end: &str, spec: &str) -> QueryScope {
+    let filters = crate::api::stats::parse_filters(spec)
+        .unwrap_or_else(|e| panic!("test filter {spec:?} is invalid: {e}"));
+    assert!(
+        !filters.is_empty(),
+        "test filter {spec:?} parsed to nothing"
+    );
+    scope(start, end).with_filters(filters)
+}

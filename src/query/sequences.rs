@@ -34,7 +34,7 @@ fn build_pattern(num_conditions: usize) -> String {
 ///
 /// `conditions` are SQL boolean expressions built by the API layer from
 /// validated step specifications, never raw request input.
-fn build_sequence_match_sql(conditions: &[&str]) -> String {
+fn build_sequence_match_sql(scope: &QueryScope, conditions: &[&str]) -> String {
     let pattern = build_pattern(conditions.len());
     let conds = conditions.join(", ");
     format!(
@@ -52,7 +52,7 @@ fn build_sequence_match_sql(conditions: &[&str]) -> String {
              WHERE {where_clause}
              GROUP BY visitor_id
          )",
-        where_clause = QueryScope::where_clause()
+        where_clause = scope.where_clause()
     )
 }
 
@@ -76,7 +76,7 @@ pub fn execute_sequence_match(
         });
     }
 
-    let sql = build_sequence_match_sql(conditions);
+    let sql = build_sequence_match_sql(scope, conditions);
     let mut stmt = conn.prepare(&sql)?;
     stmt.query_row(duckdb::params_from_iter(scope.params()), |row| {
         Ok(SequenceMatchResult {
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn test_build_sequence_match_sql() {
-        let sql = build_sequence_match_sql(CONDITIONS);
+        let sql = build_sequence_match_sql(&scope("2024-01-01", "2024-02-01"), CONDITIONS);
         assert!(sql.contains("sequence_match("));
         assert!(sql.contains("sequence_count("));
         assert!(sql.contains("(?1).*(?2)"));

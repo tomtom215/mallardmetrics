@@ -143,7 +143,7 @@ fn query_daily_top(
              FROM per_day
          )
          SELECT day, value FROM ranked WHERE rank = 1 ORDER BY day",
-        where_clause = QueryScope::where_clause()
+        where_clause = scope.where_clause()
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -203,22 +203,21 @@ pub fn query_raw_export(
         .map(|c| format!("CAST({c} AS VARCHAR)"))
         .collect::<Vec<_>>()
         .join(", ");
+    // `limit` is interpolated: it is a `usize` already capped by MAX_RAW_ROWS, so
+    // it cannot carry SQL, and binding it would place an integer parameter after
+    // a variable number of filter values.
     let sql = format!(
-        "SELECT {projection} FROM events_all WHERE {} ORDER BY timestamp LIMIT ?",
-        QueryScope::where_clause()
+        "SELECT {projection} FROM events_all WHERE {} ORDER BY timestamp LIMIT {limit}",
+        scope.where_clause()
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
     let rows = stmt
-        .query_map(
-            duckdb::params![scope.site_id, scope.start, scope.end, limit_i64],
-            |row| {
-                (0..RAW_COLUMNS.len())
-                    .map(|i| row.get::<_, Option<String>>(i))
-                    .collect::<Result<Vec<_>, _>>()
-            },
-        )?
+        .query_map(duckdb::params_from_iter(scope.params()), |row| {
+            (0..RAW_COLUMNS.len())
+                .map(|i| row.get::<_, Option<String>>(i))
+                .collect::<Result<Vec<_>, _>>()
+        })?
         .filter_map(Result::ok)
         .collect();
     Ok(rows)

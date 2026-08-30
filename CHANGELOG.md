@@ -223,6 +223,26 @@ the data the ingest path has always collected is now queryable.
   session-derived `entry-pages` and `exit-pages`. One
   `/api/stats/breakdown/{dimension}` route replaces the six near-identical
   handlers.
+- **Segment filters.** A `filters` parameter narrows every figure a request
+  returns — headline metrics, the time series, breakdowns, goals, revenue,
+  exports and the behavioral reports alike. Until now a report could only ever
+  describe a whole site, so "how do German visitors move through the funnel"
+  had no answer at all.
+
+  Conditions are written `dimension==value` or `dimension!=value` and joined by
+  `;` (not `,`, because campaign names contain commas). Dimension names are the
+  breakdown slugs, so a row in a breakdown becomes a filter without a second
+  vocabulary — and the dashboard makes those rows clickable, with a chip per
+  active condition.
+
+  `(unknown)` matches events where the value was not recorded, which is exactly
+  what a breakdown displays for `NULL`. Negation is NULL-safe in the direction a
+  reader expects: `browsers!=Chrome` includes events with no browser recorded,
+  where plain SQL would silently drop them. Values are always bound, never
+  interpolated; only column names are, and those come from a fixed enum. Entry
+  and exit pages are refused with a `400` rather than quietly filtered on
+  `pathname`, because they are derived from a whole session and have no
+  per-event value to match.
 - **Raw event export** (`kind=raw`) in CSV or JSON, deliberately excluding
   `visitor_id`: a file of per-event pseudonyms is the artefact this project
   exists to avoid producing.

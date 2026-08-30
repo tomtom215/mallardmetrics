@@ -3,7 +3,7 @@
 > **Self-hosted, privacy-focused web analytics powered by DuckDB and the `behavioral` extension.**
 > Single binary. Single process. Zero external dependencies.
 
-[![Tests](https://img.shields.io/badge/tests-551_passing-brightgreen?style=flat-square)](#development)
+[![Tests](https://img.shields.io/badge/tests-581_passing-brightgreen?style=flat-square)](#development)
 [![Rust](https://img.shields.io/badge/rust-1.98%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
 [![Clippy](https://img.shields.io/badge/clippy-0_warnings-brightgreen?style=flat-square)](#development)
@@ -59,6 +59,7 @@ A lightweight, privacy-respecting alternative to Plausible Analytics. Runs entir
 - **Core metrics** — Unique visitors, pageviews, events, visits, bounce rate, visit duration
 - **Realtime** — Current visitors, top pages and sources, with a per-minute series
 - **Twenty breakdown dimensions** — Pages, entry and exit pages, referrers and sources, all five UTM parameters, countries, regions, cities, browsers and versions, operating systems and versions, device types, screen widths, and event names
+- **Segment filters** — `filters=countries==DE;devices!=mobile` narrows every figure a request returns, not just the breakdown you were looking at. Dimension names are the breakdown slugs, so clicking a row in the dashboard filters everything to it
 - **Goals and custom properties** — Conversion rates for every custom event, and drill-down into the properties attached to them
 - **Revenue** — Totals, order counts and average order value, reported per currency and never summed across them
 - **Time-series** — Hourly and daily aggregation, gap-filled so a quiet day reads as zero rather than vanishing
@@ -289,6 +290,10 @@ maximum is an error rather than a silent clamp.
 
 #### Core Analytics (authenticated)
 
+Every stats endpoint accepts `site_id`, a date range (`period`, or
+`start_date`/`end_date`), and `filters` — a segment such as
+`browsers==Chrome;countries!=US` that narrows the whole report.
+
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/api/sites` | Site IDs that have data |
@@ -495,7 +500,7 @@ cargo bench
 
 - **Zero clippy warnings** — pedantic, nursery, and cargo lint groups enabled
 - **Zero formatting violations** — enforced via `cargo fmt`
-- **All 551 tests pass** — no ignored tests
+- **All 581 tests pass** — no ignored tests
 - **Documentation builds without errors**
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow.

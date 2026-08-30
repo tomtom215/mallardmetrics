@@ -104,6 +104,32 @@ impl Dimension {
         })
     }
 
+    /// The URL slug for this dimension — the inverse of [`Dimension::from_slug`].
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::Page => "pages",
+            Self::EntryPage => "entry-pages",
+            Self::ExitPage => "exit-pages",
+            Self::Referrer => "referrers",
+            Self::ReferrerSource => "sources",
+            Self::CountryCode => "countries",
+            Self::Region => "regions",
+            Self::City => "cities",
+            Self::Browser => "browsers",
+            Self::BrowserVersion => "browser-versions",
+            Self::Os => "os",
+            Self::OsVersion => "os-versions",
+            Self::DeviceType => "devices",
+            Self::ScreenSize => "screen-sizes",
+            Self::UtmSource => "utm-sources",
+            Self::UtmMedium => "utm-mediums",
+            Self::UtmCampaign => "utm-campaigns",
+            Self::UtmContent => "utm-contents",
+            Self::UtmTerm => "utm-terms",
+            Self::EventName => "events",
+        }
+    }
+
     /// Every dimension slug, for API discovery and documentation.
     pub const SLUGS: &'static [&'static str] = &[
         "pages",
@@ -141,31 +167,32 @@ pub fn query_breakdown(
     dimension: Dimension,
     limit: usize,
 ) -> Result<Vec<BreakdownRow>, duckdb::Error> {
-    let sql = breakdown_sql(dimension, scope);
+    let sql = breakdown_sql(dimension, scope, limit);
     let mut stmt = conn.prepare(&sql)?;
-    let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
 
     let rows = stmt
-        .query_map(
-            duckdb::params![scope.site_id, scope.start, scope.end, limit_i64],
-            |row| {
-                Ok(BreakdownRow {
-                    value: row.get(0)?,
-                    visitors: row.get(1)?,
-                    pageviews: row.get(2)?,
-                    events: row.get(3)?,
-                })
-            },
-        )?
+        .query_map(duckdb::params_from_iter(scope.params()), |row| {
+            Ok(BreakdownRow {
+                value: row.get(0)?,
+                visitors: row.get(1)?,
+                pageviews: row.get(2)?,
+                events: row.get(3)?,
+            })
+        })?
         .filter_map(Result::ok)
         .collect();
     Ok(rows)
 }
 
 /// SQL for a breakdown. Split out so it can be unit-tested.
-fn breakdown_sql(dimension: Dimension, scope: &QueryScope) -> String {
+///
+/// `limit` is interpolated rather than bound. It is a `usize` already capped by
+/// the API layer, so it cannot carry SQL, and binding it would put an integer
+/// parameter after a variable number of filter values — an ordering that is
+/// easy to get wrong and hard to notice.
+fn breakdown_sql(dimension: Dimension, scope: &QueryScope, limit: usize) -> String {
     let col = dimension.column_name();
-    let where_clause = QueryScope::where_clause();
+    let where_clause = scope.where_clause();
 
     match dimension {
         Dimension::EntryPage | Dimension::ExitPage => {
@@ -201,7 +228,7 @@ fn breakdown_sql(dimension: Dimension, scope: &QueryScope) -> String {
                  FROM per_session
                  GROUP BY page
                  ORDER BY COUNT(DISTINCT visitor_id) DESC, page
-                 LIMIT ?"
+                 LIMIT {limit}"
             )
         }
         _ => format!(
@@ -213,7 +240,7 @@ fn breakdown_sql(dimension: Dimension, scope: &QueryScope) -> String {
              WHERE {where_clause}
              GROUP BY dim_value
              ORDER BY visitors DESC, dim_value
-             LIMIT ?"
+             LIMIT {limit}"
         ),
     }
 }
@@ -475,6 +502,216 @@ mod tests {
     }
 
     #[test]
+    fn test_breakdown_respects_a_filter() {
+        let db = TestDb::new();
+        db.insert_dimensional(
+            "v1",
+            "2024-01-15 10:00:00",
+            "/a",
+            Some("Chrome"),
+            Some("DE"),
+            None,
+            None,
+        );
+        db.insert_dimensional(
+            "v2",
+            "2024-01-15 11:00:00",
+            "/b",
+            Some("Firefox"),
+            Some("DE"),
+            None,
+            None,
+        );
+        db.insert_dimensional(
+            "v3",
+            "2024-01-15 12:00:00",
+            "/c",
+            Some("Chrome"),
+            Some("US"),
+            None,
+            None,
+        );
+
+        let rows = query_breakdown(
+            &db.conn,
+            &crate::query::test_support::filtered_scope(
+                "2024-01-01",
+                "2024-02-01",
+                "browsers==Chrome",
+            ),
+            Dimension::Page,
+            10,
+        )
+        .unwrap();
+        let pages: Vec<&str> = rows.iter().map(|r| r.value.as_str()).collect();
+        assert_eq!(
+            pages,
+            vec!["/a", "/c"],
+            "the Firefox visitor must be excluded"
+        );
+    }
+
+    #[test]
+    fn test_breakdown_negated_filter_keeps_rows_with_no_value() {
+        // "not Chrome" plainly covers "no browser recorded"; plain SQL would
+        // drop those rows through three-valued logic.
+        let db = TestDb::new();
+        db.insert_dimensional(
+            "v1",
+            "2024-01-15 10:00:00",
+            "/a",
+            Some("Chrome"),
+            None,
+            None,
+            None,
+        );
+        db.insert_dimensional(
+            "v2",
+            "2024-01-15 11:00:00",
+            "/b",
+            Some("Firefox"),
+            None,
+            None,
+            None,
+        );
+        db.insert_dimensional("v3", "2024-01-15 12:00:00", "/c", None, None, None, None);
+
+        let rows = query_breakdown(
+            &db.conn,
+            &crate::query::test_support::filtered_scope(
+                "2024-01-01",
+                "2024-02-01",
+                "browsers!=Chrome",
+            ),
+            Dimension::Page,
+            10,
+        )
+        .unwrap();
+        let pages: Vec<&str> = rows.iter().map(|r| r.value.as_str()).collect();
+        assert_eq!(pages, vec!["/b", "/c"]);
+    }
+
+    #[test]
+    fn test_breakdown_unknown_filter_selects_rows_with_no_value() {
+        let db = TestDb::new();
+        db.insert_dimensional(
+            "v1",
+            "2024-01-15 10:00:00",
+            "/a",
+            Some("Chrome"),
+            None,
+            None,
+            None,
+        );
+        db.insert_dimensional("v2", "2024-01-15 11:00:00", "/b", None, None, None, None);
+
+        let rows = query_breakdown(
+            &db.conn,
+            &crate::query::test_support::filtered_scope(
+                "2024-01-01",
+                "2024-02-01",
+                "browsers==(unknown)",
+            ),
+            Dimension::Page,
+            10,
+        )
+        .unwrap();
+        let pages: Vec<&str> = rows.iter().map(|r| r.value.as_str()).collect();
+        assert_eq!(pages, vec!["/b"]);
+    }
+
+    #[test]
+    fn test_multiple_filters_are_combined_with_and() {
+        let db = TestDb::new();
+        db.insert_dimensional(
+            "v1",
+            "2024-01-15 10:00:00",
+            "/a",
+            Some("Chrome"),
+            Some("DE"),
+            None,
+            None,
+        );
+        db.insert_dimensional(
+            "v2",
+            "2024-01-15 11:00:00",
+            "/b",
+            Some("Chrome"),
+            Some("US"),
+            None,
+            None,
+        );
+        db.insert_dimensional(
+            "v3",
+            "2024-01-15 12:00:00",
+            "/c",
+            Some("Firefox"),
+            Some("DE"),
+            None,
+            None,
+        );
+
+        let rows = query_breakdown(
+            &db.conn,
+            &crate::query::test_support::filtered_scope(
+                "2024-01-01",
+                "2024-02-01",
+                "browsers==Chrome;countries==DE",
+            ),
+            Dimension::Page,
+            10,
+        )
+        .unwrap();
+        let pages: Vec<&str> = rows.iter().map(|r| r.value.as_str()).collect();
+        assert_eq!(pages, vec!["/a"]);
+    }
+
+    #[test]
+    fn test_filter_value_that_looks_like_sql_is_treated_as_data() {
+        let db = TestDb::new();
+        db.insert_dimensional(
+            "v1",
+            "2024-01-15 10:00:00",
+            "/a",
+            Some("Chrome"),
+            None,
+            None,
+            None,
+        );
+
+        let rows = query_breakdown(
+            &db.conn,
+            &crate::query::test_support::filtered_scope(
+                "2024-01-01",
+                "2024-02-01",
+                "browsers==' OR 1=1 --",
+            ),
+            Dimension::Page,
+            10,
+        )
+        .unwrap();
+        assert!(
+            rows.is_empty(),
+            "an injection attempt must simply match nothing"
+        );
+
+        // And the table is still there.
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_slug_round_trips_for_every_dimension() {
+        for slug in Dimension::SLUGS {
+            let dim = Dimension::from_slug(slug).expect("slug maps to a dimension");
+            assert_eq!(dim.slug(), *slug, "slug() disagrees with from_slug()");
+        }
+    }
+
+    #[test]
     fn test_behavioral_requirement_flags() {
         assert!(Dimension::EntryPage.requires_behavioral());
         assert!(Dimension::ExitPage.requires_behavioral());
@@ -484,15 +721,38 @@ mod tests {
 
     #[test]
     fn test_sql_uses_bound_parameters_for_user_input() {
-        let sql = breakdown_sql(Dimension::Page, &scope("2024-01-01", "2024-02-01"));
-        assert_eq!(sql.matches('?').count(), 4, "site, start, end, limit");
+        let sql = breakdown_sql(Dimension::Page, &scope("2024-01-01", "2024-02-01"), 10);
+        assert_eq!(sql.matches('?').count(), 3, "site, start, end");
         assert!(!sql.contains("test.com"));
+        assert!(
+            sql.contains("LIMIT 10"),
+            "the validated limit is interpolated"
+        );
+    }
+
+    #[test]
+    fn test_filtered_sql_binds_one_parameter_per_filter() {
+        let scope = crate::query::test_support::filtered_scope(
+            "2024-01-01",
+            "2024-02-01",
+            "browsers==Chrome;countries!=US",
+        );
+        let sql = breakdown_sql(Dimension::Page, &scope, 10);
+        assert_eq!(
+            sql.matches('?').count(),
+            scope.params().len(),
+            "every ? must have exactly one bound value"
+        );
+        assert!(
+            !sql.contains("Chrome"),
+            "filter values must not be interpolated"
+        );
     }
 
     #[test]
     fn test_entry_page_sql_rejects_unsafe_session_window() {
         let bad = QueryScope::new("a.com", "s", "e", "1 minute; DROP TABLE events");
-        let sql = breakdown_sql(Dimension::EntryPage, &bad);
+        let sql = breakdown_sql(Dimension::EntryPage, &bad, 10);
         assert!(sql.contains("INTERVAL '30 minutes'"));
         assert!(!sql.contains("DROP TABLE"));
     }

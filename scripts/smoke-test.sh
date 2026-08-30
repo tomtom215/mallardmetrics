@@ -126,6 +126,26 @@ for dim in pages entry-pages exit-pages referrers sources countries regions \
 done
 check breakdown_unknown '400' "$(code "$BASE/api/stats/breakdown/not-a-dimension?$Q")"
 
+# ── Segment filters ───────────────────────────────────────────────────────
+# Chrome was the User-Agent every ingest above used, so the segment holds all
+# the pageviews and its complement holds none.
+check filter_matches    '"unique_visitors":1' \
+  "$(curl -sS "$BASE/api/stats/main?$Q&filters=browsers%3D%3DChrome")"
+check filter_excludes   '"total_pageviews":0' \
+  "$(curl -sS "$BASE/api/stats/main?$Q&filters=browsers%3D%3DFirefox")"
+check filter_negation   '"total_pageviews":0' \
+  "$(curl -sS "$BASE/api/stats/main?$Q&filters=browsers%21%3DChrome")"
+check filter_breakdown  '200' \
+  "$(code "$BASE/api/stats/breakdown/pages?$Q&filters=browsers%3D%3DChrome")"
+check filter_timeseries '200' \
+  "$(code "$BASE/api/stats/timeseries?$Q&filters=browsers%3D%3DChrome")"
+check filter_bad_dim    '400' "$(code "$BASE/api/stats/main?$Q&filters=nope%3D%3Dx")"
+check filter_no_op      '400' "$(code "$BASE/api/stats/main?$Q&filters=browsers")"
+check filter_entry_page '400' "$(code "$BASE/api/stats/main?$Q&filters=entry-pages%3D%3D%2F")"
+# A value that looks like SQL must be data, and the server must stay healthy.
+check filter_injection  '200' \
+  "$(code "$BASE/api/stats/main?$Q&filters=pages%3D%3D%27%20OR%201%3D1%20--")"
+
 # ── Behavioral endpoints ──────────────────────────────────────────────────
 # They answer 503 without the extension, which is correct rather than a failure.
 for name in sessions funnel retention sequences flow; do

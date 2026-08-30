@@ -36,6 +36,8 @@ The failure mode is not an error. When the filesystem fills, the C++ compile doe
 
 Cheapest recovery, in order: delete `target/debug/incremental` (~1.4 GB, costs only rebuild speed), then the stale `libduckdb-sys-*` directories — the current ones are the newest with an `output` file. `cargo clean` is the blunt instrument and forces the whole amalgamation to rebuild.
 
+Four commands in one session accumulated four such directories — `cargo check`, `cargo test`, `cargo build` and `cargo doc` each unify features differently — for about 18 GB. Prefer `cargo test --all-targets` over a separate `cargo check` (it type-checks the same code), and expect `cargo build` and `cargo doc` to want a directory each.
+
 ### L22: The `behavioral` extension is version-gated on DuckDB
 
 The community extension is built per DuckDB version. `INSTALL behavioral FROM community` returns 404 for a DuckDB release the extension has not been published for — so the `duckdb` crate version is not a free choice: bumping or pinning it can silently disable every behavioral endpoint. Before changing the crate version, confirm the extension resolves for the DuckDB version it bundles (v1.5.5 and v1.5.1 do; v1.4.1 does not).

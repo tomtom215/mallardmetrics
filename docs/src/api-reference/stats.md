@@ -22,9 +22,56 @@ and return `429` with a `Retry-After` header when it is reached.
 | `start_date` | string | `YYYY-MM-DD`, **inclusive**. Must be paired with `end_date`; overrides `period`. |
 | `end_date` | string | `YYYY-MM-DD`, **inclusive**. Range may span at most 366 days. |
 | `limit` | integer | Rows to return, where the endpoint returns a list. Exceeding the endpoint's maximum is a `400`, not a silent clamp. |
+| `filters` | string | Narrow the report to a segment. See below. |
 
 Both explicit dates are inclusive, so `start_date=2024-01-01&end_date=2024-01-31`
 covers all of January.
+
+### Segment filters
+
+`filters` narrows every figure a request returns — headline metrics, the time
+series, breakdowns, goals, revenue, exports and the behavioral reports alike.
+
+```
+filters=browsers==Chrome
+filters=countries==DE;devices!=mobile
+filters=utm-campaigns==spring,sale-2024
+```
+
+Each condition is `dimension==value` or `dimension!=value`, and conditions are
+joined by `;`. All conditions must hold, so the set is an AND.
+
+`;` separates conditions and `,` does not: values legitimately contain commas,
+as `utm-campaigns==spring,sale-2024` above shows.
+
+**Dimension names are the breakdown slugs** — `browsers`, `countries`,
+`utm-sources`, `events` and the rest listed under
+[`GET /api/stats/breakdown/{dimension}`](#get-apistatsbreakdowndimension). One
+vocabulary, so a row in a breakdown can be turned into a filter without
+translating it.
+
+**Matching is exact and case-sensitive.** Values are compared to what is stored,
+which is what the corresponding breakdown displays.
+
+**`(unknown)` matches events where the value was not recorded.** A breakdown
+renders `NULL` as `(unknown)`, and `filters=browsers==(unknown)` selects exactly
+those rows. `!=` is NULL-safe in the direction a reader expects:
+`browsers!=Chrome` includes events with no browser at all, because "not Chrome"
+plainly covers "no browser recorded" — plain SQL would silently drop them.
+
+**Entry and exit pages cannot be filtered on.** They are derived by looking at a
+whole session rather than read from a column, so no per-event predicate
+expresses them; asking for one returns `400` rather than quietly filtering on
+`pages` and answering a different question.
+
+At most 12 conditions per request, each value at most 512 characters. An unknown
+dimension, a missing operator or an empty value is a `400` naming the problem.
+
+Filtered and unfiltered results are cached separately, and the cache key is
+built from the parsed conditions, so `a==1;b==2` and `b==2;a==1` share an entry.
+
+`GET /api/stats/realtime` does not accept `filters`: it reports a live snapshot
+rather than a report over a range.
 
 ### `site_id` validation
 

@@ -222,7 +222,7 @@ class TimeseriesChart extends Component {
 }
 
 /** A ranked list with an inline bar for relative magnitude. */
-function BreakdownList({ rows, valueLabel = 'Visitors' }) {
+function BreakdownList({ rows, valueLabel = 'Visitors', onFilter }) {
   if (!rows || rows.length === 0) {
     return html`<div class="placeholder">No data</div>`;
   }
@@ -242,7 +242,15 @@ function BreakdownList({ rows, valueLabel = 'Visitors' }) {
             <tr>
               <td class="bar-cell">
                 <span class="bar" style=${`width:${(row.visitors / max) * 100}%`}></span>
-                <span class="bar-label" title=${row.value}>${row.value}</span>
+                ${onFilter
+                  ? html`<button
+                      class="bar-label bar-link"
+                      title=${`Filter to ${row.value}`}
+                      onClick=${() => onFilter(row.value)}
+                    >
+                      ${row.value}
+                    </button>`
+                  : html`<span class="bar-label" title=${row.value}>${row.value}</span>`}
               </td>
               <td class="numeric">${num(row.visitors)}</td>
               <td class="numeric">${num(row.pageviews)}</td>
@@ -254,6 +262,33 @@ function BreakdownList({ rows, valueLabel = 'Visitors' }) {
   `;
 }
 
+/** The active segment, with a chip per condition. */
+function FilterBar({ filters, onRemove, onClear }) {
+  if (!filters || filters.length === 0) return null;
+  return html`
+    <div class="filter-bar" role="region" aria-label="Active filters">
+      <span class="filter-bar-label">Filtered by</span>
+      ${filters.map(
+        (f, i) => html`
+          <span class="filter-chip">
+            <span class="filter-chip-dim">${BREAKDOWN_LABELS[f.dimension] || f.dimension}</span>
+            <span class="filter-chip-op">${f.negated ? 'is not' : 'is'}</span>
+            <span class="filter-chip-value" title=${f.value}>${f.value}</span>
+            <button
+              class="filter-chip-remove"
+              aria-label=${`Remove filter ${f.dimension} ${f.value}`}
+              onClick=${() => onRemove(i)}
+            >
+              ×
+            </button>
+          </span>
+        `,
+      )}
+      <button class="filter-clear" onClick=${onClear}>Clear all</button>
+    </div>
+  `;
+}
+
 /** Tabbed group of breakdowns sharing one panel. */
 class BreakdownTabs extends Component {
   constructor(props) {
@@ -261,8 +296,9 @@ class BreakdownTabs extends Component {
     this.state = { active: props.tabs[0].slug };
   }
 
-  render({ tabs, data }, { active }) {
+  render({ tabs, data, onFilter }, { active }) {
     const current = data[active];
+    const filterable = onFilter && FILTERABLE_SLUGS.has(active);
     return html`
       <div class="tabs">
         <div class="tab-strip" role="tablist">
@@ -282,7 +318,10 @@ class BreakdownTabs extends Component {
         <div class="tab-panel">
           ${current && current.kind !== 'ok'
             ? html`<${Placeholder} state=${current} />`
-            : html`<${BreakdownList} rows=${(current && current.data) || []} />`}
+            : html`<${BreakdownList}
+                rows=${(current && current.data) || []}
+                onFilter=${filterable ? (value) => onFilter(active, value) : null}
+              />`}
         </div>
       </div>
     `;
@@ -649,6 +688,23 @@ const BREAKDOWN_GROUPS = [
 
 const ALL_BREAKDOWN_SLUGS = BREAKDOWN_GROUPS.flatMap((g) => g.tabs.map((t) => t.slug));
 
+/** Human labels for the dimensions a filter chip can name. */
+const BREAKDOWN_LABELS = Object.fromEntries(
+  BREAKDOWN_GROUPS.flatMap((g) => g.tabs.map((t) => [t.slug, t.label])),
+);
+
+// Entry and exit pages are derived from a whole session rather than stored on
+// an event, so the server has no per-event predicate for them and answers 400.
+// Rows in those tables are therefore not clickable.
+const FILTERABLE_SLUGS = new Set(
+  ALL_BREAKDOWN_SLUGS.filter((slug) => slug !== 'entry-pages' && slug !== 'exit-pages'),
+);
+
+/** Render the active segment the way the API parses it. */
+function serializeFilters(filters) {
+  return filters.map((f) => `${f.dimension}${f.negated ? '!=' : '=='}${f.value}`).join(';');
+}
+
 const REALTIME_REFRESH_MS = 15000;
 
 class Dashboard extends Component {
@@ -680,6 +736,9 @@ class Dashboard extends Component {
       sequenceSteps: prefs.sequenceSteps || 'page:/,event:signup',
       flowPage: prefs.flowPage || '/',
       flowDirection: prefs.flowDirection || 'forward',
+      // Active segment, as [{dimension, negated, value}]. Not persisted: a
+      // filter is a question you are asking right now, not a preference.
+      filters: [],
     };
   }
 
@@ -706,16 +765,38 @@ class Dashboard extends Component {
     savePrefs({ siteId, period, startDate, endDate, theme, funnelSteps, funnelModes, sequenceSteps, flowPage, flowDirection });
   }
 
-  /** The shared query string for the selected site and range. */
+  /** The shared query string for the selected site, range and segment. */
   query() {
-    const { siteId, period, startDate, endDate } = this.state;
+    const { siteId, period, startDate, endDate, filters } = this.state;
     const parts = [`site_id=${encodeURIComponent(siteId)}`];
     if (period === 'custom' && startDate && endDate) {
       parts.push(`start_date=${startDate}`, `end_date=${endDate}`);
     } else {
       parts.push(`period=${period}`);
     }
+    if (filters.length > 0) {
+      parts.push(`filters=${encodeURIComponent(serializeFilters(filters))}`);
+    }
     return parts.join('&');
+  }
+
+  /** Add a filter, replacing any existing one on the same dimension. */
+  addFilter(dimension, value, negated = false) {
+    if (!FILTERABLE_SLUGS.has(dimension)) return;
+    const filters = this.state.filters
+      .filter((f) => f.dimension !== dimension)
+      .concat([{ dimension, value, negated }]);
+    this.setState({ filters }, () => this.load());
+  }
+
+  removeFilter(index) {
+    const filters = this.state.filters.filter((_, i) => i !== index);
+    this.setState({ filters }, () => this.load());
+  }
+
+  clearFilters() {
+    if (this.state.filters.length === 0) return;
+    this.setState({ filters: [] }, () => this.load());
   }
 
   async loadSites() {
@@ -948,6 +1029,11 @@ class Dashboard extends Component {
               </div>
             `}
           >
+            <${FilterBar}
+              filters=${this.state.filters}
+              onRemove=${(i) => this.removeFilter(i)}
+              onClear=${() => this.clearFilters()}
+            />
             ${this.renderHeadline()}
             ${timeseries && timeseries.kind === 'ok'
               ? html`<${TimeseriesChart} data=${timeseries.data} />`
@@ -960,7 +1046,11 @@ class Dashboard extends Component {
             ${BREAKDOWN_GROUPS.map(
               (group) => html`
                 <${Panel} title=${group.title}>
-                  <${BreakdownTabs} tabs=${group.tabs} data=${breakdowns} />
+                  <${BreakdownTabs}
+                    tabs=${group.tabs}
+                    data=${breakdowns}
+                    onFilter=${(dimension, value) => this.addFilter(dimension, value)}
+                  />
                 </${Panel}>
               `,
             )}

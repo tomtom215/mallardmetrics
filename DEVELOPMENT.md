@@ -20,7 +20,7 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 # Build
 cargo build
 
-# Run all tests (551 total: 489 unit + 62 integration)
+# Run all tests (581 total: 515 unit + 66 integration)
 cargo test --all-targets
 
 # Behavioral-extension tests skip when the extension cannot be downloaded.
@@ -59,9 +59,9 @@ cargo bench
 
 | Metric | Value | Verified |
 |---|---|---|
-| Unit tests | 489 | `cargo test --lib` |
-| Integration tests | 62 | `cargo test --test ingest_test` |
-| Total tests | 551 | `cargo test --all-targets` |
+| Unit tests | 515 | `cargo test --lib` |
+| Integration tests | 66 | `cargo test --test ingest_test` |
+| Total tests | 581 | `cargo test --all-targets` |
 | Property-test suites | 3 | `query/cache.rs`, `ingest/ratelimit.rs`, `ingest/visitor_id.rs` |
 | Clippy warnings | 0 | `cargo clippy --all-targets --all-features -- -D warnings` |
 | Format violations | 0 | `cargo fmt -- --check` |

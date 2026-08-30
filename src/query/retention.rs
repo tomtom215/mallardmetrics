@@ -55,31 +55,31 @@ pub fn query_retention(
         return Ok(Vec::new());
     }
 
-    let sql = retention_sql(weeks);
+    let sql = retention_sql(weeks, scope);
     let mut stmt = conn.prepare(&sql)?;
     let weeks_usize = weeks as usize;
 
-    // Bind order: end (for the first-seen bound), start, site, then site,
-    // start, end for the event scan.
+    // Bind order follows the statement text: the cohort CTE takes site and end,
+    // then its filters, then start for the HAVING; the event scan takes site,
+    // start, end and its filters. Filters apply to both halves, so a segmented
+    // report defines its cohorts from the same subset it measures.
+    let mut bound: Vec<&str> = vec![&scope.site_id, &scope.end];
+    bound.extend(scope.filter_params());
+    bound.push(&scope.start);
+    bound.push(&scope.site_id);
+    bound.push(&scope.start);
+    bound.push(&scope.end);
+    bound.extend(scope.filter_params());
+
     let rows = stmt
-        .query_map(
-            duckdb::params![
-                scope.site_id,
-                scope.end,
-                scope.start,
-                scope.site_id,
-                scope.start,
-                scope.end
-            ],
-            |row| {
-                let cohort_date: String = row.get(0)?;
-                let mut retained = Vec::with_capacity(weeks_usize);
-                for i in 0..weeks_usize {
-                    retained.push(row.get::<_, u64>(i + 1)?);
-                }
-                Ok((cohort_date, retained))
-            },
-        )?
+        .query_map(duckdb::params_from_iter(bound), |row| {
+            let cohort_date: String = row.get(0)?;
+            let mut retained = Vec::with_capacity(weeks_usize);
+            for i in 0..weeks_usize {
+                retained.push(row.get::<_, u64>(i + 1)?);
+            }
+            Ok((cohort_date, retained))
+        })?
         .filter_map(Result::ok)
         .map(|(cohort_date, retained)| {
             let cohort_size = retained.first().copied().unwrap_or(0);
@@ -107,7 +107,8 @@ pub fn query_retention(
 }
 
 /// SQL for the per-visitor retention report. Split out so it can be unit-tested.
-fn retention_sql(weeks: u32) -> String {
+fn retention_sql(weeks: u32, scope: &QueryScope) -> String {
+    let filters = scope.filter_clause();
     let conditions: Vec<String> = (0..weeks)
         .map(|i| {
             format!(
@@ -133,7 +134,7 @@ fn retention_sql(weeks: u32) -> String {
         "WITH first_seen AS (
              SELECT visitor_id, MIN(timestamp) AS first_ts
              FROM events_all
-             WHERE site_id = ? AND timestamp < CAST(? AS TIMESTAMP)
+             WHERE site_id = ? AND timestamp < CAST(? AS TIMESTAMP){filters}
              GROUP BY visitor_id
              HAVING MIN(timestamp) >= CAST(? AS TIMESTAMP)
          ),
@@ -147,7 +148,7 @@ fn retention_sql(weeks: u32) -> String {
              JOIN first_seen f ON e.visitor_id = f.visitor_id
              WHERE e.site_id = ?
                AND e.timestamp >= CAST(? AS TIMESTAMP)
-               AND e.timestamp <  CAST(? AS TIMESTAMP)
+               AND e.timestamp <  CAST(? AS TIMESTAMP){filters}
              GROUP BY cohort_week, e.visitor_id
          )
          SELECT STRFTIME(cohort_week, '%Y-%m-%d') AS cohort_date,
@@ -288,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_sql_generates_one_condition_and_one_column_per_week() {
-        let sql = retention_sql(3);
+        let sql = retention_sql(3, &scope("2024-01-01", "2024-02-01"));
         assert_eq!(sql.matches("INTERVAL '").count(), 3);
         assert!(sql.contains("r[1]") && sql.contains("r[2]") && sql.contains("r[3]"));
         assert!(!sql.contains("r[0]"), "DuckDB list indices are 1-based");
@@ -299,14 +300,14 @@ mod tests {
     fn test_sql_bounds_the_first_seen_scan() {
         // Without the upper bound this scanned the site's entire history on
         // every request.
-        let sql = retention_sql(4);
+        let sql = retention_sql(4, &scope("2024-01-01", "2024-02-01"));
         assert!(sql.contains("timestamp < CAST(? AS TIMESTAMP)"));
         assert!(sql.contains("HAVING MIN(timestamp) >= CAST(? AS TIMESTAMP)"));
     }
 
     #[test]
     fn test_sql_uses_bound_parameters() {
-        let sql = retention_sql(4);
+        let sql = retention_sql(4, &scope("2024-01-01", "2024-02-01"));
         assert_eq!(sql.matches('?').count(), 6);
     }
 }

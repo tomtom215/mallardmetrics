@@ -814,6 +814,161 @@ fn seed_funnel(state: &Arc<AppState>) {
     }
 }
 
+// ── Segment filters ──────────────────────────────────────────────────────
+
+/// Two visitors on Chrome from Germany, one on Firefox from the US.
+async fn seed_segments(state: &Arc<AppState>) {
+    let chrome = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+                  (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+    let firefox = "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0";
+    for (ua, path) in [
+        (chrome, "/pricing"),
+        (chrome, "/docs"),
+        (firefox, "/pricing"),
+    ] {
+        send(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/api/event")
+                .header("content-type", "application/json")
+                .header("user-agent", ua)
+                .body(Body::from(
+                    serde_json::json!({
+                        "d": "example.com",
+                        "n": "pageview",
+                        "u": format!("https://example.com{path}"),
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+    }
+    flush(state);
+}
+
+#[tokio::test]
+async fn test_filters_narrow_every_report() {
+    let (state, _dir) = plain_state();
+    seed_segments(&state).await;
+
+    let all = body_json(get(&state, "/api/stats/main?site_id=example.com&period=30d").await).await;
+    assert_eq!(all["total_pageviews"], 3);
+
+    let chrome = body_json(
+        get(
+            &state,
+            "/api/stats/main?site_id=example.com&period=30d&filters=browsers%3D%3DChrome",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(chrome["total_pageviews"], 2, "{chrome}");
+
+    // The same filter must narrow the breakdown too, not just the headline.
+    let pages = body_json(
+        get(
+            &state,
+            "/api/stats/breakdown/pages?site_id=example.com&period=30d\
+             &filters=browsers%3D%3DFirefox",
+        )
+        .await,
+    )
+    .await;
+    let rows = pages.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{pages}");
+    assert_eq!(rows[0]["value"], "/pricing");
+}
+
+#[tokio::test]
+async fn test_filtered_and_unfiltered_results_do_not_share_a_cache_entry() {
+    // Regression risk: the cache key must carry the segment, or the first
+    // request answered would be replayed for every other segment.
+    let (state, _dir) = plain_state();
+    seed_segments(&state).await;
+
+    let unfiltered =
+        body_json(get(&state, "/api/stats/main?site_id=example.com&period=30d").await).await;
+    let filtered = body_json(
+        get(
+            &state,
+            "/api/stats/main?site_id=example.com&period=30d&filters=browsers%3D%3DChrome",
+        )
+        .await,
+    )
+    .await;
+    assert_ne!(
+        unfiltered["total_pageviews"], filtered["total_pageviews"],
+        "the filtered request was served the unfiltered answer"
+    );
+
+    // And asking again returns the same thing rather than the other segment's.
+    let again = body_json(
+        get(
+            &state,
+            "/api/stats/main?site_id=example.com&period=30d&filters=browsers%3D%3DChrome",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(again["total_pageviews"], filtered["total_pageviews"]);
+}
+
+#[tokio::test]
+async fn test_malformed_filters_are_rejected() {
+    let (state, _dir) = plain_state();
+    for bad in [
+        "browsers",
+        "browsers%3DChrome",
+        "nonexistent%3D%3Dx",
+        "entry-pages%3D%3D%2F",
+        "browsers%3D%3D",
+    ] {
+        let uri = format!("/api/stats/main?site_id=example.com&period=30d&filters={bad}");
+        let response = get(&state, &uri).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "filters={bad} should be rejected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_filters_reach_the_timeseries_and_export() {
+    let (state, _dir) = plain_state();
+    seed_segments(&state).await;
+
+    let series = body_json(
+        get(
+            &state,
+            "/api/stats/timeseries?site_id=example.com&period=30d&filters=browsers%3D%3DChrome",
+        )
+        .await,
+    )
+    .await;
+    let total: u64 = series
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["pageviews"].as_u64().unwrap())
+        .sum();
+    assert_eq!(total, 2, "{series}");
+
+    let csv = body_text(
+        get(
+            &state,
+            "/api/stats/export?site_id=example.com&period=30d&kind=raw\
+             &filters=browsers%3D%3DFirefox",
+        )
+        .await,
+    )
+    .await;
+    // Header plus exactly one data row.
+    assert_eq!(csv.trim().lines().count(), 2, "{csv}");
+}
+
 #[tokio::test]
 async fn test_sessions_endpoint_returns_session_metrics() {
     // Every other analytics route had an end-to-end test; this one did not, and

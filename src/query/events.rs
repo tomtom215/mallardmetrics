@@ -54,7 +54,7 @@ pub fn query_goals(
     conn: &Connection,
     scope: &QueryScope,
 ) -> Result<Vec<GoalConversion>, duckdb::Error> {
-    let where_clause = QueryScope::where_clause();
+    let where_clause = scope.where_clause();
     let sql = format!(
         "WITH scoped AS (
              SELECT visitor_id, event_name FROM events_all WHERE {where_clause}
@@ -100,7 +100,7 @@ pub fn query_property_keys(
          WHERE {} AND props IS NOT NULL
          ORDER BY key
          LIMIT {TOP_N}",
-        QueryScope::where_clause()
+        scope.where_clause()
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
@@ -144,7 +144,7 @@ pub fn query_property_values(
          HAVING value IS NOT NULL
          ORDER BY visitors DESC, value
          LIMIT {TOP_N}",
-        where_clause = QueryScope::where_clause()
+        where_clause = scope.where_clause()
     );
 
     let mut stmt = conn.prepare(&sql)?;
