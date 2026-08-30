@@ -16,9 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-A broad modernisation pass: the toolchain, edition and every dependency are
-current, several analytics results that were quietly wrong are corrected, and
-the data the ingest path has always collected is now queryable.
+A broad modernisation pass. The toolchain, edition and every dependency are
+current. Several analytics results that were quietly wrong are corrected —
+funnels were inverted, retention measured "did anybody come back" rather than
+how many, and the realtime endpoint could not run at all. The data the ingest
+path has always collected is now queryable, and every report can be narrowed to
+a segment. Two of the bugs fixed here were invisible to a fully green test
+suite and were found by a new end-to-end check that runs the actual binary.
 
 ### Fixed — analytics correctness
 

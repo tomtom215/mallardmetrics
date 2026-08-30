@@ -99,7 +99,8 @@ mallardmetrics/
 ├── scripts/
 │   ├── smoke-test.sh            -- End-to-end checks against the real binary
 │   ├── check-dashboard-methods.mjs -- Static check for dead method references
-│   └── check-dashboard-browser.mjs -- Drives the dashboard in a real browser
+│   ├── check-dashboard-browser.mjs -- Drives the dashboard in a real browser
+│   └── seed-demo-data.py        -- 30 days of synthetic events, for demos
 └── .github/workflows/ci.yml     -- CI pipeline (8 jobs; the first is a 4-way matrix)
 ```
 
@@ -176,6 +177,11 @@ node scripts/check-dashboard-browser.mjs http://127.0.0.1:8000
 
 That one needs Playwright, which is why it is a local script rather than a CI
 job. Run it before shipping a dashboard change.
+
+An empty dashboard exercises very little, so seed it first —
+`scripts/seed-demo-data.py` writes 30 days of synthetic events with recurring
+visitors, multi-step journeys, revenue and custom events, which is enough for
+every panel to render something.
 
 ---
 
