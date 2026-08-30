@@ -38,9 +38,20 @@ occur.
 | IP address | `X-Forwarded-For` / `X-Real-IP` / socket | GeoIP lookup + visitor ID derivation | Single request (~µs); dropped when handler returns |
 | Raw User-Agent string | `User-Agent` request header | UA parsing + bot detection + visitor ID derivation | Single request (~µs); dropped when handler returns |
 
-**IP addresses are never logged, never written to the event buffer, and never written to
-DuckDB or Parquet.** The relevant code is in `src/ingest/handler.rs` and
+**No IP address is ever written to the event buffer, to DuckDB or to Parquet.** On the
+analytics path it is never logged either: it exists only for the duration of the request,
+as GeoIP input and as HMAC input. The relevant code is in `src/ingest/handler.rs` and
 `src/ingest/visitor_id.rs`.
+
+There is one deliberate exception, and it is not on the analytics path. Authentication
+events — a failed login, a lockout, first-run setup, a logout, an API-key operation —
+log a **truncated** client address so an operator can investigate an attack against the
+dashboard. `anonymize_ip` (`src/api/auth.rs`) keeps the IPv4 `/24` or the IPv6 `/48`
+prefix and discards the rest; a value that does not parse as an address is replaced with
+a fixed placeholder rather than echoed. These lines identify a network, not a person, and
+they are written only for operator-authentication activity, never for a site visitor.
+Whether they persist at all is a property of the operator's log retention, which is
+outside this application's control — see [GDPR obligations this triggers](#gdpr-obligations-this-triggers).
 
 ### Persistently stored (written to DuckDB and Parquet)
 
@@ -107,28 +118,75 @@ ephemeral processing.
 ### Algorithm (two-step HMAC-SHA256)
 
 ```
-Step 1 — Daily salt derivation:
-  Input:  MALLARD_SECRET + ":" + UTC_DATE (e.g. "my-secret:2024-01-15")
-  Key:    Literal constant "mallard-metrics-salt"
-  Output: daily_salt (64-char hex)
+Step 1 — Salt derivation:
+  Key:    MALLARD_SECRET
+  Input:  "mallard-metrics/salt/v2" + "|" + salt_period
+          where salt_period = floor(days_since_epoch / visitor_salt_rotation_days)
+  Output: salt (64-char hex)
 
 Step 2 — Visitor ID derivation:
-  Input:  IP_ADDRESS + "|" + USER_AGENT
-  Key:    daily_salt (from Step 1)
+  Key:    salt (from Step 1)
+  Input:  SITE_ID + "|" + IP_ADDRESS + "|" + USER_AGENT
   Output: visitor_id (64-char hex, stored in Parquet)
 ```
 
-Source: `src/ingest/visitor_id.rs:10–30`.
+Source: `src/ingest/visitor_id.rs`.
+
+Two properties are worth calling out:
+
+- **The secret is the HMAC key**, not part of the message. This is the
+  conventional construction and means the secret's full entropy contributes as
+  key material.
+- **The site ID is part of the input.** Without it, one person visiting two
+  sites hosted on the same instance produced the *same* identifier on both, so
+  anyone able to read the stored data could correlate them across sites. Because
+  every query already filters by `site_id`, this costs nothing analytically.
+
+Salt periods are numbered from the Unix epoch, so period boundaries do not drift
+with when the process happened to start.
 
 ### Privacy properties
 
 | Property | Guaranteed | Notes |
 |---|---|---|
 | IP not stored | Yes | Only the hash output is retained |
-| Different visitors produce different IDs | Yes | Property-tested (`visitor_id.rs:127–138`) |
-| Same visitor produces same ID within a day | Yes | Enables deduplication without cookies |
-| Same visitor produces different IDs across days | Yes | Salt changes at UTC midnight |
-| ID cannot be reversed to recover the IP | Practically yes | HMAC-SHA256 is a one-way function; brute-force impractical |
+| Different visitors produce different IDs | Yes | Property-tested |
+| Same visitor produces the same ID within a salt period | Yes | Enables deduplication without cookies |
+| Same visitor produces different IDs across salt periods | Yes | Salt rotates every `visitor_salt_rotation_days` (default: 1) |
+| One visitor is not correlatable across two sites | Yes | The site ID is part of the HMAC input |
+| ID cannot be reversed to recover the IP | Practically yes | HMAC-SHA256 is one-way; brute-force over the IP space is impractical without the secret |
+
+### The salt rotation trade-off
+
+Salt rotation is the mechanism that keeps a visitor ID from becoming a long-lived
+identifier. It is also, unavoidably, the thing that limits what the analytics can
+measure — and the two cannot be separated. Being explicit about it matters more
+than presenting a number that looks precise.
+
+With the default one-day rotation:
+
+- **"Unique visitors" over a multi-day range counts visitor-days, not people.** A
+  person who visits every day for a month contributes about 30 to a 30-day
+  unique-visitor figure. The number is not wrong so much as differently defined,
+  and it is the same definition Plausible and similar cookieless tools use.
+- **Weekly retention cohorts cannot work at all.** A visitor returning in week 1
+  carries an identifier unrelated to the one they had in week 0, so retention
+  past the first week is structurally zero regardless of how loyal the audience
+  is. `GET /api/stats/retention` reports this in an `identity_supports_cohorts`
+  field and an explanatory `caveat` rather than presenting the zeros as a
+  finding.
+- **Sessions spanning UTC midnight split in two.** A visit from 23:55 to 00:05 is
+  recorded as two visits.
+
+Raising `visitor_salt_rotation_days` makes those measurements meaningful, at a
+real privacy cost: the identifier survives longer, so the window in which an
+operator holding both the secret and contemporaneous network logs could correlate
+a visitor to an IP grows correspondingly. Retention over *N* weeks needs a
+rotation of at least `(N - 1) × 7` days.
+
+This is a deployment decision with a legal dimension, not a tuning knob. If you
+raise it, say so in your privacy notice and record the reasoning in your
+Art. 30 record.
 
 ### Is the visitor ID "anonymous" under GDPR?
 
@@ -137,9 +195,10 @@ Source: `src/ingest/visitor_id.rs:10–30`.
 individual. The visitor ID is **pseudonymous** (Art. 4(5)) because:
 
 1. The operator holds `MALLARD_SECRET`. With the secret and a target date, they can
-   regenerate the daily salt.
+   regenerate the salt for that period.
 2. If an operator also had access to network logs containing the original IP addresses, they
-   could in principle correlate those IPs to visitor IDs for the same calendar day.
+   could in principle correlate those IPs to visitor IDs for the same salt period.
+   Lengthening `visitor_salt_rotation_days` widens that window proportionally.
 3. Pseudonymous data therefore remains personal data subject to GDPR (Recital 26, confirmed
    in EDPB Opinion 05/2022 on anonymisation techniques).
 
@@ -466,7 +525,7 @@ This section summarises the minimum obligations for a legally compliant deployme
 - [ ] **Legal review:** Have a qualified data protection attorney review your deployment for your
   jurisdiction and user base
 - [ ] **Privacy notice:** Publish a privacy notice on your site disclosing the data processing
-  described in the [Persistently stored](#persistently-stored) table above
+  described in the [Persistently stored](#persistently-stored-written-to-duckdb-and-parquet) table above
 - [ ] **Lawful basis:** Document your chosen lawful basis (legitimate interests is typical)
 - [ ] **Legitimate Interests Assessment:** If using legitimate interests, complete and document
   a balancing test (template available from the ICO and CNIL)

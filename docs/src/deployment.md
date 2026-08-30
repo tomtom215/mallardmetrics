@@ -20,7 +20,7 @@ Before going to production:
 - [ ] Set `MALLARD_GDPR_MODE=true` (or enable individual flags) to reduce data collection surface.
 - [ ] Set `MALLARD_RETENTION_DAYS=30` (or your DPA-approved retention period) for Art. 5(1)(e) storage limitation compliance.
 - [ ] Set `MALLARD_GEOIP_PRECISION=country` (already forced by `gdpr_mode`; document it explicitly in your DPIA).
-- [ ] Document your legal basis for processing in a DPIA or privacy notice. See [PRIVACY.md](../../../PRIVACY.md) for the full analysis.
+- [ ] Document your legal basis for processing in a DPIA or privacy notice. See [PRIVACY.md](https://github.com/tomtom215/mallardmetrics/blob/main/PRIVACY.md) for the full analysis.
 - [ ] Use `DELETE /api/gdpr/erase?site_id=...&start_date=...&end_date=...` (Admin API key required) to honour Art. 17 erasure requests.
 
 ---
@@ -122,7 +122,18 @@ server {
 }
 ```
 
-> **Important:** Mallard Metrics reads the client IP for visitor ID hashing. If behind a proxy, the `X-Forwarded-For` or `X-Real-IP` header must be set correctly. Configure your proxy to send the real client IP.
+> **Important:** the client IP feeds visitor-ID hashing, GeoIP lookup and the
+> per-IP rate limiter. Behind a proxy you must do *both* of the following:
+>
+> 1. Configure the proxy to set `X-Forwarded-For` (or `X-Real-IP`) to the real
+>    client address, **overwriting** anything the client sent.
+> 2. Set `MALLARD_TRUST_PROXY_HEADERS=true`.
+>
+> Without step 2, every visitor is attributed to the proxy's own address.
+> Without step 1 — or with step 2 enabled on a directly reachable server — the
+> header is attacker-controlled, and any client can choose its own visitor ID,
+> geolocation and rate-limit bucket. The default is `false` precisely because
+> the unsafe direction is the one that fails silently.
 
 ### Caddy
 
@@ -132,7 +143,7 @@ analytics.example.com {
 }
 ```
 
-Caddy sets `X-Forwarded-For` automatically.
+Caddy sets `X-Forwarded-For` automatically; still set `MALLARD_TRUST_PROXY_HEADERS=true` so the server honours it.
 
 ### After-Proxy Configuration
 
@@ -175,12 +186,27 @@ readinessProbe:
   failureThreshold: 3
 ```
 
-### Docker Compose Health Check
+### Container health checks
 
-The `FROM scratch` image has no shell or utilities (`wget`, `curl`). Use Docker's `HEALTHCHECK` with an external check from the host, or rely on your reverse proxy or orchestrator's health probes:
+The `FROM scratch` image has no shell and no `curl` or `wget`, so the binary
+probes itself: `mallard-metrics --healthcheck` reads the same configuration the
+server would, requests `/health/ready` on the loopback address, and exits
+non-zero if it does not answer.
+
+The image declares this already, so `docker run` and Swarm pick it up with no
+extra configuration:
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD ["/mallard-metrics", "--healthcheck"]
+```
+
+`docker-compose.yml` sets the same check explicitly. Under Kubernetes, prefer
+the HTTP probes above — the kubelet does not run a container's `HEALTHCHECK`.
+
+To check from outside the container instead:
 
 ```bash
-# External health check from the host
 curl -sf http://localhost:8000/health/ready || exit 1
 ```
 

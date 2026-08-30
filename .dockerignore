@@ -1,0 +1,34 @@
+# Build artifacts — by far the largest source of build-context bloat.
+target/
+docs/book/
+
+# Version control
+.git/
+.github/
+
+# Runtime data and secrets
+data/
+*.parquet
+*.duckdb
+*.duckdb.wal
+.secret
+.env
+*.mmdb
+lcov.info
+
+# Node artifacts (not used by the build)
+node_modules/
+package.json
+package-lock.json
+
+# Editor / OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.log

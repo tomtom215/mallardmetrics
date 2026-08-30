@@ -16,14 +16,14 @@ Sets the admin password for the first time. Returns `409 Conflict` if a password
 **No authentication required.**
 
 ```json
-// Request — password must be at least 8 characters
+// Request — password must be at least 12 characters
 {"password": "your-secure-password"}
 
 // Response 200 — also sets HttpOnly, SameSite=Strict cookie mm_session
 {"token": "<session-token>"}
 
 // Response 400 — password too short
-{"error": "Password must be at least 8 characters"}
+{"error": "Password must be at least 12 characters"}
 
 // Response 409 — password already configured
 {"error": "Admin password already configured"}
@@ -93,8 +93,13 @@ Returns the current authentication state.
 
 | Field | Type | Notes |
 |---|---|---|
-| `setup_required` | boolean | `true` when no admin password has been set. System is in open-access mode. |
+| `setup_required` | boolean | `true` when no admin password has been set. Analytics reads are open in this state. |
 | `authenticated` | boolean | `true` when the request carries a valid session or API key, or when `setup_required` is `true`. |
+
+Open access covers **reads only**. Key management and `DELETE /api/gdpr/erase`
+return `401` until an admin password exists — before setup there is no admin to
+authorise, and a key minted in that window would keep working afterwards. Run
+`POST /api/auth/setup` before exposing an instance to a network.
 
 ---
 
@@ -102,7 +107,9 @@ Returns the current authentication state.
 
 API keys are prefixed with `mm_` and are SHA-256 hashed before storage. The plaintext key is only returned once at creation time.
 
-All key management endpoints require authentication.
+All key management endpoints require **admin** authentication: a session, or an
+API key with the `admin` scope. A read-only key gets `403`, and every one of
+them gets `401` before setup has run.
 
 ### `POST /api/keys`
 

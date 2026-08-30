@@ -26,11 +26,21 @@ The DuckDB Rust crate requires the `parquet` feature flag (`duckdb = { features 
 
 ### L3: Rust edition 2024 features require toolchain >= 1.85
 
-Transitive dependencies (e.g., `getrandom 0.4.x`) may require edition 2024, which is only supported in Rust 1.85.0+. Pin the MSRV to at least 1.85.0.
+Transitive dependencies (e.g., `getrandom 0.4.x`) may require edition 2024, which is only supported in Rust 1.85.0+. Pin the MSRV to at least 1.85.0. The project now targets 1.98.0 for let-chains and `Ipv6Addr` const support; `Cargo.toml`'s `rust-version` and `rust-toolchain.toml`'s `channel` must agree, and a CI step fails the build if they drift apart.
 
 ### L4: DuckDB bundled compilation uses significant disk space
 
-The `duckdb` crate with `bundled` + `parquet` features produces ~27GB of build artifacts in debug mode. This can exhaust disk space in constrained environments. Use `cargo clean` between major rebuilds.
+The `duckdb` crate with `bundled` + `parquet` features produces ~26 GB of build artifacts in debug mode, and each distinct feature or profile combination gets its **own** `target/debug/build/libduckdb-sys-*` directory of about 4.4 GB. A session that changes features, or runs `cargo doc` after `cargo test`, accumulates several of them.
+
+The failure mode is not an error. When the filesystem fills, the C++ compile does not abort — it slows to a crawl, so `cargo doc` looks hung at 0% CPU while actually starving. Check `df -h` before concluding a build is stuck.
+
+Cheapest recovery, in order: delete `target/debug/incremental` (~1.4 GB, costs only rebuild speed), then the stale `libduckdb-sys-*` directories — the current ones are the newest with an `output` file. `cargo clean` is the blunt instrument and forces the whole amalgamation to rebuild.
+
+Four commands in one session accumulated four such directories — `cargo check`, `cargo test`, `cargo build` and `cargo doc` each unify features differently — for about 18 GB. Prefer `cargo test --all-targets` over a separate `cargo check` (it type-checks the same code), and expect `cargo build` and `cargo doc` to want a directory each.
+
+### L22: The `behavioral` extension is version-gated on DuckDB
+
+The community extension is built per DuckDB version. `INSTALL behavioral FROM community` returns 404 for a DuckDB release the extension has not been published for — so the `duckdb` crate version is not a free choice: bumping or pinning it can silently disable every behavioral endpoint. Before changing the crate version, confirm the extension resolves for the DuckDB version it bundles (v1.5.5 and v1.5.1 do; v1.4.1 does not).
 
 ---
 
@@ -52,6 +62,24 @@ iPhone UA strings like `"iPhone; CPU iPhone OS 17_2_1 like Mac OS X"` contain th
 
 `"reddit.com".contains("t.co")` is true because `reddit.com` contains the substring `t.co` at position 5 (`reddi[t.co]m`). Use exact hostname matching (`host == "t.co"`) for short domain names to avoid false positives.
 
+### L23: A test that reads the wall clock tests the clock as well as the code
+
+The realtime tests inserted `NOW() - INTERVAL 'n minutes'` and then queried against the wall clock. An event written at `:59.9` and a minute spine built a millisecond later disagree about which bucket it belongs to, so the suite was one unlucky scheduling gap away from a red build. Worse, wall-clock tests cannot assert the *edges*, which is where the interesting behaviour lives.
+
+Fix: take the instant as a parameter. `query_realtime` reads `Utc::now()` once and delegates to `query_realtime_at(conn, site, window, now)`; the tests call the latter with a fixed timestamp. Boundary inclusivity, future-dated events and per-minute bucketing then become exact assertions rather than approximations, and one test still exercises the wall-clock entry point so it cannot rot.
+
+### L24: A test that does not flush is testing the buffer, not the database
+
+Two buffer tests pushed events and immediately queried the `events` table. `push` only buffers below the flush threshold, so both queried an empty table: one failed with `QueryReturnedNoRows`, the other compared an empty vector against three expected paths.
+
+`flush()` also moves rows onward to Parquet and deletes them from the hot table, so after a flush the only place the data exists is the `events_all` view. Any test asserting on written data must flush first and read through `events_all` — which is stronger anyway, since it covers the Parquet round-trip that the hot table alone would hide.
+
+### L25: A poisoned test mutex turns one failure into a dozen
+
+Tests that mutate the process environment serialise on a `static Mutex<()>`. When one test panics while holding it, every later `lock().unwrap()` panics with `PoisonError` — so a single real assertion failure was reported as twelve failures, eleven of them fictional, with the genuine one buried in the middle.
+
+The lock guards ordering, not invariants, so poisoning carries no information: `ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner)`. The failure list then names exactly what broke.
+
 ---
 
 ## Architecture
@@ -63,6 +91,21 @@ The `behavioral` extension is installed from the DuckDB community repository at 
 ### L10: E2E testing is non-negotiable
 
 Unit tests alone miss integration boundary bugs. HTTP API integration tests validate the full path: JSON -> handler -> buffer -> DuckDB -> response.
+
+### L26: Do not use SQL clock functions against naive-UTC event data
+
+`NOW()` and `CURRENT_TIMESTAMP` return `TIMESTAMP WITH TIME ZONE`. Two consequences bit this project at once:
+
+1. `TIMESTAMPTZ - INTERVAL` is implemented by DuckDB's **ICU extension**, which this build does not load. Every realtime query failed at bind time with "No function matches the given name and argument types '-(TIMESTAMP WITH TIME ZONE, INTERVAL)'", so the endpoint returned `500` in production.
+2. Casting back with `::TIMESTAMP` (or `CURRENT_LOCALTIMESTAMP`) resolves through the session time zone, which defaults to the **host's** locale. Every stored timestamp is naive UTC, so on a server not set to UTC the window silently slides by the UTC offset — no error, just wrong numbers.
+
+Compute the instant in Rust with `Utc::now().naive_utc()` and bind it as a parameter. This also makes the code testable and keeps sub-queries of one request consistent with each other, rather than each calling `NOW()` and possibly straddling a boundary.
+
+### L27: Epoch-aligned buckets do not respect the calendar
+
+`salt_period` numbers rotation windows from the Unix epoch so that every instance sharing a secret agrees on boundaries. That is correct, and it means two dates a few days apart can still land in different periods: 2024-01-15 and 2024-01-20 are five days apart and in *different* 30-day periods, because the boundary falls on the 18th.
+
+A test needing "two dates in the same period" must derive them from a period start, never pick calendar dates by hand. The same arithmetic explains a product behaviour worth documenting rather than hiding: a retention cohort spanning a salt boundary loses its visitor linkage.
 
 ### L11: Axum Tower middleware composes cleanly
 

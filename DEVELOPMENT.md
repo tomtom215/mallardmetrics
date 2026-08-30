@@ -6,13 +6,13 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 
 ## Architecture
 
-- **Language**: Rust (MSRV 1.94.0)
+- **Language**: Rust, edition 2024 (MSRV 1.98.0)
 - **Web framework**: Axum 0.8.x
-- **Database**: DuckDB (embedded, via `duckdb` crate with `bundled` + `parquet` features)
-- **Analytics**: `behavioral` extension (loaded at runtime)
-- **Storage**: Date-partitioned Parquet files
-- **Frontend**: Preact + HTM (no build step, embedded in binary)
-- **Deployment**: Static musl binary, `FROM scratch` Docker image
+- **Database**: DuckDB 1.5.5 (embedded, via the `duckdb` crate 1.10505.0 with `bundled` + `parquet` + `chrono` features)
+- **Analytics**: `behavioral` community extension 0.9.1 (installed and loaded at runtime; published per DuckDB version, so the crate version is not a free choice)
+- **Storage**: Two-tier — a DuckDB hot table plus date-partitioned Parquet, unioned by the `events_all` view
+- **Frontend**: Preact + HTM (no build step, embedded in the binary)
+- **Deployment**: Static musl binary in a distroless-style image, running as UID 65532
 
 ## Build & Test Commands
 
@@ -20,17 +20,30 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 # Build
 cargo build
 
-# Run all tests (333 total: 262 unit + 71 integration)
-cargo test
+# Run all tests (585 total: 519 unit + 66 integration)
+cargo test --all-targets
+
+# Behavioral-extension tests skip when the extension cannot be downloaded.
+# Setting this turns a skip into a failure, which is what CI does.
+MALLARD_REQUIRE_BEHAVIORAL=1 cargo test --all-targets
+
+# End-to-end against the real binary on a real socket. The in-process tests
+# cannot see a route that 500s only once the server is actually assembled.
+cargo build && scripts/smoke-test.sh
+
+# Nothing in the Rust suite runs the dashboard's JavaScript.
+node scripts/check-dashboard-methods.mjs src/dashboard/assets/app.js
+node scripts/check-dashboard-browser.mjs http://127.0.0.1:8000   # needs Playwright
 
 # Clippy (zero warnings required)
-cargo clippy --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
 
 # Format check
 cargo fmt -- --check
 
-# Documentation
-cargo doc --no-deps
+# Documentation. The workflows set RUSTDOCFLAGS globally; a local shell does
+# not, and `cargo doc` exits 0 on a broken intra-doc link without it.
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 # Run the server
 cargo run
@@ -51,47 +64,37 @@ cargo bench
 
 | Metric | Value | Verified |
 |---|---|---|
-| Unit tests | 262 | `cargo test --lib` |
-| Integration tests | 71 | `cargo test --test ingest_test` |
-| Total tests | 333 | `cargo test` |
-| Clippy warnings | 0 | `cargo clippy --all-targets` |
+| Unit tests | 519 | `cargo test --lib` |
+| Integration tests | 66 | `cargo test --test ingest_test` |
+| Total tests | 585 | `cargo test --all-targets` |
+| Property-test suites | 3 | `query/cache.rs`, `ingest/ratelimit.rs`, `ingest/visitor_id.rs` |
+| Clippy warnings | 0 | `cargo clippy --all-targets --all-features -- -D warnings` |
 | Format violations | 0 | `cargo fmt -- --check` |
-| CI jobs | 12 | `.github/workflows/ci.yml` (4 jobs), `.github/workflows/pages.yml` (2 jobs), `.github/workflows/release.yml` (6 jobs) |
+| CI jobs | 16 | `.github/workflows/ci.yml` (8), `pages.yml` (2), `release.yml` (6) |
+
+The `ci` job is a four-way matrix (Test, Clippy, Format, Documentation), so a
+push runs 19 job instances from those 16 definitions.
 
 ## Module Map
 
-| Module | Purpose |
-|---|---|
-| `config.rs` | TOML + env var configuration |
-| `server.rs` | Axum router setup |
-| `ingest/handler.rs` | POST /api/event ingestion |
-| `ingest/buffer.rs` | In-memory event buffer with periodic flush |
-| `ingest/visitor_id.rs` | HMAC-SHA256 privacy-safe visitor ID |
-| `ingest/useragent.rs` | User-Agent parsing |
-| `ingest/geoip.rs` | MaxMind GeoIP reader with graceful fallback |
-| `ingest/ratelimit.rs` | Per-site token-bucket rate limiter |
-| `storage/schema.rs` | DuckDB table definitions |
-| `storage/parquet.rs` | Parquet write/read/partitioning |
-| `storage/migrations.rs` | Schema versioning |
-| `query/metrics.rs` | Core metric calculations |
-| `query/breakdowns.rs` | Dimension breakdown queries |
-| `query/timeseries.rs` | Time-bucketed aggregations |
-| `query/sessions.rs` | sessionize-based session queries |
-| `query/funnel.rs` | window_funnel query builder |
-| `query/retention.rs` | retention cohort query execution |
-| `query/sequences.rs` | sequence_match query execution |
-| `query/flow.rs` | sequence_next_node flow analysis |
-| `query/cache.rs` | TTL-based query result cache |
-| `api/stats.rs` | All analytics API handlers (core, sessions, funnel, retention, sequences, flow, export) |
-| `api/errors.rs` | API error types |
-| `api/auth.rs` | Origin validation, session auth, API key management |
-| `dashboard/` | Embedded SPA (Preact + HTM) with 5 advanced analytics views |
+See [`docs/src/architecture.md`](docs/src/architecture.md#module-map) for the
+current map, kept in one place so the two cannot drift apart.
 
 ## Development Workflow
 
-1. Run the full validation suite before and after changes: `cargo test && cargo clippy --all-targets && cargo fmt -- --check`
+1. Run the full validation suite before and after changes:
+   ```bash
+   cargo test --all-targets \
+     && cargo clippy --all-targets --all-features -- -D warnings \
+     && cargo fmt -- --check \
+     && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+   ```
 2. Verify all claims with actual command output
 3. Update documentation and test counts when adding features or tests
+4. `tracking/script.js` is served to every visitor on every page. The
+   `static-checks` CI job holds it to a 4,096-byte gzipped budget (currently
+   3,789); growing past that should be a decision, and the documented "about
+   3 KB" updated with it
 
 ## Development Guidelines
 
@@ -100,3 +103,8 @@ cargo bench
 - Do not guess SQL semantics -- test with actual DuckDB
 - Do not introduce SQL injection (use parameterized queries)
 - Do not store PII (IP addresses are used only for hashing, then discarded)
+- Do not use SQL clock functions (`NOW()`, `CURRENT_TIMESTAMP`) against event
+  data. They return `TIMESTAMP WITH TIME ZONE`, whose interval arithmetic lives
+  in DuckDB's ICU extension, and whose cast to a naive `TIMESTAMP` follows the
+  host's time zone — while every stored timestamp is naive UTC. Compute the
+  instant in Rust with `Utc::now().naive_utc()` and bind it as a parameter.

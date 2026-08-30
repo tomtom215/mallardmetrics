@@ -1,6 +1,7 @@
 services:
   mallard-metrics:
     build: .
+    image: mallard-metrics:local
     ports:
       - "8000:8000"
     volumes:
@@ -13,8 +14,25 @@ services:
       - MALLARD_SECURE_COOKIES=${MALLARD_SECURE_COOKIES:-false}
       - MALLARD_METRICS_TOKEN=${MALLARD_METRICS_TOKEN:-}
       - MALLARD_DASHBOARD_ORIGIN=${MALLARD_DASHBOARD_ORIGIN:-}
+      - MALLARD_TRUST_PROXY_HEADERS=${MALLARD_TRUST_PROXY_HEADERS:-false}
       - RUST_LOG=mallard_metrics=info
     restart: unless-stopped
+
+    # The image ships a single static binary and writes only to /data.
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+    healthcheck:
+      # /health/ready reports 503 until DuckDB is queryable, so it is the
+      # correct probe for "ready to serve" rather than "process is alive".
+      test: ["CMD", "/mallard-metrics", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
 
 volumes:
   mallard-data:

@@ -23,24 +23,36 @@
 <!-- Describe how you tested this. Include test names added, commands run, and any manual verification. -->
 
 ```
-cargo test
-cargo clippy --all-targets
+cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt -- --check
-cargo doc --no-deps
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+
+# Behavioral-extension tests skip when the extension cannot be downloaded,
+# so a green run does not prove they ran. CI turns a skip into a failure.
+MALLARD_REQUIRE_BEHAVIORAL=1 cargo test --all-targets
+
+# The in-process tests cannot see a route that only breaks once the binary
+# is assembled and listening.
+cargo build && scripts/smoke-test.sh
 ```
 
-- [ ] All 333+ tests pass (`cargo test`)
-- [ ] Zero clippy warnings (`cargo clippy --all-targets -- -D warnings`)
+- [ ] All tests pass (`cargo test --all-targets`), and the count in DEVELOPMENT.md matches
+- [ ] Behavioral tests really ran (`MALLARD_REQUIRE_BEHAVIORAL=1`)
+- [ ] Zero clippy warnings (`cargo clippy --all-targets --all-features -- -D warnings`)
 - [ ] Zero formatting violations (`cargo fmt -- --check`)
-- [ ] Documentation builds without errors (`cargo doc --no-deps`)
+- [ ] Documentation builds clean (`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`)
+- [ ] `scripts/smoke-test.sh` passes against the real binary
 - [ ] New functionality is covered by unit tests
 - [ ] Integration tests added/updated if HTTP behaviour changed
+- [ ] If the dashboard changed: `node scripts/check-dashboard-browser.mjs` passes
 
 ## Security checklist (if applicable)
 
 - [ ] No SQL injection vectors introduced (parameterized queries used)
 - [ ] No path traversal vectors introduced (`is_safe_path_component` called)
-- [ ] No PII stored (IPs only for hashing, never persisted)
+- [ ] No PII stored (IPs only for hashing, never persisted; auth logs keep only a truncated prefix)
+- [ ] Filter and query values are bound, never interpolated — only fixed-enum column names are
 - [ ] No new `unwrap()` / `expect()` that could panic in production
 - [ ] `MALLARD_ADMIN_PASSWORD` and other secrets not logged
 

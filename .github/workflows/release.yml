@@ -118,21 +118,18 @@ jobs:
             command: cargo test --locked --all-targets
           - name: "clippy"
             components: clippy
-            command: cargo clippy --all-targets -- -D warnings
+            command: cargo clippy --all-targets --all-features -- -D warnings
           - name: "fmt"
             components: rustfmt
             command: cargo fmt -- --check
           - name: "doc"
             command: cargo doc --no-deps
             rustdocflags: "-D warnings"
-          - name: "MSRV 1.94"
-            toolchain: "1.94.0"
-            command: cargo build --locked
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
         with:
-          toolchain: ${{ matrix.toolchain || '1.94.1' }}
+          toolchain: "1.98.0"
           components: ${{ matrix.components || '' }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: ${{ matrix.name }}
@@ -187,7 +184,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
         with:
-          toolchain: "1.94.1"
+          toolchain: "1.98.0"
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -200,8 +197,9 @@ jobs:
       # ship a complete musl C/C++ toolchain, so a single path handles both.
       - name: Install cross
         if: matrix.cross
-        shell: bash
-        run: cargo install cross --locked
+        uses: taiki-e/install-action@edba51d32f66935a112c0516fec65a13d420cbc6 # v2.68.17
+        with:
+          tool: cross
 
       # Native build (x86_64-linux, macOS targets)
       - name: Build (native)
@@ -326,6 +324,9 @@ jobs:
           FROM scratch
           ARG TARGETARCH
           COPY dist/${TARGETARCH}/mallard-metrics /mallard-metrics
+          # Mirrors the from-source Dockerfile: non-root uid, /data default.
+          USER 65532:65532
+          ENV MALLARD_DATA_DIR=/data
           EXPOSE 8000
           VOLUME ["/data"]
           ENTRYPOINT ["/mallard-metrics"]

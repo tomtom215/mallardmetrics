@@ -10,7 +10,20 @@ Pass the path to a TOML file as the first command-line argument:
 mallard-metrics /etc/mallard-metrics/config.toml
 ```
 
-If no argument is provided, defaults are used.
+With no argument, defaults apply.
+
+Two loading rules are worth knowing:
+
+- **A named file that cannot be read or parsed is a startup error.** It is not
+  silently replaced with defaults, because that could quietly disable retention
+  or drop the site allowlist with nothing but a log line to say so.
+- **Unknown keys are rejected.** A typo such as `retention_dayz = 30` fails at
+  startup rather than leaving the real setting at its default while appearing
+  configured.
+
+Environment variables override file values. Validation runs before the server
+binds, so a malformed `dashboard_origin` or `geoip_precision` is reported
+immediately rather than surfacing on the first request.
 
 ## Environment Variables
 
@@ -29,7 +42,7 @@ These two values are secrets and must not be stored in files committed to source
 | `MALLARD_DASHBOARD_ORIGIN` | Optional | Restrict dashboard CORS and enable CSRF protection. |
 | `MALLARD_MAX_CONCURRENT_QUERIES` | Optional | Max concurrent analytical queries (default 10). Returns 429 when exhausted. |
 | `MALLARD_CACHE_MAX_ENTRIES` | Optional | Max query cache entries (default 10000). |
-| `MALLARD_GDPR_MODE` | Optional | Enable GDPR-friendly preset (see [PRIVACY.md](../../../PRIVACY.md)). |
+| `MALLARD_GDPR_MODE` | Optional | Enable GDPR-friendly preset (see [PRIVACY.md](https://github.com/tomtom215/mallardmetrics/blob/main/PRIVACY.md)). |
 | `MALLARD_GEOIP_PRECISION` | Optional | GeoIP precision: `city`, `region`, `country`, or `none`. |
 | `MALLARD_HOST` | Optional | Server bind address (default `0.0.0.0`). |
 | `MALLARD_PORT` | Optional | Server listen port (default `8000`). |
@@ -48,6 +61,56 @@ These two values are secrets and must not be stored in files committed to source
 | `MALLARD_SUPPRESS_BROWSER_VERSION` | Optional | Store browser name only (default `false`). |
 | `MALLARD_SUPPRESS_OS_VERSION` | Optional | Store OS name only (default `false`). |
 | `MALLARD_SUPPRESS_SCREEN_SIZE` | Optional | Omit screen width and device type (default `false`). |
+| `MALLARD_SITE_IDS` | Optional | Comma-separated site allowlist, enforced against the Origin header *and* the event payload. |
+| `MALLARD_TRUST_PROXY_HEADERS` | Optional | Trust `X-Forwarded-For` / `X-Real-IP` (default `false`). See below. |
+| `MALLARD_VISITOR_SALT_ROTATION_DAYS` | Optional | Days a visitor-ID salt stays valid (default `1`). See below. |
+| `MALLARD_SESSION_WINDOW_MINUTES` | Optional | Inactivity gap that ends a session (default `30`). |
+| `MALLARD_REALTIME_WINDOW_MINUTES` | Optional | Window the realtime endpoint treats as "now" (default `5`). |
+| `MALLARD_COMPACT_AFTER_FILES` | Optional | Merge a partition's Parquet files past this count; 0 disables (default `24`). |
+| `MALLARD_READ_CONNECTIONS` | Optional | Read-only DuckDB connections for queries (default `4`). |
+| `MALLARD_MAX_BUFFERED_EVENTS` | Optional | Cap on buffered events; 0 = unbounded (default `100000`). |
+| `MALLARD_MAX_TRACKED_KEYS` | Optional | Cap on rate-limit buckets and login-attempt records (default `10000`). |
+| `MALLARD_MAX_SESSIONS` | Optional | Cap on concurrent dashboard sessions (default `10000`). |
+| `MALLARD_RATE_LIMIT_PER_IP` | Optional | Max events/sec per client IP; 0 = unlimited (default `0`). |
+
+Boolean variables accept `1/true/yes/on` and `0/false/no/off`, case-insensitively.
+Anything else logs a warning and leaves the setting unchanged, rather than being
+read as "true" because it is not the literal string `false`.
+
+## Two settings that need a decision
+
+### `trust_proxy_headers`
+
+Defaults to `false`, which means the client address comes from the connection.
+
+Turn it on **only** when every request reaches the server through a reverse
+proxy that overwrites `X-Forwarded-For` (the bundled Caddy config does). On a
+directly reachable server those headers are attacker-controlled, and trusting
+them lets any client pick its own visitor ID, geolocation and rate-limit bucket.
+
+Leaving it off on a proxied deployment is also wrong, just less dangerously: every
+visitor is then attributed to the proxy's address.
+
+Even when the headers are trusted, their value must parse as an IP address —
+with or without a port, bracketed or not. Anything else falls through to the
+peer address, so a request that reaches the server without traversing the proxy
+cannot inject arbitrary text into the rate-limit key, the GeoIP lookup or the
+visitor-ID input. The parsed form is also canonical, so `::1` and
+`0:0:0:0:0:0:0:1` are one visitor rather than two.
+
+### `visitor_salt_rotation_days`
+
+Defaults to `1`, the most privacy-protective setting — and the one that limits
+what can be measured. A visitor seen on two days carries two unrelated IDs, so:
+
+- "Unique visitors" over a multi-day range counts visitor-days, not people.
+- Weekly retention cohorts are structurally impossible;
+  `/api/stats/retention` reports this in a `caveat` field.
+- A visit spanning UTC midnight is recorded as two visits.
+
+Raise it (7, 30) if you need cross-day analysis, and record the reasoning: it
+lengthens the life of a pseudonymous identifier, which is a privacy decision.
+Retention over *N* weeks needs at least `(N - 1) * 7` days.
 
 ## TOML Configuration Reference
 

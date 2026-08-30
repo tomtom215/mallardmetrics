@@ -32,66 +32,112 @@ CREATE TABLE IF NOT EXISTS events (
 )
 ";
 
+/// Column list of the `events` table, in declaration order.
+///
+/// `events_all` unions the hot table with Parquet files positionally, so both
+/// sides must project the same columns in the same order. Naming them
+/// explicitly (rather than `SELECT *`) means a future column added to the table
+/// cannot silently misalign against Parquet files written by an older build.
+pub const EVENT_COLUMNS: &[&str] = &[
+    "site_id",
+    "visitor_id",
+    "timestamp",
+    "event_name",
+    "pathname",
+    "hostname",
+    "referrer",
+    "referrer_source",
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_content",
+    "utm_term",
+    "browser",
+    "browser_version",
+    "os",
+    "os_version",
+    "device_type",
+    "screen_size",
+    "country_code",
+    "region",
+    "city",
+    "props",
+    "revenue_amount",
+    "revenue_currency",
+];
+
 /// Initialize the database schema.
+///
+/// # Errors
+///
+/// Returns an error if the table cannot be created.
 pub fn init_schema(conn: &Connection) -> Result<(), duckdb::Error> {
-    conn.execute_batch(CREATE_EVENTS_TABLE)?;
-    Ok(())
+    conn.execute_batch(CREATE_EVENTS_TABLE)
 }
 
-/// Install and load the behavioral extension.
+/// Install and load the `behavioral` community extension.
+///
+/// # Errors
+///
+/// Returns an error if the extension cannot be downloaded or loaded — for
+/// example when the host has no network access, or no build exists for the
+/// running DuckDB version.
 pub fn load_behavioral_extension(conn: &Connection) -> Result<(), duckdb::Error> {
-    conn.execute_batch("INSTALL behavioral FROM community; LOAD behavioral;")?;
-    Ok(())
+    conn.execute_batch("INSTALL behavioral FROM community; LOAD behavioral;")
 }
 
-/// Create or refresh the `events_all` view that unions the hot in-memory events
-/// table with the persisted Parquet files on disk.
+/// Version string reported by the loaded `behavioral` extension.
+///
+/// Returns `None` when the extension is not loaded. Surfaced through
+/// `/health/detailed` so an operator can tell which build is answering
+/// funnel/retention/session queries.
+pub fn behavioral_version(conn: &Connection) -> Option<String> {
+    conn.query_row("SELECT behavioral_version()", [], |row| row.get(0))
+        .ok()
+}
+
+/// Create or refresh the `events_all` view unioning the hot table with Parquet.
 ///
 /// ## Two-tier design
-/// - **Hot tier** (`events` table): events received in the current session that
-///   have not yet been flushed to Parquet.  Always up-to-date.
-/// - **Cold tier** (Parquet glob): events flushed in this and previous sessions.
-///   Provides durability and enables queries across server restarts.
+/// - **Hot tier** (`events` table): events received but not yet flushed.
+/// - **Cold tier** (Parquet glob): everything flushed, in this run and previous ones.
 ///
-/// ## View lifecycle
-/// - Called once at startup so historical data is immediately queryable.
-/// - Called again after every `flush_events()` so freshly written Parquet files
-///   are included (DuckDB re-evaluates the glob on each query, but creating the
-///   union view for the first time requires at least one matching file).
-/// - If no Parquet files exist yet the function silently falls back to a
-///   passthrough view over the `events` table only.  The view is upgraded to the
-///   full union on the next call (after the first flush writes files to disk).
+/// ## Lifecycle
+/// - Called at startup so historical data is queryable immediately.
+/// - Called again after each flush that wrote files, so new Parquet appears.
+/// - Falls back to a passthrough over `events` when no Parquet files exist yet.
+///
+/// `hive_partitioning=false` is required: the Parquet files already contain
+/// `site_id` and `timestamp` columns, and Hive-style inference would add
+/// duplicate `site_id`/`date` columns from the directory names, breaking the union.
+///
+/// # Errors
+///
+/// Returns an error if even the passthrough view cannot be created.
 pub fn setup_query_view(conn: &Connection, parquet_dir: &Path) -> Result<(), duckdb::Error> {
-    // Build the glob pattern that covers all partitioned Parquet files.
-    // Single quotes in the path are escaped to prevent SQL injection.
+    let columns = EVENT_COLUMNS.join(", ");
     let glob = format!(
         "{}/site_id=*/date=*/*.parquet",
         parquet_dir.to_string_lossy()
     );
     let escaped_glob = glob.replace('\'', "''");
 
-    // Attempt the union view first.  DuckDB ≥1.2 returns zero rows for an
-    // unmatched glob, but older patch-level builds may raise an error; we
-    // handle both cases by falling back to the events-only view.
-    // hive_partitioning=false is required because the Parquet files already
-    // contain site_id/timestamp columns; the Hive-style directory names
-    // (site_id=.../date=...) are for human navigation and retention cleanup
-    // only. With hive_partitioning=true (the default), DuckDB would add
-    // duplicate site_id/date columns from the path, breaking the UNION ALL.
     let union_sql = format!(
         "CREATE OR REPLACE VIEW events_all AS \
-         SELECT * FROM events \
+         SELECT {columns} FROM events \
          UNION ALL \
-         SELECT * FROM read_parquet('{escaped_glob}', union_by_name=true, hive_partitioning=false)"
+         SELECT {columns} FROM read_parquet('{escaped_glob}', union_by_name=true, hive_partitioning=false)"
     );
 
     if conn.execute_batch(&union_sql).is_ok() {
         return Ok(());
     }
 
-    // No Parquet files yet — create a passthrough view so queries compile.
-    conn.execute_batch("CREATE OR REPLACE VIEW events_all AS SELECT * FROM events")?;
-    Ok(())
+    // No Parquet files yet (an unmatched glob errors on some builds and returns
+    // zero rows on others) — fall back so queries still compile.
+    conn.execute_batch(&format!(
+        "CREATE OR REPLACE VIEW events_all AS SELECT {columns} FROM events"
+    ))
 }
 
 #[cfg(test)]
@@ -102,14 +148,12 @@ mod tests {
     fn test_setup_query_view_no_parquet() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-
         let dir = tempfile::tempdir().unwrap();
-        // No Parquet files: should fall back gracefully to the events-only view.
         setup_query_view(&conn, dir.path()).unwrap();
 
-        // The view must be queryable even when empty.
-        let mut stmt = conn.prepare("SELECT COUNT(*) FROM events_all").unwrap();
-        let count: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events_all", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -117,10 +161,9 @@ mod tests {
     fn test_init_schema() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-
-        // Verify table exists by querying it
-        let mut stmt = conn.prepare("SELECT COUNT(*) FROM events").unwrap();
-        let count: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(count, 0);
     }
 
@@ -128,15 +171,34 @@ mod tests {
     fn test_init_schema_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
-        init_schema(&conn).unwrap(); // Should not error
+        init_schema(&conn).unwrap();
     }
 
     #[test]
-    fn test_schema_columns() {
+    fn test_event_columns_match_the_table_exactly() {
+        // Guards the positional UNION ALL in events_all: if a column is added to
+        // CREATE_EVENTS_TABLE without updating EVENT_COLUMNS, the hot and cold
+        // tiers would silently misalign.
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT column_name FROM information_schema.columns \
+                 WHERE table_name = 'events' ORDER BY ordinal_position",
+            )
+            .unwrap();
+        let actual: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(actual, EVENT_COLUMNS, "EVENT_COLUMNS is out of date");
+    }
 
-        // Insert a row with all columns to verify schema
+    #[test]
+    fn test_schema_columns_accept_a_full_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
         conn.execute(
             "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname,
              hostname, referrer, referrer_source, utm_source, utm_medium,
@@ -163,7 +225,7 @@ mod tests {
                 "Windows",
                 "11",
                 "desktop",
-                "1920x1080",
+                "1920",
                 "US",
                 "California",
                 "San Francisco",
@@ -173,9 +235,16 @@ mod tests {
             ],
         )
         .unwrap();
-
-        let mut stmt = conn.prepare("SELECT COUNT(*) FROM events").unwrap();
-        let count: i64 = stmt.query_row([], |row| row.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_behavioral_version_is_none_without_extension() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        assert!(behavioral_version(&conn).is_none());
     }
 }

@@ -6,7 +6,7 @@ Mallard Metrics is a single Rust binary that handles the complete analytics life
 
 ```mermaid
 flowchart TD
-    TS["Tracking Script\nmallard.js &lt;1KB"]
+    TS["Tracking Script\nmallard.js ~3.8KB gzipped"]
     DASH["Dashboard SPA\nPreact + HTM"]
 
     TS -->|"POST /api/event"| AXUM
@@ -137,7 +137,24 @@ flowchart LR
 
 **Cold tier** (`.parquet` files): After flushing, events are written as ZSTD-compressed Parquet files partitioned by site and date. These files are the primary durability layer for historical data and can be queried independently with any Parquet-compatible tool (DuckDB CLI, pandas, Apache Spark).
 
-**The `events_all` VIEW** is created at startup and refreshed after each flush. It transparently unions the hot and cold tiers so all analytics queries work correctly regardless of which tier the data resides in.
+Each file is written under a temporary `.parquet.tmp` name and renamed into
+place, and the read glob only matches `*.parquet`. A crash or a full disk
+mid-write therefore leaves a partial file that no query can see, rather than a
+truncated file that blocks every read of that partition. Any temporary files
+left by an earlier crash are swept at startup.
+
+**Compaction.** A 60-second flush interval writes about 1,440 files per site per
+day, and DuckDB reads the footer of every matching file on every query — so scan
+cost would grow with uptime. Once a partition holds more than
+`compact_after_files` files they are merged into one, again through a temporary
+file and a rename, so an interruption leaves either the old files or the new one
+and never neither.
+
+**The `events_all` VIEW** is created at startup and refreshed after each flush
+that wrote files. It transparently unions the hot and cold tiers so all
+analytics queries work correctly regardless of which tier the data resides in.
+DuckDB connections opened against one database share a catalog, so refreshing it
+on the writer connection is enough for the whole read pool.
 
 The cold-tier directory layout:
 
@@ -239,7 +256,16 @@ INSTALL behavioral FROM community;
 LOAD behavioral;
 ```
 
-If loading fails (network unavailable, air-gapped environment), all extension-dependent endpoints return **graceful defaults** (zeroes or empty arrays). Core analytics continue working normally. The `GET /health/detailed` JSON response and `GET /metrics` Prometheus output both report whether the extension loaded successfully.
+If loading fails — no network on first run, or an air-gapped environment — the
+extension-dependent endpoints return **`503` with an explanation** and
+`/api/stats/main` reports its session-derived fields as `null`. They deliberately
+do not return zeros: a flat `0.0` bounce rate is indistinguishable from a site
+where every visitor bounces, so a missing dependency would look like a finding.
+
+Core analytics — visitors, pageviews, breakdowns, time series, goals, revenue and
+custom properties — continue working. `GET /health/detailed` reports both
+`behavioral_extension_loaded` and `behavioral_version`, and `GET /metrics`
+exposes the `mallard_behavioral_extension` gauge.
 
 ---
 
@@ -247,27 +273,41 @@ If loading fails (network unavailable, air-gapped environment), all extension-de
 
 | Module | Purpose |
 |---|---|
-| `config.rs` | TOML + environment variable configuration |
-| `server.rs` | Axum router with CORS configuration and middleware stack |
-| `ingest/handler.rs` | `POST /api/event` ingestion handler |
-| `ingest/buffer.rs` | In-memory event buffer with periodic flush |
-| `ingest/visitor_id.rs` | HMAC-SHA256 privacy-safe visitor ID |
-| `ingest/useragent.rs` | User-Agent parsing |
+| `lib.rs` | Library root; the binary is a thin wrapper over it |
+| `main.rs` | Startup, background tasks, `--healthcheck`, graceful shutdown |
+| `config.rs` | TOML + environment variable configuration, validation, advisories |
+| `server.rs` | Axum router, CORS, middleware stack, `/metrics`, health probes |
+| `test_support.rs` | `AppState` builder shared by unit and integration tests |
+| `ingest/handler.rs` | `POST /api/event` and the `GET` pixel; shared event construction |
+| `ingest/buffer.rs` | Bounded in-memory event buffer with periodic flush |
+| `ingest/visitor_id.rs` | HMAC-SHA256 visitor ID and epoch-aligned salt rotation |
+| `ingest/useragent.rs` | User-Agent and Client Hints parsing |
 | `ingest/geoip.rs` | MaxMind GeoIP reader with graceful fallback |
-| `ingest/ratelimit.rs` | Per-site token-bucket rate limiter |
-| `storage/schema.rs` | DuckDB table definitions and `events_all` view |
-| `storage/parquet.rs` | Parquet write/read/partitioning |
+| `ingest/ratelimit.rs` | Per-site and per-IP token-bucket rate limiters |
+| `storage/mod.rs` | `ReaderPool` — round-robin read connections |
+| `storage/schema.rs` | DuckDB table definitions and the `events_all` view |
+| `storage/parquet.rs` | Atomic Parquet writes, compaction, retention, erasure |
 | `storage/migrations.rs` | Schema versioning |
-| `query/metrics.rs` | Core metric calculations |
+| `query/mod.rs` | `QueryScope` — the site, range and session window every query shares |
+| `query/metrics.rs` | Core metrics, including `sessionize`-derived session metrics |
 | `query/breakdowns.rs` | Dimension breakdown queries |
-| `query/timeseries.rs` | Time-bucketed aggregations |
-| `query/sessions.rs` | `sessionize`-based session queries |
-| `query/funnel.rs` | `window_funnel` query builder |
-| `query/retention.rs` | Retention cohort query execution |
-| `query/sequences.rs` | `sequence_match` query execution |
-| `query/flow.rs` | `sequence_next_node` flow analysis |
-| `query/cache.rs` | TTL-based query result cache |
+| `query/timeseries.rs` | Gap-filled time-bucketed aggregations |
+| `query/realtime.rs` | Last-N-minutes activity snapshot |
+| `query/funnel.rs` | `window_funnel` cumulative funnels with ordering modes |
+| `query/retention.rs` | Per-visitor weekly retention cohorts |
+| `query/sequences.rs` | `sequence_match` / `sequence_count` execution |
+| `query/flow.rs` | `sequence_next_node` forward and backward flow analysis |
+| `query/events.rs` | Goal conversions and custom property keys and values |
+| `query/revenue.rs` | Per-currency revenue totals |
+| `query/export.rs` | Daily and raw event export as CSV or JSON |
+| `query/cache.rs` | TTL + LRU query result cache |
+| `query/test_support.rs` | `TestDb` — a seeded database for query tests |
 | `api/stats.rs` | All analytics API handlers |
-| `api/errors.rs` | API error types |
+| `api/errors.rs` | API error types, including the 503 for a missing extension |
 | `api/auth.rs` | Origin validation, session auth, API key management |
-| `dashboard/` | Embedded SPA (Preact + HTM) |
+| `dashboard/` | Embedded SPA (Preact + HTM, no build step) |
+| `tracking/script.js` | The tracking script, compiled into the binary |
+
+`query/sessions.rs` no longer exists: computing session metrics separately meant
+scanning the events twice for one dashboard panel, so it was folded into
+`query/metrics.rs`.

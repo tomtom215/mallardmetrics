@@ -6,7 +6,7 @@ realistic web analytics events for dashboard testing and demo screenshots.
 
 Usage:
     pip3 install duckdb
-    python3 .claude/seed-demo-data.py [DB_PATH]
+    python3 scripts/seed-demo-data.py [DB_PATH]
 
 Default DB_PATH: /tmp/mallard-demo-data/mallard.duckdb
 
@@ -20,7 +20,7 @@ The script generates ~7,000 events across 30 days for 500 visitors with:
 
 To start the server with this data:
     mkdir -p /tmp/mallard-demo-data/events
-    python3 .claude/seed-demo-data.py
+    python3 scripts/seed-demo-data.py
     MALLARD_DATA_DIR=/tmp/mallard-demo-data \
     MALLARD_ADMIN_PASSWORD=demodemo123 \
     MALLARD_HOST=127.0.0.1 \
@@ -212,8 +212,22 @@ for visitor in visitors:
             ))
 
 print(f"Inserting {len(batch)} events...")
+# Columns are named rather than positional: a bare VALUES list silently
+# misaligns if a column is ever inserted into the middle of the schema, and
+# every value here is a string or NULL, so the mistake would not even raise.
+COLUMNS = [
+    "site_id", "visitor_id", "timestamp", "event_name", "pathname", "hostname",
+    "referrer", "referrer_source", "utm_source", "utm_medium", "utm_campaign",
+    "utm_content", "utm_term", "browser", "browser_version", "os", "os_version",
+    "device_type", "screen_size", "country_code", "region", "city", "props",
+    "revenue_amount", "revenue_currency",
+]
+assert len(COLUMNS) == len(batch[0]), (
+    f"{len(COLUMNS)} columns but {len(batch[0])} values per row"
+)
 conn.executemany(
-    "INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    f"INSERT INTO events ({', '.join(COLUMNS)}) "
+    f"VALUES ({', '.join('?' * len(COLUMNS))})",
     batch,
 )
 count = conn.execute(

@@ -33,10 +33,10 @@ git clone https://github.com/tomtom215/mallardmetrics.git
 cd mallardmetrics
 
 # Verify your setup compiles and all tests pass
-cargo test
+cargo test --all-targets
 
 # Verify zero lint warnings and formatting violations
-cargo clippy --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt -- --check
 ```
 
@@ -51,45 +51,57 @@ mallardmetrics/
 ├── src/
 │   ├── main.rs                  -- Entry point, background tasks, signal handling
 │   ├── lib.rs                   -- Module declarations
-│   ├── config.rs                -- TOML + env var configuration
-│   ├── server.rs                -- Axum router, middleware, route registration
+│   ├── config.rs                -- TOML + env var configuration, validation, advisories
+│   ├── server.rs                -- Axum router, middleware, routes, /metrics, health
+│   ├── test_support.rs          -- Shared AppState builder for tests
 │   ├── api/
 │   │   ├── auth.rs              -- Authentication, sessions, API keys
 │   │   ├── errors.rs            -- Error types and HTTP responses
 │   │   └── stats.rs             -- All analytics endpoint handlers
 │   ├── ingest/
-│   │   ├── handler.rs           -- POST /api/event handler
-│   │   ├── buffer.rs            -- In-memory event buffer with flush
-│   │   ├── visitor_id.rs        -- HMAC-SHA256 visitor ID generation
-│   │   ├── useragent.rs         -- User-Agent parsing
+│   │   ├── handler.rs           -- POST /api/event and the GET pixel
+│   │   ├── buffer.rs            -- Bounded in-memory event buffer with flush
+│   │   ├── visitor_id.rs        -- HMAC-SHA256 visitor ID and salt rotation
+│   │   ├── useragent.rs         -- User-Agent and Client Hints parsing
 │   │   ├── geoip.rs             -- MaxMind GeoIP reader
-│   │   └── ratelimit.rs         -- Token-bucket rate limiter
+│   │   └── ratelimit.rs         -- Per-site and per-IP token-bucket limiters
 │   ├── query/
-│   │   ├── metrics.rs           -- Core metric calculations
+│   │   ├── mod.rs               -- QueryScope: site, range and session window
+│   │   ├── metrics.rs           -- Core metrics, including session metrics
 │   │   ├── breakdowns.rs        -- Dimension breakdown queries
-│   │   ├── timeseries.rs        -- Time-bucketed aggregations
-│   │   ├── sessions.rs          -- Session analytics (behavioral ext)
-│   │   ├── funnel.rs            -- Funnel analysis (behavioral ext)
-│   │   ├── retention.rs         -- Retention cohorts (behavioral ext)
+│   │   ├── timeseries.rs        -- Gap-filled time-bucketed aggregations
+│   │   ├── realtime.rs          -- Last-N-minutes activity snapshot
+│   │   ├── funnel.rs            -- Cumulative funnels (behavioral ext)
+│   │   ├── retention.rs         -- Per-visitor retention cohorts (behavioral ext)
 │   │   ├── sequences.rs         -- Sequence matching (behavioral ext)
 │   │   ├── flow.rs              -- Flow analysis (behavioral ext)
-│   │   └── cache.rs             -- TTL-based query cache
+│   │   ├── events.rs            -- Goals and custom property keys/values
+│   │   ├── revenue.rs           -- Per-currency revenue totals
+│   │   ├── export.rs            -- Daily and raw export as CSV or JSON
+│   │   ├── cache.rs             -- TTL + LRU query cache
+│   │   └── test_support.rs      -- TestDb for query tests
 │   ├── storage/
-│   │   ├── schema.rs            -- DuckDB schema, behavioral extension
-│   │   ├── parquet.rs           -- Parquet storage, date-partitioning
+│   │   ├── mod.rs               -- ReaderPool: round-robin read connections
+│   │   ├── schema.rs            -- DuckDB schema, events_all view, behavioral ext
+│   │   ├── parquet.rs           -- Atomic writes, compaction, retention, erasure
 │   │   └── migrations.rs        -- Schema versioning
 │   └── dashboard/
 │       └── mod.rs               -- Embedded Preact+HTM SPA
 ├── tests/
-│   └── ingest_test.rs           -- Integration tests (71 tests)
+│   └── ingest_test.rs           -- Integration tests (66 tests)
 ├── benches/
 │   └── ingest_bench.rs          -- Criterion.rs benchmarks
 ├── src/dashboard/assets/        -- Frontend SPA files (embedded via rust-embed)
-├── tracking/script.js           -- Tracking script (<1KB)
+├── tracking/script.js           -- Tracking script (~3.8 KB gzipped)
 ├── mallard-metrics.toml.example -- Configuration template
-├── Dockerfile                   -- Multi-stage, FROM scratch
+├── Dockerfile                   -- Alpine musl builder, FROM scratch runtime
 ├── docker-compose.yml           -- Production-ready compose file
-└── .github/workflows/ci.yml    -- CI pipeline (8 jobs: 5 matrix + 3 standalone)
+├── scripts/
+│   ├── smoke-test.sh            -- End-to-end checks against the real binary
+│   ├── check-dashboard-methods.mjs -- Static check for dead method references
+│   ├── check-dashboard-browser.mjs -- Drives the dashboard in a real browser
+│   └── seed-demo-data.py        -- 30 days of synthetic events, for demos
+└── .github/workflows/ci.yml     -- CI pipeline (8 jobs; the first is a 4-way matrix)
 ```
 
 ---
@@ -103,7 +115,10 @@ mallardmetrics/
 3. Establish a baseline by running the full validation suite:
 
 ```bash
-cargo test && cargo clippy --all-targets && cargo fmt -- --check
+cargo test --all-targets \
+  && cargo clippy --all-targets --all-features -- -D warnings \
+  && cargo fmt -- --check \
+  && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
 ### Making Changes
@@ -114,7 +129,10 @@ cargo test && cargo clippy --all-targets && cargo fmt -- --check
 4. Run the full validation suite:
 
 ```bash
-cargo test && cargo clippy --all-targets && cargo fmt -- --check && cargo doc --no-deps
+cargo test --all-targets \
+  && cargo clippy --all-targets --all-features -- -D warnings \
+  && cargo fmt -- --check \
+  && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
 5. Commit with a clear, descriptive message
@@ -126,10 +144,44 @@ All four commands must pass before submitting a PR:
 
 | Command | Requirement |
 |---|---|
-| `cargo test` | All 333 tests pass (262 unit + 71 integration) |
-| `cargo clippy --all-targets` | Zero warnings (pedantic + nursery + cargo lints) |
+| `cargo test --all-targets` | All 585 tests pass (519 unit + 66 integration) |
+| `cargo clippy --all-targets --all-features -- -D warnings` | Zero warnings (pedantic + nursery + cargo lints) |
 | `cargo fmt -- --check` | Zero formatting violations |
-| `cargo doc --no-deps` | Documentation builds without errors |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | Documentation builds without errors |
+
+Tests that need the `behavioral` extension skip when it cannot be downloaded, so
+a green run on an air-gapped machine does not prove they ran. CI sets
+`MALLARD_REQUIRE_BEHAVIORAL=1`, which turns a skip into a failure; run it the
+same way before touching any behavioral query:
+
+```bash
+MALLARD_REQUIRE_BEHAVIORAL=1 cargo test --all-targets
+```
+
+The test suite drives the router in-process, which cannot catch a route that
+only fails once the binary is assembled and listening. Run the end-to-end
+checks too before changing a handler, a route, or the auth middleware:
+
+```bash
+cargo build && scripts/smoke-test.sh
+```
+
+Nothing in the Rust suite executes the dashboard's JavaScript. `node --check`
+sees only syntax, so `scripts/check-dashboard-methods.mjs` (which CI runs)
+catches a handler wired to a method that no longer exists. For anything more —
+a render crash, a fetch to a route that moved — drive it in a browser:
+
+```bash
+node scripts/check-dashboard-browser.mjs http://127.0.0.1:8000
+```
+
+That one needs Playwright, which is why it is a local script rather than a CI
+job. Run it before shipping a dashboard change.
+
+An empty dashboard exercises very little, so seed it first —
+`scripts/seed-demo-data.py` writes 30 days of synthetic events with recurring
+visitors, multi-step journeys, revenue and custom events, which is enough for
+every panel to render something.
 
 ---
 
@@ -262,10 +314,13 @@ If you discover a security vulnerability, see `SECURITY.md` for responsible disc
 
 Before submitting your PR, verify every item:
 
-- [ ] `cargo test` -- all tests pass
-- [ ] `cargo clippy --all-targets` -- zero warnings
+- [ ] `cargo test --all-targets` -- all tests pass
+- [ ] `MALLARD_REQUIRE_BEHAVIORAL=1 cargo test --all-targets` -- behavioral tests really ran
+- [ ] `scripts/smoke-test.sh` -- the real binary still serves every route
+- [ ] `node scripts/check-dashboard-browser.mjs` -- if the dashboard changed
+- [ ] `cargo clippy --all-targets --all-features -- -D warnings` -- zero warnings
 - [ ] `cargo fmt -- --check` -- zero formatting violations
-- [ ] `cargo doc --no-deps` -- documentation builds without errors
+- [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` -- documentation builds without errors
 - [ ] New or changed functionality has corresponding tests
 - [ ] No SQL injection vectors introduced (parameterized queries used)
 - [ ] No PII stored (IP addresses only for hashing/GeoIP, then discarded)

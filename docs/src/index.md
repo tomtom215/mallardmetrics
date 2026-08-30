@@ -18,22 +18,22 @@ Built in Rust for predictable, low resource usage. The embedded DuckDB database 
 
 | Property | Value |
 |---|---|
-| Language | Rust (MSRV 1.94.0) |
+| Language | Rust 1.98.0, edition 2024 |
 | Web framework | Axum 0.8.x |
-| Database | DuckDB (disk-based, embedded, in-process) |
-| Analytics | `behavioral` extension (loaded at runtime) |
-| Storage | Date-partitioned Parquet files (ZSTD-compressed) |
+| Database | DuckDB 1.5.5 (disk-based, embedded, in-process; `duckdb` crate 1.10505.0) |
+| Analytics | `behavioral` extension 0.9.1 (installed and loaded at runtime) |
+| Storage | DuckDB hot table plus date-partitioned Parquet (ZSTD-compressed) |
 | Frontend | Preact + HTM (no build step, embedded in binary) |
 | Deployment | Static musl binary, `FROM scratch` Docker image |
-| Tests | 333 passing (262 unit + 71 integration) |
+| Tests | 585 passing (519 unit + 66 integration) |
 
 ## Key Features
 
 ### Privacy by Design
 
-- **No cookies** — Visitor identification uses a daily-rotating HMAC-SHA256 hash of `IP + User-Agent + daily salt`.
+- **No cookies** — Visitor identification is an HMAC-SHA256 of `site_id + IP + User-Agent` under a rotating salt (daily by default). See [Behavioral Analytics](behavioral-analytics.md#a-prerequisite-that-is-easy-to-miss-visitor-identity) for what that costs analytically.
 - **No PII storage** — IP addresses are hashed and discarded; they are never written to disk.
-- **Daily salt rotation** — Visitor IDs change every 24 hours, preventing long-term tracking.
+- **Rotating salt** — Visitor IDs change every UTC day by default, preventing long-term tracking. `visitor_salt_rotation_days` lengthens the period where cross-day analysis matters more than the shorter pseudonym.
 - **Privacy-preserving** — Pseudonymous visitor IDs; no cookies; no raw IP storage. See [Security & Privacy](security.md) for details.
 
 ### Single Binary Deployment
@@ -47,14 +47,19 @@ Built in Rust for predictable, low resource usage. The embedded DuckDB database 
 
 | Category | Capabilities |
 |---|---|
-| Core metrics | Unique visitors, pageviews, bounce rate, pages/session |
-| Breakdowns | Pages, referrers, browsers, OS, devices, countries |
-| Time-series | Hourly and daily aggregations |
-| Funnel analysis | Multi-step conversion funnels via `window_funnel()` |
-| Retention cohorts | Weekly retention grids via `retention()` |
-| Session analytics | Duration, depth via `sessionize()` |
+| Core metrics | Unique visitors, pageviews, events, visits, bounce rate, visit duration |
+| Breakdowns | Twenty dimensions — every column the ingest path populates |
+| Segment filters | Narrow any report to `browsers==Chrome;countries!=US` |
+| Time-series | Gap-filled hourly and daily aggregations |
+| Realtime | Current visitors, top pages and sources, per-minute series |
+| Goals and properties | Conversion rates per custom event, and their properties |
+| Revenue | Totals per currency, event and page |
+| Funnel analysis | Cumulative conversion funnels via `window_funnel()` |
+| Retention cohorts | Per-visitor weekly cohorts via `retention()` |
+| Session analytics | Duration, depth, bounce rate via `sessionize()` |
 | Sequence matching | Behavioral patterns via `sequence_match()` |
-| Flow analysis | Next-page navigation via `sequence_next_node()` |
+| Flow analysis | Forward and backward navigation via `sequence_next_node()` |
+| Export | Daily rollups or raw events, as CSV or JSON |
 
 ### Production Ready
 

@@ -38,8 +38,11 @@ We will acknowledge receipt within 48 hours and provide a timeline for a fix.
 ### Data Protection
 
 - **Storage format** -- Event data is stored in Parquet files with ZSTD compression, organized by `site_id` and `date` for partition pruning
+- **Atomic writes** -- Parquet files, `api_keys.json` and the visitor-ID secret are written to a temporary file and renamed into place, so an interrupted write leaves either the old content or the new, never a truncated file
+- **File permissions** -- `api_keys.json` and `.secret` are created mode 0600. Anyone able to read the secret can re-derive every visitor ID from an IP and User-Agent, which is the whole pseudonymisation guarantee
 - **Encryption at rest** -- Not provided by Mallard Metrics itself. Use filesystem-level encryption (e.g., LUKS, dm-crypt) if required
 - **Data retention** -- Configurable automatic deletion of old partitions via `MALLARD_RETENTION_DAYS`
+- **Container hardening** -- The image runs as uid 65532 and writes only to `/data`; the bundled compose file adds `read_only`, `cap_drop: ALL` and `no-new-privileges`
 
 ---
 
@@ -106,10 +109,36 @@ All user-provided data (page names, referrers, UTM parameters, custom properties
 | URL / pathname | 2048 characters |
 | Referrer | 2048 characters |
 | Custom properties (JSON) | 4096 characters |
+| Request body | 65,536 bytes (`413` beyond) |
+| `X-Request-ID` (echoed back) | 128 printable ASCII characters |
+
+Beyond length, two fields are validated by shape:
+
+- **Custom properties** must parse as a JSON *object*. Anything else is dropped
+  rather than stored, because a non-object value would break every JSON query on
+  that site's `props` column.
+- **`revenue_currency`** must be three ASCII letters. It was previously
+  truncated to three characters, which turned `DOLLARS` into `DOL`.
 
 ### Rate Limiting
 
-Per-site token-bucket rate limiting is available on the ingestion endpoint. Configure via `MALLARD_RATE_LIMIT` (max events/sec per site, 0 = unlimited). For additional protection, a reverse proxy (nginx, Caddy) can provide IP-based rate limiting.
+Two independent token-bucket limiters guard the ingestion endpoint:
+
+| Setting | Keyed by | Protects |
+|---|---|---|
+| `MALLARD_RATE_LIMIT` | `site_id` | The server, from one site's traffic |
+| `MALLARD_RATE_LIMIT_PER_IP` | Client IP | A site's real visitors, from one abusive client |
+
+Both default to 0 (unlimited). The per-site limit alone is not sufficient: a
+single client can consume the whole site budget and deny service to everyone
+else on that site.
+
+Both bucket maps are capped by `MALLARD_MAX_TRACKED_KEYS`, because their keys
+come from attacker-influenced values and the cleanup sweep only runs every 15
+minutes. Idle buckets are reclaimed before a new key is refused.
+
+The per-IP limiter depends on the client address being accurate — see
+`MALLARD_TRUST_PROXY_HEADERS` under Threat Model.
 
 ### Bot Filtering
 
@@ -124,9 +153,17 @@ Known bot User-Agents are automatically filtered from analytics when `MALLARD_FI
 | SQL injection | Parameterized queries for all user input. Safe format parsing for funnel/sequence conditions |
 | XSS | Input sanitization, control character removal, length limits |
 | Data exfiltration | No external network calls, embedded database, authenticated API access |
-| PII leakage | IP addresses never stored. Daily hash rotation. No cookies |
-| Brute force (login) | Argon2id hashing (inherently slow), per-IP attempt counting with configurable lockout (`MALLARD_MAX_LOGIN_ATTEMPTS`, `MALLARD_LOGIN_LOCKOUT`) |
-| Brute force (API) | Per-site token-bucket rate limiting on ingestion |
+| PII leakage | IP addresses never stored. Salt rotation (daily by default). Per-site hash scoping. No cookies |
+| Cross-site correlation | The site ID is part of the visitor-ID HMAC input, so one person on two sites of an instance produces unrelated identifiers |
+| Spoofed client identity | `X-Forwarded-For` and `X-Real-IP` are ignored unless `MALLARD_TRUST_PROXY_HEADERS` is set; otherwise the peer socket address is used. Even when trusted, the value must parse as an IP address, so a request that bypasses the proxy cannot inject arbitrary text into the rate-limit key, the GeoIP lookup or the visitor-ID input |
+| Unauthorised event injection | When `site_ids` is configured it is enforced against the event payload as well as the `Origin` header, so a client that omits `Origin` cannot write to an unlisted site |
+| Secret disclosure at rest | `api_keys.json` and the visitor-ID secret are written mode 0600, atomically (temp file plus rename) |
+| Memory exhaustion | The event buffer, session store, rate-limit buckets and login-attempt records are all capped; dropped events are counted in `mallard_events_dropped_total` |
+| Corrupt data blocking reads | Parquet files are written to a temporary name and renamed into place, so an interrupted write cannot leave a truncated file in the read glob |
+| Brute force (login) | Argon2id hashing (inherently slow, run off the async runtime), per-IP attempt counting with configurable lockout. `/api/auth/setup` shares the same protection, so the window before first configuration cannot be probed freely |
+| Brute force (API) | Per-site and per-IP token-bucket rate limiting on ingestion |
+| Weak admin password | Minimum 12 characters, and a short list of obvious values is refused |
+| Privilege escalation before setup | Key management and GDPR erasure return `401` until an admin password exists, so an unconfigured instance cannot be used to mint an admin key that would outlive setup |
 | Session hijacking | HttpOnly cookies, Secure flag with TLS, SameSite=Strict, 256-bit random tokens |
 | CSRF | Origin/Referer header validation on all state-mutating session-authenticated endpoints |
 | Clickjacking | `X-Frame-Options: DENY` and `Content-Security-Policy` headers |

@@ -1,277 +1,321 @@
 # Analytics Stats API
 
-All stats endpoints require authentication (session cookie, `Authorization: Bearer` API key, or `X-API-Key` header).
+All stats endpoints require authentication: a session cookie, an
+`Authorization: Bearer <key>` API key, or an `X-API-Key` header.
 
-Query results for `/api/stats/main` and `/api/stats/timeseries` are cached per `(site_id, period)` for `cache_ttl_secs` seconds (default 60).
+Every read endpoint is cached for `cache_ttl_secs` (default 60) except
+`/api/stats/realtime`, where a cached answer would not be realtime. The cache
+evicts least-recently-used entries when full, and a GDPR erasure drops that
+site's entries immediately.
+
+All endpoints share one concurrency limit (`max_concurrent_queries`, default 10)
+and return `429` with a `Retry-After` header when it is reached.
 
 ---
 
-## Common Query Parameters
+## Common query parameters
 
 | Parameter | Type | Description |
 |---|---|---|
 | `site_id` | string | Required. The site to query. |
-| `period` | string | Optional. One of `day`, `today`, `7d`, `30d`, `90d`. Defaults to `30d`. |
-| `start_date` | string | Optional. Explicit start date (`YYYY-MM-DD`). Both `start_date` and `end_date` must be provided together; a lone date is ignored. Overrides `period`. |
-| `end_date` | string | Optional. Explicit end date (`YYYY-MM-DD`, exclusive). Maximum range: 366 days. |
+| `period` | string | `day`, `today`, `7d`, `30d`, `90d`, `12mo`. Defaults to `30d`. |
+| `start_date` | string | `YYYY-MM-DD`, **inclusive**. Must be paired with `end_date`; overrides `period`. |
+| `end_date` | string | `YYYY-MM-DD`, **inclusive**. Range may span at most 366 days. |
+| `limit` | integer | Rows to return, where the endpoint returns a list. Exceeding the endpoint's maximum is a `400`, not a silent clamp. |
+| `filters` | string | Narrow the report to a segment. See below. |
 
-### `site_id` Validation
+Both explicit dates are inclusive, so `start_date=2024-01-01&end_date=2024-01-31`
+covers all of January.
 
-All endpoints validate `site_id` and return `400 Bad Request` if any of the following conditions are not met:
+### Segment filters
 
-- Non-empty string.
-- At most 256 characters.
-- ASCII alphanumeric characters plus `.`, `-`, `_`, and `:` only.
+`filters` narrows every figure a request returns — headline metrics, the time
+series, breakdowns, goals, revenue, exports and the behavioral reports alike.
+
+```
+filters=browsers==Chrome
+filters=countries==DE;devices!=mobile
+filters=utm-campaigns==spring,sale-2024
+```
+
+Each condition is `dimension==value` or `dimension!=value`, and conditions are
+joined by `;`. All conditions must hold, so the set is an AND.
+
+`;` separates conditions and `,` does not: values legitimately contain commas,
+as `utm-campaigns==spring,sale-2024` above shows.
+
+**Dimension names are the breakdown slugs** — `browsers`, `countries`,
+`utm-sources`, `events` and the rest listed under
+[`GET /api/stats/breakdown/{dimension}`](#get-apistatsbreakdowndimension). One
+vocabulary, so a row in a breakdown can be turned into a filter without
+translating it.
+
+**Matching is exact and case-sensitive.** Values are compared to what is stored,
+which is what the corresponding breakdown displays.
+
+**`(unknown)` matches events where the value was not recorded.** A breakdown
+renders `NULL` as `(unknown)`, and `filters=browsers==(unknown)` selects exactly
+those rows. `!=` is NULL-safe in the direction a reader expects:
+`browsers!=Chrome` includes events with no browser at all, because "not Chrome"
+plainly covers "no browser recorded" — plain SQL would silently drop them.
+
+**Entry and exit pages cannot be filtered on.** They are derived by looking at a
+whole session rather than read from a column, so no per-event predicate
+expresses them; asking for one returns `400` rather than quietly filtering on
+`pages` and answering a different question.
+
+At most 12 conditions per request, each value at most 512 characters. An unknown
+dimension, a missing operator or an empty value is a `400` naming the problem.
+
+Filtered and unfiltered results are cached separately, and the cache key is
+built from the parsed conditions, so `a==1;b==2` and `b==2;a==1` share an entry.
+
+`GET /api/stats/realtime` does not accept `filters`: it reports a live snapshot
+rather than a report over a range.
+
+### `site_id` validation
+
+Returns `400` unless the value is non-empty, at most 256 characters, and made up
+only of ASCII alphanumerics plus `.`, `-`, `_` and `:`. The same rule governs
+ingestion, so anything accepted at ingest is queryable.
+
+---
+
+## `GET /api/sites`
+
+Site IDs that have data — from the query view, from the on-disk partitions, and
+from the configured `site_ids` allowlist.
 
 ```json
-// 400 response for invalid site_id
-{"error": "Invalid site_id"}
+{"sites": ["blog.example.com", "example.com"]}
 ```
 
 ---
 
 ## `GET /api/stats/main`
 
-Returns core aggregate metrics.
-
-### Response
-
 ```json
 {
-  "unique_visitors": 1423,
-  "total_pageviews": 5812,
+  "unique_visitors": 1284,
+  "total_pageviews": 3910,
+  "total_events": 4102,
+  "views_per_visitor": 3.05,
+  "total_sessions": 1601,
   "bounce_rate": 0.42,
-  "avg_visit_duration_secs": 0.0,
-  "pages_per_visit": 4.08
+  "avg_visit_duration_secs": 96.4,
+  "views_per_visit": 2.44,
+  "behavioral_available": true
 }
 ```
 
-| Field | Type | Notes |
-|---|---|---|
-| `unique_visitors` | integer | Distinct `visitor_id` values in the period. |
-| `total_pageviews` | integer | Events where `event_name = 'pageview'`. |
-| `bounce_rate` | float | Sessions with exactly one pageview / total sessions. Requires behavioral extension; returns `0.0` if unavailable. |
-| `avg_visit_duration_secs` | float | Always `0.0` in this version (requires behavioral extension integration; computed separately via `/api/stats/sessions`). |
-| `pages_per_visit` | float | `total_pageviews / unique_visitors`. |
+| Field | Notes |
+|---|---|
+| `unique_visitors` | Distinct `visitor_id` values. Over a range longer than one salt rotation this counts visitor-periods, not people — see [Behavioral Analytics](../behavioral-analytics.md#a-prerequisite-that-is-easy-to-miss-visitor-identity). |
+| `total_pageviews` | Events named `pageview`. |
+| `total_events` | All events, custom ones included. |
+| `views_per_visitor` | `total_pageviews / unique_visitors`. Previously called `pages_per_visit`, which is not what it measured. |
+| `total_sessions`, `bounce_rate`, `avg_visit_duration_secs`, `views_per_visit` | Need the `behavioral` extension. **`null` when unavailable**, which is meaningfully different from `0`. |
+| `behavioral_available` | Whether those four could be computed. |
 
 ---
 
 ## `GET /api/stats/timeseries`
 
-Returns visitors and pageviews bucketed by time.
-
-Granularity is determined automatically from the `period`: `day`/`today` returns hourly buckets; all other periods return daily buckets.
-
-### Response
+Hourly buckets for ranges up to two days, daily beyond that.
 
 ```json
 [
-  {"date": "2024-01-15", "visitors": 142, "pageviews": 518},
-  {"date": "2024-01-16", "visitors": 167, "pageviews": 603}
+  {"date": "2024-01-14", "visitors": 0,  "pageviews": 0},
+  {"date": "2024-01-15", "visitors": 42, "pageviews": 130}
 ]
 ```
 
-For `period=day` the `date` field includes the hour (e.g. `"2024-01-15 10:00"`).
+Every bucket in range is returned, including empty ones. A chart drawn from a
+series with gaps connects the points either side and shows traffic that never
+happened.
 
 ---
 
 ## `GET /api/stats/breakdown/{dimension}`
 
-Returns visitor and pageview counts grouped by a single dimension.
-
-### Dimensions
-
-| Path | Grouped by |
-|---|---|
-| `/breakdown/pages` | `pathname` |
-| `/breakdown/sources` | `referrer_source` |
-| `/breakdown/browsers` | `browser` |
-| `/breakdown/os` | `os` |
-| `/breakdown/devices` | `device_type` |
-| `/breakdown/countries` | `country_code` |
-
-### Additional Parameters
-
-| Parameter | Type | Description |
-|---|---|---|
-| `limit` | integer | Maximum rows to return. Default 10, maximum 1000. Returns 400 if exceeded. |
-
-### Response
-
 ```json
 [
-  {"value": "/pricing", "visitors": 312, "pageviews": 489},
-  {"value": "/about",   "visitors": 201, "pageviews": 247}
+  {"value": "/pricing", "visitors": 210, "pageviews": 260, "events": 271}
 ]
 ```
 
-Unknown/null dimension values are represented as `"(unknown)"`.
+Ordered by visitors, then by value — so equal counts do not reorder between
+refreshes.
+
+| Dimension | Column |
+|---|---|
+| `pages` | `pathname` |
+| `entry-pages` \* | First pageview of each session |
+| `exit-pages` \* | Last pageview of each session |
+| `referrers` | `referrer` |
+| `sources` | `referrer_source` |
+| `countries`, `regions`, `cities` | `country_code`, `region`, `city` |
+| `browsers`, `browser-versions` | `browser`, `browser_version` |
+| `os`, `os-versions` | `os`, `os_version` |
+| `devices`, `screen-sizes` | `device_type`, `screen_size` |
+| `utm-sources`, `utm-mediums`, `utm-campaigns`, `utm-contents`, `utm-terms` | The `utm_*` columns |
+| `events` | `event_name` |
+
+\* Needs the `behavioral` extension; returns `503` without it.
+
+An unknown dimension returns `400` listing the available ones. `limit` defaults
+to 10, maximum 1000.
 
 ---
 
-## `GET /api/stats/sessions`
-
-Returns session-level aggregates using the `sessionize` behavioral function.
-
-Requires the behavioral extension. Returns zeroes if the extension is not loaded.
-
-### Response
+## `GET /api/stats/realtime`
 
 ```json
 {
-  "total_sessions": 892,
-  "avg_session_duration_secs": 124.7,
-  "avg_pages_per_session": 3.2
+  "current_visitors": 7,
+  "pageviews": 19,
+  "window_minutes": 5,
+  "top_pages":   [{"value": "/pricing", "visitors": 3}],
+  "top_sources": [{"value": "Google",   "visitors": 4}],
+  "per_minute":  [2, 5, 3, 4, 3, 2]
 }
 ```
 
+The window is `realtime_window_minutes` (default 5), ending at the current UTC
+instant and inclusive at both ends. Events timestamped in the future are outside
+it, so a client with a skewed clock cannot inflate "right now".
+
+`per_minute` is gap-filled and ordered oldest first, and holds one entry per
+minute boundary in the window — six for a five-minute window, because both ends
+are included. Its entries sum to `pageviews`.
+
 ---
 
-## `GET /api/stats/funnel`
+## `GET /api/stats/goals`
 
-Returns a conversion funnel where each step is a filter condition.
-
-### Additional Parameters
-
-| Parameter | Type | Description |
-|---|---|---|
-| `steps` | string | Comma-separated list of steps. Format: `page:/path` or `event:name`. |
-| `window` | string | Session window duration. Default `"1 day"`. Must be of the form `N unit` (e.g. `"30 minutes"`, `"2 hours"`). |
-
-### Step Format
-
-| Format | Meaning |
-|---|---|
-| `page:/pricing` | `pathname = '/pricing'` |
-| `event:signup` | `event_name = 'signup'` |
-
-### Example Request
-
-```
-GET /api/stats/funnel?site_id=example.com&steps=page:/pricing,event:signup&window=1+hour
-```
-
-### Response
+Conversion figures for every event other than `pageview`.
 
 ```json
 [
-  {"step": 1, "visitors": 500},
-  {"step": 2, "visitors": 120}
+  {"name": "signup", "visitors": 64, "events": 71, "conversion_rate": 0.05}
 ]
 ```
 
-Requires behavioral extension. Returns empty array if unavailable.
+`conversion_rate` is converting visitors over all visitors in range.
 
 ---
 
-## `GET /api/stats/retention`
+## `GET /api/stats/properties` and `GET /api/stats/property-values`
 
-Returns weekly retention cohorts using the `retention` behavioral function.
+`properties` lists the custom property keys present in range:
 
-### Additional Parameters
+```json
+["coupon", "plan"]
+```
 
-| Parameter | Type | Description |
-|---|---|---|
-| `weeks` | integer | Number of cohort weeks to compute. Range: 1–52. Default 4. |
+`property-values` breaks one down. `key` is required and must contain only
+alphanumerics, `_`, `-` or `.`; `event` optionally restricts it to one event
+name.
 
-### Response
+```
+GET /api/stats/property-values?site_id=example.com&key=plan&event=signup
+```
 
 ```json
 [
-  {
-    "cohort_date": "2024-01-08",
-    "retained": [true, true, false, true]
-  }
+  {"value": "pro",  "visitors": 41, "events": 44},
+  {"value": "free", "visitors": 23, "events": 27}
 ]
 ```
 
-Each `retained` boolean corresponds to one cohort week.
-
-Requires behavioral extension. Returns empty array if unavailable.
-
 ---
 
-## `GET /api/stats/sequences`
-
-Returns conversion metrics for a sequence of behavioral steps using `sequence_match`.
-
-### Additional Parameters
-
-| Parameter | Type | Description |
-|---|---|---|
-| `steps` | string | Comma-separated steps in `page:/path` or `event:name` format. Minimum 2 steps required. |
-
-### Response
+## `GET /api/stats/revenue`
 
 ```json
 {
-  "converting_visitors": 89,
-  "total_visitors": 500,
-  "conversion_rate": 0.178
+  "by_currency": [
+    {
+      "currency": "USD",
+      "total": 4820.0,
+      "transactions": 61,
+      "paying_visitors": 58,
+      "average_order_value": 79.02
+    }
+  ],
+  "by_event": [{"value": "purchase", "currency": "USD", "total": 4820.0, "transactions": 61}],
+  "by_page":  [{"value": "/checkout", "currency": "USD", "total": 4820.0, "transactions": 61}]
 }
 ```
 
-Requires behavioral extension. Returns zeroes if unavailable.
+Currencies are always reported separately. There is no exchange-rate source, so
+adding 10 USD to 10 EUR would produce a number that means nothing.
 
 ---
 
-## `GET /api/stats/flow`
+## Behavioral endpoints
 
-Returns the most common next pages after a given starting page using `sequence_next_node`.
+`GET /api/stats/sessions`, `/funnel`, `/retention`, `/sequences` and `/flow` are
+documented in full under [Behavioral Analytics](../behavioral-analytics.md).
 
-### Additional Parameters
-
-| Parameter | Type | Description |
-|---|---|---|
-| `page` | string | The target page path to start from (e.g. `/pricing`). |
-
-### Response
-
-```json
-[
-  {"next_page": "/signup",  "visitors": 234},
-  {"next_page": "/contact", "visitors": 89}
-]
-```
-
-Returns up to 10 results. Requires behavioral extension.
+They return **`503`** with an explanatory `error` when the `behavioral`
+extension is not loaded, rather than an empty `200` that reads as "no data".
 
 ---
 
 ## `GET /api/stats/export`
 
-Exports daily aggregated stats as CSV or JSON.
-
-### Additional Parameters
-
-| Parameter | Type | Description |
+| Parameter | Default | Description |
 |---|---|---|
-| `format` | string | `csv` (default) or `json`. Any other value returns 400. |
+| `kind` | `daily` | `daily` for one row per day, `raw` for one row per event |
+| `format` | `csv` | `csv` or `json` |
+| `limit` | `100000` | Raw exports only; maximum 1,000,000 |
 
-### CSV Response
+A daily export carries each day's **own** top page and source:
 
 ```csv
 date,visitors,pageviews,top_page,top_source
-2024-01-15,142,518,/pricing,(direct)
-2024-01-16,167,603,/pricing,google
+2024-01-15,42,130,"/pricing","Google"
+2024-01-16,38,121,"/blog","Direct"
 ```
 
-CSV fields that might trigger formula injection (start with `=`, `+`, `-`, `@`) are prefixed with a single quote.
+A raw export carries one row per stored event. **`visitor_id` is deliberately
+excluded**: a file of per-event pseudonyms is precisely the artefact this project
+exists to avoid producing.
 
-`Content-Disposition: attachment; filename="export.csv"` is set so browsers prompt a download.
+CSV fields are quoted, internal quotes doubled, and values beginning with `=`,
+`+`, `-`, `@`, tab or carriage return are prefixed with an apostrophe so a
+spreadsheet does not evaluate them as formulas.
 
-### JSON Response
+The response is built in memory rather than streamed, so `limit` is also a
+memory bound: the 100,000-row default is a few tens of megabytes, and the
+1,000,000-row ceiling a few hundred. Export in date-range slices rather than
+raising the limit on a memory-constrained host.
+
+---
+
+## `DELETE /api/gdpr/erase`
+
+**Requires admin authentication.** Permanently deletes a site's events across an
+inclusive date range, from both the hot table and the on-disk Parquet
+partitions, then refreshes the query view and drops that site's cached results.
+
+```
+DELETE /api/gdpr/erase?site_id=example.com&start_date=2024-01-01&end_date=2024-01-31
+```
 
 ```json
-[
-  {
-    "date": "2024-01-15",
-    "visitors": 142,
-    "pageviews": 518,
-    "top_page": "/pricing",
-    "top_source": "(direct)"
-  }
-]
+{
+  "status": "erased",
+  "site_id": "example.com",
+  "start_date": "2024-01-01",
+  "end_date": "2024-01-31",
+  "db_records_deleted": 1204,
+  "parquet_partitions_deleted": 31
+}
 ```
 
-`top_page` and `top_source` reflect the single highest-traffic page and referrer source for the entire queried period, not per-day.
+Visitor IDs are pseudonymous hashes rather than identities, so a specific
+person's rows cannot be singled out. Erasure therefore operates on site and date
+range, which is the granularity an operator can act on. Document that limitation
+in your privacy notice.

@@ -1,226 +1,434 @@
+use super::QueryScope;
 use duckdb::Connection;
+use serde::{Deserialize, Serialize};
 
-/// Core metric results for a given time range.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Core metrics for a site over a time range.
+///
+/// Fields that depend on the `behavioral` extension are `Option`: `None` means
+/// "could not be computed", which is meaningfully different from `0`. The
+/// previous release reported a flat `0.0` bounce rate and `0.0` visit duration
+/// whenever the extension was missing, which is indistinguishable from a site
+/// where every visitor bounces instantly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoreMetrics {
+    /// Distinct `visitor_id` values in range.
+    ///
+    /// Note that `visitor_id` rotates with the configured salt period (daily by
+    /// default), so over a range longer than one rotation this counts
+    /// visitor-periods rather than people. See `visitor_salt_rotation_days`.
     pub unique_visitors: u64,
+    /// Events with `event_name = 'pageview'`.
     pub total_pageviews: u64,
-    pub bounce_rate: f64,
-    pub avg_visit_duration_secs: f64,
-    pub pages_per_visit: f64,
+    /// All events, including custom ones.
+    pub total_events: u64,
+    /// `total_pageviews / unique_visitors`.
+    ///
+    /// Renamed from `pages_per_visit`, which was a misnomer: it was never
+    /// per-visit, only ever per-visitor. `views_per_visit` below is the real
+    /// per-session figure.
+    pub views_per_visitor: f64,
+
+    /// Sessions derived by `sessionize`. Requires the behavioral extension.
+    pub total_sessions: Option<u64>,
+    /// Fraction of sessions with exactly one pageview, 0.0–1.0.
+    pub bounce_rate: Option<f64>,
+    /// Mean session duration in seconds.
+    pub avg_visit_duration_secs: Option<f64>,
+    /// Mean pageviews per session.
+    pub views_per_visit: Option<f64>,
+    /// Whether session-derived fields above could be computed.
+    pub behavioral_available: bool,
 }
 
-/// Query core metrics for a site within a date range.
+/// Counts that do not need the behavioral extension.
+struct BaseCounts {
+    unique_visitors: u64,
+    total_pageviews: u64,
+    total_events: u64,
+}
+
+/// Session-derived metrics.
+struct SessionAggregates {
+    total_sessions: u64,
+    bounce_rate: f64,
+    avg_duration_secs: f64,
+    avg_pages: f64,
+}
+
+/// Query all core metrics for a scope.
+///
+/// Runs at most two statements: one scan for the plain counts and one
+/// `sessionize` pass for the session-derived figures. The previous
+/// implementation issued four independent full scans of `events_all` — the
+/// counts, the bounce rate, and the session metrics each re-read the range,
+/// and the session query ran twice because `/stats/main` and `/stats/sessions`
+/// both called it.
+///
+/// # Errors
+///
+/// Returns an error if the base counts cannot be read. A failure of the
+/// session pass is not an error: it means the behavioral extension is
+/// unavailable, and the affected fields are reported as `None`.
 pub fn query_core_metrics(
     conn: &Connection,
-    site_id: &str,
-    start_date: &str,
-    end_date: &str,
+    scope: &QueryScope,
 ) -> Result<CoreMetrics, duckdb::Error> {
-    let unique_visitors = query_unique_visitors(conn, site_id, start_date, end_date)?;
-    let total_pageviews = query_total_pageviews(conn, site_id, start_date, end_date)?;
-    // bounce_rate requires the behavioral extension (sessionize).
-    // Gracefully return 0.0 if the extension is not loaded.
-    let bounce_rate = query_bounce_rate(conn, site_id, start_date, end_date).unwrap_or(0.0);
+    let base = query_base_counts(conn, scope)?;
+    let sessions = query_session_aggregates(conn, scope).ok();
 
-    let pages_per_visit = if unique_visitors > 0 {
-        #[allow(clippy::cast_precision_loss)]
-        let pv = total_pageviews as f64 / unique_visitors as f64;
-        pv
+    #[allow(clippy::cast_precision_loss)]
+    let views_per_visitor = if base.unique_visitors > 0 {
+        base.total_pageviews as f64 / base.unique_visitors as f64
     } else {
         0.0
     };
 
-    // avg_visit_duration_secs requires the behavioral extension (sessionize).
-    // Gracefully return 0.0 if the extension is not loaded.
-    let avg_visit_duration_secs =
-        super::sessions::query_session_metrics(conn, site_id, start_date, end_date)
-            .map(|s| s.avg_session_duration_secs)
-            .unwrap_or(0.0);
-
     Ok(CoreMetrics {
-        unique_visitors,
-        total_pageviews,
-        bounce_rate,
-        avg_visit_duration_secs,
-        pages_per_visit,
+        unique_visitors: base.unique_visitors,
+        total_pageviews: base.total_pageviews,
+        total_events: base.total_events,
+        views_per_visitor,
+        total_sessions: sessions.as_ref().map(|s| s.total_sessions),
+        bounce_rate: sessions.as_ref().map(|s| s.bounce_rate),
+        avg_visit_duration_secs: sessions.as_ref().map(|s| s.avg_duration_secs),
+        views_per_visit: sessions.as_ref().map(|s| s.avg_pages),
+        behavioral_available: sessions.is_some(),
     })
 }
 
-/// Count unique visitors in a date range.
-pub fn query_unique_visitors(
-    conn: &Connection,
-    site_id: &str,
-    start_date: &str,
-    end_date: &str,
-) -> Result<u64, duckdb::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT COUNT(DISTINCT visitor_id) FROM events_all
-         WHERE site_id = ? AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)",
-    )?;
-    let count: u64 = stmt.query_row(duckdb::params![site_id, start_date, end_date], |row| {
-        row.get(0)
-    })?;
-    Ok(count)
+/// Visitor, pageview and event counts in one scan.
+fn query_base_counts(conn: &Connection, scope: &QueryScope) -> Result<BaseCounts, duckdb::Error> {
+    let sql = format!(
+        "SELECT COUNT(DISTINCT visitor_id),
+                COUNT(*) FILTER (WHERE event_name = 'pageview'),
+                COUNT(*)
+         FROM events_all WHERE {}",
+        scope.where_clause()
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.query_row(duckdb::params_from_iter(scope.params()), |row| {
+        Ok(BaseCounts {
+            unique_visitors: row.get(0)?,
+            total_pageviews: row.get(1)?,
+            total_events: row.get(2)?,
+        })
+    })
 }
 
-/// Count total pageviews in a date range.
-pub fn query_total_pageviews(
+/// Session count, bounce rate, mean duration and mean pages in one `sessionize` pass.
+fn query_session_aggregates(
     conn: &Connection,
-    site_id: &str,
-    start_date: &str,
-    end_date: &str,
-) -> Result<u64, duckdb::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT COUNT(*) FROM events_all
-         WHERE site_id = ? AND event_name = 'pageview'
-         AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)",
-    )?;
-    let count: u64 = stmt.query_row(duckdb::params![site_id, start_date, end_date], |row| {
-        row.get(0)
-    })?;
-    Ok(count)
+    scope: &QueryScope,
+) -> Result<SessionAggregates, duckdb::Error> {
+    let sql = session_aggregate_sql(scope);
+    let mut stmt = conn.prepare(&sql)?;
+    stmt.query_row(duckdb::params_from_iter(scope.params()), |row| {
+        Ok(SessionAggregates {
+            total_sessions: row.get(0)?,
+            bounce_rate: row.get(1)?,
+            avg_duration_secs: row.get(2)?,
+            avg_pages: row.get(3)?,
+        })
+    })
 }
 
-/// Calculate bounce rate using sessionize from the behavioral extension.
+/// SQL for the session aggregate pass. Split out so it can be unit-tested.
+fn session_aggregate_sql(scope: &QueryScope) -> String {
+    // The session window comes from operator config, not request input, and is
+    // validated by `Config::validate`; it is re-checked here so a future caller
+    // cannot interpolate something arbitrary.
+    let window = if scope.session_window_is_safe() {
+        scope.session_window.clone()
+    } else {
+        "30 minutes".to_string()
+    };
+    format!(
+        "WITH scoped AS (
+             SELECT visitor_id, timestamp, event_name
+             FROM events_all WHERE {where_clause}
+         ),
+         sessionized AS (
+             SELECT visitor_id, timestamp, event_name,
+                    sessionize(timestamp, INTERVAL '{window}') OVER (
+                        PARTITION BY visitor_id ORDER BY timestamp) AS session_id
+             FROM scoped
+         ),
+         per_session AS (
+             SELECT visitor_id, session_id,
+                    COUNT(*) FILTER (WHERE event_name = 'pageview') AS page_count,
+                    EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp))) AS duration_secs
+             FROM sessionized GROUP BY visitor_id, session_id
+         )
+         SELECT COUNT(*),
+                COALESCE(COUNT(*) FILTER (WHERE page_count = 1)::DOUBLE
+                         / NULLIF(COUNT(*), 0), 0.0),
+                COALESCE(AVG(duration_secs), 0.0),
+                COALESCE(AVG(page_count), 0.0)
+         FROM per_session",
+        where_clause = scope.where_clause()
+    )
+}
+
+/// Session-level metrics, exposed on its own endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMetrics {
+    pub total_sessions: u64,
+    pub avg_session_duration_secs: f64,
+    pub avg_pages_per_session: f64,
+    pub bounce_rate: f64,
+}
+
+/// Query session metrics.
 ///
-/// Returns a value between 0.0 and 1.0, or 0.0 if no sessions exist.
-pub fn query_bounce_rate(
+/// # Errors
+///
+/// Returns an error when the behavioral extension is not loaded.
+pub fn query_session_metrics(
     conn: &Connection,
-    site_id: &str,
-    start_date: &str,
-    end_date: &str,
-) -> Result<f64, duckdb::Error> {
-    let sql = r"
-        WITH sessions AS (
-            SELECT
-                visitor_id,
-                sessionize(timestamp, INTERVAL '30 minutes') OVER (
-                    PARTITION BY visitor_id ORDER BY timestamp
-                ) AS session_id,
-                event_name
-            FROM events_all
-            WHERE site_id = ? AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)
-        )
-        SELECT
-            COALESCE(
-                COUNT(DISTINCT CASE WHEN page_count = 1 THEN session_key END)::FLOAT
-                / NULLIF(COUNT(DISTINCT session_key), 0),
-                0.0
-            ) AS bounce_rate
-        FROM (
-            SELECT
-                visitor_id || '-' || CAST(session_id AS VARCHAR) AS session_key,
-                COUNT(*) FILTER (WHERE event_name = 'pageview') AS page_count
-            FROM sessions
-            GROUP BY visitor_id, session_id
-        )
-    ";
-
-    let mut stmt = conn.prepare(sql)?;
-    let bounce_rate: f64 = stmt
-        .query_row(duckdb::params![site_id, start_date, end_date], |row| {
-            row.get(0)
-        })?;
-    Ok(bounce_rate)
+    scope: &QueryScope,
+) -> Result<SessionMetrics, duckdb::Error> {
+    let agg = query_session_aggregates(conn, scope)?;
+    Ok(SessionMetrics {
+        total_sessions: agg.total_sessions,
+        avg_session_duration_secs: agg.avg_duration_secs,
+        avg_pages_per_session: agg.avg_pages,
+        bounce_rate: agg.bounce_rate,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn setup_test_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::storage::schema::init_schema(&conn).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        crate::storage::schema::setup_query_view(&conn, dir.path()).unwrap();
-        drop(dir); // view was already created; TempDir no longer needed
-        conn
-    }
-
-    fn insert_pageview(conn: &Connection, visitor_id: &str, timestamp: &str, pathname: &str) {
-        conn.execute(
-            "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname)
-             VALUES ('test.com', ?, CAST(? AS TIMESTAMP), 'pageview', ?)",
-            duckdb::params![visitor_id, timestamp, pathname],
-        )
-        .unwrap();
-    }
+    use crate::query::test_support::{TestDb, insert_pageview, scope};
 
     #[test]
     fn test_unique_visitors_empty() {
-        let conn = setup_test_db();
-        let count = query_unique_visitors(&conn, "test.com", "2024-01-01", "2024-02-01").unwrap();
-        assert_eq!(count, 0);
+        let db = TestDb::new();
+        let m = query_core_metrics(&db.conn, &scope("2024-01-01", "2024-02-01")).unwrap();
+        assert_eq!(m.unique_visitors, 0);
+        assert_eq!(m.total_pageviews, 0);
     }
 
     #[test]
-    fn test_unique_visitors_counting() {
-        let conn = setup_test_db();
-        insert_pageview(&conn, "v1", "2024-01-15 10:00:00", "/");
-        insert_pageview(&conn, "v1", "2024-01-15 10:05:00", "/about");
-        insert_pageview(&conn, "v2", "2024-01-15 11:00:00", "/");
+    fn test_counts() {
+        let db = TestDb::new();
+        insert_pageview(&db.conn, "v1", "2024-01-15 10:00:00", "/");
+        insert_pageview(&db.conn, "v1", "2024-01-15 10:05:00", "/about");
+        insert_pageview(&db.conn, "v2", "2024-01-15 11:00:00", "/");
 
-        let count = query_unique_visitors(&conn, "test.com", "2024-01-01", "2024-02-01").unwrap();
-        assert_eq!(count, 2);
+        let m = query_core_metrics(&db.conn, &scope("2024-01-01", "2024-02-01")).unwrap();
+        assert_eq!(m.unique_visitors, 2);
+        assert_eq!(m.total_pageviews, 3);
+        assert_eq!(m.total_events, 3);
+        assert!((m.views_per_visitor - 1.5).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn test_unique_visitors_date_range() {
-        let conn = setup_test_db();
-        insert_pageview(&conn, "v1", "2024-01-15 10:00:00", "/");
-        insert_pageview(&conn, "v2", "2024-02-15 10:00:00", "/");
+    fn test_date_range_is_half_open() {
+        let db = TestDb::new();
+        insert_pageview(&db.conn, "v1", "2024-01-15 10:00:00", "/");
+        insert_pageview(&db.conn, "v2", "2024-02-15 10:00:00", "/");
 
-        // Only January
-        let count = query_unique_visitors(&conn, "test.com", "2024-01-01", "2024-02-01").unwrap();
-        assert_eq!(count, 1);
+        let m = query_core_metrics(&db.conn, &scope("2024-01-01", "2024-02-01")).unwrap();
+        assert_eq!(m.unique_visitors, 1, "the end bound must be exclusive");
     }
 
     #[test]
-    fn test_total_pageviews() {
-        let conn = setup_test_db();
-        insert_pageview(&conn, "v1", "2024-01-15 10:00:00", "/");
-        insert_pageview(&conn, "v1", "2024-01-15 10:05:00", "/about");
-        insert_pageview(&conn, "v2", "2024-01-15 11:00:00", "/");
+    fn test_pageviews_exclude_custom_events() {
+        let db = TestDb::new();
+        insert_pageview(&db.conn, "v1", "2024-01-15 10:00:00", "/");
+        db.insert_event("v1", "2024-01-15 10:01:00", "signup", "/");
 
-        let count = query_total_pageviews(&conn, "test.com", "2024-01-01", "2024-02-01").unwrap();
-        assert_eq!(count, 3);
+        let m = query_core_metrics(&db.conn, &scope("2024-01-01", "2024-02-01")).unwrap();
+        assert_eq!(m.total_pageviews, 1);
+        assert_eq!(m.total_events, 2, "custom events count toward total_events");
     }
 
     #[test]
-    fn test_total_pageviews_excludes_custom_events() {
-        let conn = setup_test_db();
-        insert_pageview(&conn, "v1", "2024-01-15 10:00:00", "/");
-        conn.execute(
-            "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname)
-             VALUES ('test.com', 'v1', '2024-01-15 10:01:00', 'signup', '/')",
-            [],
+    fn test_behavioral_fields_are_none_without_the_extension() {
+        // Reporting 0.0 was indistinguishable from "every visitor bounced".
+        let db = TestDb::new();
+        insert_pageview(&db.conn, "v1", "2024-01-15 10:00:00", "/");
+        let m = query_core_metrics(&db.conn, &scope("2024-01-01", "2024-02-01")).unwrap();
+        if !db.behavioral {
+            assert!(m.bounce_rate.is_none());
+            assert!(m.avg_visit_duration_secs.is_none());
+            assert!(m.total_sessions.is_none());
+            assert!(!m.behavioral_available);
+        }
+    }
+
+    #[test]
+    fn test_session_metrics_with_behavioral_extension() {
+        let db = TestDb::new();
+        if !db.require_behavioral("session metrics") {
+            return;
+        }
+        // v1: two pageviews five minutes apart -> one session, not a bounce.
+        insert_pageview(&db.conn, "v1", "2024-01-15 10:00:00", "/");
+        insert_pageview(&db.conn, "v1", "2024-01-15 10:05:00", "/about");
+        // v2: a single pageview -> one session, a bounce.
+        insert_pageview(&db.conn, "v2", "2024-01-15 11:00:00", "/");
+
+        let m = query_core_metrics(&db.conn, &scope("2024-01-01", "2024-02-01")).unwrap();
+        assert!(m.behavioral_available);
+        assert_eq!(m.total_sessions, Some(2));
+        assert_eq!(m.bounce_rate, Some(0.5));
+        assert_eq!(m.views_per_visit, Some(1.5));
+        // v1's session spans 300s, v2's spans 0s -> mean 150s.
+        assert_eq!(m.avg_visit_duration_secs, Some(150.0));
+    }
+
+    #[test]
+    fn test_filters_reach_the_session_pass() {
+        // `query_core_metrics` swallows a session-query failure into `None`, so
+        // a filter that broke that SQL would blank the session fields rather
+        // than erroring — and a test asserting only on pageviews would still
+        // pass. This asserts the session figures themselves under a filter.
+        let db = TestDb::new();
+        if !db.require_behavioral("filtered session metrics") {
+            return;
+        }
+        db.insert_dimensional(
+            "v1",
+            "2024-01-15 10:00:00",
+            "/",
+            Some("Chrome"),
+            None,
+            None,
+            None,
+        );
+        db.insert_dimensional(
+            "v1",
+            "2024-01-15 10:05:00",
+            "/about",
+            Some("Chrome"),
+            None,
+            None,
+            None,
+        );
+        db.insert_dimensional(
+            "v2",
+            "2024-01-15 11:00:00",
+            "/",
+            Some("Firefox"),
+            None,
+            None,
+            None,
+        );
+
+        let all = query_core_metrics(&db.conn, &scope("2024-01-01", "2024-02-01")).unwrap();
+        assert_eq!(all.total_sessions, Some(2));
+        assert_eq!(all.bounce_rate, Some(0.5));
+
+        let chrome = query_core_metrics(
+            &db.conn,
+            &crate::query::test_support::filtered_scope(
+                "2024-01-01",
+                "2024-02-01",
+                "browsers==Chrome",
+            ),
         )
         .unwrap();
-
-        let count = query_total_pageviews(&conn, "test.com", "2024-01-01", "2024-02-01").unwrap();
-        assert_eq!(count, 1);
+        assert!(
+            chrome.behavioral_available,
+            "the filtered session pass failed and was silently reported as unavailable"
+        );
+        assert_eq!(chrome.total_sessions, Some(1));
+        assert_eq!(
+            chrome.bounce_rate,
+            Some(0.0),
+            "the one Chrome session has two pageviews"
+        );
+        assert_eq!(chrome.views_per_visit, Some(2.0));
+        assert_eq!(chrome.total_pageviews, 2);
     }
 
     #[test]
-    fn test_core_metrics_empty() {
-        let conn = setup_test_db();
-        let metrics = query_core_metrics(&conn, "test.com", "2024-01-01", "2024-02-01").unwrap();
-        assert_eq!(metrics.unique_visitors, 0);
-        assert_eq!(metrics.total_pageviews, 0);
-        assert!(metrics.pages_per_visit.abs() < f64::EPSILON);
+    fn test_filtered_session_metrics_endpoint_query() {
+        let db = TestDb::new();
+        if !db.require_behavioral("filtered session metrics") {
+            return;
+        }
+        db.insert_dimensional(
+            "v1",
+            "2024-01-15 10:00:00",
+            "/",
+            Some("Chrome"),
+            None,
+            None,
+            None,
+        );
+        db.insert_dimensional(
+            "v2",
+            "2024-01-15 11:00:00",
+            "/",
+            Some("Firefox"),
+            None,
+            None,
+            None,
+        );
+
+        let m = query_session_metrics(
+            &db.conn,
+            &crate::query::test_support::filtered_scope(
+                "2024-01-01",
+                "2024-02-01",
+                "browsers==Firefox",
+            ),
+        )
+        .unwrap();
+        assert_eq!(m.total_sessions, 1);
     }
 
     #[test]
-    fn test_core_metrics_with_data() {
-        let conn = setup_test_db();
-        insert_pageview(&conn, "v1", "2024-01-15 10:00:00", "/");
-        insert_pageview(&conn, "v1", "2024-01-15 10:05:00", "/about");
-        insert_pageview(&conn, "v2", "2024-01-15 11:00:00", "/");
+    fn test_session_window_splits_sessions() {
+        let db = TestDb::new();
+        if !db.require_behavioral("session window") {
+            return;
+        }
+        // Two pageviews 45 minutes apart: one session at a 60-minute window,
+        // two at the 30-minute default.
+        insert_pageview(&db.conn, "v1", "2024-01-15 10:00:00", "/");
+        insert_pageview(&db.conn, "v1", "2024-01-15 10:45:00", "/about");
 
-        let metrics = query_core_metrics(&conn, "test.com", "2024-01-01", "2024-02-01").unwrap();
-        assert_eq!(metrics.unique_visitors, 2);
-        assert_eq!(metrics.total_pageviews, 3);
-        assert!((metrics.pages_per_visit - 1.5).abs() < f64::EPSILON);
+        let narrow = QueryScope::new("test.com", "2024-01-01", "2024-02-01", "30 minutes");
+        let wide = QueryScope::new("test.com", "2024-01-01", "2024-02-01", "60 minutes");
+
+        assert_eq!(
+            query_session_metrics(&db.conn, &narrow)
+                .unwrap()
+                .total_sessions,
+            2
+        );
+        assert_eq!(
+            query_session_metrics(&db.conn, &wide)
+                .unwrap()
+                .total_sessions,
+            1
+        );
+    }
+
+    #[test]
+    fn test_unsafe_session_window_falls_back_to_the_default() {
+        let scope = QueryScope::new(
+            "a.com",
+            "2024-01-01",
+            "2024-02-01",
+            "30 minutes; DROP TABLE events",
+        );
+        let sql = session_aggregate_sql(&scope);
+        assert!(sql.contains("INTERVAL '30 minutes'"));
+        assert!(!sql.contains("DROP TABLE"));
+    }
+
+    #[test]
+    fn test_session_sql_binds_scope_parameters() {
+        let sql = session_aggregate_sql(&scope("2024-01-01", "2024-02-01"));
+        assert_eq!(sql.matches('?').count(), 3);
+        assert!(
+            !sql.contains("test.com"),
+            "site_id must be bound, not inlined"
+        );
     }
 }

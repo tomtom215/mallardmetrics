@@ -1,93 +1,110 @@
-use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Per-IP login attempt tracker for brute-force protection.
+/// Per-IP login-attempt tracker for brute-force protection.
 ///
-/// Tracks failed login attempts and locks out IPs that exceed the configured
-/// maximum. A capacity of 0 disables tracking (all requests are allowed).
+/// The map is keyed by client IP, so it is bounded: without a cap an attacker
+/// rotating source addresses grows it without limit. The previous `cleanup`
+/// retained every entry with `fail_count > 0` — which is every entry it ever
+/// created — so it freed nothing at all.
 #[derive(Clone)]
 pub struct LoginAttemptTracker {
     attempts: Arc<Mutex<HashMap<String, LoginAttemptEntry>>>,
     max_attempts: u32,
     lockout_secs: u64,
+    max_entries: usize,
 }
 
 struct LoginAttemptEntry {
     fail_count: u32,
     lockout_until: Option<Instant>,
+    last_seen: Instant,
 }
 
+/// How long a non-locked-out failure record is kept.
+const ATTEMPT_RETENTION: Duration = Duration::from_secs(3600);
+
 impl LoginAttemptTracker {
-    /// Create a new tracker. `max_attempts = 0` disables brute-force protection.
+    /// Create a tracker. `max_attempts == 0` disables brute-force protection.
     pub fn new(max_attempts: u32, lockout_secs: u64) -> Self {
+        Self::with_capacity(max_attempts, lockout_secs, 10_000)
+    }
+
+    pub fn with_capacity(max_attempts: u32, lockout_secs: u64, max_entries: usize) -> Self {
         Self {
             attempts: Arc::new(Mutex::new(HashMap::new())),
             max_attempts,
             lockout_secs,
+            max_entries,
         }
     }
 
-    /// Check whether the IP is currently locked out.
-    /// Returns `true` if the request should be allowed, `false` if locked out.
+    /// Whether the IP may attempt a login. `false` means it is locked out.
     pub fn check(&self, ip: &str) -> bool {
         if self.max_attempts == 0 {
             return true;
         }
-        // Inner block ensures the mutex guard is dropped before we return.
-        let is_locked_out = {
-            let mut map = self.attempts.lock();
-            if let Some(entry) = map.get_mut(ip) {
-                if let Some(until) = entry.lockout_until {
-                    if Instant::now() < until {
-                        true
-                    } else {
-                        // Lockout expired — reset
-                        entry.fail_count = 0;
-                        entry.lockout_until = None;
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
+        let mut map = self.attempts.lock();
+        let Some(entry) = map.get_mut(ip) else {
+            return true;
         };
-        !is_locked_out
+        let Some(until) = entry.lockout_until else {
+            return true;
+        };
+        if Instant::now() < until {
+            return false;
+        }
+        // The lockout has expired — reset so the IP gets a fresh allowance.
+        entry.fail_count = 0;
+        entry.lockout_until = None;
+        entry.last_seen = Instant::now();
+        true
     }
 
-    /// Record a failed login attempt for the IP.
-    /// Returns the current failure count after recording.
+    /// Record a failed login. Returns the failure count after recording.
     pub fn record_failure(&self, ip: &str) -> u32 {
         if self.max_attempts == 0 {
             return 0;
         }
-        // Inner block ensures the mutex guard is dropped before the tracing call.
+        let now = Instant::now();
         let fail_count = {
             let mut map = self.attempts.lock();
+            if !map.contains_key(ip) && map.len() >= self.max_entries {
+                // Reclaim expired records before giving up on tracking this IP.
+                Self::evict_stale(&mut map, now);
+                if map.len() >= self.max_entries {
+                    // Still full: every slot is an active lockout. Refusing to
+                    // track is safe — check() already denies those addresses.
+                    tracing::warn!(
+                        max_entries = self.max_entries,
+                        "Login attempt tracker is at capacity; not tracking a new IP"
+                    );
+                    return self.max_attempts;
+                }
+            }
             let entry = map.entry(ip.to_string()).or_insert(LoginAttemptEntry {
                 fail_count: 0,
                 lockout_until: None,
+                last_seen: now,
             });
             entry.fail_count += 1;
+            entry.last_seen = now;
             if entry.fail_count >= self.max_attempts {
-                entry.lockout_until = Some(Instant::now() + Duration::from_secs(self.lockout_secs));
+                entry.lockout_until = Some(now + Duration::from_secs(self.lockout_secs));
             }
-            let fc = entry.fail_count;
-            // Drop the guard before tracing to release the mutex.
-            drop(map);
-            fc
+            entry.fail_count
         };
+
         if fail_count >= self.max_attempts {
             tracing::warn!(
                 ip_prefix = %anonymize_ip(ip),
@@ -99,7 +116,7 @@ impl LoginAttemptTracker {
         fail_count
     }
 
-    /// Clear failure history for an IP (called on successful login).
+    /// Clear an IP's failure history after a successful login.
     pub fn record_success(&self, ip: &str) {
         if self.max_attempts == 0 {
             return;
@@ -107,7 +124,7 @@ impl LoginAttemptTracker {
         self.attempts.lock().remove(ip);
     }
 
-    /// Returns the remaining lockout duration in seconds for the IP, or `None` if not locked out.
+    /// Remaining lockout in seconds, or `None` when not locked out.
     pub fn remaining_lockout_secs(&self, ip: &str) -> Option<u64> {
         if self.max_attempts == 0 {
             return None;
@@ -116,37 +133,52 @@ impl LoginAttemptTracker {
         map.get(ip).and_then(|entry| {
             entry.lockout_until.and_then(|until| {
                 let now = Instant::now();
-                if until > now {
-                    Some(until.saturating_duration_since(now).as_secs().max(1))
-                } else {
-                    None
-                }
+                (until > now).then(|| until.saturating_duration_since(now).as_secs().max(1))
             })
         })
     }
 
-    /// Remove stale entries to prevent memory growth.
-    pub fn cleanup(&self) {
-        let now = Instant::now();
-        self.attempts.lock().retain(|_, entry| {
-            entry.lockout_until.is_some_and(|until| until > now) || entry.fail_count > 0
+    /// Drop entries that are neither locked out nor recently active.
+    fn evict_stale(map: &mut HashMap<String, LoginAttemptEntry>, now: Instant) {
+        map.retain(|_, entry| {
+            entry.lockout_until.is_some_and(|until| until > now)
+                || now.duration_since(entry.last_seen) < ATTEMPT_RETENTION
         });
+    }
+
+    /// Periodic housekeeping.
+    pub fn cleanup(&self) {
+        Self::evict_stale(&mut self.attempts.lock(), Instant::now());
+    }
+
+    /// Number of tracked IPs (for metrics and tests).
+    pub fn tracked_ips(&self) -> usize {
+        self.attempts.lock().len()
     }
 }
 
-/// Anonymize an IP address for logging (replaces the last octet/segment).
-fn anonymize_ip(ip: &str) -> String {
-    if ip.contains(':') {
-        // IPv6 — keep only first 4 groups
-        let groups: Vec<&str> = ip.split(':').collect();
-        format!("{}:...", groups.first().copied().unwrap_or("?"))
-    } else {
-        // IPv4 — replace last octet with 'x'
-        let octets: Vec<&str> = ip.split('.').collect();
-        match octets.as_slice() {
-            [a, b, c, _] => format!("{a}.{b}.{c}.x"),
-            _ => "?.?.?.x".to_string(),
+/// Redact an IP address for logging.
+///
+/// IPv4 keeps the /24 prefix, IPv6 the /48 routing prefix — the conventional
+/// truncations, and enough to tell one attacking network from another while
+/// dropping the bits that identify a subscriber or host.
+///
+/// The address is parsed rather than split on punctuation. Textual splitting
+/// cannot handle IPv6's `::` compression: `2001:db8::1` has four
+/// colon-separated fields, so taking "the first four" reproduced the entire
+/// address and redacted nothing. Parsing also means an unparseable value logs a
+/// fixed placeholder instead of attacker-controlled text.
+pub fn anonymize_ip(ip: &str) -> String {
+    match ip.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => {
+            let [a, b, c, _] = v4.octets();
+            format!("{a}.{b}.{c}.x")
         }
+        Ok(IpAddr::V6(v6)) => {
+            let [a, b, c, ..] = v6.segments();
+            format!("{a:x}:{b:x}:{c:x}::x")
+        }
+        Err(_) => "(unparseable)".to_string(),
     }
 }
 
@@ -181,18 +213,46 @@ pub fn validate_origin(origin: Option<&str>, allowed_sites: &[String]) -> bool {
     })
 }
 
-/// Hash a password using Argon2id (OWASP recommended).
+/// Hash a password using Argon2id with the crate's OWASP-aligned defaults.
+///
+/// Costs roughly 50-100 ms of CPU by design, so callers on an async task must
+/// run this inside `spawn_blocking` — see [`hash_password_async`].
+///
+/// # Errors
+///
+/// Returns an error if the hashing parameters are rejected or the RNG fails.
 pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
-    use rand::RngExt;
-    let salt_bytes: [u8; 16] = rand::rng().random();
-    let salt = SaltString::encode_b64(&salt_bytes)?;
-    let argon2 = Argon2::default();
-    let hash = argon2.hash_password(password.as_bytes(), &salt)?;
+    // argon2 0.6 generates the salt internally from the OS RNG; the caller no
+    // longer supplies one.
+    let hash: PasswordHash = Argon2::default().hash_password(password.as_bytes())?;
     Ok(hash.to_string())
 }
 
-/// Verify a password against an Argon2id hash.
-/// Uses timing-safe comparison (provided by argon2 crate).
+/// Hash a password on the blocking thread pool.
+///
+/// Argon2 is deliberately CPU-expensive. Running it directly on an async worker
+/// pins that worker for the duration, so a handful of concurrent login attempts
+/// could stall every other request on the server.
+///
+/// # Errors
+///
+/// Returns an error if hashing fails or the blocking task panics.
+pub async fn hash_password_async(password: String) -> Result<String, argon2::password_hash::Error> {
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .unwrap_or(Err(argon2::password_hash::Error::Crypto))
+}
+
+/// Verify a password on the blocking thread pool. See [`hash_password_async`].
+pub async fn verify_password_async(password: String, hash: String) -> bool {
+    tokio::task::spawn_blocking(move || verify_password(&password, &hash))
+        .await
+        .unwrap_or(false)
+}
+
+/// Verify a password against an Argon2id PHC string.
+///
+/// The comparison is constant-time, courtesy of the argon2 crate.
 pub fn verify_password(password: &str, hash: &str) -> bool {
     let Ok(parsed_hash) = PasswordHash::new(hash) else {
         return false;
@@ -258,11 +318,16 @@ pub struct StoredApiKey {
 }
 
 /// Thread-safe session store for dashboard authentication.
+///
+/// Bounded: every successful login mints a token, and nothing but the periodic
+/// sweep removed them, so a long-lived instance accumulated one entry per login
+/// for the whole session TTL.
 #[derive(Clone)]
 pub struct SessionStore {
     /// Maps session token → (username, expiry).
     sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     ttl: Duration,
+    max_sessions: usize,
 }
 
 struct SessionEntry {
@@ -272,36 +337,60 @@ struct SessionEntry {
 
 impl SessionStore {
     pub fn new(ttl_secs: u64) -> Self {
+        Self::with_capacity(ttl_secs, 10_000)
+    }
+
+    pub fn with_capacity(ttl_secs: u64, max_sessions: usize) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             ttl: Duration::from_secs(ttl_secs),
+            max_sessions,
         }
     }
 
-    /// Returns the TTL in seconds.
+    /// Session lifetime in seconds.
     pub const fn ttl_secs(&self) -> u64 {
         self.ttl.as_secs()
     }
 
-    /// Create a new session for a user. Returns the session token.
+    /// Create a session and return its token.
     pub fn create_session(&self, username: &str) -> String {
         let token = generate_session_token();
-        let entry = SessionEntry {
-            username: username.to_string(),
-            expires_at: Instant::now() + self.ttl,
-        };
-        self.sessions.lock().insert(token.clone(), entry);
+        let now = Instant::now();
+        let mut sessions = self.sessions.lock();
+
+        if self.max_sessions > 0 && sessions.len() >= self.max_sessions {
+            sessions.retain(|_, entry| entry.expires_at > now);
+            while sessions.len() >= self.max_sessions {
+                // Evict whichever live session expires soonest.
+                let Some(victim) = sessions
+                    .iter()
+                    .min_by_key(|(_, e)| e.expires_at)
+                    .map(|(k, _)| k.clone())
+                else {
+                    break;
+                };
+                sessions.remove(&victim);
+            }
+        }
+
+        sessions.insert(
+            token.clone(),
+            SessionEntry {
+                username: username.to_string(),
+                expires_at: now + self.ttl,
+            },
+        );
         token
     }
 
-    /// Validate a session token. Returns the username if valid and not expired.
+    /// Validate a token, returning the username if it is live.
     pub fn validate_session(&self, token: &str) -> Option<String> {
         let mut sessions = self.sessions.lock();
         if let Some(entry) = sessions.get(token) {
             if entry.expires_at > Instant::now() {
                 return Some(entry.username.clone());
             }
-            // Expired — remove it
             sessions.remove(token);
         }
         None
@@ -312,13 +401,71 @@ impl SessionStore {
         self.sessions.lock().remove(token);
     }
 
-    /// Remove all expired sessions (housekeeping).
+    /// Remove expired sessions.
     pub fn cleanup_expired(&self) {
         let now = Instant::now();
         self.sessions
             .lock()
             .retain(|_, entry| entry.expires_at > now);
     }
+
+    /// Number of live sessions (for metrics and tests).
+    pub fn len(&self) -> usize {
+        self.sessions.lock().len()
+    }
+
+    /// True when no sessions are held.
+    pub fn is_empty(&self) -> bool {
+        self.sessions.lock().is_empty()
+    }
+}
+
+/// Write `contents` to `path` atomically, readable only by the owner.
+///
+/// Used for both `api_keys.json` and the visitor-ID secret. Both were
+/// previously written with `std::fs::write`, which truncates first (so a crash
+/// mid-write loses the file) and inherits the process umask (so on a typical
+/// system they landed world-readable).
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be written, its permissions cannot be
+/// set, or the rename into place fails.
+pub fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    std::fs::create_dir_all(dir)?;
+
+    // Same directory as the target, so the rename below stays within one
+    // filesystem and is therefore atomic.
+    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let result = (|| -> std::io::Result<()> {
+        let mut file = options.open(&tmp_path)?;
+        file.write_all(contents)?;
+        // Flush to the device before the rename, so a crash cannot leave a
+        // correctly-named but empty file.
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    std::fs::rename(&tmp_path, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp_path);
+    })
 }
 
 /// Thread-safe API key store with optional disk persistence.
@@ -377,24 +524,33 @@ impl ApiKeyStore {
         }
     }
 
-    /// Persist current keys to disk.  Logs a warning on failure; never panics.
+    /// Persist the current key set to disk.
+    ///
+    /// Written to a temporary file in the same directory and renamed into
+    /// place, so an interrupted write cannot leave a truncated `api_keys.json`
+    /// that would silently revoke every key on the next restart. The file is
+    /// created with owner-only permissions: it holds the SHA-256 of each key,
+    /// which is exactly what an attacker needs to mount an offline search.
+    ///
+    /// Never panics; failures are logged.
     fn persist(&self) {
-        if let Some(path) = &self.persist_path {
-            let snapshot = self.keys.lock().clone();
-            match serde_json::to_string_pretty(&snapshot) {
-                Ok(json) => {
-                    if let Err(e) = std::fs::write(path.as_ref(), json) {
-                        tracing::warn!(
-                            path = %path.display(),
-                            error = %e,
-                            "Failed to persist API keys to disk"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to serialize API keys for persistence");
-                }
+        let Some(path) = &self.persist_path else {
+            return;
+        };
+        let snapshot = self.keys.lock().clone();
+        let json = match serde_json::to_string_pretty(&snapshot) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to serialize API keys for persistence");
+                return;
             }
+        };
+        if let Err(e) = write_private_file(path.as_ref(), json.as_bytes()) {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to persist API keys to disk"
+            );
         }
     }
 
@@ -480,32 +636,93 @@ struct LoginResponse {
 
 use crate::ingest::handler::AppState;
 
+/// Minimum admin password length.
+///
+/// Raised from 8. Eight characters is below every current recommendation
+/// (NIST SP 800-63B asks for at least 8 for user-chosen secrets but expects
+/// throttling and breach screening; OWASP suggests 12 for administrative
+/// accounts), and this password guards every visitor record on the instance.
+pub const MIN_PASSWORD_LEN: usize = 12;
+
+/// Passwords automated scanners try first.
+///
+/// Not a substitute for breach screening, but it costs nothing and blocks the
+/// handful of values that would otherwise be found within seconds.
+const OBVIOUS_PASSWORDS: &[&str] = &[
+    "password",
+    "password123",
+    "administrator",
+    "changeme",
+    "letmein",
+    "analytics",
+    "mallardmetrics",
+    "123456789012",
+];
+
+/// Reject a password that is too short or obviously guessable.
+fn validate_password(password: &str) -> Result<(), String> {
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(format!(
+            "Password must be at least {MIN_PASSWORD_LEN} characters"
+        ));
+    }
+    let lowered = password.to_ascii_lowercase();
+    if OBVIOUS_PASSWORDS.contains(&lowered.as_str()) {
+        return Err("Password is too common; choose something unpredictable".to_string());
+    }
+    Ok(())
+}
+
+/// Build the login/setup success response, including the session cookie.
+fn session_response(state: &AppState, token: String) -> Response {
+    let secure = state.secure_cookies
+        || state
+            .dashboard_origin
+            .as_deref()
+            .is_some_and(|o| o.starts_with("https://"));
+    let cookie = build_session_cookie(&token, state.sessions.ttl_secs(), secure);
+    (
+        StatusCode::OK,
+        [(axum::http::header::SET_COOKIE, cookie)],
+        Json(serde_json::json!(LoginResponse { token })),
+    )
+        .into_response()
+}
+
 /// POST /api/auth/setup — Set the initial admin password.
 ///
-/// Only works when no admin password has been configured yet.
-/// After setup, all stats/dashboard routes require authentication.
+/// Only works while no admin password is configured. Rate-limited by the same
+/// per-IP tracker as login, so the window between first boot and first setup
+/// cannot be brute-forced open by an automated scanner.
 pub async fn auth_setup(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<PasswordRequest>,
 ) -> impl IntoResponse {
-    if body.password.len() < 8 {
+    let ip = extract_client_ip_from(&state, &headers);
+
+    if !state.login_attempt_tracker.check(&ip) {
+        return too_many_attempts(&state, &ip);
+    }
+
+    if let Err(message) = validate_password(&body.password) {
+        // A rejected attempt still counts: setup is unauthenticated, so without
+        // this an attacker could probe it without limit.
+        state.login_attempt_tracker.record_failure(&ip);
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Password must be at least 8 characters"})),
+            Json(serde_json::json!({ "error": message })),
         )
             .into_response();
     }
 
-    let mut hash_guard = state.admin_password_hash.lock();
-    if hash_guard.is_some() {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "Admin password already configured"})),
-        )
-            .into_response();
+    // Check-then-hash, re-checking after: hashing takes ~50-100 ms and must not
+    // hold the lock, but two concurrent setup requests must not both succeed.
+    if state.admin_password_hash.lock().is_some() {
+        return already_configured();
     }
 
-    let hash = match hash_password(&body.password) {
+    let hash = match hash_password_async(body.password).await {
         Ok(h) => h,
         Err(e) => {
             tracing::error!(error = %e, "Failed to hash password during setup");
@@ -517,71 +734,80 @@ pub async fn auth_setup(
         }
     };
 
-    *hash_guard = Some(hash);
-    drop(hash_guard);
+    {
+        let mut guard = state.admin_password_hash.lock();
+        if guard.is_some() {
+            return already_configured();
+        }
+        *guard = Some(hash);
+    }
 
-    tracing::info!("Admin password configured via setup endpoint");
+    state.login_attempt_tracker.record_success(&ip);
+    tracing::info!("Admin password configured via the setup endpoint");
 
-    // Create a session for the newly set-up admin
-    let token = state.sessions.create_session("admin");
-    let secure = state.secure_cookies
-        || state
-            .dashboard_origin
-            .as_deref()
-            .is_some_and(|o| o.starts_with("https://"));
-    let cookie = build_session_cookie(&token, state.sessions.ttl_secs(), secure);
+    session_response(&state, state.sessions.create_session("admin"))
+}
 
+fn already_configured() -> Response {
     (
-        StatusCode::OK,
-        [(axum::http::header::SET_COOKIE, cookie)],
-        Json(serde_json::json!(LoginResponse { token })),
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({"error": "Admin password already configured"})),
     )
         .into_response()
 }
 
+/// 429 response carrying the remaining lockout as `Retry-After`.
+fn too_many_attempts(state: &AppState, ip: &str) -> Response {
+    let remaining = state
+        .login_attempt_tracker
+        .remaining_lockout_secs(ip)
+        .unwrap_or(1);
+    tracing::warn!(
+        ip_prefix = %anonymize_ip(ip),
+        remaining_secs = remaining,
+        "Request from a locked-out IP"
+    );
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({"error": "Too many failed attempts. Try again later."})),
+    )
+        .into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(&remaining.to_string()) {
+        response.headers_mut().insert("retry-after", value);
+    }
+    response
+}
+
 /// POST /api/auth/login — Authenticate with the admin password.
 ///
-/// Returns a session cookie on success. Applies per-IP brute-force protection.
+/// Returns a session cookie on success. Per-IP brute-force protection applies.
 pub async fn auth_login(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(body): Json<PasswordRequest>,
 ) -> impl IntoResponse {
-    let ip = extract_client_ip(&headers);
+    let ip = extract_client_ip_from(&state, &headers);
 
-    // Brute-force check
     if !state.login_attempt_tracker.check(&ip) {
-        let remaining = state
-            .login_attempt_tracker
-            .remaining_lockout_secs(&ip)
-            .unwrap_or(1);
-        tracing::warn!(
-            ip_prefix = %anonymize_ip(&ip),
-            remaining_secs = remaining,
-            "Login attempt from locked-out IP"
-        );
-        let mut response = (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(serde_json::json!({"error": "Too many failed login attempts. Try again later."})),
-        )
-            .into_response();
-        if let Ok(retry_val) = axum::http::HeaderValue::from_str(&remaining.to_string()) {
-            response.headers_mut().insert("retry-after", retry_val);
-        }
-        return response;
+        return too_many_attempts(&state, &ip);
     }
 
-    let hash_guard = state.admin_password_hash.lock();
-    let Some(ref stored_hash) = *hash_guard else {
+    // Clone the stored hash and release the lock immediately. Verification is
+    // ~50-100 ms of Argon2 work; holding the mutex across it serialised every
+    // login attempt and blocked every other reader of the hash, and running it
+    // inline pinned an async worker thread for the duration.
+    let stored_hash = state.admin_password_hash.lock().clone();
+    let Some(stored_hash) = stored_hash else {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "No admin password configured. Use /api/auth/setup first."})),
+            Json(serde_json::json!({
+                "error": "No admin password configured. Use /api/auth/setup first."
+            })),
         )
             .into_response();
     };
 
-    if !verify_password(&body.password, stored_hash) {
-        drop(hash_guard);
+    if !verify_password_async(body.password, stored_hash).await {
         let fail_count = state.login_attempt_tracker.record_failure(&ip);
         state
             .login_failures_total
@@ -597,26 +823,11 @@ pub async fn auth_login(
         )
             .into_response();
     }
-    drop(hash_guard);
 
     state.login_attempt_tracker.record_success(&ip);
-
-    let token = state.sessions.create_session("admin");
     tracing::info!(ip_prefix = %anonymize_ip(&ip), "Admin login successful");
 
-    let secure = state.secure_cookies
-        || state
-            .dashboard_origin
-            .as_deref()
-            .is_some_and(|o| o.starts_with("https://"));
-    let cookie = build_session_cookie(&token, state.sessions.ttl_secs(), secure);
-
-    (
-        StatusCode::OK,
-        [(axum::http::header::SET_COOKIE, cookie)],
-        Json(serde_json::json!(LoginResponse { token })),
-    )
-        .into_response()
+    session_response(&state, state.sessions.create_session("admin"))
 }
 
 /// POST /api/auth/logout — Invalidate the current session.
@@ -629,8 +840,18 @@ pub async fn auth_logout(
         tracing::info!("Admin session logged out");
     }
 
-    // Clear the cookie
-    let cookie = "mm_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".to_string();
+    // The clearing cookie must match the attributes of the one it replaces
+    // (notably Secure), or the browser treats it as a different cookie and the
+    // original survives.
+    let secure = state.secure_cookies
+        || state
+            .dashboard_origin
+            .as_deref()
+            .is_some_and(|o| o.starts_with("https://"));
+    let mut cookie = "mm_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0".to_string();
+    if secure {
+        cookie.push_str("; Secure");
+    }
     (
         StatusCode::OK,
         [(axum::http::header::SET_COOKIE, cookie)],
@@ -647,7 +868,9 @@ pub async fn auth_status(
 ) -> impl IntoResponse {
     let setup_required = state.admin_password_hash.lock().is_none();
     let authenticated = if setup_required {
-        true // No password = open access
+        // Reads are open before setup; admin routes are not (see
+        // `require_admin_auth`), so this reports read access.
+        true
     } else {
         is_authenticated(&state, &headers)
     };
@@ -773,31 +996,28 @@ enum AuthInfo {
 
 /// Determine authentication status and scope from a request.
 fn get_auth_info(state: &AppState, headers: &HeaderMap) -> AuthInfo {
-    // Check session cookie first
-    if let Some(token) = extract_session_token(headers) {
-        if state.sessions.validate_session(&token).is_some() {
-            return AuthInfo::Session;
-        }
+    // Session cookie first.
+    if let Some(token) = extract_session_token(headers)
+        && state.sessions.validate_session(&token).is_some()
+    {
+        return AuthInfo::Session;
     }
 
-    // Check Authorization: Bearer <key>
-    if let Some(auth) = headers.get("authorization") {
-        if let Ok(auth_str) = auth.to_str() {
-            if let Some(key) = auth_str.strip_prefix("Bearer ") {
-                if let Some(scope) = state.api_keys.validate_key(key) {
-                    return AuthInfo::ApiKey(scope);
-                }
-            }
-        }
+    // Authorization: Bearer <key>
+    if let Some(auth) = headers.get("authorization")
+        && let Ok(auth_str) = auth.to_str()
+        && let Some(key) = auth_str.strip_prefix("Bearer ")
+        && let Some(scope) = state.api_keys.validate_key(key)
+    {
+        return AuthInfo::ApiKey(scope);
     }
 
-    // Check X-API-Key: <key> (conventional enterprise header)
-    if let Some(api_key_header) = headers.get("x-api-key") {
-        if let Ok(key) = api_key_header.to_str() {
-            if let Some(scope) = state.api_keys.validate_key(key) {
-                return AuthInfo::ApiKey(scope);
-            }
-        }
+    // X-API-Key: <key> — the conventional enterprise header.
+    if let Some(api_key_header) = headers.get("x-api-key")
+        && let Ok(key) = api_key_header.to_str()
+        && let Some(scope) = state.api_keys.validate_key(key)
+    {
+        return AuthInfo::ApiKey(scope);
     }
 
     AuthInfo::None
@@ -853,10 +1073,14 @@ fn validate_csrf_origin(headers: &HeaderMap, dashboard_origin: Option<&String>) 
     true
 }
 
-/// Middleware that requires authentication for protected routes.
+/// Middleware that requires authentication for analytics read routes.
 ///
-/// Authentication is bypassed when no admin password is configured (open access mode).
-/// Accepts a session cookie (`mm_session`), `Authorization: Bearer mm_...`, or `X-API-Key: mm_...`.
+/// Accepts a session cookie (`mm_session`), `Authorization: Bearer mm_...`, or
+/// `X-API-Key: mm_...`.
+///
+/// Before setup, reads are open — a deliberate deployment mode for a public
+/// dashboard. That exemption is scoped to reads: [`require_admin_auth`] refuses
+/// key management and erasure until an admin exists.
 pub async fn require_auth(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -875,11 +1099,21 @@ pub async fn require_auth(
     Err(StatusCode::UNAUTHORIZED)
 }
 
-/// Middleware that requires **admin-level** authentication for key management routes.
+/// Middleware that requires **admin-level** authentication for key management
+/// and data-destroying routes.
 ///
 /// - Read-only API keys are rejected with 403 Forbidden.
 /// - Session-authenticated requests are CSRF-checked against `dashboard_origin`.
-/// - Open-access mode (no password configured) bypasses all checks.
+/// - Before setup there is no admin, so these routes are refused outright.
+///
+/// Open-access mode used to bypass this check as well as [`require_auth`], which
+/// left `POST /api/keys` and `DELETE /api/gdpr/erase` reachable by anyone who
+/// could connect to an instance whose password had not been set yet. Minting a
+/// key was the worse half: an admin key issued in that window keeps working
+/// after the operator finishes setup, turning a few unconfigured minutes into
+/// permanent access. Read access still follows the open-access rule — that is a
+/// deliberate deployment mode — but there is nothing to authorise here until an
+/// admin exists.
 pub async fn require_admin_auth(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -887,7 +1121,12 @@ pub async fn require_admin_auth(
     next: Next,
 ) -> Result<Response, StatusCode> {
     if state.admin_password_hash.lock().is_none() {
-        return Ok(next.run(request).await);
+        tracing::warn!(
+            ip_prefix = %anonymize_ip(&extract_client_ip_from(&state, &headers)),
+            "Admin endpoint refused: no admin password is configured yet. \
+             Complete POST /api/auth/setup first."
+        );
+        return Err(StatusCode::UNAUTHORIZED);
     }
 
     match get_auth_info(&state, &headers) {
@@ -918,9 +1157,9 @@ fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
     get_auth_info(state, headers) != AuthInfo::None
 }
 
-/// Re-export of the shared IP extraction helper.
-fn extract_client_ip(headers: &HeaderMap) -> String {
-    crate::ingest::handler::extract_ip(headers)
+/// Client IP for a request, honouring the deployment's proxy configuration.
+fn extract_client_ip_from(state: &AppState, headers: &HeaderMap) -> String {
+    crate::ingest::handler::client_ip(state, headers, None)
 }
 
 /// Extract session token from cookie header.
@@ -928,10 +1167,10 @@ fn extract_session_token(headers: &HeaderMap) -> Option<String> {
     let cookie = headers.get("cookie")?.to_str().ok()?;
     for part in cookie.split(';') {
         let part = part.trim();
-        if let Some(token) = part.strip_prefix("mm_session=") {
-            if !token.is_empty() {
-                return Some(token.to_string());
-            }
+        if let Some(token) = part.strip_prefix("mm_session=")
+            && !token.is_empty()
+        {
+            return Some(token.to_string());
         }
     }
     None
@@ -1425,23 +1664,23 @@ mod tests {
 
     // X-API-Key / X-Forwarded-For helper tests
     #[test]
-    fn test_extract_client_ip_x_forwarded_for() {
+    fn test_client_ip_helper_respects_the_proxy_setting() {
+        // Detailed coverage lives in ingest::handler; this checks the auth-side
+        // wrapper reaches the same decision.
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-for", "203.0.113.1, 10.0.0.1".parse().unwrap());
-        assert_eq!(extract_client_ip(&headers), "203.0.113.1");
-    }
+        headers.insert("x-forwarded-for", "203.0.113.1".parse().unwrap());
 
-    #[test]
-    fn test_extract_client_ip_x_real_ip() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-real-ip", "203.0.113.2".parse().unwrap());
-        assert_eq!(extract_client_ip(&headers), "203.0.113.2");
-    }
+        let untrusting = crate::test_support::state_builder().build_state();
+        assert_eq!(
+            extract_client_ip_from(&untrusting, &headers),
+            "unknown",
+            "a spoofable header must be ignored when no proxy is configured"
+        );
 
-    #[test]
-    fn test_extract_client_ip_unknown() {
-        let headers = HeaderMap::new();
-        assert_eq!(extract_client_ip(&headers), "unknown");
+        let trusting = crate::test_support::state_builder()
+            .trust_proxy_headers(true)
+            .build_state();
+        assert_eq!(extract_client_ip_from(&trusting, &headers), "203.0.113.1");
     }
 
     #[test]
@@ -1452,8 +1691,28 @@ mod tests {
 
     #[test]
     fn test_anonymize_ip_v6() {
-        let result = anonymize_ip("2001:db8::1");
-        assert!(result.contains("..."));
+        // Regression: the old textual split reproduced compressed addresses
+        // verbatim, so nothing was actually redacted.
+        assert_eq!(anonymize_ip("2001:db8::1"), "2001:db8:0::x");
+        assert_eq!(
+            anonymize_ip("2001:0db8:85a3:0000:0000:8a2e:0370:7334"),
+            "2001:db8:85a3::x"
+        );
+        for full in ["2001:db8::1", "2001:0db8:85a3:0000:0000:8a2e:0370:7334"] {
+            let redacted = anonymize_ip(full);
+            assert!(
+                !redacted.contains("8a2e") && !redacted.ends_with(":1"),
+                "host bits survived redaction: {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_anonymize_ip_rejects_unparseable_input() {
+        // Never echo an arbitrary header value into the log line.
+        assert_eq!(anonymize_ip("unknown"), "(unparseable)");
+        assert_eq!(anonymize_ip("1.2.3"), "(unparseable)");
+        assert_eq!(anonymize_ip("\n INJECTED"), "(unparseable)");
     }
 
     #[test]
