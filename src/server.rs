@@ -1,96 +1,86 @@
 use crate::api::auth;
 use crate::api::stats;
 use crate::dashboard;
-use crate::ingest::handler::{ingest_event, AppState};
-use axum::extract::DefaultBodyLimit;
-use axum::extract::State;
-use axum::http::{header, HeaderValue, Method, Request, StatusCode};
+use crate::ingest::handler::{AppState, ingest_event};
+use axum::Router;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{HeaderValue, Method, Request, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
-use axum::Router;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::Instrument;
 
-/// Build the Axum router with all routes.
+/// Maximum accepted request body, in bytes. A valid event is about 12 KB.
+const MAX_BODY_BYTES: usize = 65_536;
+/// Per-request timeout.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Build the Axum router.
 pub fn build_router(state: Arc<AppState>) -> Router {
-    // Permissive CORS for ingestion (tracking script runs on any origin)
+    // Ingestion accepts any origin: the tracker runs on the customer's site.
     let ingestion_cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::POST])
+        .allow_methods([Method::POST, Method::GET])
         .allow_headers([header::CONTENT_TYPE]);
 
-    // Restrictive CORS for dashboard/stats/admin routes
     let dashboard_cors = build_dashboard_cors(state.dashboard_origin.as_deref());
 
-    // Auth routes — always accessible (needed to log in)
+    // Reachable without credentials — they are how you obtain them.
     let auth_routes = Router::new()
         .route("/auth/setup", post(auth::auth_setup))
         .route("/auth/login", post(auth::auth_login))
         .route("/auth/logout", post(auth::auth_logout))
         .route("/auth/status", get(auth::auth_status));
 
-    // API key management and GDPR data management routes — require admin scope + CSRF protection
-    let key_routes = Router::new()
+    // Admin scope plus CSRF protection.
+    let admin_routes = Router::new()
         .route("/keys", post(auth::create_api_key))
         .route("/keys", get(auth::list_api_keys))
         .route("/keys/{key_hash}", delete(auth::revoke_api_key_handler))
-        // GDPR right-to-erasure endpoint: permanently deletes analytics data for a
-        // site + date range from both DuckDB and on-disk Parquet partitions.
         .route("/gdpr/erase", delete(stats::gdpr_erase))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_admin_auth,
         ));
 
-    // Stats routes
     let stats_routes = Router::new()
+        .route("/sites", get(stats::list_sites))
         .route("/stats/main", get(stats::get_main_stats))
         .route("/stats/timeseries", get(stats::get_timeseries))
-        .route("/stats/breakdown/pages", get(stats::get_pages_breakdown))
-        .route(
-            "/stats/breakdown/sources",
-            get(stats::get_sources_breakdown),
-        )
-        .route(
-            "/stats/breakdown/browsers",
-            get(stats::get_browsers_breakdown),
-        )
-        .route("/stats/breakdown/os", get(stats::get_os_breakdown))
-        .route(
-            "/stats/breakdown/devices",
-            get(stats::get_devices_breakdown),
-        )
-        .route(
-            "/stats/breakdown/countries",
-            get(stats::get_countries_breakdown),
-        )
-        .route("/stats/export", get(stats::get_export))
         .route("/stats/sessions", get(stats::get_sessions))
+        .route("/stats/realtime", get(stats::get_realtime))
+        .route("/stats/revenue", get(stats::get_revenue))
+        .route("/stats/goals", get(stats::get_goals))
+        .route("/stats/properties", get(stats::get_property_keys))
+        .route("/stats/property-values", get(stats::get_property_values))
+        // One parameterised route replaces six near-identical handlers and
+        // exposes every dimension the ingest path collects.
+        .route("/stats/breakdown/{dimension}", get(stats::get_breakdown))
+        .route("/stats/export", get(stats::get_export))
         .route("/stats/funnel", get(stats::get_funnel))
         .route("/stats/retention", get(stats::get_retention))
         .route("/stats/sequences", get(stats::get_sequences))
         .route("/stats/flow", get(stats::get_flow));
 
-    // Protected routes — stats + key management, guarded by auth middleware
     let protected_routes = stats_routes
-        .merge(key_routes)
+        .merge(admin_routes)
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_auth,
         ))
         .layer(dashboard_cors);
 
-    // Ingestion with permissive CORS and 64 KB body limit (max valid event ~12 KB).
-    // GET /api/event is included for pixel / <img> tracker compatibility.
+    // GET is the pixel / `<img>` tracker, for contexts without JavaScript.
     let ingestion_routes = Router::new()
         .route("/event", post(ingest_event))
         .route("/event", get(pixel_track))
-        .layer(DefaultBodyLimit::max(65_536))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(ingestion_cors);
 
     let api_routes = Router::new()
@@ -105,6 +95,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/metrics", get(prometheus_metrics))
         .route("/robots.txt", get(robots_txt))
         .route("/.well-known/security.txt", get(security_txt))
+        // The tracker is served from its single source under `tracking/`.
+        // `/js/script.js` is an alias for people migrating from Plausible.
+        .route("/mallard.js", get(dashboard::serve_tracking_script))
+        .route("/js/script.js", get(dashboard::serve_tracking_script))
         .nest("/api", api_routes)
         .route("/", get(dashboard::serve_index))
         .route("/{*path}", get(dashboard::serve_asset))
@@ -112,20 +106,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::map_response(add_security_headers))
         .layer(CompressionLayer::new())
         .layer(TimeoutLayer::with_status_code(
-            axum::http::StatusCode::REQUEST_TIMEOUT,
-            std::time::Duration::from_secs(30),
+            StatusCode::REQUEST_TIMEOUT,
+            REQUEST_TIMEOUT,
         ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
-/// Inject OWASP-recommended security headers and Cache-Control on every HTTP response.
+/// Add OWASP-recommended security headers and cache directives to every response.
 async fn add_security_headers(mut response: Response) -> Response {
-    // Snapshot status BEFORE taking a mutable reference to headers so both
-    // borrows do not coexist (the borrow checker forbids mixed &/&mut on the
-    // same value through different fields when they alias through the struct).
     let status = response.status();
     let headers = response.headers_mut();
+
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -137,19 +129,14 @@ async fn add_security_headers(mut response: Response) -> Response {
     );
     headers.insert(
         "permissions-policy",
-        HeaderValue::from_static("geolocation=(), microphone=(), camera=()"),
+        HeaderValue::from_static("geolocation=(), microphone=(), camera=(), interest-cohort=()"),
     );
-    // HSTS: instruct browsers to enforce HTTPS for 1 year.
-    // Safe to include on HTTP deployments — browsers only process this header
-    // when received over HTTPS, so it is a no-op on plain HTTP.
-    // `preload` opts in to browser HSTS preload lists (hstspreload.org):
-    // requires max-age ≥ 31536000, includeSubDomains, and preload all present.
+    // Browsers only honour HSTS over HTTPS, so this is inert on plain HTTP.
     headers.insert(
         "strict-transport-security",
         HeaderValue::from_static("max-age=31536000; includeSubDomains; preload"),
     );
-    // Add Retry-After: 1 to any 429 response that does not already carry the
-    // header (the login endpoint sets its own value based on the lockout period).
+
     if status == StatusCode::TOO_MANY_REQUESTS && !headers.contains_key("retry-after") {
         headers.insert("retry-after", HeaderValue::from_static("1"));
     }
@@ -160,51 +147,51 @@ async fn add_security_headers(mut response: Response) -> Response {
         .unwrap_or("")
         .to_string();
 
-    let is_html = content_type.contains("text/html");
-    let is_json = content_type.contains("application/json");
-
-    if is_html {
+    if content_type.contains("text/html") {
         headers.insert(
             "content-security-policy",
-            HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self'"),
+            HeaderValue::from_static(
+                "default-src 'self'; script-src 'self'; style-src 'self'; \
+                 img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; \
+                 base-uri 'none'; form-action 'self'",
+            ),
         );
     }
 
-    // Prevent CDN/browser caches from serving stale or cross-user analytics data.
-    if is_json {
+    // Analytics responses are per-site and often per-session; a shared cache
+    // must never hold them.
+    if content_type.contains("application/json") || content_type.contains("text/csv") {
         headers.insert(
             header::CACHE_CONTROL,
-            HeaderValue::from_static("no-store, no-cache"),
+            HeaderValue::from_static("no-store, no-cache, private"),
         );
     }
 
     response
 }
 
-/// Middleware that assigns an X-Request-ID to every request and records it in
-/// the tracing span so that all log lines emitted during request processing
-/// carry the same `request_id` field.
+/// Assign an `X-Request-ID` and put it on the tracing span for the request.
 ///
-/// If the upstream proxy already set an `X-Request-ID` header, the existing
-/// value is used (enabling end-to-end correlation through the proxy tier).
+/// An upstream proxy's existing value is reused so traces correlate end to end.
 async fn request_id_middleware(request: Request<axum::body::Body>, next: Next) -> Response {
     let id = request
         .headers()
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
+        // A proxy-supplied value is echoed back verbatim, so it is length-capped
+        // and restricted to characters that are safe in a header.
+        .filter(|v| !v.is_empty() && v.len() <= 128 && v.chars().all(|c| c.is_ascii_graphic()))
         .map_or_else(|| uuid::Uuid::new_v4().to_string(), String::from);
 
-    // Run the handler inside a span that carries request_id so all log events
-    // emitted during processing are correlated to this request.
     let span = tracing::info_span!("http_request", request_id = %id);
     let mut response = next.run(request).instrument(span).await;
-    if let Ok(val) = HeaderValue::from_str(&id) {
-        response.headers_mut().insert("x-request-id", val);
+    if let Ok(value) = HeaderValue::from_str(&id) {
+        response.headers_mut().insert("x-request-id", value);
     }
     response
 }
 
-/// GET /robots.txt — Prevent search engines from indexing the dashboard or API.
+/// GET /robots.txt — keep the dashboard and API out of search indexes.
 async fn robots_txt() -> impl axum::response::IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -212,11 +199,7 @@ async fn robots_txt() -> impl axum::response::IntoResponse {
     )
 }
 
-/// GET /.well-known/security.txt — RFC 9116 security vulnerability reporting policy.
-///
-/// Points to the GitHub private security advisory form, consistent with
-/// the process documented in SECURITY.md. Do NOT open a public issue for
-/// security vulnerabilities.
+/// GET /.well-known/security.txt — RFC 9116 vulnerability reporting policy.
 async fn security_txt() -> impl axum::response::IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
@@ -230,78 +213,81 @@ async fn security_txt() -> impl axum::response::IntoResponse {
     )
 }
 
-/// 1×1 transparent GIF (43 bytes) used by the pixel tracking endpoint.
-///
-/// Defined at module level to avoid the `items_after_statements` clippy lint
-/// that fires when a `const` is declared after an `await` expression inside a
-/// function body.
+/// A 1×1 transparent GIF (43 bytes) for the pixel endpoint.
 const TRANSPARENT_GIF_1X1: &[u8] = &[
     0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00, 0xff, 0xff, 0xff,
     0x00, 0x00, 0x00, 0x21, 0xf9, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00,
     0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
 ];
 
-/// GET /api/event — Pixel / `<img>` tracker compatibility endpoint.
+/// GET /api/event — the pixel / `<img>` tracker.
 ///
-/// Accepts the same core parameters as `POST /api/event` but via query string,
-/// returning a 1×1 transparent GIF so that it can be embedded as an `<img>`
-/// tag in HTML emails and other contexts where JavaScript is unavailable.
-///
-/// Revenue and custom-property fields are deliberately excluded because they
-/// cannot be validated or sanitised reliably in a plain query string.
+/// Takes the same core parameters as the POST endpoint via the query string and
+/// always answers with a transparent GIF, so it can be embedded in HTML email
+/// and anywhere else JavaScript is unavailable.
 async fn pixel_track(
     State(state): State<Arc<AppState>>,
+    crate::ingest::handler::PeerAddr(peer): crate::ingest::handler::PeerAddr,
     headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<crate::ingest::handler::PixelParams>,
 ) -> impl axum::response::IntoResponse {
-    // Reuse the shared event processing helper; ignore the result (fire-and-forget).
-    crate::ingest::handler::process_pixel_event(&state, &headers, params).await;
+    crate::ingest::handler::process_pixel_event(&state, &headers, peer, params).await;
 
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "image/gif")],
+        [
+            (header::CONTENT_TYPE, "image/gif"),
+            // A cached pixel is a lost pageview.
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+        ],
         TRANSPARENT_GIF_1X1,
     )
 }
 
-/// Build CORS layer for dashboard routes based on configured origin.
+/// Build the CORS layer for dashboard and stats routes.
+///
+/// `dashboard_origin` is validated at startup, so an unparsable value can no
+/// longer reach this function — it used to fall back to `*`, which tower-http
+/// rejects alongside `Allow-Credentials: true`, turning a config typo into a
+/// panic on the first cross-origin request.
 fn build_dashboard_cors(dashboard_origin: Option<&str>) -> CorsLayer {
-    dashboard_origin.map_or_else(
-        || {
-            // No dashboard origin configured — allow all origins.
-            // Set `dashboard_origin` in config to restrict cross-origin access.
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any)
-        },
-        |origin| {
-            let allowed_origin = origin
-                .parse::<axum::http::HeaderValue>()
-                .unwrap_or_else(|_| axum::http::HeaderValue::from_static("*"));
-            CorsLayer::new()
-                .allow_origin(allowed_origin)
-                .allow_methods([Method::GET, Method::POST, Method::DELETE])
-                .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::COOKIE])
-                .allow_credentials(true)
-        },
-    )
+    dashboard_origin
+        .and_then(|o| o.parse::<HeaderValue>().ok())
+        .map_or_else(
+            // No origin configured: allow any, but without credentials, so a
+            // third-party page still cannot read a logged-in dashboard's data.
+            || {
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods([Method::GET, Method::POST, Method::DELETE])
+                    .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+            },
+            |origin| {
+                CorsLayer::new()
+                    .allow_origin(origin)
+                    .allow_methods([Method::GET, Method::POST, Method::DELETE])
+                    .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION, header::COOKIE])
+                    .allow_credentials(true)
+            },
+        )
 }
 
-/// GET /health — Simple liveness probe. Always returns "ok" if the process is alive.
+/// GET /health — liveness. Answers as long as the process is running.
 async fn health_check() -> &'static str {
     "ok"
 }
 
-/// GET /health/ready — Readiness probe.
+/// GET /health/ready — readiness.
 ///
-/// Returns 200 when the DuckDB connection is alive and the events_all view is
-/// queryable.  Returns 503 if the database is not reachable, so Kubernetes can
-/// hold traffic until the instance is ready.
+/// 200 once DuckDB is reachable and `events_all` is queryable, 503 otherwise,
+/// so an orchestrator holds traffic until the instance can actually serve.
 async fn readiness_check(State(state): State<Arc<AppState>>) -> Response {
+    let readers = state.readers.clone();
     let ok = tokio::task::spawn_blocking(move || {
-        let conn = state.buffer.conn().lock();
-        conn.execute_batch("SELECT 1 FROM events_all LIMIT 0")
+        let conn = readers.acquire();
+        let guard = conn.lock();
+        guard
+            .execute_batch("SELECT 1 FROM events_all LIMIT 0")
             .is_ok()
     })
     .await
@@ -317,137 +303,174 @@ async fn readiness_check(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-/// GET /health/detailed — Detailed health check with system info.
+/// GET /health/detailed — component status and configuration summary.
 async fn detailed_health_check(
     State(state): State<Arc<AppState>>,
 ) -> axum::Json<serde_json::Value> {
-    let buffered_events = state.buffer.len();
-    let buffer_empty = state.buffer.is_empty();
-    let auth_configured = state.admin_password_hash.lock().is_some();
-    let geoip_loaded = state.geoip.is_loaded();
-
     axum::Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
-        "buffered_events": buffered_events,
-        "buffer_empty": buffer_empty,
-        "auth_configured": auth_configured,
-        "geoip_loaded": geoip_loaded,
+        "buffered_events": state.buffer.len(),
+        "buffer_empty": state.buffer.is_empty(),
+        "dropped_events": state.buffer.dropped_events.load(Ordering::Relaxed),
+        "auth_configured": state.admin_password_hash.lock().is_some(),
+        "active_sessions": state.sessions.len(),
+        "geoip_loaded": state.geoip.is_loaded(),
         "behavioral_extension_loaded": state.behavioral_extension_loaded,
+        "behavioral_version": state.behavioral_version,
+        "read_connections": state.readers.len(),
         "filter_bots": state.filter_bots,
+        "trust_proxy_headers": state.trust_proxy_headers,
+        "session_window": state.session_window,
+        "visitor_salt_rotation_days": state.visitor_salt_rotation_days,
         "cache_entries": state.query_cache.len(),
         "cache_empty": state.query_cache.is_empty(),
     }))
 }
 
-/// GET /metrics — Prometheus-compatible metrics endpoint.
-///
-/// If MALLARD_METRICS_TOKEN is set at startup, requires Authorization: Bearer <token>.
-fn build_metrics_body(state: &AppState) -> String {
+/// Emit one metric family: name, help text, type, and value.
+fn metric(out: &mut String, name: &str, help: &str, kind: &str, value: u64) {
     use std::fmt::Write;
-    use std::sync::atomic::Ordering;
+    let _ = writeln!(out, "# HELP {name} {help}");
+    let _ = writeln!(out, "# TYPE {name} {kind}");
+    let _ = writeln!(out, "{name} {value}");
+}
 
-    let buffered = state.buffer.len();
-    let cache_entries = state.query_cache.len();
-    let auth_configured = u8::from(state.admin_password_hash.lock().is_some());
-    let geoip_loaded = u8::from(state.geoip.is_loaded());
-    let behavioral_ext = u8::from(state.behavioral_extension_loaded);
-    let filter_bots = u8::from(state.filter_bots);
-    let events_ingested = state.events_ingested_total.load(Ordering::Relaxed);
-    let flush_failures = state.flush_failures_total.load(Ordering::Relaxed);
-    let rate_limit_rejections = state.rate_limit_rejections_total.load(Ordering::Relaxed);
-    let login_failures = state.login_failures_total.load(Ordering::Relaxed);
-    let cache_hits = state.query_cache.hits.load(Ordering::Relaxed);
-    let cache_misses = state.query_cache.misses.load(Ordering::Relaxed);
+/// Point-in-time values.
+fn write_gauges(out: &mut String, state: &AppState) {
+    metric(
+        out,
+        "mallard_buffered_events",
+        "Events in the in-memory buffer",
+        "gauge",
+        state.buffer.len() as u64,
+    );
+    metric(
+        out,
+        "mallard_cache_entries",
+        "Cached query results",
+        "gauge",
+        state.query_cache.len() as u64,
+    );
+    metric(
+        out,
+        "mallard_active_sessions",
+        "Live dashboard sessions",
+        "gauge",
+        state.sessions.len() as u64,
+    );
+    metric(
+        out,
+        "mallard_read_connections",
+        "DuckDB connections serving analytics queries",
+        "gauge",
+        state.readers.len() as u64,
+    );
+    metric(
+        out,
+        "mallard_auth_configured",
+        "Whether an admin password is set",
+        "gauge",
+        u64::from(state.admin_password_hash.lock().is_some()),
+    );
+    metric(
+        out,
+        "mallard_geoip_loaded",
+        "Whether a GeoIP database is loaded",
+        "gauge",
+        u64::from(state.geoip.is_loaded()),
+    );
+    metric(
+        out,
+        "mallard_behavioral_extension",
+        "Whether the DuckDB behavioral extension is loaded",
+        "gauge",
+        u64::from(state.behavioral_extension_loaded),
+    );
+    metric(
+        out,
+        "mallard_filter_bots",
+        "Whether bot filtering is enabled",
+        "gauge",
+        u64::from(state.filter_bots),
+    );
+}
 
-    let mut out = String::with_capacity(2048);
-    let _ = writeln!(
+/// Monotonic totals since process start.
+fn write_counters(out: &mut String, state: &AppState) {
+    metric(
         out,
-        "# HELP mallard_buffered_events Number of events in the in-memory buffer"
+        "mallard_events_ingested_total",
+        "Events buffered since startup",
+        "counter",
+        state.events_ingested_total.load(Ordering::Relaxed),
     );
-    let _ = writeln!(out, "# TYPE mallard_buffered_events gauge");
-    let _ = writeln!(out, "mallard_buffered_events {buffered}");
-    let _ = writeln!(
+    metric(
         out,
-        "# HELP mallard_cache_entries Number of cached query results"
+        "mallard_events_dropped_total",
+        "Events discarded because the buffer was at capacity",
+        "counter",
+        state.buffer.dropped_events.load(Ordering::Relaxed),
     );
-    let _ = writeln!(out, "# TYPE mallard_cache_entries gauge");
-    let _ = writeln!(out, "mallard_cache_entries {cache_entries}");
-    let _ = writeln!(
+    metric(
         out,
-        "# HELP mallard_auth_configured Whether admin password is set"
+        "mallard_flush_failures_total",
+        "Parquet flush failures since startup",
+        "counter",
+        state.flush_failures_total.load(Ordering::Relaxed),
     );
-    let _ = writeln!(out, "# TYPE mallard_auth_configured gauge");
-    let _ = writeln!(out, "mallard_auth_configured {auth_configured}");
-    let _ = writeln!(
+    metric(
         out,
-        "# HELP mallard_geoip_loaded Whether GeoIP database is loaded"
+        "mallard_rate_limit_rejections_total",
+        "Ingest requests rejected by a rate limiter",
+        "counter",
+        state.rate_limit_rejections_total.load(Ordering::Relaxed),
     );
-    let _ = writeln!(out, "# TYPE mallard_geoip_loaded gauge");
-    let _ = writeln!(out, "mallard_geoip_loaded {geoip_loaded}");
-    let _ = writeln!(
+    metric(
         out,
-        "# HELP mallard_behavioral_extension Whether the DuckDB behavioral extension is loaded"
+        "mallard_login_failures_total",
+        "Failed login attempts since startup",
+        "counter",
+        state.login_failures_total.load(Ordering::Relaxed),
     );
-    let _ = writeln!(out, "# TYPE mallard_behavioral_extension gauge");
-    let _ = writeln!(out, "mallard_behavioral_extension {behavioral_ext}");
-    let _ = writeln!(
+    metric(
         out,
-        "# HELP mallard_filter_bots Whether bot filtering is enabled"
+        "mallard_cache_hits_total",
+        "Query cache hits since startup",
+        "counter",
+        state.query_cache.hits.load(Ordering::Relaxed),
     );
-    let _ = writeln!(out, "# TYPE mallard_filter_bots gauge");
-    let _ = writeln!(out, "mallard_filter_bots {filter_bots}");
-    let _ = writeln!(
+    metric(
         out,
-        "# HELP mallard_events_ingested_total Total events successfully buffered since startup"
+        "mallard_cache_misses_total",
+        "Query cache misses since startup",
+        "counter",
+        state.query_cache.misses.load(Ordering::Relaxed),
     );
-    let _ = writeln!(out, "# TYPE mallard_events_ingested_total counter");
-    let _ = writeln!(out, "mallard_events_ingested_total {events_ingested}");
-    let _ = writeln!(
+    metric(
         out,
-        "# HELP mallard_flush_failures_total Total Parquet flush failures since startup"
+        "mallard_cache_evictions_total",
+        "Cache entries evicted to stay within the entry cap",
+        "counter",
+        state.query_cache.evictions.load(Ordering::Relaxed),
     );
-    let _ = writeln!(out, "# TYPE mallard_flush_failures_total counter");
-    let _ = writeln!(out, "mallard_flush_failures_total {flush_failures}");
-    let _ = writeln!(
-        out,
-        "# HELP mallard_rate_limit_rejections_total Total ingest requests rejected by rate limiter"
-    );
-    let _ = writeln!(out, "# TYPE mallard_rate_limit_rejections_total counter");
-    let _ = writeln!(
-        out,
-        "mallard_rate_limit_rejections_total {rate_limit_rejections}"
-    );
-    let _ = writeln!(
-        out,
-        "# HELP mallard_login_failures_total Total failed login attempts since startup"
-    );
-    let _ = writeln!(out, "# TYPE mallard_login_failures_total counter");
-    let _ = writeln!(out, "mallard_login_failures_total {login_failures}");
-    let _ = writeln!(
-        out,
-        "# HELP mallard_cache_hits_total Total query cache hits since startup"
-    );
-    let _ = writeln!(out, "# TYPE mallard_cache_hits_total counter");
-    let _ = writeln!(out, "mallard_cache_hits_total {cache_hits}");
-    let _ = writeln!(
-        out,
-        "# HELP mallard_cache_misses_total Total query cache misses since startup"
-    );
-    let _ = writeln!(out, "# TYPE mallard_cache_misses_total counter");
-    let _ = writeln!(out, "mallard_cache_misses_total {cache_misses}");
+}
 
+/// Render the Prometheus exposition body.
+fn build_metrics_body(state: &AppState) -> String {
+    let mut out = String::with_capacity(4096);
+    write_gauges(&mut out, state);
+    write_counters(&mut out, state);
     out
 }
 
-/// GET /metrics — Prometheus-compatible metrics endpoint.
+/// GET /metrics — Prometheus exposition.
 ///
-/// If MALLARD_METRICS_TOKEN is set at startup, requires Authorization: Bearer <token>.
+/// Requires `Authorization: Bearer <token>` when `MALLARD_METRICS_TOKEN` is set.
 async fn prometheus_metrics(
     State(state): State<Arc<AppState>>,
     request: Request<axum::body::Body>,
 ) -> Response {
-    // Optional bearer-token guard for the metrics endpoint.
     if let Some(expected) = &state.metrics_token {
         let authorized = request
             .headers()
@@ -474,366 +497,461 @@ async fn prometheus_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::auth::{ApiKeyStore, SessionStore};
-    use crate::ingest::buffer::EventBuffer;
-    use crate::storage::parquet::ParquetStorage;
+    use crate::test_support::state_builder;
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use duckdb::Connection;
     use http_body_util::BodyExt;
-    use parking_lot::Mutex;
     use tower::ServiceExt;
 
-    fn make_test_state() -> (Arc<AppState>, tempfile::TempDir) {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::storage::schema::init_schema(&conn).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        crate::storage::schema::setup_query_view(&conn, dir.path()).unwrap();
-        let storage = ParquetStorage::new(dir.path());
-        let conn = Arc::new(Mutex::new(conn));
-        let buffer = EventBuffer::new(1000, conn, storage);
-        let events_dir = dir.path().to_path_buf();
-        let state = Arc::new(AppState {
-            buffer,
-            secret: "test-secret".to_string(),
-            allowed_sites: Vec::new(),
-            geoip: crate::ingest::geoip::GeoIpReader::open(None),
-            filter_bots: false,
-            sessions: SessionStore::new(3600),
-            api_keys: ApiKeyStore::default(),
-            admin_password_hash: Mutex::new(None),
-            dashboard_origin: None,
-            query_cache: crate::query::cache::QueryCache::new(0, 0),
-            rate_limiter: crate::ingest::ratelimit::RateLimiter::new(0),
-            login_attempt_tracker: crate::api::auth::LoginAttemptTracker::new(0, 300),
-            events_ingested_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            flush_failures_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            rate_limit_rejections_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            login_failures_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            metrics_token: None,
-            query_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
-            secure_cookies: false,
-            behavioral_extension_loaded: false,
-            strip_referrer_query: false,
-            round_timestamps: false,
-            suppress_visitor_id: false,
-            suppress_browser_version: false,
-            suppress_os_version: false,
-            suppress_screen_size: false,
-            geoip_precision: "city".to_string(),
-            events_dir,
-        });
-        (state, dir)
+    async fn body_text(response: Response) -> String {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
     }
+
+    fn get(uri: &str) -> Request<Body> {
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
+    }
+
+    // ── Health and observability ─────────────────────────────────────────
 
     #[tokio::test]
     async fn test_health_check() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state).oneshot(get("/health")).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&body[..], b"ok");
-    }
-
-    #[tokio::test]
-    async fn test_prometheus_metrics() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert!(content_type.contains("text/plain"));
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let text = std::str::from_utf8(&body).unwrap();
-        assert!(text.contains("mallard_buffered_events 0"));
-        assert!(text.contains("mallard_cache_entries 0"));
-        assert!(text.contains("mallard_auth_configured 0"));
-        assert!(text.contains("mallard_geoip_loaded 0"));
-        assert!(text.contains("mallard_filter_bots 0"));
-    }
-
-    #[tokio::test]
-    async fn test_metrics_token_auth() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::storage::schema::init_schema(&conn).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        crate::storage::schema::setup_query_view(&conn, dir.path()).unwrap();
-        let storage = ParquetStorage::new(dir.path());
-        let conn = Arc::new(Mutex::new(conn));
-        let buffer = EventBuffer::new(1000, conn, storage);
-        let state = Arc::new(AppState {
-            buffer,
-            secret: "test-secret".to_string(),
-            allowed_sites: Vec::new(),
-            geoip: crate::ingest::geoip::GeoIpReader::open(None),
-            filter_bots: false,
-            sessions: SessionStore::new(3600),
-            api_keys: ApiKeyStore::default(),
-            admin_password_hash: Mutex::new(None),
-            dashboard_origin: None,
-            query_cache: crate::query::cache::QueryCache::new(0, 0),
-            rate_limiter: crate::ingest::ratelimit::RateLimiter::new(0),
-            login_attempt_tracker: crate::api::auth::LoginAttemptTracker::new(0, 300),
-            events_ingested_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            flush_failures_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            rate_limit_rejections_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            login_failures_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            metrics_token: Some("secret-token".to_string()),
-            query_semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
-            secure_cookies: false,
-            behavioral_extension_loaded: false,
-            strip_referrer_query: false,
-            round_timestamps: false,
-            suppress_visitor_id: false,
-            suppress_browser_version: false,
-            suppress_os_version: false,
-            suppress_screen_size: false,
-            geoip_precision: "city".to_string(),
-            events_dir: dir.path().to_path_buf(),
-        });
-        let _dir = dir;
-
-        // No token -> 401
-        let app = build_router(Arc::clone(&state));
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-        // Wrong token -> 401
-        let app = build_router(Arc::clone(&state));
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .header("authorization", "Bearer wrong-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-
-        // Correct token -> 200
-        let app = build_router(Arc::clone(&state));
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/metrics")
-                    .header("authorization", "Bearer secret-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_ingest_event() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
-
-        let payload = serde_json::json!({
-            "d": "example.com",
-            "n": "pageview",
-            "u": "https://example.com/",
-        });
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/event")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
-    }
-
-    #[tokio::test]
-    async fn test_ingest_event_invalid_payload() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/event")
-                    .header("content-type", "application/json")
-                    .body(Body::from("{}"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        // Missing required fields should return 422 (Unprocessable Entity from Axum's Json extractor)
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    }
-
-    #[tokio::test]
-    async fn test_ingest_event_empty_fields() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
-
-        let payload = serde_json::json!({
-            "d": "",
-            "n": "pageview",
-            "u": "https://example.com/",
-        });
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/event")
-                    .header("content-type", "application/json")
-                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_stats_main_empty() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/stats/main?site_id=test.com&period=30d")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_dashboard_index() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
-
-        let response = app
-            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_detailed_health_check() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health/detailed")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["status"], "ok");
-        assert!(json.get("version").is_some());
-        assert_eq!(json["buffered_events"], 0);
-        assert_eq!(json["buffer_empty"], true);
-        assert_eq!(json["auth_configured"], false);
-        assert_eq!(json["geoip_loaded"], false);
-        assert_eq!(json["filter_bots"], false);
+        assert_eq!(body_text(response).await, "ok");
     }
 
     #[tokio::test]
     async fn test_readiness_check() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health/ready")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state)
+            .oneshot(get("/health/ready"))
             .await
             .unwrap();
-
         assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn test_not_found() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
+    async fn test_detailed_health_reports_components() {
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state)
+            .oneshot(get("/health/detailed"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert!(json.get("version").is_some());
+        assert_eq!(json["buffered_events"], 0);
+        assert_eq!(json["auth_configured"], false);
+        assert_eq!(json["geoip_loaded"], false);
+        assert!(json.get("behavioral_version").is_some());
+        assert!(json.get("read_connections").is_some());
+        assert!(json.get("visitor_salt_rotation_days").is_some());
+    }
 
-        let response = app
+    #[tokio::test]
+    async fn test_prometheus_metrics() {
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state).oneshot(get("/metrics")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = body_text(response).await;
+        for expected in [
+            "mallard_buffered_events 0",
+            "mallard_cache_entries 0",
+            "mallard_auth_configured 0",
+            "mallard_geoip_loaded 0",
+            "mallard_events_dropped_total",
+            "mallard_cache_evictions_total",
+            "mallard_active_sessions",
+        ] {
+            assert!(text.contains(expected), "missing metric: {expected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_metrics_exposition_is_well_formed() {
+        let (state, _dir) = state_builder().build();
+        let text = build_metrics_body(&state);
+        for line in text.lines() {
+            if line.starts_with("# HELP") || line.starts_with("# TYPE") {
+                continue;
+            }
+            let parts: Vec<&str> = line.split(' ').collect();
+            assert_eq!(parts.len(), 2, "malformed sample line: {line}");
+            assert!(parts[1].parse::<u64>().is_ok(), "non-numeric value: {line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_metrics_token_auth() {
+        let (state, _dir) = state_builder()
+            .metrics_token(Some("secret-token".to_string()))
+            .build();
+
+        for (header_value, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("Bearer wrong-token"), StatusCode::UNAUTHORIZED),
+            (Some("Bearer secret-token"), StatusCode::OK),
+        ] {
+            let mut request = Request::builder().uri("/metrics");
+            if let Some(value) = header_value {
+                request = request.header("authorization", value);
+            }
+            let response = build_router(Arc::clone(&state))
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "for {header_value:?}");
+        }
+    }
+
+    // ── Ingestion ────────────────────────────────────────────────────────
+
+    async fn post_event(state: Arc<AppState>, payload: serde_json::Value) -> StatusCode {
+        build_router(state)
             .oneshot(
                 Request::builder()
-                    .uri("/nonexistent.file")
+                    .method("POST")
+                    .uri("/api/event")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn test_ingest_event() {
+        let (state, _dir) = state_builder().build();
+        let status = post_event(
+            state,
+            serde_json::json!({"d": "example.com", "n": "pageview", "u": "https://example.com/"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_ingest_rejects_missing_fields() {
+        let (state, _dir) = state_builder().build();
+        assert_eq!(
+            post_event(state, serde_json::json!({})).await,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ingest_rejects_empty_fields() {
+        let (state, _dir) = state_builder().build();
+        let status = post_event(
+            state,
+            serde_json::json!({"d": "", "n": "pageview", "u": "https://example.com/"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_pixel_track_returns_a_gif() {
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state)
+            .oneshot(get(
+                "/api/event?d=example.com&n=pageview&u=https%3A%2F%2Fexample.com%2F",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("image/gif")
+        );
+        assert!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .contains("no-store"),
+            "a cached pixel is a lost pageview"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body.len(), 43);
+        assert_eq!(&body[..6], b"GIF89a");
+    }
+
+    // ── Routing ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_stats_main_on_an_empty_database() {
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state)
+            .oneshot(get("/api/stats/main?site_id=test.com&period=30d"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_breakdown_route_accepts_every_dimension() {
+        let (state, _dir) = state_builder().build();
+        for slug in crate::query::breakdowns::Dimension::SLUGS {
+            let dim = crate::query::breakdowns::Dimension::from_slug(slug).unwrap();
+            let response = build_router(Arc::clone(&state))
+                .oneshot(get(&format!(
+                    "/api/stats/breakdown/{slug}?site_id=test.com&period=30d"
+                )))
+                .await
+                .unwrap();
+            let expected = if dim.requires_behavioral() && !state.behavioral_extension_loaded {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            };
+            assert_eq!(response.status(), expected, "dimension {slug}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unknown_breakdown_dimension_is_a_bad_request() {
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state)
+            .oneshot(get("/api/stats/breakdown/nonsense?site_id=test.com"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(response).await.contains("Available"));
+    }
+
+    #[tokio::test]
+    async fn test_sites_endpoint_lists_configured_sites() {
+        let (state, _dir) = state_builder()
+            .allowed_sites(vec!["a.com".to_string(), "b.com".to_string()])
+            .build();
+        let response = build_router(state)
+            .oneshot(get("/api/sites"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(json["sites"], serde_json::json!(["a.com", "b.com"]));
+    }
+
+    #[tokio::test]
+    async fn test_realtime_endpoint_responds() {
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state)
+            .oneshot(get("/api/stats/realtime?site_id=test.com"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(json["current_visitors"], 0);
+    }
+
+    #[tokio::test]
+    async fn test_revenue_and_goal_endpoints_respond() {
+        let (state, _dir) = state_builder().build();
+        for uri in [
+            "/api/stats/revenue?site_id=test.com",
+            "/api/stats/goals?site_id=test.com",
+            "/api/stats/properties?site_id=test.com",
+        ] {
+            let response = build_router(Arc::clone(&state))
+                .oneshot(get(uri))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_behavioral_endpoints_report_503_when_unavailable() {
+        // Reporting 200 with an empty body made a missing extension look like a
+        // site with no data.
+        let (state, _dir) = state_builder().build();
+        if state.behavioral_extension_loaded {
+            return;
+        }
+        for uri in [
+            "/api/stats/funnel?site_id=test.com&steps=page%3A%2F%2Cevent%3Asignup",
+            "/api/stats/retention?site_id=test.com&weeks=4",
+            "/api/stats/sequences?site_id=test.com&steps=page%3A%2F%2Cevent%3Asignup",
+            "/api/stats/flow?site_id=test.com&page=%2F",
+        ] {
+            let response = build_router(Arc::clone(&state))
+                .oneshot(get(uri))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_index() {
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state).oneshot(get("/")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_tracking_script_route() {
+        let (state, _dir) = state_builder().build();
+        for uri in ["/mallard.js", "/js/script.js"] {
+            let response = build_router(Arc::clone(&state))
+                .oneshot(get(uri))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_not_found() {
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state)
+            .oneshot(get("/nonexistent.file"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_robots_and_security_txt() {
+        let (state, _dir) = state_builder().build();
+        let robots = build_router(Arc::clone(&state))
+            .oneshot(get("/robots.txt"))
+            .await
+            .unwrap();
+        let robots_body = body_text(robots).await;
+        assert!(robots_body.contains("Disallow: /api/"));
+
+        let security = build_router(state)
+            .oneshot(get("/.well-known/security.txt"))
+            .await
+            .unwrap();
+        let security_body = body_text(security).await;
+        assert!(security_body.contains("Contact:"));
+        assert!(security_body.contains("Expires:"));
+    }
+
+    // ── Headers ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_security_headers_present() {
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state).oneshot(get("/health")).await.unwrap();
+        let headers = response.headers();
+        for name in [
+            "x-content-type-options",
+            "x-frame-options",
+            "referrer-policy",
+            "permissions-policy",
+            "strict-transport-security",
+            "x-request-id",
+        ] {
+            assert!(headers.contains_key(name), "missing header: {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hsts_is_preload_eligible() {
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state).oneshot(get("/health")).await.unwrap();
+        let hsts = response
+            .headers()
+            .get("strict-transport-security")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(hsts.contains("max-age=31536000"));
+        assert!(hsts.contains("includeSubDomains"));
+        assert!(hsts.contains("preload"));
+    }
+
+    #[tokio::test]
+    async fn test_json_responses_are_not_cached() {
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state)
+            .oneshot(get("/api/stats/main?site_id=test.com&period=30d"))
+            .await
+            .unwrap();
+        let cache_control = response
+            .headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(cache_control.contains("no-store"));
+        assert!(cache_control.contains("private"));
+    }
+
+    #[tokio::test]
+    async fn test_html_carries_a_content_security_policy() {
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state).oneshot(get("/")).await.unwrap();
+        let csp = response
+            .headers()
+            .get("content-security-policy")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(csp.contains("default-src 'self'"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+    }
+
+    #[tokio::test]
+    async fn test_request_id_is_echoed_when_supplied() {
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("x-request-id", "upstream-trace-id")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("upstream-trace-id")
+        );
     }
 
     #[tokio::test]
-    async fn test_cors_headers() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
+    async fn test_hostile_request_id_is_replaced() {
+        // The header is echoed back, so an over-long or non-printable value
+        // must not be reflected verbatim.
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header("x-request-id", "x".repeat(500))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(id.len(), 36, "expected a generated UUID, got {id:?}");
+    }
 
-        let response = app
+    #[tokio::test]
+    async fn test_cors_headers_on_ingestion() {
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state)
             .oneshot(
                 Request::builder()
                     .method("OPTIONS")
@@ -845,220 +963,112 @@ mod tests {
             )
             .await
             .unwrap();
-
-        assert!(response
-            .headers()
-            .contains_key("access-control-allow-origin"));
+        assert!(
+            response
+                .headers()
+                .contains_key("access-control-allow-origin")
+        );
     }
 
     #[tokio::test]
-    async fn test_security_headers_present() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
-
-        let response = app
+    async fn test_wildcard_cors_never_allows_credentials() {
+        // `Allow-Origin: *` with `Allow-Credentials: true` is rejected by
+        // browsers and panics inside tower-http.
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state)
             .oneshot(
                 Request::builder()
-                    .uri("/health")
+                    .method("OPTIONS")
+                    .uri("/api/stats/main")
+                    .header("origin", "https://elsewhere.example")
+                    .header("access-control-request-method", "GET")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-
         let headers = response.headers();
-        assert!(headers.contains_key("x-content-type-options"));
-        assert!(headers.contains_key("x-frame-options"));
-        assert!(headers.contains_key("referrer-policy"));
-        assert!(headers.contains_key("permissions-policy"));
-        assert!(headers.contains_key("strict-transport-security"));
-        assert!(headers.contains_key("x-request-id"));
+        if headers
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok())
+            == Some("*")
+        {
+            assert!(!headers.contains_key("access-control-allow-credentials"));
+        }
     }
 
     #[tokio::test]
-    async fn test_cache_control_on_json_api_response() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
-
-        let response = app
+    async fn test_configured_origin_allows_credentials() {
+        let (state, _dir) = state_builder()
+            .dashboard_origin(Some("https://analytics.example.com".to_string()))
+            .build();
+        let response = build_router(state)
             .oneshot(
                 Request::builder()
-                    .uri("/api/stats/main?site_id=test.com&period=30d")
+                    .method("OPTIONS")
+                    .uri("/api/stats/main")
+                    .header("origin", "https://analytics.example.com")
+                    .header("access-control-request-method", "GET")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-
-        let cache_control = response
-            .headers()
-            .get("cache-control")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(
-            cache_control.contains("no-store"),
-            "JSON API responses must have Cache-Control: no-store"
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-credentials")
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
         );
     }
 
     #[tokio::test]
-    async fn test_robots_txt() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/robots.txt")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let text = std::str::from_utf8(&body).unwrap();
-        assert!(text.contains("User-agent: *"));
-        assert!(text.contains("Disallow: /api/"));
-    }
-
-    #[tokio::test]
-    async fn test_security_txt() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/.well-known/security.txt")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let text = std::str::from_utf8(&body).unwrap();
-        assert!(text.contains("Contact:"));
-        assert!(text.contains("Expires:"));
-    }
-
-    #[tokio::test]
-    async fn test_pixel_track_returns_gif() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/event?d=example.com&n=pageview&u=https%3A%2F%2Fexample.com%2F")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert_eq!(content_type, "image/gif");
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(body.len(), 43, "1×1 transparent GIF is always 43 bytes");
-        assert_eq!(&body[..6], b"GIF89a");
-    }
-
-    #[tokio::test]
-    async fn test_hsts_header_present() {
-        let (state, _dir) = make_test_state();
-        let app = build_router(state);
-
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        let hsts = response
-            .headers()
-            .get("strict-transport-security")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert!(
-            hsts.contains("max-age=31536000"),
-            "HSTS must include max-age directive"
-        );
-        assert!(hsts.contains("includeSubDomains"));
-        assert!(
-            hsts.contains("preload"),
-            "HSTS must include preload for preload list eligibility"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_retry_after_present_on_query_semaphore_429() {
-        // Exhaust the semaphore with max_concurrent=0 (unlimited)
-        // Use a state with 0 permits to force 429 on the semaphore gate.
-        let conn = Connection::open_in_memory().unwrap();
-        crate::storage::schema::init_schema(&conn).unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        crate::storage::schema::setup_query_view(&conn, dir.path()).unwrap();
-        let storage = ParquetStorage::new(dir.path());
-        let conn = Arc::new(Mutex::new(conn));
-        let buffer = crate::ingest::buffer::EventBuffer::new(1000, conn, storage);
-        let state = Arc::new(AppState {
-            buffer,
-            secret: "test".to_string(),
-            allowed_sites: Vec::new(),
-            geoip: crate::ingest::geoip::GeoIpReader::open(None),
-            filter_bots: false,
-            sessions: crate::api::auth::SessionStore::new(3600),
-            api_keys: crate::api::auth::ApiKeyStore::default(),
-            admin_password_hash: Mutex::new(None),
-            dashboard_origin: None,
-            query_cache: crate::query::cache::QueryCache::new(0, 0),
-            rate_limiter: crate::ingest::ratelimit::RateLimiter::new(0),
-            login_attempt_tracker: crate::api::auth::LoginAttemptTracker::new(0, 300),
-            events_ingested_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            flush_failures_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            rate_limit_rejections_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            login_failures_total: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            metrics_token: None,
-            query_semaphore: Arc::new(tokio::sync::Semaphore::new(0)), // 0 permits → always 429
-            secure_cookies: false,
-            behavioral_extension_loaded: false,
-            strip_referrer_query: false,
-            round_timestamps: false,
-            suppress_visitor_id: false,
-            suppress_browser_version: false,
-            suppress_os_version: false,
-            suppress_screen_size: false,
-            geoip_precision: "city".to_string(),
-            events_dir: dir.path().to_path_buf(),
-        });
-        let _dir = dir;
-        let app = build_router(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/stats/funnel?site_id=test.com&steps=page%3A%2F%2Cpage%3A%2Fabout")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+    async fn test_retry_after_is_set_on_a_semaphore_rejection() {
+        let (state, _dir) = state_builder().query_permits(0).build();
+        let response = build_router(state)
+            .oneshot(get("/api/stats/main?site_id=test.com"))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert!(
-            response.headers().contains_key("retry-after"),
-            "429 responses must include Retry-After"
-        );
+        assert!(response.headers().contains_key("retry-after"));
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_cap_applies_to_every_analytics_endpoint() {
+        // The semaphore previously guarded only four of thirteen endpoints, so
+        // it could not bound concurrent database load.
+        let (state, _dir) = state_builder().query_permits(0).build();
+        for uri in [
+            "/api/stats/main?site_id=test.com",
+            "/api/stats/timeseries?site_id=test.com",
+            "/api/stats/breakdown/pages?site_id=test.com",
+            "/api/stats/revenue?site_id=test.com",
+            "/api/stats/goals?site_id=test.com",
+            "/api/stats/export?site_id=test.com",
+        ] {
+            let response = build_router(Arc::clone(&state))
+                .oneshot(get(uri))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_oversized_body_is_rejected() {
+        let (state, _dir) = state_builder().build();
+        let response = build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/event")
+                    .header("content-type", "application/json")
+                    .body(Body::from("x".repeat(MAX_BODY_BYTES + 1024)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

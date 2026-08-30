@@ -3,8 +3,8 @@
 > **Self-hosted, privacy-focused web analytics powered by DuckDB and the `behavioral` extension.**
 > Single binary. Single process. Zero external dependencies.
 
-[![Tests](https://img.shields.io/badge/tests-333_passing-brightgreen?style=flat-square)](#development)
-[![Rust](https://img.shields.io/badge/rust-1.94%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
+[![Tests](https://img.shields.io/badge/tests-551_passing-brightgreen?style=flat-square)](#development)
+[![Rust](https://img.shields.io/badge/rust-1.98%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
 [![Clippy](https://img.shields.io/badge/clippy-0_warnings-brightgreen?style=flat-square)](#development)
 [![Privacy](https://img.shields.io/badge/privacy-no_cookies-teal?style=flat-square)](#privacy-by-design)
@@ -35,10 +35,17 @@ A lightweight, privacy-respecting alternative to Plausible Analytics. Runs entir
 
 ### Privacy by Design
 
-- **No cookies** — Visitor identification uses a daily-rotating HMAC-SHA256 hash of IP + User-Agent + daily salt; no cookies are set and no browser storage is accessed
-- **No persistent IP storage** — IP addresses are processed ephemerally in RAM (for GeoIP lookup and visitor ID derivation) and never written to disk or logs
-- **Daily salt rotation** — Visitor IDs change every 24 hours; the same IP + User-Agent produces a different hash on different days, preventing cross-day tracking
-- **Pseudonymous, not anonymous** — Stored visitor IDs are HMAC-SHA256 hashes; pseudonymous data is still personal data under GDPR Recital 26. Geographic data (country, region, city) derived from IP is stored. See [PRIVACY.md](PRIVACY.md) for the full analysis and operator obligations.
+- **No cookies** — Visitor identification is an HMAC-SHA256 of site + IP + User-Agent under a rotating salt; no cookies are set and no browser storage is written
+- **No persistent IP storage** — IP addresses are used in RAM for the GeoIP lookup and the visitor-ID derivation, then discarded; no IP is ever written to the event store. The one exception is deliberate and not on the analytics path: authentication events log a *truncated* address (IPv4 `/24`, IPv6 `/48`) so an operator can investigate an attack on the dashboard
+- **Rotating salt** — Visitor IDs change when the salt rotates (every 24 hours by default), so the same IP and User-Agent hash differently on different days
+- **Per-site scoping** — The site ID is part of the hash input, so one person visiting two sites on the same instance is not correlatable across them
+- **Pseudonymous, not anonymous** — Stored visitor IDs are hashes, and pseudonymous data is still personal data under GDPR Recital 26. Geographic data derived from IP is stored. See [PRIVACY.md](PRIVACY.md) for the full analysis and operator obligations.
+
+> **Salt rotation has an analytical cost.** With the default daily rotation, a
+> visitor seen on two days carries two unrelated IDs. "Unique visitors" over a
+> multi-day range therefore counts visitor-days rather than people, and weekly
+> retention cohorts cannot work at all. Raise `visitor_salt_rotation_days` if you
+> need cross-day analysis, and read the trade-off in [PRIVACY.md](PRIVACY.md).
 
 ### Single Binary Deployment
 
@@ -49,14 +56,18 @@ A lightweight, privacy-respecting alternative to Plausible Analytics. Runs entir
 
 ### Analytical Power
 
-- **Core metrics** — Unique visitors, pageviews, bounce rate, average session duration
-- **Breakdowns** — Pages, referrer sources, browsers, operating systems, devices, countries
-- **Time-series** — Hourly and daily aggregations with chart visualization
-- **Funnel analysis** — Multi-step conversion funnels via `window_funnel()`
-- **Retention cohorts** — Weekly cohort retention grids via `retention()`
-- **Session analytics** — Session duration, pages per session via `sessionize()`
-- **Sequence matching** — Behavioral pattern detection via `sequence_match()`
-- **Flow analysis** — Next-page navigation patterns via `sequence_next_node()`
+- **Core metrics** — Unique visitors, pageviews, events, visits, bounce rate, visit duration
+- **Realtime** — Current visitors, top pages and sources, with a per-minute series
+- **Twenty breakdown dimensions** — Pages, entry and exit pages, referrers and sources, all five UTM parameters, countries, regions, cities, browsers and versions, operating systems and versions, device types, screen widths, and event names
+- **Goals and custom properties** — Conversion rates for every custom event, and drill-down into the properties attached to them
+- **Revenue** — Totals, order counts and average order value, reported per currency and never summed across them
+- **Time-series** — Hourly and daily aggregation, gap-filled so a quiet day reads as zero rather than vanishing
+- **Funnel analysis** — Cumulative multi-step funnels with drop-off, via `window_funnel()`, including its six ordering modes
+- **Retention cohorts** — Weekly cohorts with retained counts and rates, via `retention()`
+- **Session analytics** — Visits, duration and bounce rate, via `sessionize()`
+- **Sequence matching** — Ordered pattern detection via `sequence_match()` and `sequence_count()`
+- **Flow analysis** — Where visitors go next *and* where they came from, via `sequence_next_node()`
+- **Export** — Daily summaries or raw events, as CSV or JSON
 
 ### GDPR-Friendly Deployment
 
@@ -66,11 +77,11 @@ Mallard Metrics ships a first-class GDPR mode that reduces data collection to th
 |---|---|---|
 | Visitor ID | HMAC-SHA256 pseudonymous hash | HMAC-SHA256 (suppress with `suppress_visitor_id`) |
 | Referrer | Full URL with query string | Path only — query and fragment stripped |
-| Timestamps | Millisecond precision | Rounded to nearest hour |
+| Timestamps | Microsecond precision | Rounded down to the hour |
 | Browser info | Name + version | Name only |
 | OS info | Name + version | Name only |
 | Screen / device | Stored | Omitted |
-| GeoIP | City-level | Country-level only |
+| GeoIP | City-level | Country-level at most |
 
 Enable with a single environment variable (`MALLARD_GDPR_MODE=true`) or configure each flag independently. A `DELETE /api/gdpr/erase` endpoint supports GDPR Art. 17 right-to-erasure requests. See [PRIVACY.md](PRIVACY.md) for the full compliance analysis and operator obligations.
 
@@ -78,8 +89,8 @@ Enable with a single environment variable (`MALLARD_GDPR_MODE=true`) or configur
 
 - **Argon2id authentication** — Password-protected dashboard with cryptographic session tokens
 - **API key management** — Programmatic access with SHA-256 hashed keys (`mm_` prefix, disk-persisted)
-- **Rate limiting** — Per-site token-bucket rate limiter for ingestion
-- **Query caching** — TTL-based in-memory cache for analytics queries
+- **Rate limiting** — Per-site and per-client-IP token-bucket limiters, both bounded
+- **Query caching** — TTL cache with LRU eviction, applied to every read endpoint
 - **Bot filtering** — Automatic filtering of known bot User-Agents
 - **GeoIP resolution** — MaxMind GeoLite2 integration with graceful fallback
 - **Data retention** — Configurable automatic cleanup of old Parquet partitions
@@ -87,7 +98,11 @@ Enable with a single environment variable (`MALLARD_GDPR_MODE=true`) or configur
 - **Prometheus metrics** — `GET /metrics` endpoint with counters for ingestion, cache, auth, and rate limiting
 - **Security headers** — OWASP-recommended headers including HSTS, CSP, and Permissions-Policy
 - **CSRF protection** — Origin/Referer validation on all state-mutating endpoints
-- **Brute-force protection** — Per-IP login lockout with configurable thresholds
+- **Brute-force protection** — Per-IP lockout on both login and first-time setup
+- **Bounded memory** — The event buffer, session store, rate-limiter buckets and login-attempt records all have configurable caps
+- **Atomic writes** — Parquet files, the API-key store and the visitor-ID secret are written to a temporary file and renamed into place; the secret files are mode 0600
+- **Parquet compaction** — Small per-flush files are merged so scan cost does not grow with uptime
+- **Read connection pool** — Analytics queries run on their own DuckDB connections, so a slow dashboard query cannot block ingestion
 
 ---
 
@@ -115,7 +130,7 @@ The default `docker-compose.yml` includes persistent storage, restart policy, an
 ### From Source
 
 ```bash
-# Requires Rust 1.94.0+ (set automatically via rust-toolchain.toml)
+# Requires Rust 1.98.0 (installed automatically via rust-toolchain.toml)
 cargo build --release
 ./target/release/mallard-metrics
 ```
@@ -159,7 +174,7 @@ window.mallard('purchase', {
 | `currency` | String   | ISO 4217 currency code             |
 | `callback` | Function | Called after the event is sent     |
 
-The tracking script is under 1 KB minified and has zero external dependencies.
+The tracking script is about 3.8 KB gzipped, has zero external dependencies, sets no cookies, and writes nothing to browser storage. It is served unminified so you can read exactly what runs on your visitors' browsers.
 
 ---
 
@@ -207,6 +222,22 @@ See [`mallard-metrics.toml.example`](mallard-metrics.toml.example) for a fully d
 | `MALLARD_SUPPRESS_OS_VERSION` | `false` | Store OS name only, not version |
 | `MALLARD_SUPPRESS_SCREEN_SIZE` | `false` | Omit screen width and device type |
 | `MALLARD_GEOIP_PRECISION` | `city` | GeoIP precision: `city`, `region`, `country`, or `none` |
+| `MALLARD_SITE_IDS` | (none) | Comma-separated allowlist, enforced against the Origin header *and* the event payload |
+| `MALLARD_TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `X-Real-IP`. Only enable behind a proxy that overwrites them |
+| `MALLARD_VISITOR_SALT_ROTATION_DAYS` | `1` | Days a visitor-ID salt stays valid. See the note under Privacy by Design |
+| `MALLARD_SESSION_WINDOW_MINUTES` | `30` | Inactivity gap that ends a session |
+| `MALLARD_REALTIME_WINDOW_MINUTES` | `5` | Window the realtime endpoint treats as "now" |
+| `MALLARD_COMPACT_AFTER_FILES` | `24` | Merge a partition's Parquet files past this count (0 disables) |
+| `MALLARD_READ_CONNECTIONS` | `4` | Read-only DuckDB connections for analytics queries |
+| `MALLARD_MAX_BUFFERED_EVENTS` | `100000` | Hard cap on buffered events (0 = unbounded) |
+| `MALLARD_MAX_TRACKED_KEYS` | `10000` | Cap on rate-limit buckets and login-attempt records |
+| `MALLARD_MAX_SESSIONS` | `10000` | Cap on concurrent dashboard sessions |
+| `MALLARD_RATE_LIMIT_PER_IP` | `0` | Ingest events per second per client IP (0 = unlimited) |
+
+Every setting is also available in the TOML file; see
+[`mallard-metrics.toml.example`](mallard-metrics.toml.example) for the full list
+with commentary. Unknown keys in that file are a startup error, so a typo is
+reported rather than silently ignored.
 
 ---
 
@@ -219,10 +250,13 @@ All `/api/stats/*`, `/api/keys/*`, and `/api/stats/export` endpoints require aut
 | Parameter | Default | Description |
 |---|---|---|
 | `site_id` | (required) | Analytics property identifier |
-| `period` | `30d` | Time period: `day`, `today`, `7d`, `30d`, `90d` |
-| `start_date` | (none) | Explicit start date (YYYY-MM-DD) |
-| `end_date` | (none) | Explicit end date (YYYY-MM-DD) |
-| `limit` | `10` | Result limit (breakdowns only, max 1000) |
+| `period` | `30d` | Time period: `day`, `today`, `7d`, `30d`, `90d`, `12mo` |
+| `start_date` | (none) | Explicit start date, `YYYY-MM-DD`, inclusive |
+| `end_date` | (none) | Explicit end date, `YYYY-MM-DD`, **inclusive** |
+| `limit` | `10` | Row limit where the endpoint returns a list (max 1000) |
+
+An explicit range may span at most 366 days. A `limit` above the endpoint's
+maximum is an error rather than a silent clamp.
 
 ### Endpoints
 
@@ -257,19 +291,46 @@ All `/api/stats/*`, `/api/keys/*`, and `/api/stats/export` endpoints require aut
 
 | Method | Endpoint | Description |
 |---|---|---|
-| GET | `/api/stats/main` | Unique visitors, pageviews, bounce rate, avg session duration |
-| GET | `/api/stats/timeseries` | Time-bucketed visitor and pageview counts |
-| GET | `/api/stats/breakdown/{dim}` | Breakdown by: `pages`, `sources`, `browsers`, `os`, `devices`, `countries` |
+| GET | `/api/sites` | Site IDs that have data |
+| GET | `/api/stats/main` | Visitors, pageviews, events, and (with the extension) visits, bounce rate and visit duration |
+| GET | `/api/stats/timeseries` | Gap-filled visitor and pageview counts per bucket |
+| GET | `/api/stats/realtime` | Current visitors, top pages and sources, per-minute series |
+| GET | `/api/stats/revenue` | Revenue by currency, event and page |
+| GET | `/api/stats/goals` | Conversion rate for every custom event |
+| GET | `/api/stats/properties` | Custom property keys seen in range |
+| GET | `/api/stats/property-values` | One property (`key`), broken down by value; optional `event` filter |
+| GET | `/api/stats/breakdown/{dim}` | Breakdown by any dimension (below) |
+
+Breakdown dimensions: `pages`, `entry-pages`\*, `exit-pages`\*, `referrers`,
+`sources`, `countries`, `regions`, `cities`, `browsers`, `browser-versions`,
+`os`, `os-versions`, `devices`, `screen-sizes`, `utm-sources`, `utm-mediums`,
+`utm-campaigns`, `utm-contents`, `utm-terms`, `events`.
+\* needs the `behavioral` extension.
+
+Session-derived fields in `/api/stats/main` are `null` — not `0` — when the
+extension is unavailable, so "no sessions" is distinguishable from "could not
+be computed".
 
 #### Advanced Analytics (authenticated, requires `behavioral` extension)
 
 | Method | Endpoint | Parameters | Description |
 |---|---|---|---|
-| GET | `/api/stats/sessions` | — | Session metrics (total, avg duration, pages/session) |
-| GET | `/api/stats/funnel` | `steps`, `window` | Multi-step conversion funnel |
-| GET | `/api/stats/retention` | `weeks` (1–52) | Weekly retention cohort grid |
-| GET | `/api/stats/sequences` | `steps` (min: 2) | Behavioral sequence pattern matching |
-| GET | `/api/stats/flow` | `page` | Next-page flow analysis |
+| GET | `/api/stats/sessions` | — | Visits, average duration, pages per visit, bounce rate |
+| GET | `/api/stats/funnel` | `steps`, `window`, `modes` | Cumulative funnel: visitors reaching at least each step, with drop-off |
+| GET | `/api/stats/retention` | `weeks` (2–32) | Weekly cohorts with retained counts and rates |
+| GET | `/api/stats/sequences` | `steps` (2–32) | Ordered pattern matching, with a repeat-completion count |
+| GET | `/api/stats/flow` | `page`, `direction`, `limit` | Where visitors went next, or came from |
+
+These return **503** with an explanation when the `behavioral` extension is not
+loaded, rather than an empty `200` that reads as "no data".
+
+`funnel` accepts any combination of the extension's ordering modes:
+`strict`, `strict_deduplication`, `strict_order`, `strict_increase`,
+`strict_once`, `allow_reentry`, `timestamp_dedup`.
+
+`retention` also returns `identity_supports_cohorts` and, when false, a `caveat`
+explaining that the configured `visitor_salt_rotation_days` is shorter than the
+cohorts being measured — so every week past the first is structurally zero.
 
 #### Data Management (authenticated)
 
@@ -287,7 +348,7 @@ All `/api/stats/*`, `/api/keys/*`, and `/api/stats/export` endpoints require aut
 
 ```mermaid
 flowchart TD
-    TS["Tracking Script\nmallard.js &lt;1KB"]
+    TS["Tracking Script\nmallard.js ~3.8KB gzipped"]
     DASH["Dashboard SPA\nPreact + HTM"]
 
     TS -->|"POST /api/event"| AXUM
@@ -326,30 +387,36 @@ flowchart TD
 
 | Module | Purpose |
 |---|---|
-| `config.rs` | TOML + environment variable configuration |
-| `server.rs` | Axum router, middleware stack, route registration |
-| `ingest/handler.rs` | `POST /api/event` ingestion handler |
-| `ingest/buffer.rs` | In-memory event buffer with periodic flush |
-| `ingest/visitor_id.rs` | HMAC-SHA256 privacy-safe visitor ID generation |
-| `ingest/useragent.rs` | User-Agent parsing (browser, OS, version, device) |
+| `config.rs` | TOML and environment configuration, validation, and startup advisories |
+| `server.rs` | Axum router, middleware stack, health and Prometheus endpoints |
+| `ingest/handler.rs` | Shared event validation and enrichment for the POST and pixel paths |
+| `ingest/buffer.rs` | Bounded in-memory event buffer with atomic drain-and-flush |
+| `ingest/visitor_id.rs` | Per-site HMAC-SHA256 visitor IDs with configurable salt rotation |
+| `ingest/useragent.rs` | User-Agent and Client Hints parsing, bot detection |
 | `ingest/geoip.rs` | MaxMind GeoLite2 reader with graceful fallback |
-| `ingest/ratelimit.rs` | Per-site token-bucket rate limiter |
-| `storage/schema.rs` | DuckDB table definitions, `events_all` view, behavioral extension loading |
-| `storage/parquet.rs` | Parquet write, read, and date-partitioning |
+| `ingest/ratelimit.rs` | Bounded token-bucket limiter, used per site and per client IP |
+| `storage/mod.rs` | Read-connection pool for analytics queries |
+| `storage/schema.rs` | Table definitions, the `events_all` view, behavioral extension loading |
+| `storage/parquet.rs` | Atomic Parquet writes, date partitioning, compaction, retention |
 | `storage/migrations.rs` | Schema versioning |
-| `query/metrics.rs` | Core metric calculations (visitors, pageviews, bounce rate) |
-| `query/breakdowns.rs` | Dimension breakdown queries |
-| `query/timeseries.rs` | Time-bucketed aggregations |
-| `query/sessions.rs` | `sessionize()`-based session queries |
-| `query/funnel.rs` | `window_funnel()` conversion funnel builder |
-| `query/retention.rs` | `retention()` cohort query execution |
-| `query/sequences.rs` | `sequence_match()` pattern query execution |
-| `query/flow.rs` | `sequence_next_node()` flow analysis |
-| `query/cache.rs` | TTL-based query result cache |
-| `api/stats.rs` | All analytics API handlers |
-| `api/errors.rs` | API error types and HTTP responses |
-| `api/auth.rs` | Origin validation, session auth, API key management |
-| `dashboard/` | Embedded SPA (Preact + HTM, no build step) |
+| `query/mod.rs` | `QueryScope` — the parameters every analytics query shares |
+| `query/metrics.rs` | Core metrics and session aggregates, in two passes rather than four |
+| `query/breakdowns.rs` | Twenty breakdown dimensions, including session-derived entry/exit pages |
+| `query/timeseries.rs` | Gap-filled time bucketing |
+| `query/realtime.rs` | Current visitors, top pages and sources, per-minute series |
+| `query/revenue.rs` | Revenue by currency, event and page |
+| `query/events.rs` | Goal conversions and custom-property breakdowns |
+| `query/export.rs` | Daily and raw event exports, CSV and JSON rendering |
+| `query/funnel.rs` | `window_funnel()` — cumulative funnels with ordering modes |
+| `query/retention.rs` | `retention()` — per-visitor cohort counts |
+| `query/sequences.rs` | `sequence_match()` and `sequence_count()` |
+| `query/flow.rs` | `sequence_next_node()`, forward and backward |
+| `query/cache.rs` | TTL cache with LRU eviction and per-site invalidation |
+| `api/stats.rs` | Analytics handlers, parameter validation, GDPR erasure |
+| `api/errors.rs` | Error types and their HTTP mapping |
+| `api/auth.rs` | Argon2id auth, sessions, API keys, brute-force protection |
+| `dashboard/` | Embedded SPA (Preact + HTM, no build step) and the tracking script route |
+| `test_support.rs` | `AppState` builder shared by unit and integration tests |
 
 ---
 
@@ -377,14 +444,14 @@ The dashboard is a single-page application built with Preact + HTM, embedded dir
 
 | Component | Technology | Version |
 |---|---|---|
-| Language | Rust | 1.94.0 (MSRV) |
+| Language | Rust | 1.98.0 (edition 2024) |
 | Web Framework | Axum | 0.8 |
-| Database | DuckDB (disk-based, embedded) | 1.5.x (crate 1.10501.0) |
-| Analytics Engine | `behavioral` extension | runtime-loaded |
-| Storage Format | Parquet (ZSTD compressed) | date-partitioned |
+| Database | DuckDB (disk-based, embedded) | 1.5.5 (crate 1.10505.0) |
+| Analytics Engine | `behavioral` extension | 0.9.1, runtime-loaded; published per DuckDB version, currently 1.5.5 |
+| Storage Format | Parquet (ZSTD compressed) | date-partitioned, compacted |
 | Frontend | Preact + HTM | no build step |
-| Password Hashing | Argon2id | `argon2` 0.5 |
-| GeoIP | MaxMind GeoLite2 | `maxminddb` 0.27 |
+| Password Hashing | Argon2id | `argon2` 0.6 |
+| GeoIP | MaxMind GeoLite2 | `maxminddb` 0.30 |
 | Deployment | Static musl binary | `FROM scratch` Docker |
 
 ---
@@ -393,7 +460,7 @@ The dashboard is a single-page application built with Preact + HTM, embedded dir
 
 ### Prerequisites
 
-- Rust 1.94.0+ (managed automatically via `rust-toolchain.toml`)
+- Rust 1.98.0 (installed automatically via `rust-toolchain.toml`)
 - Git
 
 ### Build and Test
@@ -402,7 +469,10 @@ The dashboard is a single-page application built with Preact + HTM, embedded dir
 # Build
 cargo build
 
-# Run all tests (333 total: 262 unit + 71 integration)
+# Run all tests
+#
+# Behavioral-extension tests skip when the extension cannot be downloaded.
+# Set MALLARD_REQUIRE_BEHAVIORAL=1 to make that a failure instead, as CI does.
 cargo test
 
 # Clippy (zero warnings required)
@@ -425,7 +495,7 @@ cargo bench
 
 - **Zero clippy warnings** — pedantic, nursery, and cargo lint groups enabled
 - **Zero formatting violations** — enforced via `cargo fmt`
-- **All 333 tests pass** — no ignored tests
+- **All 551 tests pass** — no ignored tests
 - **Documentation builds without errors**
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow.

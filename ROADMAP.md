@@ -6,47 +6,88 @@ This document describes the current state of Mallard Metrics and future directio
 
 ## Current Status
 
-**v0.1.0** -- First tagged release. Core functionality complete and production-ready:
+Core functionality is complete and production-ready:
 
-- Event ingestion (`POST /api/event`, `GET /api/event` pixel)
-- Privacy-safe visitor ID generation (HMAC-SHA256 with daily salt rotation)
-- Two-tier storage: DuckDB hot table + Parquet cold tier, unioned via `events_all` view
-- Core metrics (unique visitors, pageviews, bounce rate)
-- Dimension breakdowns (pages, sources, browsers, OS, devices, countries)
-- Time-series aggregation (daily and hourly granularity)
-- Behavioral analytics via the `behavioral` DuckDB extension: funnels, retention cohorts, session analysis, sequence matching, flow analysis
-- Embedded dashboard SPA (Preact + HTM, no build step)
-- Dashboard authentication (Argon2id), session management, API keys with scoped access
-- GeoIP lookups (MaxMind GeoLite2), bot filtering, rate limiting
-- Data retention cleanup, CSV/JSON export, GDPR Art. 17 erasure endpoint
+**Ingestion**
+- `POST /api/event` plus a `GET` pixel endpoint for JavaScript-free contexts
+- Per-site HMAC-SHA256 visitor IDs with configurable salt rotation
+- User-Agent and Client Hints parsing, bot filtering, GeoIP resolution
+- Per-site and per-IP rate limiting, bounded buffering, atomic Parquet writes
+
+**Storage**
+- Two-tier DuckDB hot table plus Parquet cold tier, unioned by `events_all`
+- Date-partitioned layout with automatic compaction and retention cleanup
+- A read-connection pool so queries do not block ingestion
+
+**Analytics**
+- Visitors, pageviews, events, visits, bounce rate, visit duration
+- Twenty breakdown dimensions, covering every column the ingest path populates
+- Gap-filled time series, realtime activity, goals, custom properties, revenue
+- Behavioral analytics: cumulative funnels with ordering modes, per-visitor
+  retention cohorts, session metrics, sequence matching, forward/backward flow
+- Daily and raw event exports as CSV or JSON
+
+**Operations**
+- Embedded dashboard SPA (Preact + HTM, no build step) with dark mode
+- Argon2id authentication, scoped API keys, brute-force protection
+- GDPR mode, configurable privacy flags, Art. 17 erasure endpoint
 - Prometheus metrics, structured logging, readiness probes, graceful shutdown
-- OWASP security headers, CSRF protection, brute-force protection
+- OWASP security headers, CSRF protection, non-root container image
 
-**Test suite:** 333 tests (262 unit + 71 integration). Zero clippy warnings. Zero format violations.
+---
+
+## Known limitations
+
+Stated plainly, because each is a property of the design rather than a bug:
+
+- **Cross-period visitor analysis depends on salt rotation.** With the default
+  daily rotation, "unique visitors" over a longer range counts visitor-days, and
+  weekly retention cohorts cannot work. `visitor_salt_rotation_days` trades
+  privacy for that capability, and the retention endpoint reports which side of
+  the trade the current configuration sits on.
+- **Behavioral analytics need a community extension** downloaded at startup.
+  Without network access on first run, those endpoints return 503.
+- **Single-node.** There is no clustering, replication or read-replica story.
+  DuckDB handles a great deal on one box, but the ceiling is one box.
+- **Revenue is not converted between currencies.** There is no exchange-rate
+  source, so totals are reported per currency and never summed.
+- **Erasure is site plus date range.** Visitor IDs are pseudonymous hashes, so a
+  named individual's rows cannot be singled out.
+- **Exports are built in memory, not streamed.** `limit` therefore bounds memory
+  as well as row count. Slice by date range rather than raising the ceiling on a
+  small host.
 
 ---
 
 ## Future Considerations
 
-These are potential directions, not committed work. They depend on real-world production usage data and should only be pursued when actual need is demonstrated.
+Potential directions, not committed work. Each depends on demonstrated need.
 
-### Performance & Scale
+### Performance and scale
 
-- **Parquet compaction** -- Merge many small Parquet files per partition into fewer large ones to improve scan performance on long retention horizons.
-- **Connection pooling** -- If concurrent query load exceeds what a single DuckDB connection can handle.
-- **Multi-node deployment** -- Only if a single process cannot handle the load. DuckDB is extremely fast for analytical workloads and most deployments will never need this.
+- **Time-partitioned Parquet statistics** — record per-file min/max timestamps so
+  a narrow date range can skip files without opening their footers.
+- **Incremental pre-aggregation** — materialise daily rollups for ranges where
+  exact per-event detail is not needed.
+- **Multi-node deployment** — only if a single process demonstrably cannot cope.
 
 ### Features
 
-- **Custom dashboard themes** -- User-configurable dashboard appearance.
-- **Email reports** -- Scheduled analytics summaries delivered via SMTP.
-- **Webhook notifications** -- Real-time alerts for traffic anomalies or custom thresholds.
-- **Alternative auth backends** -- OIDC / SAML for enterprise dashboard access.
+- **Alerting** — thresholds and anomaly detection on traffic or conversions.
+- **Scheduled reports** — periodic summaries by email or webhook.
+- **Saved segments** — named filters reusable across every report.
+- **UTM-aware attribution models** — first-touch and last-touch, rather than the
+  per-event attribution available today.
+- **Alternative auth backends** — OIDC or SAML for organisations that need it.
 
 ### Ecosystem
 
-- **Additional GeoIP providers** -- Support IP2Location or other MMDB-compatible databases.
-- **Additional export formats** -- Parquet and Arrow IPC for direct data warehouse integration.
+- **Additional GeoIP providers** — IP2Location and other MMDB-compatible databases.
+- **Additional export formats** — Parquet and Arrow IPC for warehouse ingestion.
+- **Streaming exports** — a chunked response body, removing the memory bound
+  that `limit` currently doubles as.
+- **A client library** — a thin wrapper over the ingest endpoint for server-side
+  events in common languages.
 
 ---
 
@@ -55,10 +96,19 @@ These are potential directions, not committed work. They depend on real-world pr
 Every release must pass the full validation suite before tagging:
 
 ```bash
-cargo test               # all tests pass
-cargo clippy --all-targets  # zero warnings
-cargo fmt -- --check     # zero format violations
-cargo doc --no-deps      # docs build cleanly
+cargo test --all-targets   # all 551 tests pass
+cargo clippy --all-targets --all-features -- -D warnings   # zero warnings
+cargo fmt -- --check       # zero format violations
+cargo doc --no-deps        # docs build cleanly
+
+# Behavioral-extension tests skip when the extension cannot be downloaded.
+# CI sets this so a skip becomes a failure.
+MALLARD_REQUIRE_BEHAVIORAL=1 cargo test --all-targets
+
+# End-to-end against the real binary: every route, on a socket, with real
+# storage. The in-process tests cannot see a route that only breaks once the
+# server is assembled.
+cargo build && scripts/smoke-test.sh
 ```
 
 The release workflow (`.github/workflows/release.yml`) enforces these gates automatically on every tag push.

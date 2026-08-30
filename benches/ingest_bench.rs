@@ -1,29 +1,49 @@
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use duckdb::Connection;
 use mallard_metrics::ingest::buffer::{Event, EventBuffer};
+use mallard_metrics::query::QueryScope;
+use mallard_metrics::query::{breakdowns, metrics, timeseries};
 use mallard_metrics::storage::parquet::ParquetStorage;
 use mallard_metrics::storage::schema;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
+/// Site used by every benchmark.
+const SITE: &str = "bench.example.com";
+
+/// Build a synthetic event with realistic cardinality: 1000 visitors across
+/// 100 pages, spread over a day.
 fn make_event(i: usize) -> Event {
     Event {
-        site_id: "bench.example.com".to_string(),
+        site_id: SITE.to_string(),
         visitor_id: format!("visitor-{}", i % 1000),
         timestamp: chrono::NaiveDate::from_ymd_opt(2024, 1, 15)
             .unwrap()
-            .and_hms_opt(
-                10,
-                u32::try_from(i / 60).unwrap_or(0) % 24,
-                u32::try_from(i % 60).unwrap_or(0),
+            .and_hms_micro_opt(
+                u32::try_from(i / 3600).unwrap_or(0) % 24,
+                u32::try_from(i / 60).unwrap_or(0) % 60,
+                u32::try_from(i).unwrap_or(0) % 60,
+                u32::try_from(i).unwrap_or(0) % 1_000_000,
             )
             .unwrap(),
-        event_name: "pageview".to_string(),
+        event_name: if i.is_multiple_of(20) {
+            "signup"
+        } else {
+            "pageview"
+        }
+        .to_string(),
         pathname: format!("/page-{}", i % 100),
-        hostname: Some("bench.example.com".to_string()),
+        hostname: Some(SITE.to_string()),
         referrer: None,
-        referrer_source: None,
-        utm_source: None,
+        referrer_source: Some(
+            if i.is_multiple_of(3) {
+                "Google"
+            } else {
+                "Direct"
+            }
+            .to_string(),
+        ),
+        utm_source: Some(format!("campaign-{}", i % 5)),
         utm_medium: None,
         utm_campaign: None,
         utm_content: None,
@@ -38,41 +58,40 @@ fn make_event(i: usize) -> Event {
         region: None,
         city: None,
         props: None,
-        revenue_amount: None,
-        revenue_currency: None,
+        revenue_amount: i.is_multiple_of(50).then_some(19.99),
+        revenue_currency: i.is_multiple_of(50).then(|| "USD".to_string()),
     }
 }
 
-/// Benchmark steady-state buffer push on a warm connection.
+/// A warm in-memory database with an `events_all` view over `dir`.
+fn warm_db(dir: &std::path::Path) -> Arc<Mutex<Connection>> {
+    let conn = Connection::open_in_memory().unwrap();
+    schema::init_schema(&conn).unwrap();
+    schema::setup_query_view(&conn, dir).unwrap();
+    Arc::new(Mutex::new(conn))
+}
+
+/// Steady-state buffer push on a warm connection.
 ///
-/// Previously, DuckDB connection setup and schema initialisation ran inside
-/// `b.iter()`, causing the cold-start cost (~500 ms) to completely dominate the
-/// measurement.  The near-identical timings across all input sizes (17 ms for
-/// 100 events vs 19 ms for 1 000 events) were a clear signal that setup
-/// dominated rather than the push cost itself.
-///
-/// Setup now runs OUTSIDE `b.iter()` so only the push operations are timed.
-/// See PERF.md "Superseded Baselines" for the old (invalid) numbers.
+/// Setup runs outside `b.iter()` so only the push cost is measured. When it was
+/// inside, DuckDB's ~500 ms cold start dominated every result — the tell was
+/// that 100 and 1000 events timed almost identically. See PERF.md.
 fn bench_buffer_push(c: &mut Criterion) {
     let mut group = c.benchmark_group("ingest_throughput");
 
     for size in [100, 1_000, 10_000] {
-        // One-time setup — warm DuckDB connection, schema, and storage
-        let conn = Connection::open_in_memory().unwrap();
-        schema::init_schema(&conn).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let storage = ParquetStorage::new(dir.path());
-        let conn = Arc::new(Mutex::new(conn));
-        // Threshold above size so auto-flush never fires during push measurement
-        let buffer = Arc::new(EventBuffer::new(size + 1, Arc::clone(&conn), storage));
+        let conn = warm_db(dir.path());
+        let storage = ParquetStorage::new(dir.path(), 0);
+        // A threshold above `size` keeps auto-flush from firing mid-measurement.
+        let buffer = EventBuffer::new(size + 1, 0, conn, storage);
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             b.iter(|| {
-                // Measure: push N events into an already-warm buffer
                 for i in 0..size {
                     buffer.push(make_event(i)).unwrap();
                 }
-                // Reset without measuring flush cost
+                // Reset outside the measured push loop.
                 buffer.flush().unwrap();
             });
         });
@@ -81,12 +100,10 @@ fn bench_buffer_push(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark steady-state Parquet flush on a warm connection.
+/// Steady-state Parquet flush.
 ///
-/// Previously the entire connection setup + event push + flush ran inside
-/// `b.iter()`, so DuckDB cold-start dominated.  Now `iter_batched` is used:
-/// the setup closure (not measured) creates a fresh warm buffer pre-populated
-/// with N events; only `buffer.flush()` is measured.
+/// `iter_batched` keeps connection setup and event population out of the
+/// measurement; only `flush()` is timed.
 fn bench_flush(c: &mut Criterion) {
     let mut group = c.benchmark_group("parquet_flush");
 
@@ -97,19 +114,15 @@ fn bench_flush(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             b.iter_batched(
                 || {
-                    // Setup (not measured): warm connection + pre-pushed events
-                    let conn = Connection::open_in_memory().unwrap();
-                    schema::init_schema(&conn).unwrap();
-                    let storage = ParquetStorage::new(&dir_path);
-                    let conn = Arc::new(Mutex::new(conn));
-                    let buffer = EventBuffer::new(size + 1, conn, storage);
+                    let conn = warm_db(&dir_path);
+                    let storage = ParquetStorage::new(&dir_path, 0);
+                    let buffer = EventBuffer::new(size + 1, 0, conn, storage);
                     for i in 0..size {
                         buffer.push(make_event(i)).unwrap();
                     }
                     buffer
                 },
                 |buffer| {
-                    // Measure: flush only
                     buffer.flush().unwrap();
                 },
                 BatchSize::SmallInput,
@@ -120,69 +133,119 @@ fn bench_flush(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_query_metrics(c: &mut Criterion) {
-    let mut group = c.benchmark_group("query_metrics");
+/// Read-path benchmarks over a 10k-event dataset.
+fn bench_queries(c: &mut Criterion) {
+    let mut group = c.benchmark_group("query");
 
-    // Set up a database with pre-loaded events
-    let conn = Connection::open_in_memory().unwrap();
-    schema::init_schema(&conn).unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let storage = ParquetStorage::new(dir.path());
-    let arc_conn = Arc::new(Mutex::new(conn));
-    let buffer = EventBuffer::new(20_000, Arc::clone(&arc_conn), storage);
+    let conn = warm_db(dir.path());
+    let storage = ParquetStorage::new(dir.path(), 0);
+    let buffer = EventBuffer::new(20_000, 0, Arc::clone(&conn), storage);
 
     for i in 0..10_000 {
         buffer.push(make_event(i)).unwrap();
     }
 
-    // Create the events_all view that unions the hot events table with any Parquet files.
-    // All query modules target events_all rather than events directly.
-    schema::setup_query_view(&arc_conn.lock(), dir.path()).unwrap();
+    let scope = QueryScope::new(SITE, "2024-01-01", "2024-02-01", "30 minutes");
 
+    // Core metrics used to issue four independent scans of events_all; this
+    // measures the combined implementation.
     group.bench_function("core_metrics_10k", |b| {
         b.iter(|| {
-            let conn = arc_conn.lock();
-            mallard_metrics::query::metrics::query_core_metrics(
-                &conn,
-                "bench.example.com",
-                "2024-01-01",
-                "2024-02-01",
-            )
-            .unwrap();
+            let guard = conn.lock();
+            metrics::query_core_metrics(&guard, &scope).unwrap();
         });
     });
 
     group.bench_function("timeseries_10k", |b| {
         b.iter(|| {
-            let conn = arc_conn.lock();
-            mallard_metrics::query::timeseries::query_timeseries(
-                &conn,
-                "bench.example.com",
-                "2024-01-01",
-                "2024-02-01",
-                mallard_metrics::query::timeseries::Granularity::Day,
-            )
-            .unwrap();
+            let guard = conn.lock();
+            timeseries::query_timeseries(&guard, &scope, timeseries::Granularity::Day).unwrap();
         });
     });
 
     group.bench_function("breakdown_pages_10k", |b| {
         b.iter(|| {
-            let conn = arc_conn.lock();
-            mallard_metrics::query::breakdowns::query_breakdown(
-                &conn,
-                "bench.example.com",
-                "2024-01-01",
-                "2024-02-01",
-                mallard_metrics::query::breakdowns::Dimension::Page,
-                10,
-            )
-            .unwrap();
+            let guard = conn.lock();
+            breakdowns::query_breakdown(&guard, &scope, breakdowns::Dimension::Page, 10).unwrap();
+        });
+    });
+
+    group.bench_function("breakdown_utm_source_10k", |b| {
+        b.iter(|| {
+            let guard = conn.lock();
+            breakdowns::query_breakdown(&guard, &scope, breakdowns::Dimension::UtmSource, 10)
+                .unwrap();
+        });
+    });
+
+    group.bench_function("goals_10k", |b| {
+        b.iter(|| {
+            let guard = conn.lock();
+            mallard_metrics::query::events::query_goals(&guard, &scope).unwrap();
+        });
+    });
+
+    group.bench_function("revenue_10k", |b| {
+        b.iter(|| {
+            let guard = conn.lock();
+            mallard_metrics::query::revenue::query_revenue(&guard, &scope).unwrap();
         });
     });
 
     group.finish();
 }
 
-criterion_group!(benches, bench_buffer_push, bench_flush, bench_query_metrics);
+/// User-agent parsing, which runs on every ingested event.
+fn bench_user_agent(c: &mut Criterion) {
+    use mallard_metrics::ingest::useragent::parse_user_agent;
+
+    const AGENTS: &[&str] = &[
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
+         Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) \
+         Version/17.2 Safari/605.1.15",
+        "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+        "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile",
+    ];
+
+    c.bench_function("parse_user_agent", |b| {
+        b.iter(|| {
+            for ua in AGENTS {
+                std::hint::black_box(parse_user_agent(ua));
+            }
+        });
+    });
+}
+
+/// Visitor-ID derivation, which also runs on every ingested event.
+fn bench_visitor_id(c: &mut Criterion) {
+    use mallard_metrics::ingest::visitor_id::{generate_visitor_id, rotating_salt};
+
+    let salt = rotating_salt(
+        "bench-secret",
+        chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap(),
+        1,
+    );
+
+    c.bench_function("generate_visitor_id", |b| {
+        b.iter(|| {
+            std::hint::black_box(generate_visitor_id(
+                SITE,
+                "203.0.113.5",
+                "Mozilla/5.0 (Windows NT 10.0) Chrome/120.0",
+                &salt,
+            ));
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_buffer_push,
+    bench_flush,
+    bench_queries,
+    bench_user_agent,
+    bench_visitor_id
+);
 criterion_main!(benches);

@@ -1,11 +1,15 @@
 # Continuous integration — enforces all quality gates.
 #
-# Jobs: test + clippy + fmt + doc + MSRV (matrix), security audit,
-#       code coverage, Docker build, release-build smoke test.
+# Jobs: test + clippy + fmt + doc (matrix), behavioral-extension tests,
+#       static checks, security audit, code coverage, Docker build,
+#       release-build smoke test.
 #
 # Job dependency graph (all jobs run in parallel):
 #
-#   ci (5-entry matrix)
+#   ci (4-entry matrix)
+#   behavioral     # runs the DuckDB behavioral-extension-backed tests with
+#                  # MALLARD_REQUIRE_BEHAVIORAL=1 so they fail rather than skip.
+#   static-checks  # actionlint + JS syntax + tracker drift + MSRV drift
 #   security
 #   coverage
 #   docker
@@ -49,26 +53,123 @@ jobs:
             command: cargo test --locked --all-targets && cargo test --locked --doc
           - name: Clippy
             components: clippy
-            command: cargo clippy --locked --all-targets -- -D warnings
+            command: cargo clippy --locked --all-targets --all-features -- -D warnings
           - name: Format
             components: rustfmt
             command: cargo fmt -- --check
           - name: Documentation
-            command: cargo doc --no-deps
-          - name: MSRV 1.94
-            toolchain: "1.94.0"
-            command: cargo build --locked
+            command: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
         with:
-          toolchain: ${{ matrix.toolchain || '1.94.1' }}
+          toolchain: ${{ matrix.toolchain || '1.98.0' }}
           components: ${{ matrix.components || '' }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: ${{ matrix.name }}
         run: ${{ matrix.command }}
 
-# ── Job 2: Security audit ─────────────────────────────────────────────────────
+
+# ── Job 2: Behavioral-extension integration tests ─────────────────────────────
+#
+# The DuckDB `behavioral` community extension is downloaded at test time.  Unit
+# tests skip behavioral assertions when it cannot be loaded (offline dev), so CI
+# sets MALLARD_REQUIRE_BEHAVIORAL=1 to turn those skips into hard failures —
+# otherwise a regression in funnel/retention/session SQL would pass silently.
+  behavioral:
+    name: Behavioral extension tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run behavioral-backed tests
+        env:
+          MALLARD_REQUIRE_BEHAVIORAL: "1"
+        run: cargo test --locked --all-targets
+
+# ── Job 3: End-to-end smoke test against the real binary ──────────────────────
+#
+# The other jobs drive the router in-process. This one starts the executable on
+# a socket with real configuration, a real DuckDB file and real Parquet on disk.
+# Both a 500 on /api/stats/realtime and an unauthenticated /api/keys reached a
+# fully green test suite before this existed.
+  smoke:
+    name: Smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: "1.98.0"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Build the binary
+        run: cargo build --locked
+      - name: Run the smoke test
+        run: scripts/smoke-test.sh target/debug/mallard-metrics
+
+# ── Job 4: Static checks (workflows, JS, asset drift) ─────────────────────────
+  static-checks:
+    name: Static checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Lint GitHub Actions workflows
+        run: |
+          docker run --rm -v "$PWD:/repo" --workdir /repo \
+            rhysd/actionlint:1.7.7 -color
+
+      - name: Check the declared MSRV matches the pinned toolchain
+        run: |
+          set -euo pipefail
+          CARGO_MSRV=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          PINNED=$(grep -m1 '^channel' rust-toolchain.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "Cargo.toml rust-version: $CARGO_MSRV"
+          echo "rust-toolchain.toml:     $PINNED"
+          if [ "$CARGO_MSRV" != "$PINNED" ]; then
+            echo "::error file=Cargo.toml::rust-version ($CARGO_MSRV) and rust-toolchain.toml channel ($PINNED) have drifted apart."
+            exit 1
+          fi
+
+      - name: Check JavaScript syntax
+        run: |
+          set -euo pipefail
+          for f in tracking/script.js src/dashboard/assets/app.js; do
+            echo "Checking $f"
+            node --check "$f"
+          done
+
+      - name: Check the tracking script stays inside its size budget
+        run: |
+          set -euo pipefail
+          # The README and the docs both claim "about 3 KB gzipped". The budget
+          # is deliberately close to the current size: the script is served to
+          # every visitor on every page, so growth should be a decision rather
+          # than an accident.
+          BUDGET=4096
+          SIZE=$(gzip -9 -c tracking/script.js | wc -c)
+          echo "tracking/script.js: ${SIZE} bytes gzipped (budget ${BUDGET})"
+          if [ "$SIZE" -gt "$BUDGET" ]; then
+            echo "::error file=tracking/script.js::Gzipped size ${SIZE} exceeds the ${BUDGET}-byte budget; update the documented size if this is intended."
+            exit 1
+          fi
+
+      - name: Ensure the tracking script has a single source
+        run: |
+          set -euo pipefail
+          # tracking/script.js is compiled into the binary with include_str! and
+          # served from /mallard.js.  A second copy under the embedded asset
+          # directory would silently drift out of date.
+          if [ -e src/dashboard/assets/mallard.js ]; then
+            echo "::error file=src/dashboard/assets/mallard.js::Duplicate tracker copy found; tracking/script.js is the only source."
+            exit 1
+          fi
+          grep -q 'include_str!' src/dashboard/mod.rs
+
+# ── Job 5: Security audit ─────────────────────────────────────────────────────
   security:
     name: Security audit
     runs-on: ubuntu-latest
@@ -80,7 +181,7 @@ jobs:
           command: check
           arguments: --all-features
 
-# ── Job 3: Code coverage ──────────────────────────────────────────────────────
+# ── Job 6: Code coverage ──────────────────────────────────────────────────────
   coverage:
     name: Code coverage
     runs-on: ubuntu-latest
@@ -88,7 +189,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
         with:
-          toolchain: "1.94.1"
+          toolchain: "1.98.0"
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@edba51d32f66935a112c0516fec65a13d420cbc6 # v2.68.17
@@ -100,7 +201,7 @@ jobs:
           name: coverage-report
           path: lcov.info
 
-# ── Job 4: Docker build ───────────────────────────────────────────────────────
+# ── Job 7: Docker build ───────────────────────────────────────────────────────
   docker:
     name: Docker build
     runs-on: ubuntu-latest
@@ -109,7 +210,7 @@ jobs:
       - name: Build Docker image
         run: docker build -t mallard-metrics:test .
 
-# ── Job 5: Release build smoke test ───────────────────────────────────────────
+# ── Job 8: Release build smoke test ───────────────────────────────────────────
 #
 # Exercises the same cross-compilation path the release workflow uses so that
 # target-specific build breakage (e.g. a missing musl C++ toolchain for
@@ -131,12 +232,13 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
         with:
-          toolchain: "1.94.1"
+          toolchain: "1.98.0"
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: release-${{ matrix.target }}
-      - name: Install cross
-        run: cargo install cross --locked
+      - uses: taiki-e/install-action@edba51d32f66935a112c0516fec65a13d420cbc6 # v2.68.17
+        with:
+          tool: cross
       - name: Build release (cross)
         run: cross build --locked --release --target ${{ matrix.target }}

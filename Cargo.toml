@@ -1,8 +1,8 @@
 [package]
 name = "mallard-metrics"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.94.0"
+edition = "2024"
+rust-version = "1.98.0"
 description = "Self-hosted, privacy-focused web analytics powered by DuckDB and the behavioral extension"
 license = "AGPL-3.0-only"
 repository = "https://github.com/tomtom215/mallardmetrics"
@@ -10,35 +10,46 @@ readme = "README.md"
 keywords = ["analytics", "web", "duckdb", "privacy", "self-hosted"]
 categories = ["web-programming", "database"]
 
+[features]
+# Exposes `mallard_metrics::test_support` (the AppState builder) to integration
+# tests. Enabled through the dev-dependency on this crate below; never enabled
+# for a release build, so `tempfile` stays out of the shipped binary.
+testing = ["dep:tempfile"]
+
 [dependencies]
-axum = { version = "0.8.8", features = ["macros"] }
-duckdb = { version = "1.10501.0", features = ["bundled", "parquet"] }
+axum = { version = "0.8.9", features = ["macros"] }
+duckdb = { version = "1.10505.0", features = ["bundled", "parquet", "chrono"] }
 hmac = "0.13"
 sha2 = "0.11"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
-tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6.8", features = ["cors", "compression-gzip", "trace", "timeout"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4"] }
-hex = "0.4"
-parking_lot = "0.12"
-rust-embed = { version = "8.11", features = ["compression"] }
-mime_guess = "2"
-toml = "1.1"
-maxminddb = "0.27"
-argon2 = "0.5"
-rand = "0.10"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["full"] }
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.7.0", features = ["cors", "compression-gzip", "trace", "timeout"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+chrono = { version = "0.4.45", features = ["serde"] }
+uuid = { version = "1.26", features = ["v4"] }
+hex = "0.4.3"
+parking_lot = "0.12.5"
+rust-embed = { version = "8.12", features = ["compression"] }
+mime_guess = "2.0.5"
+toml = "1.1.4"
+maxminddb = "0.30.3"
+argon2 = "0.6"
+rand = "0.10.2"
+tempfile = { version = "3.27", optional = true }
 
 [dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
+# Self-dependency so integration tests and benches see the `testing`
+# feature. Cargo unifies features across the dev graph, so the library is built
+# once with the helper available to every test target.
+mallard-metrics = { path = ".", features = ["testing"] }
+criterion = { version = "0.8.2", features = ["html_reports"] }
 proptest = "1.11"
-tempfile = "3"
-tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
+tempfile = "3.27"
+tower = { version = "0.5.3", features = ["util"] }
+http-body-util = "0.1.5"
 
 [[bench]]
 name = "ingest_bench"
@@ -63,3 +74,7 @@ missing_panics_doc = "allow"
 multiple_crate_versions = "allow"
 # Doc backtick warnings are noise for internal code
 doc_markdown = "allow"
+# Nursery lint that conflicts with `let_and_return`: satisfying it means binding
+# a result purely to end a guard's scope, which `let_and_return` then flags.
+# Lock scopes here are deliberate and are documented where they matter.
+significant_drop_tightening = "allow"

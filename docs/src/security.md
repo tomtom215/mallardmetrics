@@ -51,7 +51,7 @@ Properties of this approach:
 
 ### GDPR/CCPA Compliance
 
-Mallard Metrics stores pseudonymous visitor IDs (daily-rotating HMAC-SHA256 hashes), which are personal data under GDPR Recital 26. Operators must establish a lawful basis for processing — typically Art. 6(1)(f) legitimate interests for aggregate analytics, especially when combined with [GDPR mode](../deployment.md#gdpr-friendly-deployment). See [PRIVACY.md](../../../PRIVACY.md) for the full legal analysis, DPIA guidance, and operator obligations.
+Mallard Metrics stores pseudonymous visitor IDs (HMAC-SHA256 hashes under a rotating salt, scoped per site), which are personal data under GDPR Recital 26. Operators must establish a lawful basis for processing — typically Art. 6(1)(f) legitimate interests for aggregate analytics, especially when combined with [GDPR mode](deployment.md#gdpr-friendly-deployment). See [PRIVACY.md](https://github.com/tomtom215/mallardmetrics/blob/main/PRIVACY.md) for the full legal analysis, DPIA guidance, and operator obligations.
 
 Key points:
 - **No cookies are set** for tracking — no ePrivacy consent banner is needed for the tracking script itself.

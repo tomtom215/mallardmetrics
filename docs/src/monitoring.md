@@ -60,6 +60,8 @@ If `MALLARD_METRICS_TOKEN` is set, this endpoint requires `Authorization: Bearer
 | `mallard_geoip_loaded` | gauge | `1` if GeoIP database loaded successfully |
 | `mallard_filter_bots` | gauge | `1` if bot filtering is active |
 | `mallard_behavioral_extension` | gauge | `1` if behavioral extension loaded, `0` otherwise |
+| `mallard_active_sessions` | gauge | Live dashboard sessions |
+| `mallard_read_connections` | gauge | DuckDB connections serving analytics queries |
 
 ### Counters
 
@@ -71,6 +73,15 @@ If `MALLARD_METRICS_TOKEN` is set, this endpoint requires `Authorization: Bearer
 | `mallard_login_failures_total` | counter | Total failed login attempts |
 | `mallard_cache_hits_total` | counter | Total query cache hits |
 | `mallard_cache_misses_total` | counter | Total query cache misses |
+| `mallard_cache_evictions_total` | counter | Cache entries evicted to stay within the entry cap |
+| `mallard_events_dropped_total` | counter | Events discarded because the buffer was at capacity |
+
+`mallard_events_dropped_total` is the one to alert on. It only moves when flushes
+are failing — a full disk, bad permissions — and the buffer has hit
+`max_buffered_events`. Any non-zero value means events are being lost.
+
+`mallard_rate_limit_rejections_total` covers both the per-site and the per-IP
+limiter.
 
 ### Prometheus Scrape Configuration
 

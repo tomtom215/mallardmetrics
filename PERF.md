@@ -55,7 +55,7 @@ HTML reports are generated in `target/criterion/` after each run.
 
 | Property | Value |
 |---|---|
-| `rustc` | 1.94.1 (e408947bf 2026-03-25) |
+| `rustc` | 1.94.1 (e408947bf 2026-03-25) — baselines below predate the 1.98.0 / edition 2024 move and must be re-measured |
 | Platform | Linux 4.4.0 x86\_64 |
 | CPU | Intel GenuineIntel, 2.1 GHz, 8192 KB L2 cache, 16 cores |
 | Memory | 21 GiB |

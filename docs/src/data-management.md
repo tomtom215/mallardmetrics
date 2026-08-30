@@ -70,7 +70,7 @@ To keep data indefinitely, set `retention_days = 0` (the default).
 
 ### GDPR Right to Erasure
 
-Mallard Metrics provides an admin-authenticated `DELETE /api/gdpr/erase` endpoint to permanently delete analytics data for a given `site_id` within a date range. Because visitor IDs are pseudonymous daily-rotating HMAC hashes that cannot be reverse-mapped to individuals, erasure operates at the **site + date-range** granularity — the finest granularity available without the original IP address and User-Agent. See [PRIVACY.md](../../../PRIVACY.md) for the full analysis and operator obligations.
+Mallard Metrics provides an admin-authenticated `DELETE /api/gdpr/erase` endpoint to permanently delete analytics data for a given `site_id` within a date range. Because visitor IDs are pseudonymous HMAC hashes under a rotating salt and cannot be reverse-mapped to individuals, erasure operates at the **site + date-range** granularity — the finest granularity available without the original IP address and User-Agent. See [PRIVACY.md](https://github.com/tomtom215/mallardmetrics/blob/main/PRIVACY.md) for the full analysis and operator obligations.
 
 ---
 

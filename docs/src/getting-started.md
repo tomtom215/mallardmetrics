@@ -4,7 +4,7 @@ This guide gets Mallard Metrics running and collecting events in a few minutes.
 
 ## Prerequisites
 
-- Docker (recommended), or a Linux/macOS host with Rust 1.94+ for building from source.
+- Docker (recommended), or a Linux/macOS host with Rust 1.98 for building from source.
 - A web property you want to track.
 
 ---
@@ -61,7 +61,7 @@ Replace:
 - `https://your-mallard-instance.com` with the URL of your Mallard Metrics instance.
 - `your-site.com` with the domain you configured in `site_ids` (or any domain if `site_ids` is empty).
 
-The script is under 1 KB, loads asynchronously, sets no cookies, and automatically tracks `pageview` events including URL, referrer, UTM parameters, screen size, and User-Agent.
+The script is about 3.8 KB gzipped, sets no cookies, and fires a `pageview` on load and on every subsequent route change (`pushState`, `replaceState`, and the back/forward buttons). It records the URL, UTM parameters and viewport width, plus the referrer — but only when it comes from another origin, so internal navigation does not make your own site its top traffic source.
 
 See [Tracking Script](tracking-script.md) for the full API including custom events and revenue tracking.
 

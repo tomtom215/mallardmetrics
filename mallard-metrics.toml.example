@@ -1,113 +1,175 @@
-# Mallard Metrics — Example Configuration
-# Copy this file to mallard-metrics.toml and adjust settings as needed.
-# All values shown are the defaults.
-
-# Server bind address and port
-host = "0.0.0.0"
-port = 8000
-
-# Directory for Parquet data files
-data_dir = "data"
-
-# Event buffer settings
-flush_event_count = 1000       # Flush after this many buffered events
-flush_interval_secs = 60       # Flush every N seconds regardless of count
-
-# Allowed site IDs (empty = allow all origins)
-# site_ids = ["example.com", "mysite.org"]
-
-# GeoIP database path (optional, MaxMind GeoLite2-City.mmdb)
-# geoip_db_path = "/data/GeoLite2-City.mmdb"
-
-# Dashboard CORS origin (optional, restricts API access to this origin)
-# dashboard_origin = "https://analytics.example.com"
-
-# Filter bot traffic from analytics
-filter_bots = true
-
-# Data retention in days (0 = unlimited, no automatic cleanup)
-retention_days = 0
-
-# Dashboard session TTL in seconds (default: 24 hours)
-session_ttl_secs = 86400
-
-# Brute-force protection: lock out an IP after this many failed login attempts (default: 5, 0 = disabled)
-max_login_attempts = 5
-
-# Duration in seconds to lock out an IP after exceeding max_login_attempts (default: 300)
-login_lockout_secs = 300
-
-# Graceful shutdown timeout in seconds
-shutdown_timeout_secs = 30
-
-# Rate limiting: max events per second per site_id (0 = no limit)
-rate_limit_per_site = 0
-
-# Query cache TTL in seconds (0 = no caching)
-cache_ttl_secs = 60
-
-# Log output format: "text" or "json"
-log_format = "text"
-
-# Query cache max entries (0 = unlimited)
-cache_max_entries = 10000
-
-# Max concurrent analytics queries (0 = unlimited, excess returns HTTP 429)
-max_concurrent_queries = 10
-
-# Cookie Secure flag — set to true when behind TLS
-secure_cookies = false
-
-
-# ─── GDPR-Friendly Deployment ────────────────────────────────────────────────
+# Mallard Metrics — example configuration
 #
-# Enable "GDPR mode" as a single toggle that activates a bundle of privacy-
-# preserving settings.  Each flag can also be set independently for fine-
-# grained control.  See PRIVACY.md for a full explanation of the tradeoffs.
+# Copy to mallard-metrics.toml and pass the path as the first argument:
+#     mallard-metrics /etc/mallard/mallard-metrics.toml
 #
-# gdpr_mode = false
+# Every value shown is the default. Unknown keys are a hard error, so a typo is
+# reported at startup instead of silently leaving a setting at its default.
 #
-#   When true, forces the following settings:
-#     strip_referrer_query = true
-#     round_timestamps     = true
-#     suppress_browser_version = true
-#     suppress_os_version  = true
-#     suppress_screen_size = true
-#     geoip_precision (promotes "city" → "country")
-#
-# Fine-grained privacy flags (all default to false):
-#
-# strip_referrer_query = false   # Strip ?query and #fragment from stored referrers
-# round_timestamps     = false   # Round event timestamps to the nearest hour
-# suppress_visitor_id  = false   # Replace HMAC visitor hash with per-request UUID
-#                                # WARNING: breaks unique-visitor counting
-# suppress_browser_version = false  # Store browser name only, not version
-# suppress_os_version  = false   # Store OS name only, not version
-# suppress_screen_size = false   # Omit screen width and device type
-#
-# GeoIP precision ladder (city > region > country > none):
-# geoip_precision = "city"       # Options: "city", "region", "country", "none"
-#
-# Example — GDPR-friendly preset (recommended for EU deployments):
-#
-# [privacy]
-# gdpr_mode       = true
-# retention_days  = 30           # Art. 5(1)(e) storage limitation
-# geoip_precision = "country"    # (redundant when gdpr_mode = true, shown for clarity)
+# Every field can also be set from the environment; the variable name is listed
+# beside each one. Environment variables win over the file.
 
-# ─── Environment variables (not set via TOML) ────────────────────────────────
-# MALLARD_SECRET           — HMAC secret for visitor ID hashing (auto-persisted to data_dir/.secret)
-# MALLARD_ADMIN_PASSWORD   — Admin password for dashboard authentication
-# MALLARD_METRICS_TOKEN    — Bearer token protecting the /metrics endpoint
-# MALLARD_SECURE_COOKIES   — Enable Secure flag on session cookies ("true" / "false")
-# MALLARD_MAX_LOGIN_ATTEMPTS — Override max_login_attempts at runtime
-# MALLARD_LOGIN_LOCKOUT      — Override login_lockout_secs at runtime
-# MALLARD_GDPR_MODE          — Enable GDPR-friendly preset ("true" / "false")
-# MALLARD_STRIP_REFERRER_QUERY — Strip referrer query strings ("true" / "false")
-# MALLARD_ROUND_TIMESTAMPS   — Round timestamps to the hour ("true" / "false")
-# MALLARD_SUPPRESS_VISITOR_ID — Replace HMAC visitor ID with random UUID ("true" / "false")
-# MALLARD_SUPPRESS_BROWSER_VERSION — Store browser name only ("true" / "false")
-# MALLARD_SUPPRESS_OS_VERSION — Store OS name only ("true" / "false")
-# MALLARD_SUPPRESS_SCREEN_SIZE — Omit screen size and device type ("true" / "false")
-# MALLARD_GEOIP_PRECISION    — GeoIP precision level: "city", "region", "country", "none"
-# RUST_LOG                 — Log level filter (e.g., "mallard_metrics=debug,tower_http=info")
+# ─── Server ──────────────────────────────────────────────────────────────────
+
+host = "0.0.0.0"               # MALLARD_HOST
+port = 8000                    # MALLARD_PORT
+data_dir = "data"              # MALLARD_DATA_DIR
+
+# ─── Ingestion ───────────────────────────────────────────────────────────────
+
+flush_event_count = 1000       # MALLARD_FLUSH_COUNT     — flush after N buffered events
+flush_interval_secs = 60       # MALLARD_FLUSH_INTERVAL  — and at least this often
+max_buffered_events = 100000   # MALLARD_MAX_BUFFERED_EVENTS — 0 = unbounded
+filter_bots = true             # MALLARD_FILTER_BOTS
+
+# Sites permitted to send events. Empty accepts any site ID.
+#
+# When set, this is enforced against BOTH the Origin header and the event
+# payload's domain, so an unlisted site cannot create partitions by omitting
+# Origin.
+# site_ids = ["example.com", "blog.example.com"]   # MALLARD_SITE_IDS (comma-separated)
+
+# Rate limits, in events per second. 0 disables the limit.
+#
+# The per-site limit protects the server; the per-IP limit protects a site's
+# real visitors from a single abusive client consuming the whole site budget.
+rate_limit_per_site = 0        # MALLARD_RATE_LIMIT
+rate_limit_per_ip = 0          # MALLARD_RATE_LIMIT_PER_IP
+
+# ─── Deployment topology ─────────────────────────────────────────────────────
+
+# Trust X-Forwarded-For / X-Real-IP for the client address.
+#
+# Leave false unless EVERY request reaches this server through a reverse proxy
+# that overwrites those headers (the bundled Caddy config does). On a directly
+# reachable server they are attacker-controlled: trusting them lets a client
+# choose its own visitor ID, geolocation and rate-limit bucket.
+#
+# When false, the peer socket address is used.
+trust_proxy_headers = false    # MALLARD_TRUST_PROXY_HEADERS
+
+# Restrict dashboard/stats CORS to one origin. Must include the scheme and no
+# path. Credentialed cross-origin requests are only permitted when this is set.
+# dashboard_origin = "https://analytics.example.com"   # MALLARD_DASHBOARD_ORIGIN
+
+# Force the Secure flag on session cookies. Set true behind TLS termination.
+secure_cookies = false         # MALLARD_SECURE_COOKIES
+
+# ─── Storage ─────────────────────────────────────────────────────────────────
+
+# Delete Parquet partitions older than N days. 0 keeps everything.
+retention_days = 0             # MALLARD_RETENTION_DAYS
+
+# Merge a partition's Parquet files once it holds at least this many. 0 disables.
+#
+# Each flush writes one file, so a 60-second interval produces ~1440 files per
+# site per day. Scanning thousands of small files is the dominant cost of every
+# query on a long retention horizon.
+compact_after_files = 24       # MALLARD_COMPACT_AFTER_FILES
+
+# Read-only DuckDB connections serving analytics queries. 0 or 1 shares the
+# writer connection, which lets a slow dashboard query block event ingestion.
+read_connections = 4           # MALLARD_READ_CONNECTIONS
+
+# ─── Queries ─────────────────────────────────────────────────────────────────
+
+cache_ttl_secs = 60            # MALLARD_CACHE_TTL          — 0 disables caching
+cache_max_entries = 10000      # MALLARD_CACHE_MAX_ENTRIES  — 0 = unbounded; LRU eviction
+max_concurrent_queries = 10    # MALLARD_MAX_CONCURRENT_QUERIES — excess returns 429
+
+# Inactivity gap that ends a session. Used by every sessionize-based metric:
+# visits, bounce rate, visit duration, and entry/exit pages.
+session_window_minutes = 30    # MALLARD_SESSION_WINDOW_MINUTES
+
+# Window the realtime endpoint treats as "now".
+realtime_window_minutes = 5    # MALLARD_REALTIME_WINDOW_MINUTES
+
+# ─── Dashboard authentication ────────────────────────────────────────────────
+
+session_ttl_secs = 86400       # MALLARD_SESSION_TTL
+max_sessions = 10000           # MALLARD_MAX_SESSIONS
+max_login_attempts = 5         # MALLARD_MAX_LOGIN_ATTEMPTS — 0 disables lockout
+login_lockout_secs = 300       # MALLARD_LOGIN_LOCKOUT
+
+# Cap on tracked rate-limit buckets and login-attempt records. Both maps are
+# keyed by attacker-influenced values, so they need a bound independent of the
+# periodic cleanup sweep.
+max_tracked_keys = 10000       # MALLARD_MAX_TRACKED_KEYS
+
+# ─── Operations ──────────────────────────────────────────────────────────────
+
+shutdown_timeout_secs = 30     # MALLARD_SHUTDOWN_TIMEOUT
+log_format = "text"            # MALLARD_LOG_FORMAT — "text" or "json"
+
+# MaxMind GeoLite2 database for IP geolocation. Lookups return nothing when
+# unset or missing.
+# geoip_db_path = "/data/GeoLite2-City.mmdb"   # MALLARD_GEOIP_DB
+
+# ─── Visitor identity ────────────────────────────────────────────────────────
+
+# Days a visitor-ID salt stays in use before rotating.
+#
+# The salt is what makes a visitor ID pseudonymous and unlinkable over time.
+# Rotating daily is the most privacy-protective setting and is the default — but
+# it has direct analytical consequences, because a visitor seen on two different
+# days carries two unrelated IDs:
+#
+#   * "Unique visitors" over a multi-day range counts visitor-days, not people.
+#   * Weekly retention cohorts cannot work at all: a returning visitor is a new
+#     one, so retention past week 0 reads as zero regardless of the audience.
+#     /api/stats/retention reports this in its `caveat` field.
+#
+# Raise this (7, 30) to make cross-day analysis meaningful, at the cost of a
+# longer-lived pseudonymous identifier. Retention over N weeks needs at least
+# (N-1) * 7 days.
+visitor_salt_rotation_days = 1   # MALLARD_VISITOR_SALT_ROTATION_DAYS
+
+# ─── Privacy ─────────────────────────────────────────────────────────────────
+#
+# See PRIVACY.md for the reasoning behind each flag and its analytical cost.
+
+# Convenience preset. When true it forces strip_referrer_query,
+# round_timestamps, suppress_browser_version, suppress_os_version and
+# suppress_screen_size on, and reduces geoip_precision to at most "country".
+#
+# suppress_visitor_id is deliberately NOT included: it removes the unique-visitor
+# metric entirely, so it stays an explicit choice.
+gdpr_mode = false              # MALLARD_GDPR_MODE
+
+# Strip ?query and #fragment from stored referrers, so search terms and campaign
+# parameters embedded in a referrer URL are not retained.
+strip_referrer_query = false   # MALLARD_STRIP_REFERRER_QUERY
+
+# Round event timestamps down to the hour. Daily and hourly aggregates stay
+# accurate; sub-hour session analysis does not.
+round_timestamps = false       # MALLARD_ROUND_TIMESTAMPS
+
+# Replace the HMAC visitor ID with a random UUID per request.
+# WARNING: unique-visitor counts degrade to page-load counts and every session
+# becomes one page long.
+suppress_visitor_id = false    # MALLARD_SUPPRESS_VISITOR_ID
+
+suppress_browser_version = false  # MALLARD_SUPPRESS_BROWSER_VERSION
+suppress_os_version = false       # MALLARD_SUPPRESS_OS_VERSION
+suppress_screen_size = false      # MALLARD_SUPPRESS_SCREEN_SIZE — also drops device_type
+
+# Geographic precision, most to least granular:
+#   "city"    country_code + region + city   (default)
+#   "region"  country_code + region
+#   "country" country_code
+#   "none"    no geographic data
+geoip_precision = "city"       # MALLARD_GEOIP_PRECISION
+
+# ─── Secrets (environment only) ──────────────────────────────────────────────
+#
+# These are never read from this file, so a configuration file can be committed
+# or shipped in an image without carrying credentials.
+#
+#   MALLARD_SECRET           HMAC secret for visitor IDs. Auto-generated and
+#                            persisted to data_dir/.secret (mode 0600) if unset.
+#                            Changing it re-identifies every visitor.
+#   MALLARD_ADMIN_PASSWORD   Admin password for the dashboard. At least 12
+#                            characters. Unset leaves the dashboard open until
+#                            someone completes /api/auth/setup.
+#   MALLARD_METRICS_TOKEN    Bearer token required by GET /metrics.
+#   RUST_LOG                 Log filter, e.g. "mallard_metrics=debug,tower_http=info".

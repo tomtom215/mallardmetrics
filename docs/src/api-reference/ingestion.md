@@ -99,7 +99,7 @@ When `filter_bots = true` (default), the server inspects the `User-Agent` header
 Before the event is stored:
 
 1. The client IP address is extracted from the request.
-2. A daily-rotating HMAC-SHA256 `visitor_id` is computed from `IP + User-Agent + today's UTC date + MALLARD_SECRET`.
+2. A `visitor_id` is computed as `HMAC-SHA256(salt, site_id | IP | User-Agent)`, where the salt is derived from `MALLARD_SECRET` and the current salt period (`visitor_salt_rotation_days`, one day by default). The site ID is part of the input, so a visitor is not correlatable across two sites on one instance.
 3. The IP address is discarded. It is never written to disk or the database.
 
 ### Server-Side Example
