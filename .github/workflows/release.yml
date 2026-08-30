@@ -123,13 +123,13 @@ jobs:
             components: rustfmt
             command: cargo fmt -- --check
           - name: "doc"
-            command: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+            command: cargo doc --no-deps
             rustdocflags: "-D warnings"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
         with:
-          toolchain: ${{ matrix.toolchain || '1.98.0' }}
+          toolchain: "1.98.0"
           components: ${{ matrix.components || '' }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: ${{ matrix.name }}

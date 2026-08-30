@@ -58,12 +58,12 @@ jobs:
             components: rustfmt
             command: cargo fmt -- --check
           - name: Documentation
-            command: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+            command: cargo doc --no-deps
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
         with:
-          toolchain: ${{ matrix.toolchain || '1.98.0' }}
+          toolchain: "1.98.0"
           components: ${{ matrix.components || '' }}
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: ${{ matrix.name }}
@@ -122,9 +122,14 @@ jobs:
           docker run --rm -v "$PWD:/repo" --workdir /repo \
             rhysd/actionlint:1.7.7 -color
 
-      - name: Check the declared MSRV matches the pinned toolchain
+      - name: Check the declared MSRV matches every place it is pinned
         run: |
           set -euo pipefail
+          # There is no separate "build at MSRV" job: rust-version and the
+          # pinned channel are the same version, so it would duplicate the Test
+          # job exactly. That only holds while they agree, which is what this
+          # checks — including the literals in the workflows, because a bump
+          # that misses one silently tests a different compiler than it claims.
           CARGO_MSRV=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
           PINNED=$(grep -m1 '^channel' rust-toolchain.toml | sed 's/.*"\(.*\)".*/\1/')
           echo "Cargo.toml rust-version: $CARGO_MSRV"
@@ -133,6 +138,17 @@ jobs:
             echo "::error file=Cargo.toml::rust-version ($CARGO_MSRV) and rust-toolchain.toml channel ($PINNED) have drifted apart."
             exit 1
           fi
+
+          status=0
+          for wf in .github/workflows/*.yml; do
+            while IFS= read -r version; do
+              if [ "$version" != "$CARGO_MSRV" ]; then
+                echo "::error file=$wf::pins toolchain $version but the MSRV is $CARGO_MSRV"
+                status=1
+              fi
+            done < <(grep -oE '^ *toolchain: "[0-9.]+"' "$wf" | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?')
+          done
+          exit "$status"
 
       - name: Check JavaScript syntax
         run: |

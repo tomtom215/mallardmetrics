@@ -346,10 +346,17 @@ suite and were found by a new end-to-end check that runs the actual binary.
 - Added CI jobs for the behavioral extension, `actionlint`, JavaScript syntax,
   tracker-copy drift, the tracking script's gzipped size budget, and
   MSRV/toolchain drift, plus Dependabot configuration.
-- CI lints and documents what it actually ships: clippy runs with
-  `--all-features`, so the test-support modules are linted too, and
-  `cargo doc` runs under `RUSTDOCFLAGS="-D warnings"` — it exits 0 on a broken
-  intra-doc link, so a stale link had been shipping unnoticed.
+- Clippy runs with `--all-features` in CI, so the `testing`-gated test-support
+  modules are linted rather than skipped.
+- The MSRV drift check now covers the toolchain literals in the workflows too,
+  not just `Cargo.toml` against `rust-toolchain.toml`. There is deliberately no
+  separate "build at MSRV" job — `rust-version` and the pinned channel are the
+  same version, so it would duplicate the Test job — and that reasoning only
+  holds while every pin agrees, which is now enforced rather than assumed.
+- The documented local commands set `RUSTDOCFLAGS="-D warnings"` explicitly.
+  Both workflows already set it at the workflow level, so CI was catching
+  broken intra-doc links all along; a plain local `cargo doc --no-deps` was
+  not, which is how one reached a commit here before being caught.
 - Query functions take a `QueryScope` rather than four positional `&str`
   arguments that the compiler could not tell apart.
 - A test asserts that `mallard-metrics.toml.example` parses, validates, and

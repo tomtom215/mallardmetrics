@@ -102,7 +102,7 @@ Every release must pass the full validation suite before tagging:
 cargo test --all-targets   # all 585 tests pass
 cargo clippy --all-targets --all-features -- -D warnings   # zero warnings
 cargo fmt -- --check       # zero format violations
-cargo doc --no-deps        # docs build cleanly
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps   # docs build cleanly
 
 # Behavioral-extension tests skip when the extension cannot be downloaded.
 # CI sets this so a skip becomes a failure.

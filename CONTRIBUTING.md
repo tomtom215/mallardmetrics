@@ -118,7 +118,7 @@ mallardmetrics/
 cargo test --all-targets \
   && cargo clippy --all-targets --all-features -- -D warnings \
   && cargo fmt -- --check \
-  && cargo doc --no-deps
+  && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
 ### Making Changes
@@ -132,7 +132,7 @@ cargo test --all-targets \
 cargo test --all-targets \
   && cargo clippy --all-targets --all-features -- -D warnings \
   && cargo fmt -- --check \
-  && cargo doc --no-deps && cargo doc --no-deps
+  && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
 5. Commit with a clear, descriptive message
@@ -147,7 +147,7 @@ All four commands must pass before submitting a PR:
 | `cargo test --all-targets` | All 585 tests pass (519 unit + 66 integration) |
 | `cargo clippy --all-targets --all-features -- -D warnings` | Zero warnings (pedantic + nursery + cargo lints) |
 | `cargo fmt -- --check` | Zero formatting violations |
-| `cargo doc --no-deps` | Documentation builds without errors |
+| `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | Documentation builds without errors |
 
 Tests that need the `behavioral` extension skip when it cannot be downloaded, so
 a green run on an air-gapped machine does not prove they ran. CI sets
@@ -320,7 +320,7 @@ Before submitting your PR, verify every item:
 - [ ] `node scripts/check-dashboard-browser.mjs` -- if the dashboard changed
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` -- zero warnings
 - [ ] `cargo fmt -- --check` -- zero formatting violations
-- [ ] `cargo doc --no-deps` -- documentation builds without errors
+- [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` -- documentation builds without errors
 - [ ] New or changed functionality has corresponding tests
 - [ ] No SQL injection vectors introduced (parameterized queries used)
 - [ ] No PII stored (IP addresses only for hashing/GeoIP, then discarded)

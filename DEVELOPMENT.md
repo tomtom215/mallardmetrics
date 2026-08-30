@@ -41,8 +41,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 # Format check
 cargo fmt -- --check
 
-# Documentation
-cargo doc --no-deps
+# Documentation. The workflows set RUSTDOCFLAGS globally; a local shell does
+# not, and `cargo doc` exits 0 on a broken intra-doc link without it.
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 # Run the server
 cargo run
@@ -86,7 +87,7 @@ current map, kept in one place so the two cannot drift apart.
    cargo test --all-targets \
      && cargo clippy --all-targets --all-features -- -D warnings \
      && cargo fmt -- --check \
-     && cargo doc --no-deps
+     && RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
    ```
 2. Verify all claims with actual command output
 3. Update documentation and test counts when adding features or tests
