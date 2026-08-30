@@ -142,6 +142,14 @@ jobs:
             node --check "$f"
           done
 
+      - name: Check dashboard method references
+        run: |
+          set -euo pipefail
+          # `node --check` validates syntax and says nothing about whether a
+          # method exists, and the dashboard has no test harness — so a button
+          # wired to a method that was renamed fails only when a user clicks it.
+          node scripts/check-dashboard-methods.mjs src/dashboard/assets/app.js
+
       - name: Check the tracking script stays inside its size budget
         run: |
           set -euo pipefail

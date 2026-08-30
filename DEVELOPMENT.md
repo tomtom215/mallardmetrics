@@ -20,7 +20,7 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 # Build
 cargo build
 
-# Run all tests (581 total: 515 unit + 66 integration)
+# Run all tests (585 total: 519 unit + 66 integration)
 cargo test --all-targets
 
 # Behavioral-extension tests skip when the extension cannot be downloaded.
@@ -30,6 +30,10 @@ MALLARD_REQUIRE_BEHAVIORAL=1 cargo test --all-targets
 # End-to-end against the real binary on a real socket. The in-process tests
 # cannot see a route that 500s only once the server is actually assembled.
 cargo build && scripts/smoke-test.sh
+
+# Nothing in the Rust suite runs the dashboard's JavaScript.
+node scripts/check-dashboard-methods.mjs src/dashboard/assets/app.js
+node scripts/check-dashboard-browser.mjs http://127.0.0.1:8000   # needs Playwright
 
 # Clippy (zero warnings required)
 cargo clippy --all-targets --all-features -- -D warnings
@@ -59,9 +63,9 @@ cargo bench
 
 | Metric | Value | Verified |
 |---|---|---|
-| Unit tests | 515 | `cargo test --lib` |
+| Unit tests | 519 | `cargo test --lib` |
 | Integration tests | 66 | `cargo test --test ingest_test` |
-| Total tests | 581 | `cargo test --all-targets` |
+| Total tests | 585 | `cargo test --all-targets` |
 | Property-test suites | 3 | `query/cache.rs`, `ingest/ratelimit.rs`, `ingest/visitor_id.rs` |
 | Clippy warnings | 0 | `cargo clippy --all-targets --all-features -- -D warnings` |
 | Format violations | 0 | `cargo fmt -- --check` |

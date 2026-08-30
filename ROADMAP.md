@@ -99,7 +99,7 @@ Potential directions, not committed work. Each depends on demonstrated need.
 Every release must pass the full validation suite before tagging:
 
 ```bash
-cargo test --all-targets   # all 581 tests pass
+cargo test --all-targets   # all 585 tests pass
 cargo clippy --all-targets --all-features -- -D warnings   # zero warnings
 cargo fmt -- --check       # zero format violations
 cargo doc --no-deps        # docs build cleanly

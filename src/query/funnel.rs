@@ -189,6 +189,59 @@ mod tests {
     ];
 
     #[test]
+    fn test_filters_narrow_the_funnel() {
+        let db = TestDb::new();
+        if !db.require_behavioral("filtered funnel") {
+            return;
+        }
+        // Two Chrome visitors reach step 2; the Firefox visitor only step 1.
+        for (v, browser, steps) in [
+            ("c1", "Chrome", vec!["/", "/pricing"]),
+            ("c2", "Chrome", vec!["/", "/pricing"]),
+            ("f1", "Firefox", vec!["/"]),
+        ] {
+            for (i, path) in steps.iter().enumerate() {
+                db.insert_dimensional(
+                    v,
+                    &format!("2024-01-15 10:0{i}:00"),
+                    path,
+                    Some(browser),
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
+        let conds = ["pathname = '/'", "pathname = '/pricing'"];
+
+        let all = query_funnel(
+            &db.conn,
+            &scope("2024-01-01", "2024-02-01"),
+            "1 day",
+            "",
+            &conds,
+        )
+        .unwrap();
+        assert_eq!(all[0].visitors, 3);
+        assert_eq!(all[1].visitors, 2);
+
+        let chrome = query_funnel(
+            &db.conn,
+            &crate::query::test_support::filtered_scope(
+                "2024-01-01",
+                "2024-02-01",
+                "browsers==Chrome",
+            ),
+            "1 day",
+            "",
+            &conds,
+        )
+        .unwrap();
+        assert_eq!(chrome[0].visitors, 2, "the Firefox visitor is excluded");
+        assert_eq!(chrome[1].visitors, 2);
+    }
+
+    #[test]
     fn test_funnel_is_cumulative() {
         // Regression: the report used to group by the furthest step reached, so
         // this dataset produced 2/1/1 ("stopped at exactly step N") instead of

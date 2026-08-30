@@ -41,13 +41,24 @@ HTML reports are generated in `target/criterion/` after each run.
 
 ## Benchmark Suite
 
-| Benchmark | Operation | Scales | Status |
-|---|---|---|---|
-| `ingest_throughput` | Buffer push (event -> buffer) | 100, 1K, 10K | Implemented |
-| `parquet_flush` | Buffer flush to Parquet | 1K, 10K | Implemented |
-| `query_core_metrics` | Core metrics query (visitors, pageviews) | -- | Implemented |
-| `query_timeseries` | Time-bucketed aggregation | -- | Implemented |
-| `query_breakdowns` | Dimension breakdown queries | -- | Implemented |
+| Group | Benchmark | Operation |
+|---|---|---|
+| `ingest_throughput` | 100 / 1K / 10K | Buffer push (event → in-memory buffer) |
+| `parquet_flush` | 1K / 10K | Buffer flush through DuckDB to Parquet |
+| `query` | `core_metrics_10k` | Headline metrics over 10K events |
+| `query` | `timeseries_10k` | Gap-filled daily aggregation |
+| `query` | `breakdown_pages_10k` | Breakdown over a dense column |
+| `query` | `breakdown_utm_source_10k` | Breakdown over a sparse, mostly-NULL column |
+| `query` | `goals_10k` | Conversion rates per custom event |
+| `query` | `revenue_10k` | Revenue totals per currency |
+| (top level) | `parse_user_agent` | User-Agent parsing |
+| (top level) | `generate_visitor_id` | HMAC-SHA256 visitor ID derivation |
+
+Verify this table against the source with:
+
+```bash
+grep -E "benchmark_group|bench_function|bench_with_input" benches/ingest_bench.rs
+```
 
 ### Current Baseline
 

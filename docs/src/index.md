@@ -25,7 +25,7 @@ Built in Rust for predictable, low resource usage. The embedded DuckDB database 
 | Storage | DuckDB hot table plus date-partitioned Parquet (ZSTD-compressed) |
 | Frontend | Preact + HTM (no build step, embedded in binary) |
 | Deployment | Static musl binary, `FROM scratch` Docker image |
-| Tests | 581 passing (515 unit + 66 integration) |
+| Tests | 585 passing (519 unit + 66 integration) |
 
 ## Key Features
 

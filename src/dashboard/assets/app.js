@@ -271,7 +271,7 @@ function FilterBar({ filters, onRemove, onClear }) {
       ${filters.map(
         (f, i) => html`
           <span class="filter-chip">
-            <span class="filter-chip-dim">${BREAKDOWN_LABELS[f.dimension] || f.dimension}</span>
+            <span class="filter-chip-dim">${FILTER_LABELS[f.dimension] || f.dimension}</span>
             <span class="filter-chip-op">${f.negated ? 'is not' : 'is'}</span>
             <span class="filter-chip-value" title=${f.value}>${f.value}</span>
             <button
@@ -688,10 +688,28 @@ const BREAKDOWN_GROUPS = [
 
 const ALL_BREAKDOWN_SLUGS = BREAKDOWN_GROUPS.flatMap((g) => g.tabs.map((t) => t.slug));
 
-/** Human labels for the dimensions a filter chip can name. */
-const BREAKDOWN_LABELS = Object.fromEntries(
-  BREAKDOWN_GROUPS.flatMap((g) => g.tabs.map((t) => [t.slug, t.label])),
-);
+// Filter chips read as a sentence — "Page is /pricing" — so they need singular
+// labels, not the tab headings ("Top pages is /pricing" reads as nonsense).
+const FILTER_LABELS = {
+  pages: 'Page',
+  referrers: 'Referrer',
+  sources: 'Source',
+  countries: 'Country',
+  regions: 'Region',
+  cities: 'City',
+  browsers: 'Browser',
+  'browser-versions': 'Browser version',
+  os: 'OS',
+  'os-versions': 'OS version',
+  devices: 'Device',
+  'screen-sizes': 'Screen width',
+  'utm-sources': 'UTM source',
+  'utm-mediums': 'UTM medium',
+  'utm-campaigns': 'UTM campaign',
+  'utm-contents': 'UTM content',
+  'utm-terms': 'UTM term',
+  events: 'Event',
+};
 
 // Entry and exit pages are derived from a whole session rather than stored on
 // an event, so the server has no per-event predicate for them and answers 400.
@@ -786,17 +804,17 @@ class Dashboard extends Component {
     const filters = this.state.filters
       .filter((f) => f.dimension !== dimension)
       .concat([{ dimension, value, negated }]);
-    this.setState({ filters }, () => this.load());
+    this.setState({ filters }, () => this.refresh());
   }
 
   removeFilter(index) {
     const filters = this.state.filters.filter((_, i) => i !== index);
-    this.setState({ filters }, () => this.load());
+    this.setState({ filters }, () => this.refresh());
   }
 
   clearFilters() {
     if (this.state.filters.length === 0) return;
-    this.setState({ filters: [] }, () => this.load());
+    this.setState({ filters: [] }, () => this.refresh());
   }
 
   async loadSites() {

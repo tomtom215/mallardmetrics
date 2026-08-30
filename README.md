@@ -3,7 +3,7 @@
 > **Self-hosted, privacy-focused web analytics powered by DuckDB and the `behavioral` extension.**
 > Single binary. Single process. Zero external dependencies.
 
-[![Tests](https://img.shields.io/badge/tests-581_passing-brightgreen?style=flat-square)](#development)
+[![Tests](https://img.shields.io/badge/tests-585_passing-brightgreen?style=flat-square)](#development)
 [![Rust](https://img.shields.io/badge/rust-1.98%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
 [![Clippy](https://img.shields.io/badge/clippy-0_warnings-brightgreen?style=flat-square)](#development)
@@ -500,7 +500,7 @@ cargo bench
 
 - **Zero clippy warnings** — pedantic, nursery, and cargo lint groups enabled
 - **Zero formatting violations** — enforced via `cargo fmt`
-- **All 581 tests pass** — no ignored tests
+- **All 585 tests pass** — no ignored tests
 - **Documentation builds without errors**
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow.

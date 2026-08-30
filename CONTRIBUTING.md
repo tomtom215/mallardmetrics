@@ -96,7 +96,10 @@ mallardmetrics/
 ├── mallard-metrics.toml.example -- Configuration template
 ├── Dockerfile                   -- Alpine musl builder, FROM scratch runtime
 ├── docker-compose.yml           -- Production-ready compose file
-├── scripts/smoke-test.sh        -- End-to-end checks against the real binary
+├── scripts/
+│   ├── smoke-test.sh            -- End-to-end checks against the real binary
+│   ├── check-dashboard-methods.mjs -- Static check for dead method references
+│   └── check-dashboard-browser.mjs -- Drives the dashboard in a real browser
 └── .github/workflows/ci.yml     -- CI pipeline (8 jobs; the first is a 4-way matrix)
 ```
 
@@ -140,7 +143,7 @@ All four commands must pass before submitting a PR:
 
 | Command | Requirement |
 |---|---|
-| `cargo test --all-targets` | All 581 tests pass (515 unit + 66 integration) |
+| `cargo test --all-targets` | All 585 tests pass (519 unit + 66 integration) |
 | `cargo clippy --all-targets --all-features -- -D warnings` | Zero warnings (pedantic + nursery + cargo lints) |
 | `cargo fmt -- --check` | Zero formatting violations |
 | `cargo doc --no-deps` | Documentation builds without errors |
@@ -161,6 +164,18 @@ checks too before changing a handler, a route, or the auth middleware:
 ```bash
 cargo build && scripts/smoke-test.sh
 ```
+
+Nothing in the Rust suite executes the dashboard's JavaScript. `node --check`
+sees only syntax, so `scripts/check-dashboard-methods.mjs` (which CI runs)
+catches a handler wired to a method that no longer exists. For anything more —
+a render crash, a fetch to a route that moved — drive it in a browser:
+
+```bash
+node scripts/check-dashboard-browser.mjs http://127.0.0.1:8000
+```
+
+That one needs Playwright, which is why it is a local script rather than a CI
+job. Run it before shipping a dashboard change.
 
 ---
 
@@ -296,6 +311,7 @@ Before submitting your PR, verify every item:
 - [ ] `cargo test --all-targets` -- all tests pass
 - [ ] `MALLARD_REQUIRE_BEHAVIORAL=1 cargo test --all-targets` -- behavioral tests really ran
 - [ ] `scripts/smoke-test.sh` -- the real binary still serves every route
+- [ ] `node scripts/check-dashboard-browser.mjs` -- if the dashboard changed
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` -- zero warnings
 - [ ] `cargo fmt -- --check` -- zero formatting violations
 - [ ] `cargo doc --no-deps` -- documentation builds without errors

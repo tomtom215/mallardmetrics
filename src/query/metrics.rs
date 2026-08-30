@@ -280,6 +280,108 @@ mod tests {
     }
 
     #[test]
+    fn test_filters_reach_the_session_pass() {
+        // `query_core_metrics` swallows a session-query failure into `None`, so
+        // a filter that broke that SQL would blank the session fields rather
+        // than erroring — and a test asserting only on pageviews would still
+        // pass. This asserts the session figures themselves under a filter.
+        let db = TestDb::new();
+        if !db.require_behavioral("filtered session metrics") {
+            return;
+        }
+        db.insert_dimensional(
+            "v1",
+            "2024-01-15 10:00:00",
+            "/",
+            Some("Chrome"),
+            None,
+            None,
+            None,
+        );
+        db.insert_dimensional(
+            "v1",
+            "2024-01-15 10:05:00",
+            "/about",
+            Some("Chrome"),
+            None,
+            None,
+            None,
+        );
+        db.insert_dimensional(
+            "v2",
+            "2024-01-15 11:00:00",
+            "/",
+            Some("Firefox"),
+            None,
+            None,
+            None,
+        );
+
+        let all = query_core_metrics(&db.conn, &scope("2024-01-01", "2024-02-01")).unwrap();
+        assert_eq!(all.total_sessions, Some(2));
+        assert_eq!(all.bounce_rate, Some(0.5));
+
+        let chrome = query_core_metrics(
+            &db.conn,
+            &crate::query::test_support::filtered_scope(
+                "2024-01-01",
+                "2024-02-01",
+                "browsers==Chrome",
+            ),
+        )
+        .unwrap();
+        assert!(
+            chrome.behavioral_available,
+            "the filtered session pass failed and was silently reported as unavailable"
+        );
+        assert_eq!(chrome.total_sessions, Some(1));
+        assert_eq!(
+            chrome.bounce_rate,
+            Some(0.0),
+            "the one Chrome session has two pageviews"
+        );
+        assert_eq!(chrome.views_per_visit, Some(2.0));
+        assert_eq!(chrome.total_pageviews, 2);
+    }
+
+    #[test]
+    fn test_filtered_session_metrics_endpoint_query() {
+        let db = TestDb::new();
+        if !db.require_behavioral("filtered session metrics") {
+            return;
+        }
+        db.insert_dimensional(
+            "v1",
+            "2024-01-15 10:00:00",
+            "/",
+            Some("Chrome"),
+            None,
+            None,
+            None,
+        );
+        db.insert_dimensional(
+            "v2",
+            "2024-01-15 11:00:00",
+            "/",
+            Some("Firefox"),
+            None,
+            None,
+            None,
+        );
+
+        let m = query_session_metrics(
+            &db.conn,
+            &crate::query::test_support::filtered_scope(
+                "2024-01-01",
+                "2024-02-01",
+                "browsers==Firefox",
+            ),
+        )
+        .unwrap();
+        assert_eq!(m.total_sessions, 1);
+    }
+
+    #[test]
     fn test_session_window_splits_sessions() {
         let db = TestDb::new();
         if !db.require_behavioral("session window") {

@@ -356,6 +356,19 @@ the data the ingest path has always collected is now queryable.
   disk, and exercises every route. Two of the bugs fixed in this release — a
   `500` from `/api/stats/realtime` and an unauthenticated `/api/keys` — were
   invisible to a fully green suite and were both found by running it.
+- **Added checks that actually execute the dashboard.** Nothing did before:
+  `node --check` validates syntax and says nothing about whether a method
+  exists, so a filter button calling a renamed method would have failed only
+  when a user clicked it. `scripts/check-dashboard-methods.mjs` catches that
+  statically and runs in CI; `scripts/check-dashboard-browser.mjs` drives the
+  page in a real browser and fails on any console or page error, and is a local
+  script because CI would pay for a browser download on every run.
+- Filter tests assert on results, not just on the generated SQL. Two paths get
+  their own: `query_core_metrics` swallows a session-query failure into `None`,
+  so a test checking only pageview counts would pass while the filtered session
+  pass was broken; and retention binds its parameters in a hand-written order
+  that a wrong offset would shift silently, producing plausible-looking but
+  wrong cohorts rather than an error.
 - Time-dependent tests take the instant under test as a parameter rather than
   reading the wall clock, so a run that crosses a minute boundary cannot fail
   and the window edges can be asserted exactly.

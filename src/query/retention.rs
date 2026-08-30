@@ -177,6 +177,55 @@ mod tests {
     }
 
     #[test]
+    fn test_filters_apply_to_both_halves_of_the_cohort_query() {
+        // This query binds site, end, <filters>, start, site, start, end,
+        // <filters> — a hand-written order that a wrong offset would silently
+        // shift, producing plausible-looking but wrong cohorts rather than an
+        // error. Two cohorts of different sizes make a mix-up visible.
+        let db = TestDb::new();
+        if !db.require_behavioral("filtered retention cohorts") {
+            return;
+        }
+        // Three Chrome visitors, one of whom returns; one Firefox visitor.
+        for (v, browser, days) in [
+            ("c1", "Chrome", vec!["2024-01-02", "2024-01-09"]),
+            ("c2", "Chrome", vec!["2024-01-03"]),
+            ("c3", "Chrome", vec!["2024-01-04"]),
+            ("f1", "Firefox", vec!["2024-01-05", "2024-01-09"]),
+        ] {
+            for day in days {
+                db.insert_dimensional(
+                    v,
+                    &format!("{day} 10:00:00"),
+                    "/",
+                    Some(browser),
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
+
+        let all = query_retention(&db.conn, &scope("2024-01-01", "2024-03-01"), 2).unwrap();
+        assert_eq!(all[0].cohort_size, 4);
+        assert_eq!(all[0].retained[1], 2, "c1 and f1 both returned");
+
+        let chrome = query_retention(
+            &db.conn,
+            &crate::query::test_support::filtered_scope(
+                "2024-01-01",
+                "2024-03-01",
+                "browsers==Chrome",
+            ),
+            2,
+        )
+        .unwrap();
+        assert_eq!(chrome.len(), 1, "one cohort week");
+        assert_eq!(chrome[0].cohort_size, 3, "the Firefox visitor is excluded");
+        assert_eq!(chrome[0].retained[1], 1, "only c1 returned");
+    }
+
+    #[test]
     fn test_retention_counts_visitors_not_a_boolean_flag() {
         // Regression: grouping only by cohort week made retention() aggregate
         // across the whole cohort, so the result was [true, true, true] — a
