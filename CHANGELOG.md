@@ -103,6 +103,17 @@ recommends.
   from the from-source one, so GHCR could not link the image back to this
   repository and `docker run` had no readiness signal — on an image with no
   shell, where the binary's own `--healthcheck` is the only option.
+- **The recommended production deployment could never load the extension.**
+  `deploy/docker-compose.production.yml` puts Mallard on an `internal: true`
+  network with no outbound route — deliberately, so a compromised container
+  cannot reach the internet — which also means the first-run extension download
+  has nowhere to download from. Neither the compose file nor the deployment
+  guide mentioned it. A new `--install-extension` subcommand seeds the extension
+  onto the data volume in one command (creating no database, so it is safe
+  against a live directory); the isolated deployment then loads it from disk and
+  needs no network at all. Verified in both directions with a binary run in an
+  empty network namespace: unseeded it reports `Failed to download extension`,
+  seeded it loads version 0.9.1.
 - **The `scratch` image had no CA certificates.** DuckDB downloads the
   `behavioral` community extension over HTTPS on first run, and an image built
   `FROM scratch` carries no trust store, so that request had nothing to verify

@@ -565,6 +565,24 @@ server {
 
 If the GeoIP database is missing, country/region/city fields are stored as `NULL`. The system degrades gracefully — no errors are raised.
 
+### Behavioral extension on an air-gapped host
+
+The `behavioral` extension is downloaded from the DuckDB community repository on
+first run, so a deployment whose runtime network has no outbound route — the
+bundled production compose file is one, on purpose — cannot install it, and
+funnels, retention, sessions, sequences and flow answer 503. Seed it once from
+somewhere with a route, against the same data directory:
+
+```bash
+mallard-metrics --install-extension
+# Installed the behavioral extension (version 0.9.1) into data/extensions
+```
+
+It writes the extension to the data volume and exits without creating a
+database. Every later start loads it from disk. See
+[the VPS guide](https://tomtom215.github.io/mallardmetrics/deploy-vps.html) for
+the Docker form.
+
 ---
 
 ## Documentation

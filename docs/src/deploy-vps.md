@@ -215,6 +215,58 @@ curl -s https://analytics.example.com/health/ready
 
 Open `https://<your-domain>` in a browser. You should see the Mallard Metrics dashboard login page.
 
+### Step 5 — Seed the behavioral extension
+
+**This deployment has no internet access by design, so the extension cannot
+install itself.** Mallard runs on the `proxy` network, which is declared
+`internal: true`: Docker adds no default route, so the container cannot reach
+the internet even if Caddy is compromised. That is the point of the design — and
+it also means `INSTALL behavioral FROM community`, which downloads over HTTPS on
+first run, has nowhere to download from.
+
+Without the extension, `/api/stats/funnel`, `/retention`, `/sessions`,
+`/sequences` and `/flow` answer `503` and the dashboard shows "Not available" in
+those panels. Everything else — visitors, pageviews, breakdowns, the time
+series, goals, revenue, realtime, export — works normally.
+
+Check which state you are in:
+
+```bash
+curl -s https://analytics.example.com/health/detailed | grep behavioral
+# "behavioral_extension_loaded": false   ← needs seeding
+```
+
+The extension lives on the data volume, so it only has to be fetched once. The
+binary has a subcommand for exactly this: run it on Docker's default bridge,
+which *does* have a route, pointed at the same directory.
+
+```bash
+sudo docker run --rm \
+  -v /srv/mallard/data:/data \
+  mallard-metrics:latest --install-extension
+
+# Installed the behavioral extension (version 0.9.1) into /data/extensions
+# Start the server normally; it will load the extension from disk.
+```
+
+It downloads, writes two files, and exits. It creates no database, so it is safe
+to run against a live data directory. Restart the stack and check again:
+
+```bash
+docker compose -f deploy/docker-compose.production.yml restart mallard-metrics
+curl -s https://analytics.example.com/health/detailed | grep behavioral
+# "behavioral_extension_loaded": true
+```
+
+The extension is version-matched to DuckDB, so repeat this after an upgrade that
+changes the bundled DuckDB version. The paths under `extensions/` name both
+(`v1.5.5/linux_amd64/`), so a stale one is easy to spot.
+
+If you would rather not give the container a route even once, copy
+`/srv/mallard/data/extensions/` from any machine running the same release. It is
+two files — the extension and the `.info` metadata DuckDB reads to decide the
+file is loadable — and neither is host-specific.
+
 ---
 
 ## What setup.sh Does

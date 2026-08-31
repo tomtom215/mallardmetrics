@@ -196,6 +196,26 @@ check login_wrong_password '401' \
   "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE/api/auth/login" \
       -H 'Content-Type: application/json' -d '{"password":"not-the-password"}')"
 
+# ── The extension seeder ──────────────────────────────────────────────────
+# `--install-extension` is what makes the behavioral endpoints usable on a
+# deployment with no outbound route, so it has to keep working. It needs the
+# network, and CI has one; without it the command correctly fails, which is why
+# only the "creates no database" invariant is asserted unconditionally.
+SEED_DIR="$WORK/seed"
+MALLARD_DATA_DIR="$SEED_DIR" "$BIN" --install-extension > "$WORK/seed.log" 2>&1
+seed_status=$?
+if [ "$seed_status" -eq 0 ]; then
+  check seed_reports_where 'extensions' "$(cat "$WORK/seed.log")"
+  check seed_wrote_extension 'behavioral.duckdb_extension' \
+    "$(find "$SEED_DIR" -name 'behavioral.duckdb_extension' 2>/dev/null)"
+else
+  echo "note: --install-extension could not reach the network; skipping its output checks"
+fi
+# Seeding must never leave a half-initialised database behind, because it is
+# documented as safe to run against a live data directory.
+absent seed_creates_no_database 'mallard.duckdb' \
+  "$(find "$SEED_DIR" -maxdepth 1 2>/dev/null)"
+
 # ── Conditional requests ──────────────────────────────────────────────────
 # The dashboard assets carry an ETag; nothing read `If-None-Match`, so every
 # "cheap revalidation" re-sent the whole file.

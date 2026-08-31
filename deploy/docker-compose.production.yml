@@ -108,6 +108,17 @@ services:
     # Mallard is ONLY on the internal network — it has no internet access.
     # Caddy reaches it via the shared `proxy` network; the internet cannot
     # reach Mallard directly even if Caddy is misconfigured.
+    #
+    # This has one consequence worth knowing before you wonder why half the
+    # dashboard says "Not available": the DuckDB `behavioral` extension is
+    # downloaded on first run, and there is nowhere to download it from here, so
+    # funnels, retention, sessions, sequences and flow answer 503. Seed it once
+    # onto the data volume and it is loaded from disk from then on:
+    #
+    #   docker run --rm -v ${MALLARD_DATA_HOST_DIR:-/srv/mallard/data}:/data \
+    #     mallard-metrics:latest --install-extension
+    #
+    # See docs/src/deploy-vps.md, "Seed the behavioral extension".
     networks:
       - proxy
 

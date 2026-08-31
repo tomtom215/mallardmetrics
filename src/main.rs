@@ -37,6 +37,7 @@ async fn main() {
 
     match args.first().map(String::as_str) {
         Some("--healthcheck") => std::process::exit(run_healthcheck().await),
+        Some("--install-extension") => std::process::exit(run_install_extension()),
         Some("--version" | "-V") => {
             println!("mallard-metrics {}", env!("CARGO_PKG_VERSION"));
             return;
@@ -58,16 +59,98 @@ fn print_help() {
          Self-hosted, privacy-focused web analytics.\n\n\
          USAGE:\n    \
              mallard-metrics [CONFIG_FILE]\n    \
-             mallard-metrics --healthcheck\n\n\
+             mallard-metrics --healthcheck\n    \
+             mallard-metrics --install-extension\n\n\
          OPTIONS:\n    \
-             CONFIG_FILE      Path to a TOML configuration file (optional)\n    \
-             --healthcheck    Probe a running instance and exit 0 when healthy\n    \
-             --version, -V    Print the version and exit\n    \
-             --help, -h       Print this message\n\n\
+             CONFIG_FILE           Path to a TOML configuration file (optional)\n    \
+             --healthcheck         Probe a running instance and exit 0 when healthy\n    \
+             --install-extension   Download the DuckDB `behavioral` extension into\n                          \
+                                   the data directory and exit. For deployments\n                          \
+                                   whose runtime network has no outbound route:\n                          \
+                                   run this once with one, then start normally.\n    \
+             --version, -V         Print the version and exit\n    \
+             --help, -h            Print this message\n\n\
          Configuration may also be supplied through MALLARD_* environment\n\
          variables; see mallard-metrics.toml.example for the full list.",
         version = env!("CARGO_PKG_VERSION")
     );
+}
+
+/// Download and load the `behavioral` extension, then exit.
+///
+/// The extension is fetched over HTTPS the first time a database needs it, and
+/// stored under the configured extension directory — which is on the data
+/// volume, so it persists. That matters for any deployment whose runtime
+/// network has no outbound route: the bundled production compose file puts
+/// Mallard on an `internal: true` network specifically so a compromised
+/// container cannot reach the internet, and the extension can therefore never
+/// install itself there. Funnels, retention, sessions, sequences and flow would
+/// answer 503 forever, on a deployment that is otherwise entirely healthy.
+///
+/// Running this once with a route, against the same data directory, seeds the
+/// file; the isolated deployment then loads it from disk and needs no network.
+/// Doing it through the real installer rather than by hand also writes the
+/// `.info` metadata DuckDB uses to decide the file is loadable.
+///
+/// Returns a process exit code: 0 when the extension is available afterwards.
+fn run_install_extension() -> i32 {
+    let loaded = match Config::load(None) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("Configuration error: {e}");
+            return EXIT_FAILURE;
+        }
+    };
+    let config = loaded.config;
+
+    if let Err(e) = std::fs::create_dir_all(&config.data_dir) {
+        eprintln!(
+            "Could not create the data directory {}: {e}",
+            config.data_dir.display()
+        );
+        return EXIT_FAILURE;
+    }
+
+    // Opened in memory: seeding the extension must not create or migrate a
+    // database file, which would leave a half-initialised one behind if the
+    // real deployment is configured differently. The extension directory is a
+    // database-level setting, so an in-memory database installs to the same
+    // place a persistent one would.
+    let conn = match Connection::open_in_memory() {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("Could not open DuckDB: {e}");
+            return EXIT_FAILURE;
+        }
+    };
+    // No tracing subscriber exists on this path, so the `info!` inside is a
+    // no-op and the result is reported to stdout below instead.
+    if let Err(e) = apply_duckdb_settings(&conn, &config) {
+        eprintln!("{e}");
+        return EXIT_FAILURE;
+    }
+
+    match storage::schema::load_behavioral_extension(&conn) {
+        Ok(()) => {
+            let version = storage::schema::behavioral_version(&conn);
+            println!(
+                "Installed the behavioral extension{} into {}",
+                version.map_or_else(String::new, |v| format!(" (version {v})")),
+                config.extension_dir().display()
+            );
+            println!("Start the server normally; it will load the extension from disk.");
+            0
+        }
+        Err(e) => {
+            eprintln!("Could not install the behavioral extension: {e}");
+            eprintln!(
+                "This step needs outbound HTTPS to the DuckDB community extension \
+                 repository. Run it from a host or network that has one, against the \
+                 same data directory."
+            );
+            EXIT_FAILURE
+        }
+    }
 }
 
 /// Probe a running instance's readiness endpoint.
