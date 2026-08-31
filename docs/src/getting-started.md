@@ -16,7 +16,7 @@ docker run -p 8000:8000 \
   -v mallard-data:/data \
   -e MALLARD_SECRET=your-random-32-char-secret \
   -e MALLARD_ADMIN_PASSWORD=your-dashboard-password \
-  ghcr.io/tomtom215/mallard-metrics
+  ghcr.io/tomtom215/mallardmetrics
 ```
 
 Open `http://localhost:8000` to access the dashboard.

@@ -25,7 +25,7 @@ Built in Rust for predictable, low resource usage. The embedded DuckDB database 
 | Storage | DuckDB hot table plus date-partitioned Parquet (ZSTD-compressed) |
 | Frontend | Preact + HTM (no build step, embedded in binary) |
 | Deployment | Static musl binary, `FROM scratch` Docker image |
-| Tests | 585 passing (519 unit + 66 integration) |
+| Tests | 602 passing (535 unit + 67 integration) |
 
 ## Key Features
 
@@ -63,7 +63,7 @@ Built in Rust for predictable, low resource usage. The embedded DuckDB database 
 
 ### Production Ready
 
-- **Argon2id authentication** — Password-protected dashboard with cryptographic session tokens.
+- **Argon2id authentication** — Password-protected dashboard with cryptographic session tokens, and a credential that survives a restart.
 - **API key management** — Programmatic access with SHA-256 hashed keys (`mm_` prefix), disk-persisted.
 - **Rate limiting** — Per-site token-bucket rate limiter on the ingestion endpoint.
 - **Query caching** — TTL-based in-memory cache for analytics queries.

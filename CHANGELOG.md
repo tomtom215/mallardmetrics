@@ -10,11 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Table of Contents
 
 - [Unreleased](#unreleased)
+- [0.2.0](#020---2026-08-31)
 - [0.1.0](#010---2026-04-11)
 
 ---
 
 ## [Unreleased]
+
+## [0.2.0] - 2026-08-31
 
 A broad modernisation pass. The toolchain, edition and every dependency are
 current. Several analytics results that were quietly wrong are corrected —
@@ -23,6 +26,150 @@ how many, and the realtime endpoint could not run at all. The data the ingest
 path has always collected is now queryable, and every report can be narrowed to
 a segment. Two of the bugs fixed here were invisible to a fully green test
 suite and were found by a new end-to-end check that runs the actual binary.
+
+A second review pass then found four defects that a deployment would have hit
+rather than a test: an instance could be claimed by a stranger after a restart,
+five bad logins locked out everybody, reports occasionally double-counted, and
+the behavioral extension could not install in the container the README
+recommends.
+
+### Fixed — takeover, lockout and consistency
+
+- **An admin password set through `/api/auth/setup` was never persisted.** It
+  lived in a `Mutex<Option<String>>` and nothing wrote it anywhere, so a
+  restart put the instance back into first-run mode: `setup_required` was true
+  again and whoever reached it first — not necessarily the operator — could
+  claim it and mint an admin API key. The Argon2id hash is now written to
+  `data_dir/admin.json` at mode 0600 and loaded at startup.
+  `MALLARD_ADMIN_PASSWORD` still takes precedence and is deliberately not
+  written back, so removing the variable does not leave a stale credential.
+  A setup request that cannot persist the hash now fails rather than accepting
+  a password it would silently lose.
+- **Brute-force protection was global, not per-IP.** The login and setup
+  handlers resolved the client address with the peer socket omitted, so on any
+  deployment not behind a trusted proxy — the default — every attempt was keyed
+  by the literal string `"unknown"`. Five failures from anyone locked *everyone*
+  out for the lockout period, and an attacker rotating source addresses gained
+  nothing because the addresses were never distinguished. The handlers now take
+  the peer address.
+- **Reports could double-count events during a flush or a compaction.**
+  `events_all` is the hot table `UNION ALL` a live Parquet glob, re-expanded on
+  every query. A flush writes the Parquet file and only then deletes the rows it
+  copied; compaction renames the merged file into the glob and only then removes
+  its sources. A query landing inside either window saw the same rows on both
+  sides. A new `TierLock` gives writers exclusive access for the length of that
+  window and readers shared access, so no query can observe it. The regression
+  test reproduces the old behaviour reliably — 180 rows where 120 were written.
+- **The bulk insert was not atomic.** DuckDB's appender commits whenever an
+  internal chunk fills, so a failure part-way through a flush left the earlier
+  chunks durably inserted while the buffer restored every event for the next
+  attempt — duplicating everything up to the failure point. The batch is now one
+  explicit transaction, rolled back on failure.
+- **A failed hot-table delete left permanent duplicates.** If the `DELETE` after
+  a Parquet write failed, the rows existed in both tiers and nothing ever
+  retried, so every subsequent query counted them twice, forever. The Parquet
+  file is now removed, restoring the partition so the next flush retries it.
+- **One oversized revenue value could stop ingestion entirely.**
+  `revenue_amount` is `DECIMAL(12,2)`; a value past its range is not clipped on
+  insert, it fails the whole bulk append. A single event carrying `1e30` would
+  therefore fail every flush, fill the buffer and start discarding unrelated
+  events. Out-of-range and non-finite amounts are now dropped at ingest, keeping
+  the rest of the event.
+- **GDPR erasure ignored buffered events.** Events already in the buffer for the
+  erased range were written out by the next flush, minutes after the endpoint
+  reported success. The buffer is now flushed first.
+- **A newer database could be opened by an older build.** Migrations ran happily
+  against a schema version they did not understand, which is how a rollback
+  becomes data loss. Startup now refuses, naming the cause.
+
+### Fixed — deployment
+
+- **The behavioral extension could not install in the shipped container.**
+  DuckDB installs community extensions under `$HOME/.duckdb/extensions`; the
+  `FROM scratch` image sets no `HOME`, and the production compose file runs with
+  a read-only root filesystem. `INSTALL behavioral FROM community` failed with
+  `IO Error: Can't find the home directory at ''`, so funnels, retention,
+  sessions, sequences and flow answered 503 on a deployment that looked healthy
+  in every other respect. Both `home_directory` and `extension_directory` are
+  now set to the writable data volume — DuckDB resolves the home directory
+  during an install even when the extension directory points elsewhere, so
+  setting only the latter is not enough. The location is configurable through
+  `MALLARD_EXTENSION_DIR`.
+- **Every documented `docker pull` command named an image that does not exist.**
+  The README and docs said `ghcr.io/tomtom215/mallard-metrics`; the release
+  workflow publishes `ghcr.io/tomtom215/mallardmetrics`.
+- **The released image had no healthcheck and no OCI labels.** The release
+  workflow writes its own Dockerfile from the pre-built binaries and had drifted
+  from the from-source one, so GHCR could not link the image back to this
+  repository and `docker run` had no readiness signal — on an image with no
+  shell, where the binary's own `--healthcheck` is the only option.
+- **The `scratch` image had no CA certificates.** DuckDB downloads the
+  `behavioral` community extension over HTTPS on first run, and an image built
+  `FROM scratch` carries no trust store, so that request had nothing to verify
+  the server against. Both the from-source and the release image now copy the
+  distribution's ~200 KB root bundle.
+- **Dashboard assets were cached for a year at unversioned URLs.** `/app.js` and
+  `/style.css` were served `immutable, max-age=31536000`, so upgrading the
+  binary changed nothing a returning visitor saw. `index.html` being `no-cache`
+  did not help — it pointed at the same URLs. They now revalidate, and the
+  `If-None-Match` header is finally read, so a revalidation returns a 304 with
+  no body instead of the whole file as it did before.
+
+### Fixed — the dashboard
+
+- **The first-run password prompt did not exist.** `GET /api/auth/status`
+  reports `authenticated: true` before setup — reads are open then, which is a
+  deliberate deployment mode — and the shell showed the login form only when
+  `authenticated` was false. So the form was unreachable: the README promised
+  "on first visit you will be prompted to set an admin password" and the first
+  visit showed an open dashboard with no prompt and no way to find one. An
+  operator had to `POST /api/auth/setup` by hand or restart with
+  `MALLARD_ADMIN_PASSWORD`. The dashboard now carries a warning banner saying
+  the instance is unprotected, with a button that opens the setup form.
+- **No favicon.** The catch-all asset route answered `404` for
+  `/favicon.ico` on every page load and the browser tab showed a blank icon.
+- **A comparison against an empty period looked broken.** The note named the
+  dates but no percentages appeared beside them, because a baseline of zero has
+  no meaningful percentage. It now says so.
+- **The demo seed script's data was invisible.** `scripts/seed-demo-data.py`
+  hard-coded its end date, so every run after that date produced seven thousand
+  events outside "Last 30 days" — the dashboard came up empty and the script
+  looked broken. The window now ends today.
+
+### Added — features
+
+- **Period comparison.** `/api/stats/main` accepts `compare=previous_period` or
+  `compare=year_over_year` and returns a `comparison` object with the same
+  headline figures for an equally long earlier window, plus the dates it covers.
+  The dashboard renders per-metric change, with the arrow as well as the colour
+  carrying the direction, and treats a fall in bounce rate as the good news.
+- **API key management in the dashboard.** `POST/GET/DELETE /api/keys` shipped
+  with no way to reach them, so issuing a key meant hand-writing a curl command
+  with a session cookie pasted out of devtools. Keys can now be created, listed
+  and revoked from the UI; the plaintext is shown once and stays on screen until
+  dismissed.
+- **Segment filters on the realtime endpoint.** It accepted `filters` and
+  silently ignored them while the documentation promised every stats endpoint
+  honoured them, so a dashboard filtered to one country still showed everyone as
+  "right now". The per-minute series is filtered too, so it agrees with the
+  totals beside it.
+- **HTTP metrics.** `/metrics` exported internal counters and nothing about the
+  traffic being served, so "is the dashboard slow?" and "are we returning 500s?"
+  needed a separate exporter — which the single-binary deployment exists to
+  avoid. It now exports `mallard_http_requests_total` by status class and a
+  `mallard_http_request_duration_seconds` histogram on the conventional bucket
+  spread.
+- **DuckDB resource limits.** `duckdb_memory_limit` and `duckdb_threads` are
+  configurable. DuckDB otherwise claims roughly 80% of system RAM and every
+  core, so one expensive analytics query could get the process OOM-killed,
+  taking ingestion down with it.
+
+### Changed — security hardening
+
+- Constant-time secret comparison uses `subtle` rather than a hand-rolled fold.
+  The old version was constant-time only as long as LLVM chose not to turn it
+  into an early-exit loop, and that guarantee is the entire point of the
+  function.
 
 ### Fixed — analytics correctness
 

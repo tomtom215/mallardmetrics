@@ -64,7 +64,11 @@ Key points:
 
 ### Dashboard Password
 
-Passwords are hashed with **Argon2id** using PHC default parameters before any comparison. The plaintext password is never stored. The hash is held in memory and loaded from the `MALLARD_ADMIN_PASSWORD` environment variable at startup.
+Passwords are hashed with **Argon2id** using PHC default parameters before any comparison. The plaintext password is never stored.
+
+The hash comes from `MALLARD_ADMIN_PASSWORD` when that variable is set. Otherwise it is read from `data_dir/admin.json`, where a password set through `POST /api/auth/setup` is written at mode 0600. That file is what makes the credential survive a restart: the hash previously lived only in memory, so a restart returned the instance to first-run mode and the next request to reach it — from anyone, not necessarily the operator — could set a new admin password and mint an admin API key that outlived the takeover.
+
+`MALLARD_ADMIN_PASSWORD` is deliberately not written back to disk. The environment already supplies it on every start, and persisting it would leave a working credential behind after the variable was removed.
 
 ### Session Tokens
 
@@ -135,6 +139,8 @@ The CSV export endpoint escapes fields starting with formula-triggering characte
 Login attempts are tracked per client IP address. After `max_login_attempts` consecutive failures (default 5), the IP is locked out for `login_lockout_secs` seconds (default 300). The server returns `429 Too Many Requests` with a `Retry-After` header containing the remaining lockout duration.
 
 A successful login clears the failure count for that IP. Failure counts are stored in memory and reset on server restart.
+
+The counter is keyed by the client address as the deployment resolves it: the peer socket address by default, or the leftmost `X-Forwarded-For` entry when `trust_proxy_headers` is on. It previously omitted the peer address entirely, so on any deployment not behind a trusted proxy every attempt was keyed by the literal string `"unknown"` — five failures from anyone locked everyone out, and rotating source addresses cost an attacker nothing.
 
 Configure via TOML fields `max_login_attempts` and `login_lockout_secs`, or the environment variables `MALLARD_MAX_LOGIN_ATTEMPTS` and `MALLARD_LOGIN_LOCKOUT`. Set `max_login_attempts = 0` to disable.
 

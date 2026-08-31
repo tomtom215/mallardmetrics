@@ -65,6 +65,16 @@ check() { # name expected-extended-regex actual
     fail=$((fail + 1))
   fi
 }
+absent() { # name unwanted-extended-regex actual
+  if printf '%s' "$3" | grep -Eq "$2"; then
+    echo "FAIL $1"
+    echo "     did not expect /$2/"
+    echo "     got      $3"
+    fail=$((fail + 1))
+  else
+    pass=$((pass + 1))
+  fi
+}
 code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 
 # ── Service surface ───────────────────────────────────────────────────────
@@ -72,6 +82,8 @@ check health          'ok'                          "$(curl -sS "$BASE/health")"
 check ready           'ready|ok'                    "$(curl -sS "$BASE/health/ready")"
 check detailed        'behavioral_extension_loaded' "$(curl -sS "$BASE/health/detailed")"
 check metrics         'mallard_events_ingested_total' "$(curl -sS "$BASE/metrics")"
+check metrics_http    'mallard_http_requests_total\{status="2xx"\}' "$(curl -sS "$BASE/metrics")"
+check metrics_latency 'mallard_http_request_duration_seconds_bucket' "$(curl -sS "$BASE/metrics")"
 check tracker         'sendBeacon'                  "$(curl -sS "$BASE/mallard.js")"
 check tracker_alias   'sendBeacon'                  "$(curl -sS "$BASE/js/script.js")"
 check dashboard       '<div id="app">'              "$(curl -sS "$BASE/")"
@@ -107,8 +119,22 @@ START=$(date -u -d '7 days ago' +%F)
 Q="site_id=$SITE&start_date=$START&end_date=$TODAY"
 
 check main       '"unique_visitors":1'  "$(curl -sS "$BASE/api/stats/main?$Q")"
+# A comparison window is only meaningful against real data on both sides; what
+# matters end to end is that the field appears, names its dates, and that a bad
+# value is refused rather than silently ignored.
+check compare_previous  '"comparison"' \
+  "$(curl -sS "$BASE/api/stats/main?$Q&compare=previous_period")"
+check compare_dates     '"start_date"' \
+  "$(curl -sS "$BASE/api/stats/main?$Q&compare=year_over_year")"
+absent compare_absent_by_default 'comparison' "$(curl -sS "$BASE/api/stats/main?$Q")"
+check compare_rejects_junk '400' "$(code "$BASE/api/stats/main?$Q&compare=last_tuesday")"
 check timeseries '"visitors"'           "$(curl -sS "$BASE/api/stats/timeseries?$Q")"
 check realtime   '"current_visitors":1' "$(curl -sS "$BASE/api/stats/realtime?site_id=$SITE")"
+# Realtime used to accept `filters` and ignore them.
+check realtime_filtered '"current_visitors":1' \
+  "$(curl -sS "$BASE/api/stats/realtime?site_id=$SITE&filters=browsers%3D%3DChrome")"
+check realtime_filtered_out '"current_visitors":0' \
+  "$(curl -sS "$BASE/api/stats/realtime?site_id=$SITE&filters=browsers%3D%3DFirefox")"
 check revenue    '"currency":"USD"'     "$(curl -sS "$BASE/api/stats/revenue?$Q")"
 check goals      'purchase'             "$(curl -sS "$BASE/api/stats/goals?$Q")"
 check props      'plan'                 "$(curl -sS "$BASE/api/stats/properties?$Q")"
@@ -170,12 +196,66 @@ check login_wrong_password '401' \
   "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE/api/auth/login" \
       -H 'Content-Type: application/json' -d '{"password":"not-the-password"}')"
 
+# ── Conditional requests ──────────────────────────────────────────────────
+# The dashboard assets carry an ETag; nothing read `If-None-Match`, so every
+# "cheap revalidation" re-sent the whole file.
+ETAG=$(curl -sSI "$BASE/style.css" | tr -d '\r' | awk 'tolower($1) == "etag:" { print $2 }')
+check asset_etag '"' "$ETAG"
+check asset_304 '304' "$(code -H "If-None-Match: $ETAG" "$BASE/style.css")"
+check asset_200_when_stale '200' "$(code -H 'If-None-Match: "0000000000000000"' "$BASE/style.css")"
+
 # ── The server must still be healthy, and quiet ───────────────────────────
 check still_alive '200' "$(code "$BASE/health")"
 if grep -qiE '\bERROR\b|panicked' "$WORK/server.log"; then
   echo "FAIL server log contains errors:"
   grep -iE '\bERROR\b|panicked' "$WORK/server.log" | head -10
   fail=$((fail + 1))
+fi
+
+# ── The admin password must survive a restart ─────────────────────────────
+# It used to live only in memory, so a restart put the instance back into
+# first-run mode and the next request to reach it — from anyone — could claim
+# it. Only a real restart can catch that, which is why it is tested here and
+# not in the in-process suite.
+kill "$SRV" 2>/dev/null
+wait "$SRV" 2>/dev/null
+
+MALLARD_HOST=127.0.0.1 \
+MALLARD_PORT="$PORT" \
+MALLARD_DATA_DIR="$WORK/data" \
+MALLARD_FLUSH_COUNT=1 \
+MALLARD_FLUSH_INTERVAL=1 \
+  "$BIN" > "$WORK/server2.log" 2>&1 &
+SRV=$!
+
+restarted=0
+for _ in $(seq 1 60); do
+  if curl -fsS "$BASE/health" >/dev/null 2>&1; then restarted=1; break; fi
+  kill -0 "$SRV" 2>/dev/null || break
+  sleep 1
+done
+
+if [ "$restarted" -ne 1 ]; then
+  echo "FAIL the server did not come back up after a restart:"
+  cat "$WORK/server2.log"
+  fail=$((fail + 1))
+else
+  check setup_not_required_after_restart '"setup_required":false' \
+    "$(curl -sS "$BASE/api/auth/status")"
+  check setup_refused_after_restart '409' \
+    "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE/api/auth/setup" \
+        -H 'Content-Type: application/json' -d '{"password":"an-attackers-password"}')"
+  # The password set before the restart is the one that still works — proof the
+  # stored hash is the original and not something regenerated.
+  JAR2="$WORK/cookies2"
+  check login_after_restart '200' \
+    "$(curl -sS -o /dev/null -w '%{http_code}' -c "$JAR2" -X POST "$BASE/api/auth/login" \
+        -H 'Content-Type: application/json' -d '{"password":"a-sufficiently-long-password"}')"
+  # Reads are protected again, and the events written before the restart are
+  # still there — the analytics data and the credential both survived.
+  check reads_protected_after_restart '401' "$(code "$BASE/api/stats/main?$Q")"
+  check data_survived_restart '"unique_visitors":1' \
+    "$(curl -sS -b "$JAR2" "$BASE/api/stats/main?$Q")"
 fi
 
 echo

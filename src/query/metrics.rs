@@ -38,6 +38,52 @@ pub struct CoreMetrics {
     pub views_per_visit: Option<f64>,
     /// Whether session-derived fields above could be computed.
     pub behavioral_available: bool,
+
+    /// The same site over an earlier window, when the caller asked to compare.
+    ///
+    /// Absent from the response entirely when no comparison was requested, so
+    /// a client that does not know about the field sees exactly what it did
+    /// before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<ComparisonWindow>,
+}
+
+/// Headline figures for the window a report is being compared against.
+///
+/// Deliberately flat and deliberately a subset: a comparison exists to answer
+/// "up or down, and by how much", and every field here is one a dashboard can
+/// render a delta for. It carries its own dates because "the previous period"
+/// is computed server-side, and a reader needs to know which days that was.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComparisonWindow {
+    /// Inclusive first day of the comparison window, `YYYY-MM-DD`.
+    pub start_date: String,
+    /// Inclusive last day of the comparison window, `YYYY-MM-DD`.
+    pub end_date: String,
+    pub unique_visitors: u64,
+    pub total_pageviews: u64,
+    pub total_events: u64,
+    /// `None` when the behavioral extension could not compute it, exactly as
+    /// in [`CoreMetrics`].
+    pub total_sessions: Option<u64>,
+    pub bounce_rate: Option<f64>,
+    pub avg_visit_duration_secs: Option<f64>,
+}
+
+impl ComparisonWindow {
+    /// Build a comparison window from a scope's metrics and its dates.
+    pub const fn from_metrics(start_date: String, end_date: String, metrics: &CoreMetrics) -> Self {
+        Self {
+            start_date,
+            end_date,
+            unique_visitors: metrics.unique_visitors,
+            total_pageviews: metrics.total_pageviews,
+            total_events: metrics.total_events,
+            total_sessions: metrics.total_sessions,
+            bounce_rate: metrics.bounce_rate,
+            avg_visit_duration_secs: metrics.avg_visit_duration_secs,
+        }
+    }
 }
 
 /// Counts that do not need the behavioral extension.
@@ -93,6 +139,7 @@ pub fn query_core_metrics(
         avg_visit_duration_secs: sessions.as_ref().map(|s| s.avg_duration_secs),
         views_per_visit: sessions.as_ref().map(|s| s.avg_pages),
         behavioral_available: sessions.is_some(),
+        comparison: None,
     })
 }
 

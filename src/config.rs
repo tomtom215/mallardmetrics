@@ -214,6 +214,37 @@ pub struct Config {
     /// whether the configured rotation supports the requested cohort length.
     #[serde(default = "default_visitor_salt_rotation_days")]
     pub visitor_salt_rotation_days: u32,
+
+    // ── DuckDB runtime ───────────────────────────────────────────────────
+    /// Directory DuckDB installs and loads community extensions from.
+    ///
+    /// Defaults to `data_dir/extensions`. DuckDB's own default is
+    /// `$HOME/.duckdb/extensions`, which does not work in the shipped
+    /// container: the `FROM scratch` image sets no `HOME`, and the recommended
+    /// compose file runs with a read-only root filesystem. The `behavioral`
+    /// extension therefore failed to install, and every funnel, retention,
+    /// session, sequence and flow request answered 503 — on a deployment that
+    /// looked healthy in every other respect. Pointing it at the data volume,
+    /// which is writable by definition, makes the install work and puts the
+    /// downloaded extension somewhere an operator can find and back up.
+    #[serde(default)]
+    pub extension_directory: Option<PathBuf>,
+
+    /// DuckDB `memory_limit`, e.g. `"512MB"` or `"2GB"`. Unset = DuckDB's
+    /// default, which is 80% of system RAM.
+    ///
+    /// Worth setting on a shared host: an expensive analytics query is
+    /// otherwise entitled to most of the machine, and the process that gets
+    /// OOM-killed for it is the one also handling ingestion.
+    #[serde(default)]
+    pub duckdb_memory_limit: Option<String>,
+
+    /// DuckDB worker threads. Unset = one per core.
+    ///
+    /// Capping this leaves headroom for the ingest path on a small box, where
+    /// a single query would otherwise saturate every core.
+    #[serde(default)]
+    pub duckdb_threads: Option<u32>,
 }
 
 fn default_host() -> String {
@@ -349,6 +380,9 @@ impl Default for Config {
             suppress_screen_size: false,
             geoip_precision: default_geoip_precision(),
             visitor_salt_rotation_days: default_visitor_salt_rotation_days(),
+            extension_directory: None,
+            duckdb_memory_limit: None,
+            duckdb_threads: None,
         }
     }
 }
@@ -422,6 +456,27 @@ fn is_valid_authority(authority: &str) -> bool {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
+}
+
+/// Is `value` a DuckDB memory size such as `512MB`, `2GB` or `1.5 GiB`?
+///
+/// The value is interpolated into a `SET memory_limit` statement, so it is
+/// checked here rather than trusted. DuckDB would reject a malformed size at
+/// startup anyway; validating first means the operator gets a message naming
+/// the setting instead of a raw binder error.
+fn is_valid_memory_limit(value: &str) -> bool {
+    let trimmed = value.trim();
+    let digits_end = trimmed
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(trimmed.len());
+    let (number, unit) = trimmed.split_at(digits_end);
+    if number.is_empty() || number.parse::<f64>().is_err() {
+        return false;
+    }
+    matches!(
+        unit.trim().to_ascii_uppercase().as_str(),
+        "" | "B" | "KB" | "KIB" | "MB" | "MIB" | "GB" | "GIB" | "TB" | "TIB"
+    )
 }
 
 /// Ordering of `geoip_precision` values from most to least granular.
@@ -585,6 +640,24 @@ impl Config {
             u32
         );
 
+        // DuckDB runtime settings
+        if let Ok(dir) = std::env::var("MALLARD_EXTENSION_DIR") {
+            config.extension_directory =
+                Some(PathBuf::from(dir)).filter(|p| !p.as_os_str().is_empty());
+        }
+        if let Ok(limit) = std::env::var("MALLARD_DUCKDB_MEMORY_LIMIT") {
+            let limit = limit.trim().to_string();
+            config.duckdb_memory_limit = (!limit.is_empty()).then_some(limit);
+        }
+        if let Ok(raw) = std::env::var("MALLARD_DUCKDB_THREADS") {
+            match raw.trim().parse::<u32>() {
+                Ok(v) if v > 0 => config.duckdb_threads = Some(v),
+                _ => warnings.push(format!(
+                    "MALLARD_DUCKDB_THREADS={raw:?} is not a positive integer; keeping the DuckDB default"
+                )),
+            }
+        }
+
         config.apply_gdpr_mode();
 
         Ok(LoadedConfig { config, warnings })
@@ -620,6 +693,13 @@ impl Config {
     /// Returns the path to the DuckDB database file.
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("mallard.duckdb")
+    }
+
+    /// Directory DuckDB installs community extensions into.
+    pub fn extension_dir(&self) -> PathBuf {
+        self.extension_directory
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("extensions"))
     }
 
     /// Session inactivity window as a DuckDB interval literal, e.g. `30 minutes`.
@@ -677,6 +757,16 @@ impl Config {
                 "geoip_precision must be one of: city, region, country, none (got {:?})",
                 self.geoip_precision
             ));
+        }
+        if let Some(limit) = &self.duckdb_memory_limit
+            && !is_valid_memory_limit(limit)
+        {
+            return Err(format!(
+                "duckdb_memory_limit must be a size such as \"512MB\" or \"2GB\" (got {limit:?})"
+            ));
+        }
+        if self.duckdb_threads == Some(0) {
+            return Err("duckdb_threads must be >= 1 when set".to_string());
         }
         if !matches!(self.log_format.as_str(), "text" | "json") {
             return Err(format!(

@@ -3,6 +3,7 @@ use duckdb::Connection;
 use mallard_metrics::ingest::buffer::{Event, EventBuffer};
 use mallard_metrics::query::QueryScope;
 use mallard_metrics::query::{breakdowns, metrics, timeseries};
+use mallard_metrics::storage::TierLock;
 use mallard_metrics::storage::parquet::ParquetStorage;
 use mallard_metrics::storage::schema;
 use parking_lot::Mutex;
@@ -84,7 +85,7 @@ fn bench_buffer_push(c: &mut Criterion) {
         let conn = warm_db(dir.path());
         let storage = ParquetStorage::new(dir.path(), 0);
         // A threshold above `size` keeps auto-flush from firing mid-measurement.
-        let buffer = EventBuffer::new(size + 1, 0, conn, storage);
+        let buffer = EventBuffer::new(size + 1, 0, conn, storage, TierLock::new());
 
         group.bench_with_input(BenchmarkId::from_parameter(size), &size, |b, &size| {
             b.iter(|| {
@@ -116,7 +117,7 @@ fn bench_flush(c: &mut Criterion) {
                 || {
                     let conn = warm_db(&dir_path);
                     let storage = ParquetStorage::new(&dir_path, 0);
-                    let buffer = EventBuffer::new(size + 1, 0, conn, storage);
+                    let buffer = EventBuffer::new(size + 1, 0, conn, storage, TierLock::new());
                     for i in 0..size {
                         buffer.push(make_event(i)).unwrap();
                     }
@@ -140,7 +141,7 @@ fn bench_queries(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();
     let conn = warm_db(dir.path());
     let storage = ParquetStorage::new(dir.path(), 0);
-    let buffer = EventBuffer::new(20_000, 0, Arc::clone(&conn), storage);
+    let buffer = EventBuffer::new(20_000, 0, Arc::clone(&conn), storage, TierLock::new());
 
     for i in 0..10_000 {
         buffer.push(make_event(i)).unwrap();

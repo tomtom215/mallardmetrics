@@ -23,6 +23,7 @@ and return `429` with a `Retry-After` header when it is reached.
 | `end_date` | string | `YYYY-MM-DD`, **inclusive**. Range may span at most 366 days. |
 | `limit` | integer | Rows to return, where the endpoint returns a list. Exceeding the endpoint's maximum is a `400`, not a silent clamp. |
 | `filters` | string | Narrow the report to a segment. See below. |
+| `compare` | string | `previous_period` or `year_over_year`. Read by `/api/stats/main` only. |
 
 Both explicit dates are inclusive, so `start_date=2024-01-01&end_date=2024-01-31`
 covers all of January.
@@ -70,8 +71,9 @@ dimension, a missing operator or an empty value is a `400` naming the problem.
 Filtered and unfiltered results are cached separately, and the cache key is
 built from the parsed conditions, so `a==1;b==2` and `b==2;a==1` share an entry.
 
-`GET /api/stats/realtime` does not accept `filters`: it reports a live snapshot
-rather than a report over a range.
+`GET /api/stats/realtime` accepts `filters` but not a date range: its window is
+`realtime_window_minutes`, not the request's period. Its per-minute series is
+filtered too, so it always agrees with the totals beside it.
 
 ### `site_id` validation
 
@@ -116,6 +118,45 @@ from the configured `site_ids` allowlist.
 | `views_per_visitor` | `total_pageviews / unique_visitors`. Previously called `pages_per_visit`, which is not what it measured. |
 | `total_sessions`, `bounce_rate`, `avg_visit_duration_secs`, `views_per_visit` | Need the `behavioral` extension. **`null` when unavailable**, which is meaningfully different from `0`. |
 | `behavioral_available` | Whether those four could be computed. |
+| `comparison` | Present only when `compare` was requested. See below. |
+
+### Comparing against an earlier period
+
+`compare=previous_period` returns the equally long window immediately before
+this one; `compare=year_over_year` returns the same dates 365 days earlier. Both
+shift the range's exclusive upper bound by the same amount as its lower bound,
+so the two windows are always exactly the same length — a 30-day report compared
+against 29 days would show a fall in traffic that never happened. A year shift
+is 365 days rather than a calendar year for the same reason: a calendar shift
+changes the span across a leap year.
+
+```json
+{
+  "unique_visitors": 1284,
+  "…": "…",
+  "comparison": {
+    "start_date": "2024-05-02",
+    "end_date": "2024-05-31",
+    "unique_visitors": 1102,
+    "total_pageviews": 3301,
+    "total_events": 3480,
+    "total_sessions": 1390,
+    "bounce_rate": 0.45,
+    "avg_visit_duration_secs": 88.1
+  }
+}
+```
+
+The dates are inclusive and are returned because "the previous period" is
+computed server-side — a reader needs to know which days it was. The two windows
+never overlap: the current window's start is the previous window's exclusive
+end.
+
+A segment applies to both sides, so a comparison is always like for like. The
+comparison window is cached under its own key, so switching between the two
+modes reuses whatever either has already computed.
+
+Only `/api/stats/main` reads `compare`. The other endpoints ignore it.
 
 ---
 
@@ -180,6 +221,8 @@ to 10, maximum 1000.
   "per_minute":  [2, 5, 3, 4, 3, 2]
 }
 ```
+
+`filters` narrows every figure here, exactly as it does on the other endpoints.
 
 The window is `realtime_window_minutes` (default 5), ending at the current UTC
 instant and inclusive at both ends. Events timestamped in the future are outside

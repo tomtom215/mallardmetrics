@@ -39,7 +39,7 @@ docker run -d \
   -e MALLARD_ADMIN_PASSWORD=your-dashboard-password \
   -e MALLARD_SECURE_COOKIES=true \
   -e MALLARD_METRICS_TOKEN=your-prometheus-token \
-  ghcr.io/tomtom215/mallard-metrics
+  ghcr.io/tomtom215/mallardmetrics
 ```
 
 The image is built `FROM scratch` with a static musl binary. It has no shell, no package manager, and no runtime dependencies.
@@ -53,7 +53,7 @@ docker run -d \
   -v /etc/mallard-metrics/config.toml:/config.toml:ro \
   -e MALLARD_SECRET=... \
   -e MALLARD_ADMIN_PASSWORD=... \
-  ghcr.io/tomtom215/mallard-metrics /config.toml
+  ghcr.io/tomtom215/mallardmetrics /config.toml
 ```
 
 ---
@@ -65,7 +65,7 @@ Save the following as `docker-compose.yml`:
 ```yaml
 services:
   mallard-metrics:
-    image: ghcr.io/tomtom215/mallard-metrics:latest
+    image: ghcr.io/tomtom215/mallardmetrics:latest
     restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"
@@ -255,7 +255,7 @@ Or with Docker:
 docker run ... \
   -v /path/to/GeoLite2-City.mmdb:/data/GeoLite2-City.mmdb:ro \
   -e ... \
-  ghcr.io/tomtom215/mallard-metrics
+  ghcr.io/tomtom215/mallardmetrics
 ```
 
 If the file is missing or unreadable, country/region/city fields are stored as `NULL`. No error is raised.
@@ -283,7 +283,7 @@ docker run -d \
   -e MALLARD_SECURE_COOKIES=true \
   -e MALLARD_GDPR_MODE=true \
   -e MALLARD_RETENTION_DAYS=30 \
-  ghcr.io/tomtom215/mallard-metrics
+  ghcr.io/tomtom215/mallardmetrics
 ```
 
 Or via TOML config:

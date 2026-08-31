@@ -160,6 +160,29 @@ suppress_screen_size = false      # MALLARD_SUPPRESS_SCREEN_SIZE — also drops 
 #   "none"    no geographic data
 geoip_precision = "city"       # MALLARD_GEOIP_PRECISION
 
+# ─── DuckDB runtime ──────────────────────────────────────────────────────────
+
+# Where DuckDB installs and loads community extensions from.
+# Default: data_dir/extensions.
+#
+# DuckDB's own default is $HOME/.duckdb/extensions, which does not exist in the
+# shipped container: the FROM scratch image sets no HOME, and the production
+# compose file runs with a read-only root filesystem. Keeping this on the data
+# volume is what makes `INSTALL behavioral FROM community` succeed there — and
+# therefore what makes funnels, retention, sessions, sequences and flow answer
+# with data rather than 503.
+# extension_directory = "/data/extensions"   # MALLARD_EXTENSION_DIR
+
+# Cap on the memory a DuckDB query may use, e.g. "512MB" or "2GB".
+# Unset means DuckDB's default of roughly 80% of system RAM — which on a small
+# shared host means one expensive analytics query can get the process
+# OOM-killed, taking ingestion down with it.
+# duckdb_memory_limit = "1GB"    # MALLARD_DUCKDB_MEMORY_LIMIT
+
+# DuckDB worker threads. Unset means one per core. Capping it leaves headroom
+# for the ingest path on a small box.
+# duckdb_threads = 2             # MALLARD_DUCKDB_THREADS
+
 # ─── Secrets (environment only) ──────────────────────────────────────────────
 #
 # These are never read from this file, so a configuration file can be committed
@@ -169,7 +192,10 @@ geoip_precision = "city"       # MALLARD_GEOIP_PRECISION
 #                            persisted to data_dir/.secret (mode 0600) if unset.
 #                            Changing it re-identifies every visitor.
 #   MALLARD_ADMIN_PASSWORD   Admin password for the dashboard. At least 12
-#                            characters. Unset leaves the dashboard open until
-#                            someone completes /api/auth/setup.
+#                            characters. Takes precedence over a password set
+#                            through /api/auth/setup, which is stored as an
+#                            Argon2id hash in data_dir/admin.json (mode 0600)
+#                            and survives a restart. Unset, and with no stored
+#                            hash, reads are open until someone completes setup.
 #   MALLARD_METRICS_TOKEN    Bearer token required by GET /metrics.
 #   RUST_LOG                 Log filter, e.g. "mallard_metrics=debug,tower_http=info".

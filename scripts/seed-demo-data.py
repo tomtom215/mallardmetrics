@@ -27,20 +27,31 @@ To start the server with this data:
     MALLARD_PORT=8000 \
     cargo run
 
-Then open http://127.0.0.1:8000, log in with "demodemo123",
-enter "demo.example.com" as site_id, select "Last 30 days", click Load.
+Then open http://127.0.0.1:8000, log in with "demodemo123", pick
+"demo.example.com" from the site selector and "Last 30 days" from the period
+selector. The data ends today, so it falls inside every default period.
 
 Note: The DuckDB behavioral extension must be installed for sessions,
 funnel, retention, sequences, and flow endpoints to return data.
 Install it with: INSTALL behavioral FROM community; LOAD behavioral;
 """
 import duckdb, random, sys, hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 DB_PATH = sys.argv[1] if len(sys.argv) > 1 else "/tmp/mallard-demo-data/mallard.duckdb"
 SITE_ID = "demo.example.com"
-END_DATE = datetime(2026, 3, 10)
-START_DATE = END_DATE - timedelta(days=29)
+
+# The window ends today, in UTC, because that is what the dashboard's periods
+# are relative to. It used to be a hard-coded calendar date, so every run after
+# that date produced 7,000 events sitting outside "Last 30 days" — the dashboard
+# came up empty and the script looked broken.
+#
+# Events are stored as naive UTC, so the boundary is computed in UTC too;
+# anchoring on local midnight would shift every timestamp by the host's offset.
+END_DATE = datetime.now(timezone.utc).replace(
+    hour=0, minute=0, second=0, microsecond=0, tzinfo=None
+) + timedelta(days=1)
+START_DATE = END_DATE - timedelta(days=30)
 
 PAGES = [
     "/", "/features", "/pricing", "/about", "/blog",

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Mallard Metrics">
+  <!-- Mallard green, for the bird; ascending bars, for the metrics. Only two
+       shapes so the mark still reads at 16 pixels. -->
+  <rect width="32" height="32" rx="7" fill="#12684f"/>
+  <g fill="#ffffff">
+    <rect x="7"  y="18" width="4.5" height="8"  rx="1.4"/>
+    <rect x="13.75" y="13" width="4.5" height="13" rx="1.4"/>
+    <rect x="20.5" y="7"  width="4.5" height="19" rx="1.4"/>
+  </g>
+</svg>

@@ -9,7 +9,7 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::timeout::TimeoutLayer;
@@ -18,8 +18,74 @@ use tracing::Instrument;
 
 /// Maximum accepted request body, in bytes. A valid event is about 12 KB.
 const MAX_BODY_BYTES: usize = 65_536;
+
+/// Upper bounds of the request-latency histogram, in seconds.
+///
+/// The conventional Prometheus default spread, which is what a stock Grafana
+/// dashboard or a `histogram_quantile` recording rule expects to find.
+const LATENCY_BUCKETS_SECS: [f64; 11] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 /// Per-request timeout.
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Request counts and latency, recorded for every HTTP request.
+///
+/// The `/metrics` endpoint previously exported only internal counters —
+/// buffered events, cache hits, login failures — and nothing at all about the
+/// traffic the process was actually serving. An operator could not answer "is
+/// the dashboard slow?", "are we returning 500s?" or "how much load is this?"
+/// without a separate reverse-proxy exporter, which the single-binary,
+/// no-dependencies deployment is specifically meant to avoid.
+///
+/// Counts are kept by status class rather than by route: a per-route label set
+/// would be unbounded, because `/{*path}` matches anything a crawler asks for.
+#[derive(Debug, Default)]
+pub struct HttpMetrics {
+    /// Responses by status class, indexed `1xx`..`5xx`.
+    by_class: [AtomicU64; 5],
+    /// Cumulative latency in microseconds — integer, so the counter is exact.
+    duration_micros_total: AtomicU64,
+    /// Cumulative histogram counts, one per bound in [`LATENCY_BUCKETS_SECS`].
+    /// The implicit `+Inf` bucket is the total request count.
+    buckets: [AtomicU64; LATENCY_BUCKETS_SECS.len()],
+    /// Every observed request, i.e. the `+Inf` bucket.
+    observations: AtomicU64,
+}
+
+impl HttpMetrics {
+    /// Record one completed request.
+    pub fn record(&self, status: StatusCode, elapsed: std::time::Duration) {
+        let class = (status.as_u16() / 100).clamp(1, 5) as usize - 1;
+        self.by_class[class].fetch_add(1, Ordering::Relaxed);
+
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.duration_micros_total
+            .fetch_add(micros, Ordering::Relaxed);
+
+        let secs = elapsed.as_secs_f64();
+        for (bucket, bound) in self.buckets.iter().zip(LATENCY_BUCKETS_SECS) {
+            if secs <= bound {
+                bucket.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.observations.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Time every request and record its outcome.
+async fn http_metrics_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    state
+        .http_metrics
+        .record(response.status(), started.elapsed());
+    response
+}
 
 /// Build the Axum router.
 pub fn build_router(state: Arc<AppState>) -> Router {
@@ -110,6 +176,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             REQUEST_TIMEOUT,
         ))
         .layer(TraceLayer::new_for_http())
+        // Added last, so it is the outermost layer and sees the status the
+        // client actually receives: a request the timeout layer converts into a
+        // 408, or a body the compression layer rewrites, is counted as served.
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            http_metrics_middleware,
+        ))
         .with_state(state)
 }
 
@@ -313,7 +386,7 @@ async fn detailed_health_check(
         "buffered_events": state.buffer.len(),
         "buffer_empty": state.buffer.is_empty(),
         "dropped_events": state.buffer.dropped_events.load(Ordering::Relaxed),
-        "auth_configured": state.admin_password_hash.lock().is_some(),
+        "auth_configured": state.admin_password.is_configured(),
         "active_sessions": state.sessions.len(),
         "geoip_loaded": state.geoip.is_loaded(),
         "behavioral_extension_loaded": state.behavioral_extension_loaded,
@@ -334,6 +407,56 @@ fn metric(out: &mut String, name: &str, help: &str, kind: &str, value: u64) {
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} {kind}");
     let _ = writeln!(out, "{name} {value}");
+}
+
+/// Emit the HTTP request counters and the latency histogram.
+fn write_http_metrics(out: &mut String, state: &AppState) {
+    use std::fmt::Write;
+
+    let http = &state.http_metrics;
+
+    let _ = writeln!(
+        out,
+        "# HELP mallard_http_requests_total HTTP responses served, by status class"
+    );
+    let _ = writeln!(out, "# TYPE mallard_http_requests_total counter");
+    for (index, class) in ["1xx", "2xx", "3xx", "4xx", "5xx"].iter().enumerate() {
+        let value = http.by_class[index].load(Ordering::Relaxed);
+        let _ = writeln!(
+            out,
+            "mallard_http_requests_total{{status=\"{class}\"}} {value}"
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "# HELP mallard_http_request_duration_seconds Time to produce a response"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE mallard_http_request_duration_seconds histogram"
+    );
+    for (bucket, bound) in http.buckets.iter().zip(LATENCY_BUCKETS_SECS) {
+        let value = bucket.load(Ordering::Relaxed);
+        let _ = writeln!(
+            out,
+            "mallard_http_request_duration_seconds_bucket{{le=\"{bound}\"}} {value}"
+        );
+    }
+    let total = http.observations.load(Ordering::Relaxed);
+    let _ = writeln!(
+        out,
+        "mallard_http_request_duration_seconds_bucket{{le=\"+Inf\"}} {total}"
+    );
+    // Accumulated in microseconds so the counter stays exact; rendered in
+    // seconds because that is the unit the metric name promises.
+    #[allow(clippy::cast_precision_loss)]
+    let sum_secs = http.duration_micros_total.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    let _ = writeln!(
+        out,
+        "mallard_http_request_duration_seconds_sum {sum_secs:.6}"
+    );
+    let _ = writeln!(out, "mallard_http_request_duration_seconds_count {total}");
 }
 
 /// Point-in-time values.
@@ -371,7 +494,7 @@ fn write_gauges(out: &mut String, state: &AppState) {
         "mallard_auth_configured",
         "Whether an admin password is set",
         "gauge",
-        u64::from(state.admin_password_hash.lock().is_some()),
+        u64::from(state.admin_password.is_configured()),
     );
     metric(
         out,
@@ -461,6 +584,7 @@ fn build_metrics_body(state: &AppState) -> String {
     let mut out = String::with_capacity(4096);
     write_gauges(&mut out, state);
     write_counters(&mut out, state);
+    write_http_metrics(&mut out, state);
     out
 }
 
@@ -579,7 +703,9 @@ mod tests {
             }
             let parts: Vec<&str> = line.split(' ').collect();
             assert_eq!(parts.len(), 2, "malformed sample line: {line}");
-            assert!(parts[1].parse::<u64>().is_ok(), "non-numeric value: {line}");
+            // Histogram sums are floats; every other sample is an integer, and
+            // `f64` parses both.
+            assert!(parts[1].parse::<f64>().is_ok(), "non-numeric value: {line}");
         }
     }
 

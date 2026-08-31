@@ -4,7 +4,7 @@
 //! tree, so everything is compiled once instead of twice.
 
 use mallard_metrics::api::auth::{
-    ApiKeyStore, LoginAttemptTracker, SessionStore, write_private_file,
+    AdminPasswordStore, ApiKeyStore, LoginAttemptTracker, SessionStore, write_private_file,
 };
 use mallard_metrics::config::Config;
 use mallard_metrics::ingest::buffer::EventBuffer;
@@ -12,8 +12,8 @@ use mallard_metrics::ingest::geoip::GeoIpReader;
 use mallard_metrics::ingest::handler::AppState;
 use mallard_metrics::ingest::ratelimit::RateLimiter;
 use mallard_metrics::query::cache::QueryCache;
-use mallard_metrics::storage::ReaderPool;
 use mallard_metrics::storage::parquet::ParquetStorage;
+use mallard_metrics::storage::{ReaderPool, TierLock};
 use mallard_metrics::{server, storage};
 
 use duckdb::Connection;
@@ -263,6 +263,7 @@ struct Database {
 fn open_database(config: &Config, storage: &ParquetStorage) -> Result<Database, String> {
     let conn = Connection::open(config.db_path())
         .map_err(|e| format!("could not open {}: {e}", config.db_path().display()))?;
+    apply_duckdb_settings(&conn, config)?;
     storage::migrations::run_migrations(&conn).map_err(|e| format!("migrations failed: {e}"))?;
 
     let behavioral_loaded = match storage::schema::load_behavioral_extension(&conn) {
@@ -314,17 +315,77 @@ fn open_database(config: &Config, storage: &ParquetStorage) -> Result<Database, 
     })
 }
 
+/// Apply the deployment's DuckDB settings to the freshly opened database.
+///
+/// These are database-wide rather than per-connection, so the writer is the
+/// only place they need to be set; the reader pool clones from it.
+///
+/// `extension_directory` is the one that matters most. DuckDB defaults to
+/// `$HOME/.duckdb/extensions`, and the shipped `FROM scratch` image sets no
+/// `HOME` and is documented to run with a read-only root filesystem — so
+/// `INSTALL behavioral FROM community` had nowhere to write and every
+/// behavioral endpoint answered 503 on an otherwise healthy deployment.
+fn apply_duckdb_settings(conn: &Connection, config: &Config) -> Result<(), String> {
+    let extension_dir = config.extension_dir();
+    std::fs::create_dir_all(&extension_dir).map_err(|e| {
+        format!(
+            "could not create the extension directory {}: {e}",
+            extension_dir.display()
+        )
+    })?;
+
+    // `home_directory` has to be set as well, and this is not belt-and-braces.
+    // DuckDB resolves the home directory while installing an extension even
+    // when `extension_directory` points somewhere else, and with no `HOME` in
+    // the environment that resolution fails outright:
+    //
+    //     IO Error: Can't find the home directory at ''
+    //
+    // which is exactly what a `FROM scratch` image produces. Pointing both at
+    // the data volume is what actually makes the install work there; setting
+    // only the extension directory does not.
+    let escaped_home = config.data_dir.to_string_lossy().replace('\'', "''");
+    conn.execute_batch(&format!("SET home_directory = '{escaped_home}'"))
+        .map_err(|e| format!("could not set home_directory: {e}"))?;
+
+    let escaped = extension_dir.to_string_lossy().replace('\'', "''");
+    conn.execute_batch(&format!("SET extension_directory = '{escaped}'"))
+        .map_err(|e| format!("could not set extension_directory: {e}"))?;
+
+    if let Some(limit) = &config.duckdb_memory_limit {
+        // Validated by `Config::validate`, and re-escaped rather than trusted.
+        let escaped = limit.replace('\'', "''");
+        conn.execute_batch(&format!("SET memory_limit = '{escaped}'"))
+            .map_err(|e| format!("could not set memory_limit to {limit:?}: {e}"))?;
+    }
+    if let Some(threads) = config.duckdb_threads {
+        conn.execute_batch(&format!("SET threads = {threads}"))
+            .map_err(|e| format!("could not set threads to {threads}: {e}"))?;
+    }
+
+    tracing::info!(
+        home_directory = %config.data_dir.display(),
+        extension_directory = %extension_dir.display(),
+        memory_limit = config.duckdb_memory_limit.as_deref().unwrap_or("(DuckDB default)"),
+        threads = config.duckdb_threads.map_or_else(|| "(one per core)".to_string(), |t| t.to_string()),
+        "DuckDB configured"
+    );
+    Ok(())
+}
+
 /// Assemble the shared application state.
 fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
     let events_dir = config.events_dir();
     let storage = ParquetStorage::new(&events_dir, config.compact_after_files);
     let db = open_database(config, &storage)?;
 
+    let tier_lock = TierLock::new();
     let buffer = EventBuffer::new(
         config.flush_event_count,
         config.max_buffered_events,
         Arc::clone(&db.writer),
         storage,
+        tier_lock.clone(),
     );
 
     let metrics_token = std::env::var("MALLARD_METRICS_TOKEN")
@@ -352,13 +413,17 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
     Ok(Arc::new(AppState {
         buffer,
         readers: db.readers,
+        tier_lock,
         secret: load_or_create_secret(config),
         allowed_sites: config.site_ids.clone(),
         geoip: GeoIpReader::open(config.geoip_db_path.as_deref()),
         filter_bots: config.filter_bots,
         sessions: SessionStore::with_capacity(config.session_ttl_secs, config.max_sessions),
         api_keys: ApiKeyStore::load_from_disk(config.data_dir.join("api_keys.json")),
-        admin_password_hash: Mutex::new(load_admin_password()),
+        admin_password: AdminPasswordStore::load_from_disk(
+            config.data_dir.join("admin.json"),
+            load_admin_password(),
+        ),
         dashboard_origin: config.dashboard_origin.clone(),
         query_cache: QueryCache::new(config.cache_ttl_secs, config.cache_max_entries),
         rate_limiter: RateLimiter::new(config.rate_limit_per_site, config.max_tracked_keys),
@@ -368,6 +433,7 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
             config.login_lockout_secs,
             config.max_tracked_keys,
         ),
+        http_metrics: Arc::default(),
         events_ingested_total: Arc::new(AtomicU64::new(0)),
         flush_failures_total: Arc::new(AtomicU64::new(0)),
         rate_limit_rejections_total: Arc::new(AtomicU64::new(0)),
@@ -404,8 +470,8 @@ fn load_admin_password() -> Option<String> {
             Some(hash)
         }
         Err(e) => {
-            // Exiting would be worse: it would leave an unauthenticated
-            // dashboard running is not an option either, so refuse to start.
+            // Starting anyway would run an unauthenticated dashboard for an
+            // operator who explicitly asked for a password, so refuse to start.
             eprintln!("Failed to hash MALLARD_ADMIN_PASSWORD: {e}");
             std::process::exit(EXIT_FAILURE);
         }
@@ -498,15 +564,23 @@ fn spawn_flush_task(interval_secs: u64, state: &Arc<AppState>) {
 /// Delete Parquet partitions past the retention horizon, daily.
 fn spawn_retention_task(retention_days: u32, state: &Arc<AppState>) {
     let storage = state.buffer.storage().clone();
+    let tier_lock = state.tier_lock.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(RETENTION_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
             let storage = storage.clone();
-            let result =
-                tokio::task::spawn_blocking(move || storage.cleanup_old_partitions(retention_days))
-                    .await;
+            let tier_lock = tier_lock.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                // The read glob is expanded when a query starts and the files
+                // are opened after that, so a partition removed in between
+                // makes the query fail on a file that no longer exists. Taking
+                // the tier lock keeps deletions out of that window.
+                let _tier = tier_lock.write();
+                storage.cleanup_old_partitions(retention_days)
+            })
+            .await;
             match result {
                 Ok(Ok(0)) => {}
                 Ok(Ok(removed)) => {

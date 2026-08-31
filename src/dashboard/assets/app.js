@@ -111,11 +111,39 @@ function Placeholder({ state, empty }) {
   return null;
 }
 
-function MetricCard({ label, value, hint, muted }) {
+/**
+ * Relative change from `before` to `after`, as a rendered chip.
+ *
+ * Returns null when there is nothing honest to say: no comparison was
+ * requested, a value is missing, or the baseline was zero — "up from zero" has
+ * no percentage, and showing one anyway (or a bare "+100%") is the kind of
+ * number people quote in a meeting.
+ */
+function Delta({ before, after, invert }) {
+  if (before == null || after == null || before === 0) return null;
+  const change = (after - before) / before;
+  if (!Number.isFinite(change)) return null;
+
+  const rounded = Math.round(change * 1000) / 10;
+  if (rounded === 0) {
+    return html`<div class="metric-delta metric-delta-flat" title="No change">±0%</div>`;
+  }
+  // For bounce rate, down is the good direction — so the colour follows the
+  // metric's meaning, not the arithmetic sign.
+  const good = invert ? rounded < 0 : rounded > 0;
+  return html`
+    <div class=${`metric-delta ${good ? 'metric-delta-up' : 'metric-delta-down'}`}>
+      ${rounded > 0 ? '▲' : '▼'} ${Math.abs(rounded).toFixed(1)}%
+    </div>
+  `;
+}
+
+function MetricCard({ label, value, hint, muted, delta }) {
   return html`
     <div class=${`metric-card${muted ? ' metric-muted' : ''}`}>
       <div class="metric-value">${value}</div>
       <div class="metric-label">${label}</div>
+      ${delta}
       ${hint && html`<div class="metric-hint">${hint}</div>`}
     </div>
   `;
@@ -583,6 +611,172 @@ class GoalsPanel extends Component {
 
 /* ── Authentication ────────────────────────────────────────────────────── */
 
+/**
+ * API key management.
+ *
+ * `POST/GET/DELETE /api/keys` shipped with no way to reach them from the
+ * dashboard, so issuing a key for a script or a Grafana scrape meant hand-
+ * writing a curl command with a session cookie pasted out of devtools. The
+ * plaintext key is returned once and never again, which is exactly the kind of
+ * thing a UI should be careful about — so it stays on screen until dismissed
+ * rather than disappearing on the next render.
+ */
+class KeysPanel extends Component {
+  constructor() {
+    super();
+    this.state = {
+      keys: null,
+      name: '',
+      scope: 'ReadOnly',
+      created: null,
+      error: null,
+      busy: false,
+    };
+  }
+
+  componentDidMount() {
+    this.load();
+  }
+
+  async load() {
+    const result = await getJSON('/api/keys');
+    if (result.kind === 'unauthorized') return this.props.onAuthExpired();
+    if (result.kind === 'ok') {
+      this.setState({ keys: result.data, error: null });
+    } else {
+      this.setState({ keys: [], error: result.message });
+    }
+  }
+
+  async create(event) {
+    event.preventDefault();
+    const name = this.state.name.trim();
+    if (!name) return;
+    this.setState({ busy: true, error: null });
+    try {
+      const res = await fetch('/api/keys', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, scope: this.state.scope }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok) {
+        this.setState({ created: body, name: '', busy: false });
+        await this.load();
+      } else {
+        this.setState({ error: body.error || `Error ${res.status}`, busy: false });
+      }
+    } catch (e) {
+      this.setState({ error: 'Could not reach the server.', busy: false });
+    }
+  }
+
+  async revoke(keyHash, name) {
+    // A revoked key stops working immediately and cannot be restored, so the
+    // one destructive action in this panel asks first.
+    if (!window.confirm(`Revoke the API key "${name}"? Anything using it stops working immediately.`)) {
+      return;
+    }
+    this.setState({ busy: true, error: null });
+    try {
+      const res = await fetch(`/api/keys/${encodeURIComponent(keyHash)}`, { method: 'DELETE' });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        this.setState({ error: body.error || `Error ${res.status}` });
+      }
+    } catch (e) {
+      this.setState({ error: 'Could not reach the server.' });
+    }
+    this.setState({ busy: false });
+    await this.load();
+  }
+
+  render({ onClose }, { keys, name, scope, created, error, busy }) {
+    const live = (keys || []).filter((k) => !k.revoked);
+    return html`
+      <${Panel}
+        title="API keys"
+        subtitle="Programmatic access to the stats endpoints. Keys are stored as SHA-256 hashes; the key itself is shown once."
+        actions=${html`<button class="btn-secondary" onClick=${onClose}>Close</button>`}
+      >
+        ${created &&
+        html`
+          <div class="banner banner-key" role="alert">
+            <strong>Copy this key now — it is not shown again.</strong>
+            <code class="key-value">${created.key}</code>
+            <button class="btn-secondary" onClick=${() => this.setState({ created: null })}>
+              Done
+            </button>
+          </div>
+        `}
+
+        <form class="inline-controls" onSubmit=${(e) => this.create(e)}>
+          <label>
+            Name
+            <input
+              type="text"
+              value=${name}
+              maxlength="128"
+              placeholder="grafana-scraper"
+              onInput=${(e) => this.setState({ name: e.target.value })}
+              required
+            />
+          </label>
+          <label>
+            Scope
+            <select value=${scope} onChange=${(e) => this.setState({ scope: e.target.value })}>
+              <option value="ReadOnly">Read only — stats endpoints</option>
+              <option value="Admin">Admin — also key management and erasure</option>
+            </select>
+          </label>
+          <button type="submit" disabled=${busy || !name.trim()}>Create key</button>
+        </form>
+
+        ${error && html`<div class="placeholder placeholder-error">${error}</div>`}
+
+        ${keys === null
+          ? html`<div class="placeholder">Loading…</div>`
+          : live.length === 0
+            ? html`<div class="placeholder">No API keys yet</div>`
+            : html`
+                <table class="data-table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Scope</th>
+                      <th>Created</th>
+                      <th>Fingerprint</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${live.map(
+                      (key) => html`
+                        <tr>
+                          <td>${key.name}</td>
+                          <td>${key.scope === 'Admin' ? 'Admin' : 'Read only'}</td>
+                          <td>${key.created_at.slice(0, 10)}</td>
+                          <td><code>${key.key_hash.slice(0, 12)}…</code></td>
+                          <td>
+                            <button
+                              class="btn-secondary"
+                              disabled=${busy}
+                              onClick=${() => this.revoke(key.key_hash, key.name)}
+                            >
+                              Revoke
+                            </button>
+                          </td>
+                        </tr>
+                      `,
+                    )}
+                  </tbody>
+                </table>
+              `}
+      </${Panel}>
+    `;
+  }
+}
+
 class LoginForm extends Component {
   constructor() {
     super();
@@ -611,7 +805,7 @@ class LoginForm extends Component {
     }
   }
 
-  render({ setupRequired }, { error, busy }) {
+  render({ setupRequired, onCancel }, { error, busy }) {
     return html`
       <div class="auth-overlay">
         <form class="auth-card" onSubmit=${(e) => this.submit(e)}>
@@ -636,6 +830,8 @@ class LoginForm extends Component {
           <button type="submit" disabled=${busy}>
             ${busy ? 'Working…' : setupRequired ? 'Set password' : 'Sign in'}
           </button>
+          ${onCancel &&
+          html`<button type="button" class="btn-secondary" onClick=${onCancel}>Not now</button>`}
         </form>
       </div>
     `;
@@ -754,9 +950,11 @@ class Dashboard extends Component {
       sequenceSteps: prefs.sequenceSteps || 'page:/,event:signup',
       flowPage: prefs.flowPage || '/',
       flowDirection: prefs.flowDirection || 'forward',
+      compare: prefs.compare || 'none',
       // Active segment, as [{dimension, negated, value}]. Not persisted: a
       // filter is a question you are asking right now, not a preference.
       filters: [],
+      showKeys: false,
     };
   }
 
@@ -778,9 +976,9 @@ class Dashboard extends Component {
   }
 
   persist() {
-    const { siteId, period, startDate, endDate, theme, funnelSteps, funnelModes, sequenceSteps, flowPage, flowDirection } =
+    const { siteId, period, startDate, endDate, theme, funnelSteps, funnelModes, sequenceSteps, flowPage, flowDirection, compare } =
       this.state;
-    savePrefs({ siteId, period, startDate, endDate, theme, funnelSteps, funnelModes, sequenceSteps, flowPage, flowDirection });
+    savePrefs({ siteId, period, startDate, endDate, theme, funnelSteps, funnelModes, sequenceSteps, flowPage, flowDirection, compare });
   }
 
   /** The shared query string for the selected site, range and segment. */
@@ -828,9 +1026,19 @@ class Dashboard extends Component {
     }));
   }
 
+  /** Realtime takes the segment but not the date range: its window is its own. */
+  realtimeQuery() {
+    const { siteId, filters } = this.state;
+    const parts = [`site_id=${encodeURIComponent(siteId)}`];
+    if (filters.length > 0) {
+      parts.push(`filters=${encodeURIComponent(serializeFilters(filters))}`);
+    }
+    return parts.join('&');
+  }
+
   async refreshRealtime() {
     if (!this.state.siteId) return;
-    const result = await getJSON(`/api/stats/realtime?site_id=${encodeURIComponent(this.state.siteId)}`);
+    const result = await getJSON(`/api/stats/realtime?${this.realtimeQuery()}`);
     if (result.kind === 'unauthorized') return this.props.onAuthExpired();
     this.setState({ realtime: result });
   }
@@ -860,9 +1068,12 @@ class Dashboard extends Component {
       flow,
       ...breakdownResults
     ] = await Promise.all([
-      getJSON(`/api/stats/main?${query}`),
+      getJSON(
+        `/api/stats/main?${query}` +
+          (this.state.compare === 'none' ? '' : `&compare=${this.state.compare}`),
+      ),
       getJSON(`/api/stats/timeseries?${query}`),
-      getJSON(`/api/stats/realtime?site_id=${encodeURIComponent(siteId)}`),
+      getJSON(`/api/stats/realtime?${this.realtimeQuery()}`),
       getJSON(`/api/stats/revenue?${query}`),
       getJSON(`/api/stats/goals?${query}`),
       getJSON(`/api/stats/properties?${query}`),
@@ -961,6 +1172,16 @@ class Dashboard extends Component {
         </button>
 
         <select
+          aria-label="Compare against"
+          value=${this.state.compare}
+          onChange=${(e) => this.setState({ compare: e.target.value }, () => this.refresh())}
+        >
+          <option value="none">No comparison</option>
+          <option value="previous_period">vs. previous period</option>
+          <option value="year_over_year">vs. same period last year</option>
+        </select>
+
+        <select
           aria-label="Theme"
           value=${theme}
           onChange=${(e) => this.setState({ theme: e.target.value }, () => {
@@ -974,6 +1195,17 @@ class Dashboard extends Component {
         </select>
 
         ${this.props.onLogout &&
+        html`
+          <button
+            class="btn-secondary"
+            aria-pressed=${this.state.showKeys}
+            onClick=${() => this.setState((prev) => ({ showKeys: !prev.showKeys }))}
+          >
+            API keys
+          </button>
+        `}
+
+        ${this.props.onLogout &&
         html`<button class="btn-secondary" onClick=${this.props.onLogout}>Sign out</button>`}
       </div>
     `;
@@ -984,29 +1216,61 @@ class Dashboard extends Component {
     if (!main || main.kind !== 'ok') return html`<${Placeholder} state=${main} />`;
     const m = main.data;
     const behavioralHint = m.behavioral_available ? null : 'Needs the behavioral extension';
+    const prev = m.comparison || null;
+    // `invert` marks the metrics where a fall is the good news.
+    const delta = (key, invert) =>
+      prev ? html`<${Delta} before=${prev[key]} after=${m[key]} invert=${invert} />` : null;
+
+    // A baseline of zero produces no percentages — see `Delta` — so the note
+    // has to say why, or it reads as a comparison that silently failed.
+    const baselineEmpty = prev != null && prev.total_pageviews === 0 && prev.unique_visitors === 0;
+
     return html`
+      ${prev &&
+      html`
+        <p class="comparison-note">
+          Compared with ${prev.start_date} – ${prev.end_date}${baselineEmpty
+            ? ' — no data in that period, so there is nothing to compare against'
+            : ''}
+        </p>
+      `}
       <div class="metrics-grid">
-        <${MetricCard} label="Unique visitors" value=${num(m.unique_visitors)} />
-        <${MetricCard} label="Pageviews" value=${num(m.total_pageviews)} />
-        <${MetricCard} label="Total events" value=${num(m.total_events)} />
+        <${MetricCard}
+          label="Unique visitors"
+          value=${num(m.unique_visitors)}
+          delta=${delta('unique_visitors')}
+        />
+        <${MetricCard}
+          label="Pageviews"
+          value=${num(m.total_pageviews)}
+          delta=${delta('total_pageviews')}
+        />
+        <${MetricCard}
+          label="Total events"
+          value=${num(m.total_events)}
+          delta=${delta('total_events')}
+        />
         <${MetricCard} label="Views per visitor" value=${m.views_per_visitor.toFixed(2)} />
         <${MetricCard}
           label="Visits"
           value=${num(m.total_sessions)}
           hint=${behavioralHint}
           muted=${!m.behavioral_available}
+          delta=${delta('total_sessions')}
         />
         <${MetricCard}
           label="Bounce rate"
           value=${pct(m.bounce_rate)}
           hint=${behavioralHint}
           muted=${!m.behavioral_available}
+          delta=${delta('bounce_rate', true)}
         />
         <${MetricCard}
           label="Visit duration"
           value=${duration(m.avg_visit_duration_secs)}
           hint=${behavioralHint}
           muted=${!m.behavioral_available}
+          delta=${delta('avg_visit_duration_secs')}
         />
         <${MetricCard}
           label="Views per visit"
@@ -1033,6 +1297,27 @@ class Dashboard extends Component {
         </header>
 
         ${error && html`<div class="banner banner-error" role="alert">${error}</div>`}
+
+        ${this.props.setupRequired &&
+        html`
+          <div class="banner banner-warning" role="alert">
+            <strong>This instance has no admin password.</strong>
+            <span>
+              Anyone who can reach it can read every site's analytics. Set one
+              before exposing it to a network.
+            </span>
+            <button onClick=${this.props.onStartSetup}>Set admin password</button>
+          </div>
+        `}
+
+        ${this.state.showKeys &&
+        html`
+          <${KeysPanel}
+            onClose=${() => this.setState({ showKeys: false })}
+            onAuthExpired=${this.props.onAuthExpired}
+          />
+        `}
+
         ${!siteId && html`<div class="banner">Choose a site to see its analytics.</div>`}
 
         ${siteId &&
@@ -1188,7 +1473,7 @@ class Dashboard extends Component {
 class App extends Component {
   constructor() {
     super();
-    this.state = { checked: false, authenticated: false, setupRequired: false };
+    this.state = { checked: false, authenticated: false, setupRequired: false, showSetup: false };
   }
 
   componentDidMount() {
@@ -1214,13 +1499,26 @@ class App extends Component {
     this.setState({ authenticated: false });
   }
 
-  render(_, { checked, authenticated, setupRequired }) {
+  render(_, { checked, authenticated, setupRequired, showSetup }) {
     if (!checked) return html`<div class="loading-screen">Loading…</div>`;
-    if (!authenticated) {
-      return html`<${LoginForm} setupRequired=${setupRequired} onLogin=${() => this.checkAuth()} />`;
+    // Before setup the API reports `authenticated: true` — reads are open, and
+    // that is a deliberate deployment mode. It also meant the login form was
+    // never shown, so there was no way to set an admin password from the
+    // dashboard at all, despite the README promising a first-run prompt. The
+    // setup form is now reachable from the banner below.
+    if (!authenticated || showSetup) {
+      return html`
+        <${LoginForm}
+          setupRequired=${setupRequired}
+          onLogin=${() => this.setState({ showSetup: false }, () => this.checkAuth())}
+          onCancel=${showSetup ? () => this.setState({ showSetup: false }) : null}
+        />
+      `;
     }
     return html`
       <${Dashboard}
+        setupRequired=${setupRequired}
+        onStartSetup=${() => this.setState({ showSetup: true })}
         onLogout=${setupRequired ? null : () => this.logout()}
         onAuthExpired=${() => this.setState({ authenticated: false })}
       />

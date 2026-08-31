@@ -321,14 +321,47 @@ jobs:
       - name: Write release Dockerfile
         run: |
           cat > Dockerfile.release <<'EOF'
+          # A `scratch` image has no trust store, and DuckDB downloads the
+          # `behavioral` community extension over HTTPS on first run. Alpine is
+          # here only to supply those roots; nothing from it ships in the final
+          # image except the ~200 KB bundle.
+          # Pinned to the build platform: the bundle is a text file with no
+          # architecture, so emulating an arm64 Alpine just to read it would
+          # cost QEMU time for nothing.
+          FROM --platform=$BUILDPLATFORM alpine:3.22 AS certs
+          RUN apk add --no-cache ca-certificates
+
           FROM scratch
           ARG TARGETARCH
+
+          COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+          # Mirrors the from-source Dockerfile exactly. It previously did not:
+          # the released image carried no OCI labels (so GHCR could not link it
+          # back to this repository or state its licence) and no HEALTHCHECK
+          # (so `docker run` and Swarm had no readiness signal, even though the
+          # binary ships one specifically because `scratch` has no shell).
+          LABEL org.opencontainers.image.title="Mallard Metrics" \
+                org.opencontainers.image.description="Self-hosted, privacy-focused web analytics powered by DuckDB and the behavioral extension" \
+                org.opencontainers.image.source="https://github.com/tomtom215/mallardmetrics" \
+                org.opencontainers.image.licenses="AGPL-3.0-only"
+
           COPY dist/${TARGETARCH}/mallard-metrics /mallard-metrics
-          # Mirrors the from-source Dockerfile: non-root uid, /data default.
+
+          # Non-root uid; `scratch` has no /etc/passwd, so it must be numeric.
           USER 65532:65532
+
           ENV MALLARD_DATA_DIR=/data
+          # DuckDB's default extension directory is $HOME/.duckdb, and this
+          # image has no home directory; the data volume is the writable one.
+          ENV MALLARD_EXTENSION_DIR=/data/extensions
           EXPOSE 8000
           VOLUME ["/data"]
+
+          # Exec form: there is no shell in the image to parse a string form.
+          HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+              CMD ["/mallard-metrics", "--healthcheck"]
+
           ENTRYPOINT ["/mallard-metrics"]
           EOF
           sed -i 's/^          //' Dockerfile.release

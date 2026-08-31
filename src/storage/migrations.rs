@@ -23,6 +23,19 @@ pub fn run_migrations(conn: &Connection) -> Result<(), duckdb::Error> {
 
     let current = get_current_version(conn)?;
 
+    // A database written by a newer build may contain columns, tables or
+    // semantics this one does not know about. Silently opening it and running
+    // the old code against it is how a rollback turns into data loss, so refuse
+    // instead and say what the operator is looking at.
+    if current > CURRENT_VERSION {
+        return Err(duckdb::Error::InvalidParameterName(format!(
+            "the database is at schema version {current} but this build understands \
+             at most {CURRENT_VERSION}. It was written by a newer version of \
+             Mallard Metrics; upgrade the binary, or restore a backup taken \
+             before the upgrade."
+        )));
+    }
+
     if current < 1 {
         migrate_v1(conn)?;
     }
@@ -70,6 +83,22 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
         assert_eq!(get_current_version(&conn).unwrap(), CURRENT_VERSION);
+    }
+
+    #[test]
+    fn test_run_migrations_refuses_a_newer_database() {
+        // Opening a database written by a newer build with older code is how a
+        // rollback silently corrupts data; it must be an error, not a warning.
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        record_version(&conn, CURRENT_VERSION + 1).unwrap();
+
+        let err = run_migrations(&conn).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("newer version"),
+            "the error should name the cause: {message}"
+        );
     }
 
     #[test]

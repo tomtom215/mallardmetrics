@@ -231,8 +231,23 @@ impl ParquetStorage {
 
             // Only now that the Parquet file is durably in place do we drop the
             // rows from the hot table.
-            conn.execute_batch(&format!("DELETE FROM events WHERE {predicate}"))
-                .map_err(FlushError::Delete)?;
+            //
+            // If the delete fails the rows exist in both tiers, and every future
+            // query would double-count them — permanently, because nothing
+            // retries a delete. Removing the file we just wrote puts the
+            // partition back exactly as it was, and the next flush retries it.
+            if let Err(e) = conn.execute_batch(&format!("DELETE FROM events WHERE {predicate}")) {
+                if let Err(unlink) = fs::remove_file(&file_path) {
+                    tracing::error!(
+                        path = %file_path.display(),
+                        error = %unlink,
+                        "Could not remove the Parquet file for a partition whose rows \
+                         could not be deleted from the hot table; those events will be \
+                         counted twice until the file is removed by hand"
+                    );
+                }
+                return Err(FlushError::Delete(e));
+            }
         }
 
         if total_flushed > 0 {

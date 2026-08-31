@@ -72,6 +72,26 @@ These two values are secrets and must not be stored in files committed to source
 | `MALLARD_MAX_TRACKED_KEYS` | Optional | Cap on rate-limit buckets and login-attempt records (default `10000`). |
 | `MALLARD_MAX_SESSIONS` | Optional | Cap on concurrent dashboard sessions (default `10000`). |
 | `MALLARD_RATE_LIMIT_PER_IP` | Optional | Max events/sec per client IP; 0 = unlimited (default `0`). |
+| `MALLARD_EXTENSION_DIR` | Optional | Where DuckDB installs community extensions (default `data_dir/extensions`). |
+| `MALLARD_DUCKDB_MEMORY_LIMIT` | Optional | Cap on query memory, e.g. `1GB`. Unset means DuckDB's default of roughly 80% of system RAM. |
+| `MALLARD_DUCKDB_THREADS` | Optional | DuckDB worker threads. Unset means one per core. |
+
+### Why the extension directory is not DuckDB's default
+
+DuckDB installs community extensions under `$HOME/.duckdb/extensions`. The
+shipped `FROM scratch` image sets no `HOME`, and the production compose file
+runs with a read-only root filesystem, so `INSTALL behavioral FROM community`
+failed with `IO Error: Can't find the home directory at ''` — and funnels,
+retention, sessions, sequences and flow all answered `503` on a deployment that
+looked healthy in every other respect.
+
+The server sets DuckDB's `home_directory` to the data directory as well. DuckDB
+resolves the home directory while installing an extension even when
+`extension_directory` names somewhere else, so setting only the extension
+directory does not fix it.
+Keeping the directory on the data volume, which is writable by definition, is
+what makes those endpoints work in a container. It also puts the downloaded
+extension somewhere an operator can find and back up.
 
 Boolean variables accept `1/true/yes/on` and `0/false/no/off`, case-insensitively.
 Anything else logs a warning and leaves the setting unchanged, rather than being
