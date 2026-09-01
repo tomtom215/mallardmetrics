@@ -144,7 +144,7 @@ All four commands must pass before submitting a PR:
 
 | Command | Requirement |
 |---|---|
-| `cargo test --all-targets` | All 585 tests pass (519 unit + 66 integration) |
+| `cargo test --all-targets` | All 602 tests pass (535 unit + 67 integration) |
 | `cargo clippy --all-targets --all-features -- -D warnings` | Zero warnings (pedantic + nursery + cargo lints) |
 | `cargo fmt -- --check` | Zero formatting violations |
 | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | Documentation builds without errors |

@@ -29,8 +29,12 @@ const EPOCH: NaiveDate = match NaiveDate::from_ymd_opt(1970, 1, 1) {
 /// any metric, because every query already filters by `site_id`.
 pub fn generate_visitor_id(site_id: &str, ip: &str, user_agent: &str, salt: &str) -> String {
     let mut mac = HmacSha256::new_from_slice(salt.as_bytes()).expect("HMAC accepts any key length");
-    // Length-prefixed field separators prevent ambiguity between, say,
-    // ("a.com", "1.2.3.4") and ("a.com|1", ".2.3.4").
+    // Fields are joined with a separator that cannot occur in either of the two
+    // that precede it: `site_id` is validated to alphanumerics plus `.-_:`, and
+    // `ip` is either a canonicalised address or the literal "unknown". So
+    // ("a.com", "1.2.3.4") and ("a.com|1", ".2.3.4") cannot both be produced,
+    // and the concatenation is unambiguous. The trailing field needs no such
+    // guarantee because nothing follows it.
     mac.update(site_id.as_bytes());
     mac.update(b"|");
     mac.update(ip.as_bytes());

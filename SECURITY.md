@@ -163,6 +163,8 @@ Known bot User-Agents are automatically filtered from analytics when `MALLARD_FI
 | Brute force (login) | Argon2id hashing (inherently slow, run off the async runtime), per-IP attempt counting with configurable lockout. `/api/auth/setup` shares the same protection, so the window before first configuration cannot be probed freely |
 | Brute force (API) | Per-site and per-IP token-bucket rate limiting on ingestion |
 | Weak admin password | Minimum 12 characters, and a short list of obvious values is refused |
+| Instance takeover after a restart | The Argon2id hash of a password set through the setup endpoint is persisted to `data_dir/admin.json` (mode 0600), so a restart does not reopen first-run setup for whoever reaches the instance first |
+| Dashboard lockout as denial of service | Brute-force records are keyed by the resolved client address rather than a shared placeholder, so one attacker's failures cannot lock out every other operator |
 | Privilege escalation before setup | Key management and GDPR erasure return `401` until an admin password exists, so an unconfigured instance cannot be used to mint an admin key that would outlive setup |
 | Session hijacking | HttpOnly cookies, Secure flag with TLS, SameSite=Strict, 256-bit random tokens |
 | CSRF | Origin/Referer header validation on all state-mutating session-authenticated endpoints |

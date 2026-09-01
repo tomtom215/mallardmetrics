@@ -84,6 +84,14 @@ fn pageview(domain: &str, url: &str) -> serde_json::Value {
     serde_json::json!({ "d": domain, "n": "pageview", "u": url })
 }
 
+/// Browser User-Agents, for tests that need two distinguishable visitors.
+///
+/// The visitor ID hashes the User-Agent, so two different ones from the same
+/// address are two visitors — which is what a segment test needs.
+const CHROME_UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
+const FIREFOX_UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0";
+
 /// Flush the buffer so events become queryable through `events_all`.
 fn flush(state: &Arc<AppState>) {
     state.buffer.flush().expect("flush events");
@@ -647,6 +655,51 @@ async fn test_realtime_endpoint() {
     assert_eq!(json["current_visitors"], 1);
     assert_eq!(json["window_minutes"], 5);
     assert_eq!(json["top_pages"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_realtime_honours_the_segment() {
+    // The endpoint used to accept `filters` and silently ignore it, while the
+    // API documentation promised every stats endpoint narrowed by it — so a
+    // dashboard filtered to one country still showed everyone as "right now".
+    let (state, _dir) = plain_state();
+    post_event_with(
+        &state,
+        pageview("example.com", "https://example.com/"),
+        &[("user-agent", CHROME_UA)],
+    )
+    .await;
+    post_event_with(
+        &state,
+        pageview("example.com", "https://example.com/other"),
+        &[("user-agent", FIREFOX_UA)],
+    )
+    .await;
+    flush(&state);
+
+    let all = body_json(get(&state, "/api/stats/realtime?site_id=example.com").await).await;
+    assert_eq!(all["current_visitors"], 2);
+
+    let chrome_only = body_json(
+        get(
+            &state,
+            "/api/stats/realtime?site_id=example.com&filters=browsers%3D%3DChrome",
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(chrome_only["current_visitors"], 1);
+    assert_eq!(chrome_only["top_pages"].as_array().unwrap().len(), 1);
+    assert_eq!(chrome_only["top_pages"][0]["value"], "/");
+
+    // The per-minute series is part of the same report and must agree with it.
+    let series: u64 = chrome_only["per_minute"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(serde_json::Value::as_u64)
+        .sum();
+    assert_eq!(series, 1, "the per-minute series must be filtered too");
 }
 
 #[tokio::test]
@@ -1266,7 +1319,7 @@ async fn test_admin_routes_are_refused_before_setup() {
     // erasing data: a key issued in the window before setup keeps working
     // afterwards, so a few unconfigured minutes would grant permanent access.
     let (state, _dir) = plain_state();
-    assert!(state.admin_password_hash.lock().is_none());
+    assert!(!state.admin_password.is_configured());
 
     for (method, uri) in [
         ("GET", "/api/keys"),
@@ -1339,7 +1392,7 @@ async fn test_setup_creates_a_password_and_a_session() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert!(session_cookie(&response).is_some());
-    assert!(state.admin_password_hash.lock().is_some());
+    assert!(state.admin_password.is_configured());
 }
 
 #[tokio::test]

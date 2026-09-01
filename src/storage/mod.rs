@@ -7,6 +7,51 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Guards the windows in which the two storage tiers disagree with each other.
+///
+/// `events_all` is a `UNION ALL` of the hot `events` table and a *live* Parquet
+/// glob, and the glob is re-expanded on every query. Two write paths therefore
+/// have a moment where a row is visible on both sides at once:
+///
+/// - **Flush** writes a partition's rows to Parquet and only then deletes them
+///   from the hot table. Between those two steps a reader counts them twice.
+/// - **Compaction** renames the merged file into the glob and only then removes
+///   the source files it replaced. Between those two steps every row in the
+///   partition is visible twice.
+///
+/// Reversing either order would trade double-counting for a window where the
+/// rows are missing entirely, which is no better. Instead, writers take the
+/// exclusive side of this lock for the duration of the inconsistency and
+/// analytics queries take the shared side, so no query can observe it.
+///
+/// The lock is deliberately coarse. It is held for the length of a flush or a
+/// compaction — file writes, not user-facing work — and the alternative is a
+/// report that is quietly wrong a few times an hour.
+#[derive(Clone, Default)]
+pub struct TierLock(Arc<parking_lot::RwLock<()>>);
+
+impl TierLock {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Shared access, taken by every analytics query.
+    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
+        self.0.read()
+    }
+
+    /// Exclusive access, taken while the tiers are inconsistent.
+    pub fn write(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
+        self.0.write()
+    }
+
+    /// Shared access if it is free right now. Used by tests to assert that a
+    /// query and a flush really do contend on the same lock.
+    pub fn try_read(&self) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+        self.0.try_read()
+    }
+}
+
 /// A pool of read-only DuckDB connections for serving analytics queries.
 ///
 /// Every query used to contend for the single writer connection, so one slow
@@ -124,6 +169,115 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::storage::schema::init_schema(&conn).unwrap();
         Arc::new(Mutex::new(conn))
+    }
+
+    /// Rows written into the hot table on the writer connection.
+    fn insert_events(conn: &Connection, count: usize, offset: usize) {
+        for i in 0..count {
+            conn.execute(
+                "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname)
+                 VALUES ('a.com', ?, '2024-01-15 10:00:00', 'pageview', ?)",
+                duckdb::params![format!("v{}", offset + i), format!("/p{}", offset + i)],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Rows per insert batch, and how many batches the flusher writes.
+    const BATCH: usize = 60;
+    const ROUNDS: usize = 8;
+
+    #[test]
+    fn test_a_query_never_sees_a_half_applied_flush() {
+        // `events_all` is the hot `events` table UNION ALL a *live* Parquet
+        // glob, re-expanded on every query. A flush copies a partition to
+        // Parquet and only then deletes the rows it copied, so a query landing
+        // between those two statements counts every flushed event twice.
+        //
+        // With separate reader connections nothing else serialises the two —
+        // the writer mutex does not, because readers do not take it — so this
+        // reproduces reliably without the tier lock: the assertion below fires
+        // with a count roughly double the truth.
+        use crate::storage::parquet::ParquetStorage;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("t.duckdb")).unwrap();
+        crate::storage::schema::init_schema(&conn).unwrap();
+        let events_dir = dir.path().join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        crate::storage::schema::setup_query_view(&conn, &events_dir).unwrap();
+
+        let writer = Arc::new(Mutex::new(conn));
+        let readers = ReaderPool::new(&writer, 2);
+        assert_eq!(
+            readers.len(),
+            2,
+            "the bug needs independent read connections"
+        );
+
+        let storage = ParquetStorage::new(&events_dir, 0);
+        let tier = TierLock::new();
+        let committed = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+
+        let flusher = {
+            // `tier` is still needed by the reader below; `storage` is not.
+            let (writer, storage, tier) = (Arc::clone(&writer), storage, tier.clone());
+            let (committed, done) = (Arc::clone(&committed), Arc::clone(&done));
+            std::thread::spawn(move || {
+                for round in 0..ROUNDS {
+                    // Raised *before* the insert, so the ceiling is never
+                    // behind reality: a reader that catches a committed row the
+                    // counter has not seen yet is a false failure, and the
+                    // point of the test is the opposite direction — rows the
+                    // reader sees that were never written once.
+                    committed.fetch_add(BATCH as u64, Ordering::SeqCst);
+                    {
+                        let guard = writer.lock();
+                        insert_events(&guard, BATCH, round * BATCH);
+                    }
+                    {
+                        let _tier = tier.write();
+                        let guard = writer.lock();
+                        storage.flush_events(&guard).unwrap();
+                    }
+                }
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+
+        let mut queries = 0u32;
+        while !done.load(Ordering::SeqCst) {
+            let count: u64 = {
+                let _tier = tier.read();
+                let conn = readers.acquire();
+                let guard = conn.lock();
+                guard
+                    .query_row("SELECT COUNT(*) FROM events_all", [], |row| row.get(0))
+                    .unwrap()
+            };
+            // The counter runs ahead of the inserts, so it is an upper bound
+            // on the rows that can legitimately exist at any moment.
+            let ceiling = committed.load(Ordering::SeqCst);
+            assert!(
+                count <= ceiling,
+                "a query saw {count} rows but only {ceiling} were ever written — \
+                 the hot and Parquet tiers were both visible at once"
+            );
+            queries += 1;
+            std::thread::yield_now();
+        }
+
+        flusher.join().unwrap();
+        assert!(queries > 0, "the reader never got to run");
+
+        let total: u64 = readers
+            .acquire()
+            .lock()
+            .query_row("SELECT COUNT(*) FROM events_all", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, (BATCH * ROUNDS) as u64, "every event exactly once");
     }
 
     #[test]

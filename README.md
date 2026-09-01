@@ -3,7 +3,7 @@
 > **Self-hosted, privacy-focused web analytics powered by DuckDB and the `behavioral` extension.**
 > Single binary. Single process. Zero external dependencies.
 
-[![Tests](https://img.shields.io/badge/tests-585_passing-brightgreen?style=flat-square)](#development)
+[![Tests](https://img.shields.io/badge/tests-602_passing-brightgreen?style=flat-square)](#development)
 [![Rust](https://img.shields.io/badge/rust-1.98%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
 [![Clippy](https://img.shields.io/badge/clippy-0_warnings-brightgreen?style=flat-square)](#development)
@@ -60,6 +60,7 @@ A lightweight, privacy-respecting alternative to Plausible Analytics. Runs entir
 - **Realtime** — Current visitors, top pages and sources, with a per-minute series
 - **Twenty breakdown dimensions** — Pages, entry and exit pages, referrers and sources, all five UTM parameters, countries, regions, cities, browsers and versions, operating systems and versions, device types, screen widths, and event names
 - **Segment filters** — `filters=countries==DE;devices!=mobile` narrows every figure a request returns, not just the breakdown you were looking at. Dimension names are the breakdown slugs, so clicking a row in the dashboard filters everything to it
+- **Period comparison** — `compare=previous_period` or `compare=year_over_year` returns the same headline figures for an equally long earlier window, so the dashboard can show whether a number went up or down and by how much
 - **Goals and custom properties** — Conversion rates for every custom event, and drill-down into the properties attached to them
 - **Revenue** — Totals, order counts and average order value, reported per currency and never summed across them
 - **Time-series** — Hourly and daily aggregation, gap-filled so a quiet day reads as zero rather than vanishing
@@ -96,7 +97,10 @@ Enable with a single environment variable (`MALLARD_GDPR_MODE=true`) or configur
 - **GeoIP resolution** — MaxMind GeoLite2 integration with graceful fallback
 - **Data retention** — Configurable automatic cleanup of old Parquet partitions
 - **Graceful shutdown** — Buffered events are flushed before process exit
-- **Prometheus metrics** — `GET /metrics` endpoint with counters for ingestion, cache, auth, and rate limiting
+- **Prometheus metrics** — `GET /metrics` with counters for ingestion, cache, auth and rate limiting, plus request counts by status class and a latency histogram
+- **Persisted admin credential** — a password set through the setup endpoint is stored as an Argon2id hash (mode 0600) and survives a restart, so an instance cannot be claimed by whoever reaches it first after a reboot
+- **Consistent reads** — analytics queries never observe a flush, compaction or erasure part-way through, so a report cannot double-count events that are momentarily in both storage tiers
+- **Bounded DuckDB** — configurable `memory_limit` and thread count, so one expensive query cannot take the process down with it
 - **Security headers** — OWASP-recommended headers including HSTS, CSP, and Permissions-Policy
 - **CSRF protection** — Origin/Referer validation on all state-mutating endpoints
 - **Brute-force protection** — Per-IP lockout on both login and first-time setup
@@ -117,7 +121,7 @@ docker run -d \
   -v mallard-data:/data \
   -e MALLARD_SECRET=your-random-32-char-secret \
   -e MALLARD_ADMIN_PASSWORD=your-dashboard-password \
-  ghcr.io/tomtom215/mallard-metrics
+  ghcr.io/tomtom215/mallardmetrics
 ```
 
 ### Docker Compose
@@ -136,7 +140,7 @@ cargo build --release
 ./target/release/mallard-metrics
 ```
 
-Visit `http://localhost:8000` to access the dashboard. On first visit you will be prompted to set an admin password.
+Visit `http://localhost:8000` to access the dashboard. Until an admin password is set, analytics are readable by anyone who can reach the port — a deliberate mode for a public dashboard, and one the dashboard warns about on every load, with a button to set a password. Set `MALLARD_ADMIN_PASSWORD`, or use that button, before exposing an instance to a network.
 
 ---
 
@@ -234,6 +238,9 @@ See [`mallard-metrics.toml.example`](mallard-metrics.toml.example) for a fully d
 | `MALLARD_MAX_TRACKED_KEYS` | `10000` | Cap on rate-limit buckets and login-attempt records |
 | `MALLARD_MAX_SESSIONS` | `10000` | Cap on concurrent dashboard sessions |
 | `MALLARD_RATE_LIMIT_PER_IP` | `0` | Ingest events per second per client IP (0 = unlimited) |
+| `MALLARD_EXTENSION_DIR` | `data_dir/extensions` | Where DuckDB installs community extensions. Kept on the data volume because the `FROM scratch` image has no `HOME` and a read-only root filesystem |
+| `MALLARD_DUCKDB_MEMORY_LIMIT` | (DuckDB default: ~80% of RAM) | Cap on query memory, e.g. `1GB` |
+| `MALLARD_DUCKDB_THREADS` | (one per core) | DuckDB worker threads |
 
 Every setting is also available in the TOML file; see
 [`mallard-metrics.toml.example`](mallard-metrics.toml.example) for the full list
@@ -255,6 +262,7 @@ All `/api/stats/*`, `/api/keys/*`, and `/api/stats/export` endpoints require aut
 | `start_date` | (none) | Explicit start date, `YYYY-MM-DD`, inclusive |
 | `end_date` | (none) | Explicit end date, `YYYY-MM-DD`, **inclusive** |
 | `limit` | `10` | Row limit where the endpoint returns a list (max 1000) |
+| `filters` | (none) | Segment, e.g. `browsers==Chrome;countries!=US` |
 
 An explicit range may span at most 366 days. A `limit` above the endpoint's
 maximum is an error rather than a silent clamp.
@@ -297,9 +305,9 @@ Every stats endpoint accepts `site_id`, a date range (`period`, or
 | Method | Endpoint | Description |
 |---|---|---|
 | GET | `/api/sites` | Site IDs that have data |
-| GET | `/api/stats/main` | Visitors, pageviews, events, and (with the extension) visits, bounce rate and visit duration |
+| GET | `/api/stats/main` | Visitors, pageviews, events, and (with the extension) visits, bounce rate and visit duration. Accepts `compare=previous_period` or `compare=year_over_year`, adding a `comparison` object with the same figures for an equally long earlier window |
 | GET | `/api/stats/timeseries` | Gap-filled visitor and pageview counts per bucket |
-| GET | `/api/stats/realtime` | Current visitors, top pages and sources, per-minute series |
+| GET | `/api/stats/realtime` | Current visitors, top pages and sources, per-minute series. Takes `filters` but not a date range: its window is `realtime_window_minutes` |
 | GET | `/api/stats/revenue` | Revenue by currency, event and page |
 | GET | `/api/stats/goals` | Conversion rate for every custom event |
 | GET | `/api/stats/properties` | Custom property keys seen in range |
@@ -442,6 +450,8 @@ The dashboard is a single-page application built with Preact + HTM, embedded dir
 - Sequence matching conversion metrics
 - Flow analysis (next-page navigation table)
 - CSV and JSON export buttons
+- Period comparison (previous period or same period last year) with per-metric change
+- API key management — create, list and revoke keys, with the plaintext shown once
 
 ---
 
@@ -456,6 +466,7 @@ The dashboard is a single-page application built with Preact + HTM, embedded dir
 | Storage Format | Parquet (ZSTD compressed) | date-partitioned, compacted |
 | Frontend | Preact + HTM | no build step |
 | Password Hashing | Argon2id | `argon2` 0.6 |
+| Constant-time comparison | `subtle` | 2.6 |
 | GeoIP | MaxMind GeoLite2 | `maxminddb` 0.30 |
 | Deployment | Static musl binary | `FROM scratch` Docker |
 
@@ -500,7 +511,7 @@ cargo bench
 
 - **Zero clippy warnings** — pedantic, nursery, and cargo lint groups enabled
 - **Zero formatting violations** — enforced via `cargo fmt`
-- **All 585 tests pass** — no ignored tests
+- **All 602 tests pass** — no ignored tests
 - **Documentation builds without errors**
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow.
@@ -554,6 +565,24 @@ server {
 
 If the GeoIP database is missing, country/region/city fields are stored as `NULL`. The system degrades gracefully — no errors are raised.
 
+### Behavioral extension on an air-gapped host
+
+The `behavioral` extension is downloaded from the DuckDB community repository on
+first run, so a deployment whose runtime network has no outbound route — the
+bundled production compose file is one, on purpose — cannot install it, and
+funnels, retention, sessions, sequences and flow answer 503. Seed it once from
+somewhere with a route, against the same data directory:
+
+```bash
+mallard-metrics --install-extension
+# Installed the behavioral extension (version 0.9.1) into data/extensions
+```
+
+It writes the extension to the data volume and exits without creating a
+database. Every later start loads it from disk. See
+[the VPS guide](https://tomtom215.github.io/mallardmetrics/deploy-vps.html) for
+the Docker form.
+
 ---
 
 ## Documentation
@@ -567,7 +596,7 @@ If the GeoIP database is missing, country/region/city fields are stored as `NULL
 | [CHANGELOG.md](CHANGELOG.md) | Version history following Keep a Changelog format |
 | [ROADMAP.md](ROADMAP.md) | Implementation phases, completed work, and future plans |
 | [PERF.md](PERF.md) | Benchmark framework, methodology, and measured baselines |
-| [LESSONS.md](LESSONS.md) | 21 development lessons learned, organized by category |
+| [LESSONS.md](LESSONS.md) | 31 development lessons learned, organized by category |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Module map, build commands, and development guidelines |
 | [mallard-metrics.toml.example](mallard-metrics.toml.example) | Annotated configuration template |
 

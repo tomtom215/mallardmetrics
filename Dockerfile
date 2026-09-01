@@ -42,6 +42,13 @@ RUN touch src/main.rs src/lib.rs && \
 
 FROM scratch
 
+# A `scratch` image has no trust store, and DuckDB downloads the `behavioral`
+# community extension over HTTPS on first run. Without these roots that request
+# cannot verify the server and the extension never loads, so funnels, retention,
+# sessions, sequences and flow answer 503 on an image that is otherwise healthy.
+# ~200 KB, from the builder stage's distribution package.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
 LABEL org.opencontainers.image.title="Mallard Metrics" \
       org.opencontainers.image.description="Self-hosted, privacy-focused web analytics powered by DuckDB and the behavioral extension" \
       org.opencontainers.image.source="https://github.com/tomtom215/mallardmetrics" \
@@ -54,6 +61,11 @@ COPY --from=builder /build/target/release/mallard-metrics /mallard-metrics
 USER 65532:65532
 
 ENV MALLARD_DATA_DIR=/data
+# DuckDB installs community extensions under $HOME/.duckdb by default, and this
+# image has no home directory — nor a writable root filesystem, once the
+# recommended `read_only: true` is applied. The data volume is the one place
+# guaranteed to be writable.
+ENV MALLARD_EXTENSION_DIR=/data/extensions
 EXPOSE 8000
 VOLUME ["/data"]
 

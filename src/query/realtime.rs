@@ -1,3 +1,4 @@
+use super::Filter;
 use chrono::{NaiveDateTime, Utc};
 use duckdb::Connection;
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,55 @@ pub struct RealtimeEntry {
 /// How many rows each realtime list holds.
 const TOP_N: usize = 10;
 
+/// The site, window and segment every realtime sub-query shares.
+///
+/// Deliberately not a [`QueryScope`](super::QueryScope): that type's upper
+/// bound is exclusive, which is right for a report over whole days but wrong
+/// here. "Right now" ends at this instant, and an event stamped exactly `until`
+/// belongs inside the window — the per-minute series generates a bucket for
+/// that minute, so excluding the event would leave the series disagreeing with
+/// the totals beside it. The segment predicates are borrowed from `QueryScope`
+/// unchanged, so a filter means the same thing on every endpoint.
+struct RealtimeScope {
+    site_id: String,
+    since: NaiveDateTime,
+    until: NaiveDateTime,
+    filters: super::QueryScope,
+}
+
+impl RealtimeScope {
+    fn new(site_id: &str, since: NaiveDateTime, until: NaiveDateTime, filters: &[Filter]) -> Self {
+        Self {
+            site_id: site_id.to_string(),
+            since,
+            until,
+            // Only the filter half of this scope is ever read; the dates and
+            // session window on it are unused.
+            filters: super::QueryScope::new(site_id, "", "", "30 minutes")
+                .with_filters(filters.to_vec()),
+        }
+    }
+
+    /// `site_id = ? AND timestamp BETWEEN ? AND ?`, plus the segment.
+    fn where_clause(&self) -> String {
+        format!(
+            "site_id = ? AND timestamp >= ? AND timestamp <= ?{}",
+            self.filters.filter_clause()
+        )
+    }
+
+    /// Bound values in the order [`Self::where_clause`] spells them.
+    fn params(&self) -> Vec<String> {
+        let mut out = vec![
+            self.site_id.clone(),
+            self.since.to_string(),
+            self.until.to_string(),
+        ];
+        out.extend(self.filters.filter_params().map(str::to_string));
+        out
+    }
+}
+
 /// Query current activity for a site.
 ///
 /// "Right now" is the last `window_minutes`, ending at the current UTC instant.
@@ -40,8 +90,15 @@ pub fn query_realtime(
     conn: &Connection,
     site_id: &str,
     window_minutes: u32,
+    filters: &[Filter],
 ) -> Result<RealtimeSnapshot, duckdb::Error> {
-    query_realtime_at(conn, site_id, window_minutes, Utc::now().naive_utc())
+    query_realtime_at(
+        conn,
+        site_id,
+        window_minutes,
+        filters,
+        Utc::now().naive_utc(),
+    )
 }
 
 /// [`query_realtime`] with the end of the window supplied explicitly.
@@ -66,26 +123,36 @@ pub fn query_realtime_at(
     conn: &Connection,
     site_id: &str,
     window_minutes: u32,
+    filters: &[Filter],
     now: NaiveDateTime,
 ) -> Result<RealtimeSnapshot, duckdb::Error> {
     let window = window_minutes.max(1);
     let since = now - chrono::Duration::minutes(i64::from(window));
 
-    let mut stmt = conn.prepare(
+    // The realtime window is its own range, so it does not reuse a request's
+    // `QueryScope` dates — but it does reuse the segment, so that clicking a
+    // breakdown row narrows "right now" the same way it narrows every other
+    // panel. Without this the endpoint quietly ignored `filters` while the API
+    // documentation promised every stats endpoint honoured them.
+    let scope = RealtimeScope::new(site_id, since, now, filters);
+
+    let sql = format!(
         "SELECT COUNT(DISTINCT visitor_id),
                 COUNT(*) FILTER (WHERE event_name = 'pageview')
          FROM events_all
-         WHERE site_id = ? AND timestamp >= ? AND timestamp <= ?",
-    )?;
+         WHERE {}",
+        scope.where_clause()
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let (current_visitors, pageviews): (u64, u64) = stmt
-        .query_row(duckdb::params![site_id, since, now], |row| {
+        .query_row(duckdb::params_from_iter(scope.params()), |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?;
     drop(stmt);
 
-    let top_pages = query_top(conn, site_id, since, now, "pathname")?;
-    let top_sources = query_top(conn, site_id, since, now, "referrer_source")?;
-    let per_minute = query_per_minute(conn, site_id, since, now)?;
+    let top_pages = query_top(conn, &scope, "pathname")?;
+    let top_sources = query_top(conn, &scope, "referrer_source")?;
+    let per_minute = query_per_minute(conn, &scope, since, now)?;
 
     Ok(RealtimeSnapshot {
         current_visitors,
@@ -102,22 +169,21 @@ pub fn query_realtime_at(
 /// `column` is a fixed identifier chosen by the caller, never request input.
 fn query_top(
     conn: &Connection,
-    site_id: &str,
-    since: NaiveDateTime,
-    until: NaiveDateTime,
+    scope: &RealtimeScope,
     column: &str,
 ) -> Result<Vec<RealtimeEntry>, duckdb::Error> {
+    let where_clause = scope.where_clause();
     let sql = format!(
         "SELECT COALESCE({column}, '(direct)') AS value, COUNT(DISTINCT visitor_id) AS visitors
          FROM events_all
-         WHERE site_id = ? AND timestamp >= ? AND timestamp <= ?
+         WHERE {where_clause}
          GROUP BY value
          ORDER BY visitors DESC, value
          LIMIT {TOP_N}"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
-        .query_map(duckdb::params![site_id, since, until], |row| {
+        .query_map(duckdb::params_from_iter(scope.params()), |row| {
             Ok(RealtimeEntry {
                 value: row.get(0)?,
                 visitors: row.get(1)?,
@@ -131,11 +197,12 @@ fn query_top(
 /// Per-minute pageview counts across the window, gap-filled and oldest first.
 fn query_per_minute(
     conn: &Connection,
-    site_id: &str,
+    scope: &RealtimeScope,
     since: NaiveDateTime,
     until: NaiveDateTime,
 ) -> Result<Vec<u64>, duckdb::Error> {
-    let mut stmt = conn.prepare(
+    let where_clause = scope.where_clause();
+    let sql = format!(
         "WITH spine AS (
              SELECT UNNEST(generate_series(
                  DATE_TRUNC('minute', CAST(? AS TIMESTAMP)),
@@ -147,18 +214,19 @@ fn query_per_minute(
              SELECT DATE_TRUNC('minute', timestamp) AS bucket,
                     COUNT(*) FILTER (WHERE event_name = 'pageview') AS pageviews
              FROM events_all
-             WHERE site_id = ? AND timestamp >= ? AND timestamp <= ?
+             WHERE {where_clause}
              GROUP BY 1
          )
          SELECT COALESCE(agg.pageviews, 0)
          FROM spine LEFT JOIN agg ON agg.bucket = spine.bucket
-         ORDER BY spine.bucket",
-    )?;
+         ORDER BY spine.bucket"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    // The spine's two bounds bind first, then the scope's own parameters.
+    let mut bound: Vec<String> = vec![since.to_string(), until.to_string()];
+    bound.extend(scope.params());
     let rows = stmt
-        .query_map(
-            duckdb::params![since, until, site_id, since, until],
-            |row| row.get::<_, u64>(0),
-        )?
+        .query_map(duckdb::params_from_iter(bound), |row| row.get::<_, u64>(0))?
         .filter_map(Result::ok)
         .collect();
     Ok(rows)
@@ -194,7 +262,7 @@ mod tests {
     }
 
     fn snapshot(db: &TestDb, window: u32) -> RealtimeSnapshot {
-        query_realtime_at(&db.conn, "test.com", window, now()).unwrap()
+        query_realtime_at(&db.conn, "test.com", window, &[], now()).unwrap()
     }
 
     #[test]
@@ -334,7 +402,7 @@ mod tests {
                 duckdb::params![ts],
             )
             .unwrap();
-        let snap = query_realtime(&db.conn, "test.com", 5).unwrap();
+        let snap = query_realtime(&db.conn, "test.com", 5, &[]).unwrap();
         assert_eq!(snap.current_visitors, 1);
         assert_eq!(snap.pageviews, 1);
     }

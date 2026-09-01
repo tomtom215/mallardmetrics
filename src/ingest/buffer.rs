@@ -48,6 +48,9 @@ pub struct EventBuffer {
     max_buffered: usize,
     conn: Arc<Mutex<Connection>>,
     storage: ParquetStorage,
+    /// Held exclusively while the hot and cold tiers disagree. See
+    /// [`TierLock`](crate::storage::TierLock).
+    tier_lock: crate::storage::TierLock,
     /// Events discarded because the buffer was at capacity.
     pub dropped_events: Arc<AtomicU64>,
 }
@@ -58,6 +61,7 @@ impl EventBuffer {
         max_buffered: usize,
         conn: Arc<Mutex<Connection>>,
         storage: ParquetStorage,
+        tier_lock: crate::storage::TierLock,
     ) -> Self {
         Self {
             events: Mutex::new(Vec::with_capacity(flush_threshold.min(4096))),
@@ -65,8 +69,15 @@ impl EventBuffer {
             max_buffered,
             conn,
             storage,
+            tier_lock,
             dropped_events: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// The tier lock this buffer flushes under, so callers that make the tiers
+    /// inconsistent by other means (erasure) can take the same one.
+    pub const fn tier_lock(&self) -> &crate::storage::TierLock {
+        &self.tier_lock
     }
 
     /// Returns the DuckDB writer connection.
@@ -166,6 +177,12 @@ impl EventBuffer {
             std::mem::take(&mut *buf)
         };
 
+        // Taken before the connection lock, and in the same order by every
+        // reader, so the two locks cannot deadlock against each other. Held for
+        // the whole insert-and-copy sequence: between the Parquet write and the
+        // matching DELETE the same rows exist in both tiers, and a query that
+        // ran in that window would count them twice.
+        let _tier = self.tier_lock.write();
         let conn = self.conn.lock();
 
         // Bulk-insert with DuckDB's Appender, which bypasses per-row SQL parsing.
@@ -173,7 +190,14 @@ impl EventBuffer {
         // The appender borrows `conn`, so the insert runs inside a closure whose
         // return ends that borrow — otherwise the connection cannot be released
         // before restoring the buffer on failure.
+        //
+        // The whole batch is one explicit transaction. The appender commits
+        // whenever an internal chunk fills, so without it a failure part-way
+        // through would leave the earlier chunks durably inserted while
+        // `restore` puts every event back for the next attempt — silently
+        // duplicating everything up to the failure point.
         let insert_result = (|| -> Result<(), duckdb::Error> {
+            conn.execute_batch("BEGIN TRANSACTION")?;
             let mut appender = conn.appender("events")?;
             for event in &events {
                 // The timestamp is appended as a typed chrono value rather than a
@@ -209,10 +233,17 @@ impl EventBuffer {
                     event.revenue_currency,
                 ])?;
             }
-            appender.flush()
+            appender.flush()?;
+            drop(appender);
+            conn.execute_batch("COMMIT")
         })();
 
         if let Err(e) = insert_result {
+            // Undo whatever the transaction had staged so the restored events
+            // are the only copy of the batch.
+            if let Err(rollback) = conn.execute_batch("ROLLBACK") {
+                tracing::error!(error = %rollback, "Could not roll back a failed event insert");
+            }
             drop(conn);
             self.restore(events);
             return Err(BufferError::Insert(e));
@@ -310,7 +341,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = ParquetStorage::new(dir.path(), 0);
         let conn = Arc::new(Mutex::new(conn));
-        (EventBuffer::new(threshold, cap, conn, storage), dir)
+        (
+            EventBuffer::new(
+                threshold,
+                cap,
+                conn,
+                storage,
+                crate::storage::TierLock::new(),
+            ),
+            dir,
+        )
     }
 
     #[test]

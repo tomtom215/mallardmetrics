@@ -13,6 +13,17 @@ Mallard Metrics supports two forms of authentication:
 
 Sets the admin password for the first time. Returns `409 Conflict` if a password is already configured.
 
+The Argon2id hash is written to `data_dir/admin.json` at mode 0600 and loaded on
+every subsequent start, so the password survives a restart. Before this it lived
+only in memory: a restart put the instance back into first-run mode, and whoever
+reached it first — not necessarily the operator — could claim it. If the hash
+cannot be written the request fails with `500` rather than accepting a password
+it would silently lose.
+
+`MALLARD_ADMIN_PASSWORD`, when set, takes precedence over the stored hash and is
+deliberately not written to disk, so removing the variable does not leave a
+stale credential behind.
+
 **No authentication required.**
 
 ```json
@@ -110,6 +121,11 @@ API keys are prefixed with `mm_` and are SHA-256 hashed before storage. The plai
 All key management endpoints require **admin** authentication: a session, or an
 API key with the `admin` scope. A read-only key gets `403`, and every one of
 them gets `401` before setup has run.
+
+These endpoints are also reachable from the dashboard — the **API keys** button
+beside the period selector — which lists, creates and revokes keys. It appears
+once an admin password exists, because there is nothing to authorise before
+then.
 
 ### `POST /api/keys`
 

@@ -557,9 +557,73 @@ button:disabled {
   font-size: 0.875rem;
 }
 
+/* The unprotected-instance warning: a real security state, so it has to be
+   readable at a glance and carry its own action rather than just a sentence. */
+.banner-warning {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  background: color-mix(in srgb, var(--warning) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+}
+
+.banner-warning span { flex: 1 1 20rem; }
+.banner-warning button { margin-left: auto; }
+
 .banner-error {
   background: color-mix(in srgb, var(--danger) 12%, transparent);
   color: var(--danger);
+}
+
+/* A newly minted API key: shown once, so it has to be unmissable and easy to
+   select. `user-select: all` makes one click select the whole key. */
+/* Period-over-period change. Colour carries meaning, so the arrow glyph
+   carries it too — a red/green pair alone is unreadable for the ~8% of men
+   with a red-green deficiency. */
+.metric-delta {
+  margin-top: 0.25rem;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+.metric-delta-up { color: var(--success); }
+.metric-delta-down { color: var(--danger); }
+.metric-delta-flat { color: var(--text-muted); }
+
+.comparison-note {
+  margin: 0 0 0.75rem;
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+}
+
+.banner-key {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.key-value {
+  flex: 1 1 22rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  user-select: all;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.8125rem;
+  padding: 0.375rem 0.5rem;
+  border-radius: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.data-table code {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.8125rem;
+  color: var(--text-muted);
 }
 
 .notice {

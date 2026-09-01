@@ -159,18 +159,22 @@ impl AppStateBuilder {
         // the writer rather than cloning into an empty catalog.
         let readers = ReaderPool::shared(&conn);
         let storage = ParquetStorage::new(dir.path(), 0);
-        let buffer = EventBuffer::new(1000, 0, Arc::clone(&conn), storage);
+        let tier_lock = crate::storage::TierLock::new();
+        let buffer = EventBuffer::new(1000, 0, Arc::clone(&conn), storage, tier_lock.clone());
 
         let state = Arc::new(AppState {
             buffer,
             readers,
+            tier_lock,
             secret: "test-secret".to_string(),
             allowed_sites: self.allowed_sites,
             geoip: GeoIpReader::open(None),
             filter_bots: self.filter_bots,
             sessions: SessionStore::new(3600),
             api_keys: self.api_keys,
-            admin_password_hash: Mutex::new(self.admin_password_hash),
+            admin_password: crate::api::auth::AdminPasswordStore::in_memory(
+                self.admin_password_hash,
+            ),
             dashboard_origin: self.dashboard_origin,
             query_cache: QueryCache::new(self.cache_ttl_secs, 100),
             rate_limiter: RateLimiter::new(self.rate_limit_per_site, 1000),
@@ -179,6 +183,7 @@ impl AppStateBuilder {
                 self.max_login_attempts,
                 self.login_lockout_secs,
             ),
+            http_metrics: Arc::default(),
             events_ingested_total: Arc::new(AtomicU64::new(0)),
             flush_failures_total: Arc::new(AtomicU64::new(0)),
             rate_limit_rejections_total: Arc::new(AtomicU64::new(0)),

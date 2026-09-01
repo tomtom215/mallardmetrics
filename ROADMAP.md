@@ -30,9 +30,13 @@ Core functionality is complete and production-ready:
 
 **Operations**
 - Embedded dashboard SPA (Preact + HTM, no build step) with dark mode
-- Argon2id authentication, scoped API keys, brute-force protection
+- Period comparison against the previous period or the same period last year
+- Argon2id authentication with a persisted credential, scoped API keys managed
+  from the dashboard, per-IP brute-force protection
 - GDPR mode, configurable privacy flags, Art. 17 erasure endpoint
-- Prometheus metrics, structured logging, readiness probes, graceful shutdown
+- Prometheus metrics — internal counters plus HTTP request counts and a latency
+  histogram — structured logging, readiness probes, graceful shutdown
+- Configurable DuckDB memory limit, thread count and extension directory
 - OWASP security headers, CSRF protection, non-root container image
 
 ---
@@ -79,6 +83,10 @@ Potential directions, not committed work. Each depends on demonstrated need.
 - **Saved segments** — naming and storing a filter set, so it can be recalled
   rather than rebuilt. The filters themselves now exist; what is missing is
   persistence and a name.
+- **Comparison beyond the headline figures** — `compare` currently applies to
+  `/api/stats/main`. Extending it to breakdowns and the time series means
+  deciding how to align two rankings that do not share their rows, which is a
+  design question rather than a mechanical one.
 - **UTM-aware attribution models** — first-touch and last-touch, rather than the
   per-event attribution available today.
 - **Alternative auth backends** — OIDC or SAML for organisations that need it.
@@ -99,7 +107,7 @@ Potential directions, not committed work. Each depends on demonstrated need.
 Every release must pass the full validation suite before tagging:
 
 ```bash
-cargo test --all-targets   # all 585 tests pass
+cargo test --all-targets   # all 602 tests pass
 cargo clippy --all-targets --all-features -- -D warnings   # zero warnings
 cargo fmt -- --check       # zero format violations
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps   # docs build cleanly

@@ -39,10 +39,44 @@ pub struct StatsParams {
     pub limit: Option<usize>,
     /// Segment filters, e.g. `browsers==Chrome;countries!=US`.
     pub filters: Option<String>,
+    /// Compare against an earlier window: `previous_period` or `year_over_year`.
+    ///
+    /// Only `/api/stats/main` reads it; the other endpoints ignore it, and say
+    /// so in the documentation rather than pretending to honour it.
+    pub compare: Option<String>,
 }
 
 fn default_period() -> String {
     "30d".to_string()
+}
+
+/// Which earlier window a report is compared against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compare {
+    /// The equally long window immediately before this one.
+    PreviousPeriod,
+    /// The same dates one year earlier — the right comparison for anything
+    /// seasonal, where last month is not a fair baseline.
+    YearOverYear,
+}
+
+impl Compare {
+    /// Parse the `compare` query parameter.
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        match slug.trim() {
+            "previous_period" | "previous-period" => Some(Self::PreviousPeriod),
+            "year_over_year" | "year-over-year" => Some(Self::YearOverYear),
+            _ => None,
+        }
+    }
+
+    /// Canonical spelling, used in cache keys.
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::PreviousPeriod => "previous_period",
+            Self::YearOverYear => "year_over_year",
+        }
+    }
 }
 
 /// A canonical, order-independent rendering of a filter set for cache keys.
@@ -288,6 +322,54 @@ impl StatsParams {
     }
 }
 
+impl DateRange {
+    /// The window this range is compared against.
+    ///
+    /// `end` is exclusive throughout, so shifting both bounds by the same
+    /// amount keeps the two windows exactly the same length — which is the
+    /// whole point of the comparison. A 30-day report compared against 29 days
+    /// would show a fall in traffic that never happened.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `BadRequest` when the shifted window falls outside the range
+    /// of representable dates.
+    pub fn compared_with(&self, mode: Compare) -> Result<Self, ApiError> {
+        let start = parse_date(&self.start, "start_date")?;
+        let end = parse_date(&self.end, "end_date")?;
+
+        let shift = match mode {
+            Compare::PreviousPeriod => chrono::Duration::days(self.days),
+            // Calendar-shifting by a year would land on 29 February in three
+            // years out of four; 365 days keeps the window the same length,
+            // which matters more for a like-for-like traffic comparison.
+            Compare::YearOverYear => chrono::Duration::days(365),
+        };
+
+        let out_of_range =
+            || ApiError::BadRequest("The comparison window is out of range".to_string());
+        let start = start.checked_sub_signed(shift).ok_or_else(out_of_range)?;
+        let end = end.checked_sub_signed(shift).ok_or_else(out_of_range)?;
+
+        Ok(Self {
+            start: start.to_string(),
+            end: end.to_string(),
+            days: self.days,
+        })
+    }
+
+    /// The inclusive last day of the range, for display.
+    ///
+    /// `end` is stored exclusive, so showing it verbatim would name a day the
+    /// report does not cover.
+    pub fn inclusive_end(&self) -> String {
+        parse_date(&self.end, "end_date")
+            .ok()
+            .and_then(|d| d.pred_opt())
+            .map_or_else(|| self.end.clone(), |d| d.to_string())
+    }
+}
+
 fn parse_date(raw: &str, field: &str) -> Result<NaiveDate, ApiError> {
     NaiveDate::parse_from_str(raw, "%Y-%m-%d")
         .map_err(|_| ApiError::BadRequest(format!("Invalid {field} format. Use YYYY-MM-DD.")))
@@ -318,7 +400,13 @@ where
     })?;
 
     let readers = state.readers.clone();
+    let tier_lock = state.tier_lock.clone();
     tokio::task::spawn_blocking(move || {
+        // Taken before the connection lock — the same order flushes use, so the
+        // two cannot deadlock. It keeps this query from landing in the middle
+        // of a flush or a compaction, when the same rows are momentarily
+        // visible in both the hot table and Parquet.
+        let _tier = tier_lock.read();
         let conn = readers.acquire();
         let guard = conn.lock();
         f(&guard)
@@ -398,18 +486,65 @@ pub async fn get_main_stats(
     let range = params.validated()?;
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
     let filter_key = filters_cache_key(&filters);
+
+    let compare = params
+        .compare
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(|raw| {
+            Compare::from_slug(raw).ok_or_else(|| {
+                ApiError::BadRequest(format!(
+                    "Invalid compare: {raw:?}. Use 'previous_period' or 'year_over_year'."
+                ))
+            })
+        })
+        .transpose()?;
+
     let scope = state
         .scope(&params.site_id, &range.start, &range.end)
-        .with_filters(filters);
+        .with_filters(filters.clone());
     let key = cache_key(
         "main",
         &params.site_id,
-        &[&range.start, &range.end, &filter_key],
+        &[
+            &range.start,
+            &range.end,
+            &filter_key,
+            compare.map_or("none", Compare::slug),
+        ],
     );
-    cached_query(&state, key, move |conn| {
+    let Json(mut current) = cached_query(&state, key, move |conn| {
         metrics::query_core_metrics(conn, &scope)
     })
-    .await
+    .await?;
+
+    if let Some(mode) = compare {
+        let previous = range.compared_with(mode)?;
+        // The comparison is cached under its own window, so switching a
+        // dashboard between "previous period" and "year over year" reuses
+        // whatever either has already computed.
+        let previous_scope = state
+            .scope(&params.site_id, &previous.start, &previous.end)
+            .with_filters(filters);
+        let previous_key = cache_key(
+            "main",
+            &params.site_id,
+            &[&previous.start, &previous.end, &filter_key, "none"],
+        );
+        let Json(baseline) = cached_query(&state, previous_key, move |conn| {
+            metrics::query_core_metrics(conn, &previous_scope)
+        })
+        .await?;
+
+        current.comparison = Some(metrics::ComparisonWindow::from_metrics(
+            previous.start.clone(),
+            previous.inclusive_end(),
+            &baseline,
+        ));
+    }
+
+    Ok(Json(current))
 }
 
 /// GET /api/stats/sessions — session-level metrics.
@@ -520,9 +655,10 @@ pub async fn get_realtime(
     validate_site_id(&params.site_id)?;
     let site_id = params.site_id.clone();
     let window = state.realtime_window_minutes;
+    let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
     // Deliberately uncached: a cached "realtime" figure is not realtime.
     let snapshot = run_query(&state, move |conn| {
-        realtime::query_realtime(conn, &site_id, window)
+        realtime::query_realtime(conn, &site_id, window, &filters)
     })
     .await?;
     Ok(Json(snapshot))
@@ -619,6 +755,7 @@ pub async fn get_property_values(
         end_date: params.end_date.clone(),
         limit: None,
         filters: params.filters.clone(),
+        compare: None,
     };
     let range = common.validated()?;
 
@@ -762,6 +899,7 @@ pub async fn get_funnel(
         end_date: params.end_date.clone(),
         limit: None,
         filters: params.filters.clone(),
+        compare: None,
     };
     let range = common.validated()?;
 
@@ -850,6 +988,7 @@ pub async fn get_retention(
         end_date: params.end_date.clone(),
         limit: None,
         filters: params.filters.clone(),
+        compare: None,
     };
     let range = common.validated()?;
 
@@ -933,6 +1072,7 @@ pub async fn get_sequences(
         end_date: params.end_date.clone(),
         limit: None,
         filters: params.filters.clone(),
+        compare: None,
     };
     let range = common.validated()?;
 
@@ -998,6 +1138,7 @@ pub async fn get_flow(
         end_date: params.end_date.clone(),
         limit: params.limit,
         filters: params.filters.clone(),
+        compare: None,
     };
     let range = common.validated()?;
     let limit = common.limit_or(flow::DEFAULT_LIMIT, flow::MAX_LIMIT)?;
@@ -1081,6 +1222,7 @@ pub async fn get_export(
         end_date: params.end_date.clone(),
         limit: params.limit,
         filters: params.filters.clone(),
+        compare: None,
     };
     let range = common.validated()?;
 
@@ -1194,15 +1336,38 @@ pub async fn gdpr_erase(
         )));
     }
 
+    // Events already buffered for the erased range would otherwise be written
+    // out by the next flush, minutes after the erasure reported success.
+    // Flushing first brings them into the hot table so the DELETE below covers
+    // them. A flush failure is not fatal — the erasure still removes everything
+    // that reached storage — but it is reported, because it means some events
+    // may survive.
+    {
+        let flush_state = Arc::clone(&state);
+        match tokio::task::spawn_blocking(move || flush_state.buffer.flush()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::error!(
+                error = %e,
+                "Could not flush buffered events before erasure; events buffered for \
+                 the erased range may survive it"
+            ),
+            Err(e) => tracing::error!(error = %e, "Flush task panicked before erasure"),
+        }
+    }
+
     let site_id = params.site_id.clone();
     let start_str = params.start_date.clone();
     let end_str = params.end_date.clone();
     let events_dir = state.events_dir.clone();
     let storage = state.buffer.storage().clone();
     let writer = state.buffer.conn().clone();
+    let tier_lock = state.tier_lock.clone();
 
     let (db_records_deleted, parquet_partitions_deleted) =
         tokio::task::spawn_blocking(move || -> Result<(i64, u64), duckdb::Error> {
+            // Between the hot-table delete and the partition removal the two
+            // tiers disagree; no query may observe that.
+            let _tier = tier_lock.write();
             // Delete from the hot table first, holding the writer lock only for
             // the two statements.
             let db_count: i64 = {
@@ -1265,6 +1430,67 @@ pub async fn gdpr_erase(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Period comparison ────────────────────────────────────────────────
+
+    fn range(start: &str, end_exclusive: &str, days: i64) -> DateRange {
+        DateRange {
+            start: start.to_string(),
+            end: end_exclusive.to_string(),
+            days,
+        }
+    }
+
+    #[test]
+    fn test_previous_period_is_the_same_length_immediately_before() {
+        // A 30-day report compared against 29 days would show a drop in traffic
+        // that never happened, so the shift has to be the exact span.
+        let january = range("2024-01-01", "2024-01-31", 30);
+        let previous = january.compared_with(Compare::PreviousPeriod).unwrap();
+        assert_eq!(previous.start, "2023-12-02");
+        assert_eq!(previous.end, "2024-01-01");
+        assert_eq!(previous.days, january.days);
+        assert_eq!(
+            previous.inclusive_end(),
+            "2023-12-31",
+            "the displayed end must be a day the report covers"
+        );
+    }
+
+    #[test]
+    fn test_previous_period_windows_do_not_overlap() {
+        // The current window's start is the previous window's exclusive end, so
+        // no day is counted on both sides.
+        let current = range("2024-03-10", "2024-03-17", 7);
+        let previous = current.compared_with(Compare::PreviousPeriod).unwrap();
+        assert_eq!(previous.end, current.start);
+    }
+
+    #[test]
+    fn test_year_over_year_shifts_by_365_days() {
+        let current = range("2024-06-01", "2024-07-01", 30);
+        let previous = current.compared_with(Compare::YearOverYear).unwrap();
+        assert_eq!(previous.start, "2023-06-02");
+        assert_eq!(previous.end, "2023-07-02");
+        assert_eq!(
+            previous.days, current.days,
+            "a calendar-year shift would change the span across a leap year"
+        );
+    }
+
+    #[test]
+    fn test_compare_slugs() {
+        assert_eq!(
+            Compare::from_slug("previous_period"),
+            Some(Compare::PreviousPeriod)
+        );
+        assert_eq!(
+            Compare::from_slug("year-over-year"),
+            Some(Compare::YearOverYear)
+        );
+        assert_eq!(Compare::from_slug("last_tuesday"), None);
+        assert_eq!(Compare::PreviousPeriod.slug(), "previous_period");
+    }
 
     // ── Segment filters ──────────────────────────────────────────────────
 
@@ -1391,6 +1617,7 @@ mod tests {
             end_date: None,
             limit: None,
             filters: None,
+            compare: None,
         }
     }
 

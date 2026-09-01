@@ -284,18 +284,18 @@ pub fn hash_api_key(key: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Constant-time byte slice comparison to prevent timing attacks.
+/// Constant-time byte-slice comparison, for secrets.
 ///
-/// Always compares all bytes regardless of where the first mismatch occurs,
-/// preventing attackers from inferring hash prefixes via response timing.
+/// Delegates to `subtle`, which is written specifically to survive an
+/// optimising compiler. The previous hand-rolled fold was constant-time only as
+/// long as LLVM chose not to turn it into an early-exit loop — nothing in the
+/// language stops it, and the whole value of the function is that guarantee.
+///
+/// Length is compared first and is not itself secret here: every caller
+/// compares fixed-width values (a hex digest, or a token of known length).
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+    use subtle::ConstantTimeEq;
+    a.len() == b.len() && bool::from(a.ct_eq(b))
 }
 
 /// API key scope defining access level.
@@ -466,6 +466,137 @@ pub fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::R
     std::fs::rename(&tmp_path, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp_path);
     })
+}
+
+/// The admin password hash, with optional disk persistence.
+///
+/// The hash used to live in a bare `Mutex<Option<String>>` that nothing ever
+/// wrote to disk. A password set through `POST /api/auth/setup` therefore
+/// survived only until the process stopped: on the next start `setup_required`
+/// was true again and the first request to reach the instance — from anyone —
+/// could claim it. Persisting the hash closes that window.
+///
+/// `MALLARD_ADMIN_PASSWORD` still wins when it is set, because an operator who
+/// supplies the password on every boot expects that value to be authoritative.
+#[derive(Clone, Default)]
+pub struct AdminPasswordStore {
+    hash: Arc<Mutex<Option<String>>>,
+    /// Where a password set through the setup endpoint is written. `None`
+    /// disables persistence, which is what tests and env-supplied passwords use.
+    persist_path: Option<Arc<std::path::PathBuf>>,
+}
+
+/// On-disk form of the admin credential.
+#[derive(Serialize, Deserialize)]
+struct StoredAdminPassword {
+    /// Argon2id PHC string. Never the password itself.
+    password_hash: String,
+    updated_at: chrono::NaiveDateTime,
+}
+
+impl AdminPasswordStore {
+    /// A store that keeps the hash in memory only.
+    pub fn in_memory(hash: Option<String>) -> Self {
+        Self {
+            hash: Arc::new(Mutex::new(hash)),
+            persist_path: None,
+        }
+    }
+
+    /// A store backed by `path`.
+    ///
+    /// `env_hash` is the hash of `MALLARD_ADMIN_PASSWORD`, when one was
+    /// supplied. It takes precedence over the file and is not written back:
+    /// the environment already carries it on every start, and writing it would
+    /// leave a stale credential behind after the variable was removed.
+    pub fn load_from_disk(path: std::path::PathBuf, env_hash: Option<String>) -> Self {
+        if let Some(hash) = env_hash {
+            return Self {
+                hash: Arc::new(Mutex::new(Some(hash))),
+                persist_path: Some(Arc::new(path)),
+            };
+        }
+
+        let stored = match std::fs::read_to_string(&path) {
+            Ok(contents) => match serde_json::from_str::<StoredAdminPassword>(&contents) {
+                Ok(record) if PasswordHash::new(&record.password_hash).is_ok() => {
+                    tracing::info!(path = %path.display(), "Loaded the admin password hash");
+                    Some(record.password_hash)
+                }
+                Ok(_) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        "The stored admin password hash is not a valid Argon2 PHC string; \
+                         refusing to use it. Delete the file to run setup again, or set \
+                         MALLARD_ADMIN_PASSWORD."
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %e,
+                        "Could not parse the stored admin password; the dashboard will \
+                         ask for setup again. Move the file aside or set \
+                         MALLARD_ADMIN_PASSWORD."
+                    );
+                    None
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    "Could not read the stored admin password"
+                );
+                None
+            }
+        };
+
+        Self {
+            hash: Arc::new(Mutex::new(stored)),
+            persist_path: Some(Arc::new(path)),
+        }
+    }
+
+    /// The current hash, if one is configured.
+    pub fn get(&self) -> Option<String> {
+        self.hash.lock().clone()
+    }
+
+    /// Whether an admin password exists.
+    pub fn is_configured(&self) -> bool {
+        self.hash.lock().is_some()
+    }
+
+    /// Install `hash` if and only if none is configured yet.
+    ///
+    /// Returns `false` when a password was already set, so two concurrent setup
+    /// requests cannot both succeed. Persisting happens under the same lock: a
+    /// failure to write is reported to the caller rather than leaving a password
+    /// that works until the next restart and then silently reopens setup.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error if the hash could not be persisted.
+    pub fn set_if_unset(&self, hash: String) -> Result<bool, std::io::Error> {
+        let mut guard = self.hash.lock();
+        if guard.is_some() {
+            return Ok(false);
+        }
+        if let Some(path) = &self.persist_path {
+            let record = StoredAdminPassword {
+                password_hash: hash.clone(),
+                updated_at: chrono::Utc::now().naive_utc(),
+            };
+            let json = serde_json::to_vec_pretty(&record).map_err(std::io::Error::other)?;
+            write_private_file(path.as_ref(), &json)?;
+            tracing::info!(path = %path.display(), "Persisted the admin password hash (mode 0600)");
+        }
+        *guard = Some(hash);
+        Ok(true)
+    }
 }
 
 /// Thread-safe API key store with optional disk persistence.
@@ -696,10 +827,11 @@ fn session_response(state: &AppState, token: String) -> Response {
 /// cannot be brute-forced open by an automated scanner.
 pub async fn auth_setup(
     State(state): State<Arc<AppState>>,
+    crate::ingest::handler::PeerAddr(peer): crate::ingest::handler::PeerAddr,
     headers: HeaderMap,
     Json(body): Json<PasswordRequest>,
 ) -> impl IntoResponse {
-    let ip = extract_client_ip_from(&state, &headers);
+    let ip = extract_client_ip_from(&state, &headers, peer);
 
     if !state.login_attempt_tracker.check(&ip) {
         return too_many_attempts(&state, &ip);
@@ -718,7 +850,7 @@ pub async fn auth_setup(
 
     // Check-then-hash, re-checking after: hashing takes ~50-100 ms and must not
     // hold the lock, but two concurrent setup requests must not both succeed.
-    if state.admin_password_hash.lock().is_some() {
+    if state.admin_password.is_configured() {
         return already_configured();
     }
 
@@ -734,12 +866,23 @@ pub async fn auth_setup(
         }
     };
 
-    {
-        let mut guard = state.admin_password_hash.lock();
-        if guard.is_some() {
-            return already_configured();
+    match state.admin_password.set_if_unset(hash) {
+        Ok(true) => {}
+        Ok(false) => return already_configured(),
+        Err(e) => {
+            // Accepting the password without storing it would leave the
+            // instance claimable again after the next restart, which is exactly
+            // the failure this endpoint exists to prevent.
+            tracing::error!(error = %e, "Could not persist the admin password");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Could not store the admin password. Check that the data \
+                              directory is writable, then try again."
+                })),
+            )
+                .into_response();
         }
-        *guard = Some(hash);
     }
 
     state.login_attempt_tracker.record_success(&ip);
@@ -783,10 +926,11 @@ fn too_many_attempts(state: &AppState, ip: &str) -> Response {
 /// Returns a session cookie on success. Per-IP brute-force protection applies.
 pub async fn auth_login(
     State(state): State<Arc<AppState>>,
+    crate::ingest::handler::PeerAddr(peer): crate::ingest::handler::PeerAddr,
     headers: HeaderMap,
     Json(body): Json<PasswordRequest>,
 ) -> impl IntoResponse {
-    let ip = extract_client_ip_from(&state, &headers);
+    let ip = extract_client_ip_from(&state, &headers, peer);
 
     if !state.login_attempt_tracker.check(&ip) {
         return too_many_attempts(&state, &ip);
@@ -796,7 +940,7 @@ pub async fn auth_login(
     // ~50-100 ms of Argon2 work; holding the mutex across it serialised every
     // login attempt and blocked every other reader of the hash, and running it
     // inline pinned an async worker thread for the duration.
-    let stored_hash = state.admin_password_hash.lock().clone();
+    let stored_hash = state.admin_password.get();
     let Some(stored_hash) = stored_hash else {
         return (
             StatusCode::BAD_REQUEST,
@@ -866,7 +1010,7 @@ pub async fn auth_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let setup_required = state.admin_password_hash.lock().is_none();
+    let setup_required = !state.admin_password.is_configured();
     let authenticated = if setup_required {
         // Reads are open before setup; admin routes are not (see
         // `require_admin_auth`), so this reports read access.
@@ -1088,7 +1232,7 @@ pub async fn require_auth(
     next: Next,
 ) -> Result<Response, StatusCode> {
     // No password configured = open access
-    if state.admin_password_hash.lock().is_none() {
+    if !state.admin_password.is_configured() {
         return Ok(next.run(request).await);
     }
 
@@ -1120,9 +1264,13 @@ pub async fn require_admin_auth(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if state.admin_password_hash.lock().is_none() {
+    if !state.admin_password.is_configured() {
+        let peer = request
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|axum::extract::ConnectInfo(addr)| *addr);
         tracing::warn!(
-            ip_prefix = %anonymize_ip(&extract_client_ip_from(&state, &headers)),
+            ip_prefix = %anonymize_ip(&extract_client_ip_from(&state, &headers, peer)),
             "Admin endpoint refused: no admin password is configured yet. \
              Complete POST /api/auth/setup first."
         );
@@ -1158,8 +1306,20 @@ fn is_authenticated(state: &AppState, headers: &HeaderMap) -> bool {
 }
 
 /// Client IP for a request, honouring the deployment's proxy configuration.
-fn extract_client_ip_from(state: &AppState, headers: &HeaderMap) -> String {
-    crate::ingest::handler::client_ip(state, headers, None)
+///
+/// `peer` is the socket address the request arrived on. It used to be passed as
+/// `None`, which meant that on any deployment not behind a trusted proxy —
+/// which is the default — every login attempt was keyed by the literal string
+/// `"unknown"`. Brute-force protection was therefore global rather than
+/// per-IP: five failures from anybody locked *everyone* out of the dashboard
+/// for the lockout period, and an attacker gained nothing by rotating source
+/// addresses because they were never distinguished in the first place.
+fn extract_client_ip_from(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+) -> String {
+    crate::ingest::handler::client_ip(state, headers, peer)
 }
 
 /// Extract session token from cookie header.
@@ -1193,6 +1353,91 @@ fn build_session_cookie(token: &str, ttl_secs: u64, secure: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Admin password persistence ───────────────────────────────────────
+
+    #[test]
+    fn test_admin_password_survives_a_restart() {
+        // Before this, a password set through /api/auth/setup lived only in
+        // memory: after a restart the instance reported setup_required again
+        // and the next request to reach it — from anyone — could claim it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin.json");
+
+        let first = AdminPasswordStore::load_from_disk(path.clone(), None);
+        assert!(!first.is_configured(), "a fresh instance has no password");
+        let hash = hash_password("correct horse battery staple").unwrap();
+        assert!(first.set_if_unset(hash).unwrap());
+
+        let after_restart = AdminPasswordStore::load_from_disk(path, None);
+        assert!(after_restart.is_configured(), "the password must survive");
+        assert!(verify_password(
+            "correct horse battery staple",
+            &after_restart.get().unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_admin_password_file_is_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin.json");
+        let store = AdminPasswordStore::load_from_disk(path.clone(), None);
+        store
+            .set_if_unset(hash_password("a-long-enough-password").unwrap())
+            .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the hash must not be world-readable");
+        }
+        // The password itself must never reach the file.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains("a-long-enough-password"));
+        assert!(contents.contains("$argon2"));
+    }
+
+    #[test]
+    fn test_set_if_unset_refuses_a_second_password() {
+        let store = AdminPasswordStore::in_memory(None);
+        assert!(store.set_if_unset("first".to_string()).unwrap());
+        assert!(
+            !store.set_if_unset("second".to_string()).unwrap(),
+            "two concurrent setup requests must not both win"
+        );
+        assert_eq!(store.get().as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn test_env_password_wins_over_the_stored_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin.json");
+        AdminPasswordStore::load_from_disk(path.clone(), None)
+            .set_if_unset(hash_password("stored-password-x").unwrap())
+            .unwrap();
+
+        let env_hash = hash_password("env-password-value").unwrap();
+        let store = AdminPasswordStore::load_from_disk(path, Some(env_hash));
+        let live = store.get().unwrap();
+        assert!(verify_password("env-password-value", &live));
+        assert!(!verify_password("stored-password-x", &live));
+    }
+
+    #[test]
+    fn test_a_corrupt_stored_hash_is_not_trusted() {
+        // A truncated or hand-edited file must not become an admin credential
+        // that Argon2 then fails open on.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admin.json");
+        std::fs::write(
+            &path,
+            r#"{"password_hash":"not-a-phc-string","updated_at":"2024-01-01T00:00:00"}"#,
+        )
+        .unwrap();
+        let store = AdminPasswordStore::load_from_disk(path, None);
+        assert!(!store.is_configured());
+    }
 
     #[test]
     fn test_validate_origin_no_restrictions() {
@@ -1672,7 +1917,7 @@ mod tests {
 
         let untrusting = crate::test_support::state_builder().build_state();
         assert_eq!(
-            extract_client_ip_from(&untrusting, &headers),
+            extract_client_ip_from(&untrusting, &headers, None),
             "unknown",
             "a spoofable header must be ignored when no proxy is configured"
         );
@@ -1680,7 +1925,10 @@ mod tests {
         let trusting = crate::test_support::state_builder()
             .trust_proxy_headers(true)
             .build_state();
-        assert_eq!(extract_client_ip_from(&trusting, &headers), "203.0.113.1");
+        assert_eq!(
+            extract_client_ip_from(&trusting, &headers, None),
+            "203.0.113.1"
+        );
     }
 
     #[test]

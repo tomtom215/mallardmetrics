@@ -21,6 +21,15 @@ const MAX_URL_LEN: usize = 2048;
 const MAX_REFERRER_LEN: usize = 2048;
 const MAX_PROPS_LEN: usize = 4096;
 
+/// Largest revenue amount an event may carry.
+///
+/// `revenue_amount` is stored as `DECIMAL(12,2)`, whose range stops just short
+/// of 10^10. A larger value is not merely clipped: the bulk insert rejects the
+/// whole batch, so one event carrying `1e30` would fail every flush, fill the
+/// buffer, and start dropping unrelated events. Rejecting the field here keeps
+/// the rest of the event.
+const MAX_REVENUE_AMOUNT: f64 = 9_999_999_999.99;
+
 /// Strip the query string and fragment from a URL.
 ///
 /// `https://google.com/search?q=cancer+diagnosis#result` → `https://google.com/search`
@@ -63,7 +72,12 @@ pub struct EventPayload {
     /// Referrer URL.
     #[serde(rename = "r")]
     pub referrer: Option<String>,
-    /// Screen width in CSS pixels.
+    /// Viewport width in CSS pixels.
+    ///
+    /// The tracker reports `window.innerWidth`, not `screen.width`: the layout
+    /// the visitor actually saw is the useful figure, and reading the physical
+    /// screen would add a fingerprinting surface for no analytical gain. The
+    /// `screen-sizes` breakdown is therefore a viewport-width breakdown.
     #[serde(rename = "w")]
     pub screen_width: Option<u32>,
     /// Custom properties, as a JSON object string.
@@ -120,14 +134,18 @@ pub struct AppState {
     pub buffer: EventBuffer,
     /// Read-only DuckDB connections used to serve analytics queries.
     pub readers: crate::storage::ReaderPool,
+    /// Shared by every analytics query so no read observes a partially applied
+    /// flush, compaction or erasure. See [`TierLock`](crate::storage::TierLock).
+    pub tier_lock: crate::storage::TierLock,
     pub secret: String,
     pub allowed_sites: Vec<String>,
     pub geoip: GeoIpReader,
     pub filter_bots: bool,
     pub sessions: SessionStore,
     pub api_keys: ApiKeyStore,
-    /// Hashed admin password (Argon2id). `None` until setup runs.
-    pub admin_password_hash: parking_lot::Mutex<Option<String>>,
+    /// Hashed admin password (Argon2id), persisted so a password set through
+    /// the setup endpoint survives a restart.
+    pub admin_password: crate::api::auth::AdminPasswordStore,
     pub dashboard_origin: Option<String>,
     pub query_cache: crate::query::cache::QueryCache,
     /// Per-site ingest rate limiter.
@@ -135,6 +153,8 @@ pub struct AppState {
     /// Per-client-IP ingest rate limiter.
     pub ip_rate_limiter: crate::ingest::ratelimit::RateLimiter,
     pub login_attempt_tracker: LoginAttemptTracker,
+    /// Request counts and latency, exported through `/metrics`.
+    pub http_metrics: Arc<crate::server::HttpMetrics>,
     pub events_ingested_total: Arc<AtomicU64>,
     pub flush_failures_total: Arc<AtomicU64>,
     pub rate_limit_rejections_total: Arc<AtomicU64>,
@@ -458,7 +478,9 @@ pub fn build_event(
         region,
         city,
         props: payload.props.as_deref().and_then(sanitize_props),
-        revenue_amount: payload.revenue_amount.filter(|a| a.is_finite()),
+        revenue_amount: payload
+            .revenue_amount
+            .filter(|a| a.is_finite() && a.abs() <= MAX_REVENUE_AMOUNT),
         revenue_currency: payload
             .revenue_currency
             .as_deref()
@@ -780,6 +802,76 @@ mod tests {
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    // ── Storage consistency ──────────────────────────────────────────────
+
+    #[test]
+    fn test_queries_wait_on_the_same_tier_lock_a_flush_takes() {
+        // `events_all` unions the hot table with a live Parquet glob, and a
+        // flush is briefly visible on both sides. The guarantee that no query
+        // sees that rests entirely on both paths using *one* lock, which is
+        // easy to break by adding a second `TierLock::new()` somewhere.
+        let (state, _dir) = crate::test_support::state_builder().build();
+        let flushing = state.buffer.tier_lock().write();
+        assert!(
+            state.tier_lock.try_read().is_none(),
+            "an analytics query must block while a flush is mid-way"
+        );
+        drop(flushing);
+        assert!(state.tier_lock.try_read().is_some());
+    }
+
+    // ── Revenue bounds ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_revenue_outside_the_column_range_is_dropped() {
+        // revenue_amount is DECIMAL(12,2). A value past its range does not get
+        // clipped on insert — it fails the whole bulk append, so a single event
+        // carrying 1e30 would break every flush, fill the buffer and start
+        // discarding unrelated events.
+        let state = crate::test_support::state_builder().build_state();
+        let headers = HeaderMap::new();
+
+        let with_revenue = |amount: f64| EventPayload {
+            domain: "a.com".to_string(),
+            name: "purchase".to_string(),
+            url: "https://a.com/checkout".to_string(),
+            referrer: None,
+            screen_width: None,
+            props: None,
+            revenue_amount: Some(amount),
+            revenue_currency: Some("USD".to_string()),
+        };
+
+        for rejected in [1e30, -1e30, f64::INFINITY, f64::NAN, 10_000_000_000.0] {
+            let event = build_event(
+                &state,
+                &headers,
+                Some(addr("203.0.113.1:1")),
+                &with_revenue(rejected),
+            )
+            .expect("the event itself is still valid");
+            assert_eq!(
+                event.revenue_amount, None,
+                "{rejected} does not fit DECIMAL(12,2) and must not reach the appender"
+            );
+        }
+
+        for accepted in [0.0, 49.99, -12.50, MAX_REVENUE_AMOUNT] {
+            let event = build_event(
+                &state,
+                &headers,
+                Some(addr("203.0.113.1:1")),
+                &with_revenue(accepted),
+            )
+            .unwrap();
+            assert_eq!(
+                event.revenue_amount,
+                Some(accepted),
+                "{accepted} is in range"
+            );
+        }
     }
 
     // ── Client IP resolution ─────────────────────────────────────────────

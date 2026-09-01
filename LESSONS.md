@@ -107,6 +107,20 @@ Compute the instant in Rust with `Utc::now().naive_utc()` and bind it as a param
 
 A test needing "two dates in the same period" must derive them from a period start, never pick calendar dates by hand. The same arithmetic explains a product behaviour worth documenting rather than hiding: a retention cohort spanning a salt boundary loses its visitor linkage.
 
+### L28: A `UNION ALL` over a live glob has no transaction around it
+
+`events_all` unions the hot DuckDB table with `read_parquet('.../*.parquet')`. DuckDB's MVCC covers the table half; the glob half is the filesystem, re-expanded on every query. Any operation that writes one side before removing the other therefore has a window where a row is visible twice — a flush (copy, then delete), a compaction (rename in, then unlink sources), an erasure (delete rows, then remove partitions).
+
+Reversing the order does not fix it; it swaps double-counting for a window where the data is missing entirely. Neither can be tested by an in-process suite that shares a single connection, because the writer mutex accidentally serialises everything: the bug only appears once reads have their own connections, which is exactly what production does and what the test fixtures did not.
+
+The fix is a reader-writer lock spanning the inconsistent window — coarse, held only across file operations, and worth far more than the throughput it costs. The test that proves it has to build a real file-backed database with a real reader pool; a version driven through the in-memory fixtures passed with or without the lock, which would have been worse than no test at all.
+
+### L29: The default extension directory does not exist in a `FROM scratch` image
+
+DuckDB installs community extensions under `$HOME/.duckdb/extensions`. A `scratch` image has no `/etc/passwd` and sets no `HOME`, and the deployment this project recommends adds `read_only: true`. So `INSTALL behavioral FROM community` had nowhere to write, and every funnel, retention, session, sequence and flow request answered 503 — on a container that passed its healthcheck, served the dashboard, and ingested events perfectly.
+
+Nothing in the test suite could see it: the tests open in-memory databases on a normal filesystem with a normal `HOME`. The general lesson is that a dependency's *default path* is part of the deployment contract. Set it explicitly to somewhere the deployment guarantees is writable — here, the data volume — rather than inheriting a default that happens to work on a developer's laptop.
+
 ### L11: Axum Tower middleware composes cleanly
 
 CORS, tracing, and compression are added as Tower layers with no impedance mismatch. The `tower::ServiceExt` trait enables testing routers with `oneshot()` without starting a real server.
@@ -172,6 +186,18 @@ Correct pattern (steady-state): set up DuckDB connection, schema, and buffer OUT
 Correct pattern (per-iteration state): use `b.iter_batched(setup_fn, bench_fn, BatchSize::SmallInput)`. The `setup_fn` runs once per batch (not measured); `bench_fn` is measured. This is correct for flush benchmarks where each flush consumes state that must be recreated.
 
 The three-run minimum (L9 from duckdb-behavioral) catches fluke measurements. Publish before/after baselines when restructuring benchmarks; always note whether old baselines are being superseded and why.
+
+### L30: State that only lives in memory is a security boundary, not a convenience
+
+The admin password hash sat in a `Mutex<Option<String>>` and nothing wrote it anywhere. Every individual piece was right — Argon2id, a minimum length, per-IP lockout, a `409` on a second setup — and the whole was a takeover: a restart put the instance back into first-run mode, so whoever reached it next could set the password and mint an admin API key that outlived the takeover.
+
+Two habits catch this class. First, ask of any in-memory credential what a restart means; "sessions are cleared" is fine, "anyone can claim the instance" is not. Second, test the restart. The in-process suite cannot, by construction — it builds one `AppState` and drops it — so the check belongs in the end-to-end script that stops the binary and starts it again against the same data directory.
+
+### L31: A shared placeholder turns rate limiting into denial of service
+
+The login handler resolved the client address without the peer socket, so on any deployment not behind a trusted proxy — the default — every attempt keyed the same bucket: the literal string `"unknown"`. Every unit test passed, because each drove one synthetic address and the behaviour under a single key is indistinguishable.
+
+The tell is a fallback value that is *shared* rather than *absent*. `Option::None` would have forced a decision at every call site; `"unknown"` silently merged every client into one, which flipped a protection into an amplification — five failures from anyone locked out everyone.
 
 ---
 

@@ -76,6 +76,32 @@ If `MALLARD_METRICS_TOKEN` is set, this endpoint requires `Authorization: Bearer
 | `mallard_cache_evictions_total` | counter | Cache entries evicted to stay within the entry cap |
 | `mallard_events_dropped_total` | counter | Events discarded because the buffer was at capacity |
 
+### HTTP traffic
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `mallard_http_requests_total{status="2xx"}` | counter | Responses served, labelled by status class (`1xx`–`5xx`) |
+| `mallard_http_request_duration_seconds` | histogram | Time to produce a response, on the conventional Prometheus bucket spread |
+
+Counted by status class rather than by route: `/{*path}` matches anything a
+crawler asks for, so a per-route label set would be unbounded — the classic way
+to take a Prometheus server down with cardinality.
+
+The histogram is recorded by the outermost middleware, so it sees the status the
+client actually receives: a request the timeout layer converts into a `408` is
+counted as a `408`.
+
+A useful pair of alerts:
+
+```promql
+# 5xx rate above 1% over five minutes
+  sum(rate(mallard_http_requests_total{status="5xx"}[5m]))
+/ sum(rate(mallard_http_requests_total[5m])) > 0.01
+
+# 95th-percentile latency above two seconds
+histogram_quantile(0.95, sum(rate(mallard_http_request_duration_seconds_bucket[5m])) by (le)) > 2
+```
+
 `mallard_events_dropped_total` is the one to alert on. It only moves when flushes
 are failing — a full disk, bad permissions — and the buffer has hit
 `max_buffered_events`. Any non-zero value means events are being lost.
