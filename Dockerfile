@@ -11,7 +11,7 @@
 # .github/workflows/release.yml; this Dockerfile is the from-source path used by
 # `docker compose build` and by CI's Docker smoke test.
 
-FROM rust:1.98-alpine AS builder
+FROM rust:1.99-alpine AS builder
 
 # build-base and linux-headers are required by libduckdb-sys, which compiles the
 # bundled DuckDB C++ amalgamation via cc-rs.
