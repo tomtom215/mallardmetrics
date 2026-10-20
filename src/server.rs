@@ -93,7 +93,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let ingestion_cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::POST, Method::GET])
-        .allow_headers([header::CONTENT_TYPE]);
+        .allow_headers([header::CONTENT_TYPE])
+        // `sendBeacon` with a JSON body preflights, so without this every event
+        // costs two requests.
+        .max_age(std::time::Duration::from_hours(24));
 
     let dashboard_cors = build_dashboard_cors(state.dashboard_origin.as_deref());
 
@@ -144,8 +147,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // GET is the pixel / `<img>` tracker, for contexts without JavaScript.
     let ingestion_routes = Router::new()
-        .route("/event", post(ingest_event))
-        .route("/event", get(pixel_track))
+        .route(
+            "/event",
+            post(ingest_event).get(pixel_track).head(pixel_head),
+        )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(ingestion_cors);
 
@@ -293,6 +298,20 @@ const TRANSPARENT_GIF_1X1: &[u8] = &[
     0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
 ];
 
+/// HEAD /api/event — answers like the pixel and records nothing.
+///
+/// Left to itself axum routes HEAD to the GET handler, so a link checker or a
+/// mail client's prefetch would register a pageview.
+async fn pixel_head() -> impl axum::response::IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/gif"),
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+        ],
+    )
+}
+
 /// GET /api/event — the pixel / `<img>` tracker.
 ///
 /// Takes the same core parameters as the POST endpoint via the query string and
@@ -377,6 +396,11 @@ async fn readiness_check(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// GET /health/detailed — component status and configuration summary.
+///
+/// Unauthenticated, so it leaves out what would help an attacker rather than an
+/// operator: whether an admin password is set (that is a claimable instance),
+/// how many sessions are live, and whether proxy headers are trusted. The same
+/// facts are on `/metrics`, which can be put behind a token.
 async fn detailed_health_check(
     State(state): State<Arc<AppState>>,
 ) -> axum::Json<serde_json::Value> {
@@ -386,14 +410,11 @@ async fn detailed_health_check(
         "buffered_events": state.buffer.len(),
         "buffer_empty": state.buffer.is_empty(),
         "dropped_events": state.buffer.dropped_events.load(Ordering::Relaxed),
-        "auth_configured": state.admin_password.is_configured(),
-        "active_sessions": state.sessions.len(),
         "geoip_loaded": state.geoip.is_loaded(),
         "behavioral_extension_loaded": state.behavioral_extension_loaded,
         "behavioral_version": state.behavioral_version,
         "read_connections": state.readers.len(),
         "filter_bots": state.filter_bots,
-        "trust_proxy_headers": state.trust_proxy_headers,
         "session_window": state.session_window,
         "visitor_salt_rotation_days": state.visitor_salt_rotation_days,
         "cache_entries": state.query_cache.len(),
@@ -544,6 +565,34 @@ fn write_counters(out: &mut String, state: &AppState) {
     );
     metric(
         out,
+        "mallard_rate_limiter_evictions_total",
+        "Rate-limiter buckets dropped early because the key table was full",
+        "counter",
+        state
+            .rate_limiter
+            .capacity_evictions
+            .load(Ordering::Relaxed)
+            + state
+                .ip_rate_limiter
+                .capacity_evictions
+                .load(Ordering::Relaxed),
+    );
+    metric(
+        out,
+        "mallard_process_start_time_seconds",
+        "Unix time at which the process started",
+        "gauge",
+        state.started_at_unix,
+    );
+    metric(
+        out,
+        "mallard_last_flush_success_timestamp_seconds",
+        "Unix time of the last flush that completed without error (0 before the first)",
+        "gauge",
+        state.last_flush_success_unix.load(Ordering::Relaxed),
+    );
+    metric(
+        out,
         "mallard_rate_limit_rejections_total",
         "Ingest requests rejected by a rate limiter",
         "counter",
@@ -582,10 +631,38 @@ fn write_counters(out: &mut String, state: &AppState) {
 /// Render the Prometheus exposition body.
 fn build_metrics_body(state: &AppState) -> String {
     let mut out = String::with_capacity(4096);
+    write_build_info(&mut out, state);
     write_gauges(&mut out, state);
     write_counters(&mut out, state);
     write_http_metrics(&mut out, state);
     out
+}
+
+/// Escape a Prometheus label value: backslash, double quote and newline.
+fn escape_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// Emit `mallard_build_info`: a constant `1` whose labels say what is running.
+///
+/// The behavioral extension is a separate download with its own version, and it
+/// decides what funnel results mean, so it belongs next to the binary's own.
+fn write_build_info(out: &mut String, state: &AppState) {
+    use std::fmt::Write;
+    let _ = writeln!(
+        out,
+        "# HELP mallard_build_info Version of this binary and of the loaded behavioral extension"
+    );
+    let _ = writeln!(out, "# TYPE mallard_build_info gauge");
+    let _ = writeln!(
+        out,
+        "mallard_build_info{{version=\"{}\",behavioral_version=\"{}\"}} 1",
+        escape_label(env!("CARGO_PKG_VERSION")),
+        escape_label(state.behavioral_version.as_deref().unwrap_or("none"))
+    );
 }
 
 /// GET /metrics — Prometheus exposition.
@@ -667,11 +744,86 @@ mod tests {
         assert_eq!(json["status"], "ok");
         assert!(json.get("version").is_some());
         assert_eq!(json["buffered_events"], 0);
-        assert_eq!(json["auth_configured"], false);
         assert_eq!(json["geoip_loaded"], false);
+        for hidden in ["auth_configured", "active_sessions", "trust_proxy_headers"] {
+            assert!(
+                json.get(hidden).is_none(),
+                "{hidden} must not be disclosed without authentication"
+            );
+        }
         assert!(json.get("behavioral_version").is_some());
         assert!(json.get("read_connections").is_some());
         assert!(json.get("visitor_salt_rotation_days").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_head_on_the_pixel_answers_without_recording_an_event() {
+        let (state, _dir) = state_builder().build();
+        let request = Request::builder()
+            .method(Method::HEAD)
+            .uri("/api/event?d=example.com&n=pageview&u=https%3A%2F%2Fexample.com%2F")
+            .body(Body::empty())
+            .unwrap();
+        let response = build_router(Arc::clone(&state))
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("image/gif")
+        );
+        assert_eq!(
+            state.buffer.len(),
+            0,
+            "a link checker's HEAD must not register a pageview"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ingest_preflight_is_cacheable() {
+        let (state, _dir) = state_builder().build();
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/api/event")
+            .header(header::ORIGIN, "https://example.com")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+            .body(Body::empty())
+            .unwrap();
+        let response = build_router(state).oneshot(request).await.unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_MAX_AGE)
+                .and_then(|v| v.to_str().ok()),
+            Some("86400")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_report_build_flush_and_limiter_state() {
+        let (state, _dir) = state_builder().build();
+        state
+            .last_flush_success_unix
+            .store(1_700_000_000, Ordering::Relaxed);
+        let text = build_metrics_body(&state);
+        let build = format!(
+            "mallard_build_info{{version=\"{}\",behavioral_version=",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(text.contains(&build), "missing build info in:\n{text}");
+        assert!(text.contains("mallard_last_flush_success_timestamp_seconds 1700000000"));
+        assert!(text.contains("mallard_process_start_time_seconds"));
+        assert!(text.contains("mallard_rate_limiter_evictions_total 0"));
+    }
+
+    #[test]
+    fn test_label_values_are_escaped() {
+        assert_eq!(escape_label("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
     }
 
     #[tokio::test]

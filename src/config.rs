@@ -86,12 +86,23 @@ pub struct Config {
     /// Default false. When the server is reachable directly, these headers are
     /// attacker-controlled: trusting them lets a client forge its visitor ID,
     /// its geolocation, and its rate-limit bucket. Enable this ONLY when every
-    /// request arrives through a reverse proxy that overwrites the header
-    /// (the bundled Caddy config does).
+    /// request arrives through a reverse proxy in front of this server (the
+    /// bundled Caddy config is one).
     ///
     /// When false, the peer socket address is used instead.
     #[serde(default)]
     pub trust_proxy_headers: bool,
+
+    /// Reverse proxies between the client and this server: how many
+    /// `X-Forwarded-For` entries to skip from the right. Only used when
+    /// `trust_proxy_headers` is on.
+    ///
+    /// Each proxy appends the address it received the connection from, so the
+    /// client is the Nth entry from the right, where N is the number of proxies
+    /// that are yours. Entries further left were supplied by the client and
+    /// prove nothing. A CDN in front of nginx is 2. Default 1.
+    #[serde(default = "default_trusted_proxy_hops")]
+    pub trusted_proxy_hops: usize,
 
     /// Number of read-only DuckDB connections used to serve analytics queries.
     ///
@@ -287,6 +298,14 @@ fn default_log_format() -> String {
     "text".to_string()
 }
 
+const fn default_trusted_proxy_hops() -> usize {
+    crate::ingest::handler::DEFAULT_TRUSTED_PROXY_HOPS
+}
+
+/// Most proxies a request is plausibly relayed through. A larger number is
+/// almost certainly a mistake, and it widens the span of forgeable entries.
+const MAX_TRUSTED_PROXY_HOPS: usize = 8;
+
 const fn default_max_login_attempts() -> u32 {
     5
 }
@@ -364,6 +383,7 @@ impl Default for Config {
             max_concurrent_queries: default_max_concurrent_queries(),
             secure_cookies: false,
             trust_proxy_headers: false,
+            trusted_proxy_hops: default_trusted_proxy_hops(),
             read_connections: default_read_connections(),
             max_buffered_events: default_max_buffered_events(),
             max_tracked_keys: default_max_tracked_keys(),
@@ -552,7 +572,11 @@ impl Config {
         }
         parse_env_num!("MALLARD_FLUSH_COUNT", config.flush_event_count, usize);
         parse_env_num!("MALLARD_FLUSH_INTERVAL", config.flush_interval_secs, u64);
-        if let Ok(geoip) = std::env::var("MALLARD_GEOIP_DB") {
+        // An empty value means "not set": compose files pass `${VAR:-}` through
+        // as an empty string, and an empty path is not a database.
+        if let Ok(geoip) = std::env::var("MALLARD_GEOIP_DB")
+            && !geoip.trim().is_empty()
+        {
             config.geoip_db_path = Some(PathBuf::from(geoip));
         }
         if let Ok(origin) = std::env::var("MALLARD_DASHBOARD_ORIGIN") {
@@ -596,6 +620,11 @@ impl Config {
         );
         parse_env_bool!("MALLARD_SECURE_COOKIES", config.secure_cookies);
         parse_env_bool!("MALLARD_TRUST_PROXY_HEADERS", config.trust_proxy_headers);
+        parse_env_num!(
+            "MALLARD_TRUSTED_PROXY_HOPS",
+            config.trusted_proxy_hops,
+            usize
+        );
         parse_env_num!("MALLARD_READ_CONNECTIONS", config.read_connections, usize);
         parse_env_num!(
             "MALLARD_MAX_BUFFERED_EVENTS",
@@ -716,6 +745,7 @@ impl Config {
     ///
     /// Returns a human-readable description of the first problem found.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_access_controls()?;
         if self.flush_event_count == 0 {
             return Err(
                 "flush_event_count must be > 0; 0 would mean events never auto-flush".to_string(),
@@ -823,6 +853,27 @@ impl Config {
         Ok(())
     }
 
+    /// Settings that decide who is let in and who is believed about their address.
+    fn validate_access_controls(&self) -> Result<(), String> {
+        if self.login_lockout_secs == 0 {
+            return Err(
+                "login_lockout_secs must be > 0; 0 would end every lockout immediately, \
+                 which disables brute-force protection"
+                    .to_string(),
+            );
+        }
+        if self.trust_proxy_headers
+            && !(1..=MAX_TRUSTED_PROXY_HOPS).contains(&self.trusted_proxy_hops)
+        {
+            return Err(format!(
+                "trusted_proxy_hops must be between 1 and {MAX_TRUSTED_PROXY_HOPS} when \
+                 trust_proxy_headers is on (got {})",
+                self.trusted_proxy_hops
+            ));
+        }
+        Ok(())
+    }
+
     /// Warnings about configurations that are valid but likely to surprise.
     ///
     /// Emitted at startup once logging is initialised.
@@ -845,10 +896,25 @@ impl Config {
             );
         }
         if self.trust_proxy_headers {
+            out.push(format!(
+                "trust_proxy_headers is enabled with trusted_proxy_hops={n}: the client \
+                 address is entry {n} from the RIGHT of X-Forwarded-For. Set \
+                 trusted_proxy_hops to the number of reverse proxies in front of this \
+                 server (a CDN in front of nginx is 2); too small a value attributes \
+                 traffic to a proxy, too large a value lets a client choose its address.",
+                n = self.trusted_proxy_hops
+            ));
+        }
+        if self.max_login_attempts == 0 {
             out.push(
-                "trust_proxy_headers is enabled: X-Forwarded-For and X-Real-IP are trusted. \
-                 Ensure every request reaches this server through a proxy that overwrites \
-                 them, or clients can forge their visitor ID, geolocation and rate-limit bucket."
+                "max_login_attempts is 0: brute-force protection on login is disabled.".to_string(),
+            );
+        }
+        if self.site_ids.is_empty() && self.rate_limit_per_ip == 0 {
+            out.push(
+                "site_ids is empty and rate_limit_per_ip is 0: anyone who can reach this \
+                 server can create sites and write events without limit. Set site_ids, or \
+                 a per-IP rate limit."
                     .to_string(),
             );
         }
@@ -1240,6 +1306,102 @@ visitor_salt_rotation_days = 30
         set_env("MALLARD_PORT", "3000");
         assert_eq!(Config::load(None).unwrap().config.port, 3000);
         restore_env("MALLARD_PORT", orig);
+    }
+
+    #[test]
+    fn test_trusted_proxy_hops_defaults_to_one_and_reads_the_environment() {
+        let _guard = env_lock();
+        let orig = std::env::var("MALLARD_TRUSTED_PROXY_HOPS").ok();
+        remove_env("MALLARD_TRUSTED_PROXY_HOPS");
+        assert_eq!(Config::load(None).unwrap().config.trusted_proxy_hops, 1);
+        set_env("MALLARD_TRUSTED_PROXY_HOPS", "2");
+        assert_eq!(Config::load(None).unwrap().config.trusted_proxy_hops, 2);
+        restore_env("MALLARD_TRUSTED_PROXY_HOPS", orig);
+    }
+
+    #[test]
+    fn test_trusted_proxy_hops_is_bounded_only_when_headers_are_trusted() {
+        for hops in [0, MAX_TRUSTED_PROXY_HOPS + 1] {
+            let trusted = Config {
+                trust_proxy_headers: true,
+                trusted_proxy_hops: hops,
+                ..Config::default()
+            };
+            assert!(
+                trusted.validate().is_err(),
+                "{hops} hops must be rejected when proxy headers are trusted"
+            );
+            let untrusted = Config {
+                trusted_proxy_hops: hops,
+                ..Config::default()
+            };
+            assert!(
+                untrusted.validate().is_ok(),
+                "the value is unused, and so harmless, when headers are not trusted"
+            );
+        }
+        let ok = Config {
+            trust_proxy_headers: true,
+            trusted_proxy_hops: MAX_TRUSTED_PROXY_HOPS,
+            ..Config::default()
+        };
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn test_zero_login_lockout_is_rejected() {
+        let config = Config {
+            login_lockout_secs: 0,
+            ..Config::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("login_lockout_secs"), "{err}");
+    }
+
+    #[test]
+    fn test_empty_geoip_env_means_not_set() {
+        let _guard = env_lock();
+        let orig = std::env::var("MALLARD_GEOIP_DB").ok();
+        set_env("MALLARD_GEOIP_DB", "");
+        assert!(Config::load(None).unwrap().config.geoip_db_path.is_none());
+        set_env("MALLARD_GEOIP_DB", "/data/city.mmdb");
+        assert_eq!(
+            Config::load(None).unwrap().config.geoip_db_path,
+            Some(PathBuf::from("/data/city.mmdb"))
+        );
+        restore_env("MALLARD_GEOIP_DB", orig);
+    }
+
+    #[test]
+    fn test_advisory_reports_the_proxy_depth_and_open_ingest() {
+        let proxied = Config {
+            trust_proxy_headers: true,
+            trusted_proxy_hops: 2,
+            ..Config::default()
+        };
+        assert!(
+            proxied
+                .advisories()
+                .iter()
+                .any(|a| a.contains("trusted_proxy_hops=2"))
+        );
+        assert!(
+            Config::default()
+                .advisories()
+                .iter()
+                .any(|a| a.contains("rate_limit_per_ip")),
+            "ingest that is open to anyone must be surfaced"
+        );
+        let limited = Config {
+            rate_limit_per_ip: 60,
+            ..Config::default()
+        };
+        assert!(
+            !limited
+                .advisories()
+                .iter()
+                .any(|a| a.contains("rate_limit_per_ip"))
+        );
     }
 
     #[test]

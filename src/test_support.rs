@@ -32,6 +32,7 @@ pub struct AppStateBuilder {
     allowed_sites: Vec<String>,
     filter_bots: bool,
     trust_proxy_headers: bool,
+    trusted_proxy_hops: usize,
     rate_limit_per_site: u32,
     rate_limit_per_ip: u32,
     admin_password_hash: Option<String>,
@@ -60,6 +61,7 @@ impl Default for AppStateBuilder {
             allowed_sites: Vec::new(),
             filter_bots: false,
             trust_proxy_headers: false,
+            trusted_proxy_hops: crate::ingest::handler::DEFAULT_TRUSTED_PROXY_HOPS,
             rate_limit_per_site: 0,
             rate_limit_per_ip: 0,
             admin_password_hash: None,
@@ -101,6 +103,7 @@ impl AppStateBuilder {
     setter!(allowed_sites, Vec<String>);
     setter!(filter_bots, bool);
     setter!(trust_proxy_headers, bool);
+    setter!(trusted_proxy_hops, usize);
     setter!(rate_limit_per_site, u32);
     setter!(rate_limit_per_ip, u32);
     setter!(admin_password_hash, Option<String>);
@@ -186,6 +189,8 @@ impl AppStateBuilder {
             http_metrics: Arc::default(),
             events_ingested_total: Arc::new(AtomicU64::new(0)),
             flush_failures_total: Arc::new(AtomicU64::new(0)),
+            last_flush_success_unix: Arc::new(AtomicU64::new(0)),
+            started_at_unix: 0,
             rate_limit_rejections_total: Arc::new(AtomicU64::new(0)),
             login_failures_total: Arc::new(AtomicU64::new(0)),
             metrics_token: self.metrics_token,
@@ -197,6 +202,7 @@ impl AppStateBuilder {
             behavioral_extension_loaded: self.behavioral_extension_loaded || behavioral_loaded,
             behavioral_version,
             trust_proxy_headers: self.trust_proxy_headers,
+            trusted_proxy_hops: self.trusted_proxy_hops,
             session_window: "30 minutes".to_string(),
             realtime_window_minutes: 5,
             visitor_salt_rotation_days: self.visitor_salt_rotation_days,

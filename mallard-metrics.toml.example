@@ -40,21 +40,22 @@ rate_limit_per_ip = 0          # MALLARD_RATE_LIMIT_PER_IP
 
 # Trust X-Forwarded-For / X-Real-IP for the client address.
 #
-# Leave false unless EVERY request reaches this server through a reverse proxy
-# that OVERWRITES those headers with the address it accepted the connection
-# from (the bundled Caddy config does, and deploy/docker-compose.production.yml
-# turns this on). On a directly reachable server they are attacker-controlled:
-# trusting them lets a client choose its own visitor ID, geolocation,
-# rate-limit bucket and login-lockout key. A proxy that APPENDS to a
-# client-supplied X-Forwarded-For (nginx's $proxy_add_x_forwarded_for) is not
-# safe with this on; set the header to $remote_addr instead.
-#
-# Behind exactly one proxy, also set MALLARD_TRUSTED_PROXY_HOPS=1 (the number of
-# trusted proxies in front of Mallard) in builds that support it; the address is
-# then taken from that many entries from the right of X-Forwarded-For.
+# Leave false unless EVERY request reaches this server through your reverse
+# proxy (the bundled Caddy config is one, and deploy/docker-compose.production.yml
+# turns this on). On a directly reachable server these headers are
+# attacker-controlled: trusting them lets a client choose its own visitor ID,
+# geolocation, rate-limit bucket and login-lockout key.
 #
 # When false, the peer socket address is used.
 trust_proxy_headers = false    # MALLARD_TRUST_PROXY_HEADERS
+
+# How many reverse proxies sit between the client and this server. The client
+# address is taken from that many entries from the RIGHT of X-Forwarded-For:
+# every proxy appends the address it received the connection from, so entries
+# further left were supplied by the client. One proxy (Caddy, or nginx with
+# $proxy_add_x_forwarded_for) is 1; a CDN in front of nginx is 2. Only used when
+# trust_proxy_headers is true; must then be between 1 and 8.
+trusted_proxy_hops = 1         # MALLARD_TRUSTED_PROXY_HOPS
 
 # Restrict dashboard/stats CORS to one origin. Must include the scheme and no
 # path. Credentialed cross-origin requests are only permitted when this is set.

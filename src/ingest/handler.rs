@@ -169,6 +169,12 @@ pub struct AppState {
     pub http_metrics: Arc<crate::server::HttpMetrics>,
     pub events_ingested_total: Arc<AtomicU64>,
     pub flush_failures_total: Arc<AtomicU64>,
+    /// Unix time of the last flush that completed without error, or 0 before the
+    /// first. A flush that finds nothing to write counts: the signal is that the
+    /// flush loop is alive, not that traffic arrived.
+    pub last_flush_success_unix: Arc<AtomicU64>,
+    /// Unix time at which this process started.
+    pub started_at_unix: u64,
     pub rate_limit_rejections_total: Arc<AtomicU64>,
     pub login_failures_total: Arc<AtomicU64>,
     /// Bearer token required by `/metrics`. `None` leaves it open.
@@ -182,6 +188,8 @@ pub struct AppState {
     pub behavioral_version: Option<String>,
     /// Trust `X-Forwarded-For` / `X-Real-IP` for the client address.
     pub trust_proxy_headers: bool,
+    /// Reverse proxies in front of this server; see `Config::trusted_proxy_hops`.
+    pub trusted_proxy_hops: usize,
     /// Session inactivity window, as a DuckDB interval literal.
     pub session_window: String,
     /// Window treated as "now" by the realtime endpoint.
@@ -274,15 +282,14 @@ pub const DEFAULT_TRUSTED_PROXY_HOPS: usize = 1;
 /// is not a proxy chain, and refusing it bounds the work done per request.
 const MAX_FORWARDED_ENTRIES: usize = 32;
 
-/// Resolve the client IP for a request, with the default proxy depth.
+/// Resolve the client IP for a request.
 ///
-/// See [`resolve_client_ip`]; this reads `trust_proxy_headers` from `state` and
-/// assumes [`DEFAULT_TRUSTED_PROXY_HOPS`] proxies until the deployment's hop
-/// count is carried in the application state.
+/// See [`resolve_client_ip`]; this reads the trust setting and the proxy depth
+/// from `state`.
 pub fn client_ip(state: &AppState, headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
     resolve_client_ip(
         state.trust_proxy_headers,
-        DEFAULT_TRUSTED_PROXY_HOPS,
+        state.trusted_proxy_hops,
         headers,
         peer,
     )

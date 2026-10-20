@@ -554,6 +554,8 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
         http_metrics: Arc::default(),
         events_ingested_total: Arc::new(AtomicU64::new(0)),
         flush_failures_total: Arc::new(AtomicU64::new(0)),
+        last_flush_success_unix: Arc::new(AtomicU64::new(0)),
+        started_at_unix: unix_now(),
         rate_limit_rejections_total: Arc::new(AtomicU64::new(0)),
         login_failures_total: Arc::new(AtomicU64::new(0)),
         metrics_token,
@@ -562,6 +564,7 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
         behavioral_extension_loaded: db.behavioral_loaded,
         behavioral_version: db.behavioral_version,
         trust_proxy_headers: config.trust_proxy_headers,
+        trusted_proxy_hops: config.trusted_proxy_hops,
         session_window: config.session_window_interval(),
         realtime_window_minutes: config.realtime_window_minutes,
         visitor_salt_rotation_days: config.visitor_salt_rotation_days,
@@ -582,6 +585,13 @@ fn load_admin_password() -> Option<String> {
         .ok()
         .filter(|p| !p.is_empty())?;
 
+    // The same policy as the setup endpoint: an environment variable is not a
+    // way around the minimum length.
+    if let Err(msg) = mallard_metrics::api::auth::validate_password(&password) {
+        eprintln!("MALLARD_ADMIN_PASSWORD rejected: {msg}");
+        std::process::exit(EXIT_FAILURE);
+    }
+
     match mallard_metrics::api::auth::hash_password(&password) {
         Ok(hash) => {
             tracing::info!("Admin password configured from MALLARD_ADMIN_PASSWORD");
@@ -596,6 +606,9 @@ fn load_admin_password() -> Option<String> {
     }
 }
 
+/// Shortest accepted `MALLARD_SECRET`.
+const MIN_SECRET_CHARS: usize = 16;
+
 /// Resolve the visitor-ID secret, generating and persisting one if needed.
 ///
 /// Priority: `MALLARD_SECRET`, then `data_dir/.secret`, then a fresh value.
@@ -609,16 +622,39 @@ fn load_or_create_secret(config: &Config) -> String {
     if let Ok(secret) = std::env::var("MALLARD_SECRET") {
         let secret = secret.trim().to_string();
         if !secret.is_empty() {
+            // The visitor ID is an HMAC keyed with this value; a short, guessable
+            // key lets anyone who sees an ID brute-force the IP behind it.
+            if secret.chars().count() < MIN_SECRET_CHARS {
+                eprintln!(
+                    "MALLARD_SECRET is shorter than {MIN_SECRET_CHARS} characters. \
+                     Use a random value, e.g. `openssl rand -hex 32`."
+                );
+                std::process::exit(EXIT_FAILURE);
+            }
             return secret;
         }
     }
 
     let secret_path = config.data_dir.join(".secret");
-    if let Ok(existing) = std::fs::read_to_string(&secret_path) {
-        let existing = existing.trim().to_string();
-        if !existing.is_empty() {
+    // Clear temp files an interrupted write left beside the secret.
+    mallard_metrics::api::auth::remove_stale_temp_files(&secret_path);
+    match std::fs::read_to_string(&secret_path) {
+        Ok(existing) if !existing.trim().is_empty() => {
+            mallard_metrics::api::auth::restrict_to_owner(&secret_path);
             tracing::info!(path = %secret_path.display(), "Loaded the persisted visitor-ID secret");
-            return existing;
+            return existing.trim().to_string();
+        }
+        // An empty file carries no secret; fall through and generate one.
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            // Generating a fresh secret here would replace the one on disk and
+            // silently break every visitor ID derived from it.
+            eprintln!(
+                "Cannot read {}: {e}; refusing to replace the visitor-ID secret",
+                secret_path.display()
+            );
+            std::process::exit(EXIT_FAILURE);
         }
     }
 
@@ -664,8 +700,14 @@ fn spawn_flush_task(interval_secs: u64, state: &Arc<AppState>) {
             let task_state = Arc::clone(&state);
             let result = tokio::task::spawn_blocking(move || task_state.buffer.flush()).await;
             match result {
-                Ok(Ok(count)) if count > 0 => tracing::info!(count, "Periodic flush completed"),
-                Ok(Ok(_)) => {}
+                Ok(Ok(count)) => {
+                    state
+                        .last_flush_success_unix
+                        .store(unix_now(), Ordering::Relaxed);
+                    if count > 0 {
+                        tracing::info!(count, "Periodic flush completed");
+                    }
+                }
                 Ok(Err(e)) => {
                     state.flush_failures_total.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(error = %e, "Periodic flush failed");
@@ -677,6 +719,14 @@ fn spawn_flush_task(interval_secs: u64, state: &Arc<AppState>) {
             }
         }
     });
+}
+
+/// Seconds since the Unix epoch. Zero if the clock is before it, which a
+/// monotonic-failure metric can only read as "never".
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Delete Parquet partitions past the retention horizon, daily.
