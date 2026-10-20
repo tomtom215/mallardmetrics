@@ -227,6 +227,12 @@ pub fn parse_user_agent_with_hints(ua: &str, hints: &ClientHints) -> ParsedUserA
     if let Some(platform) = &hints.platform
         && let Some(os) = normalize_platform(platform)
     {
+        // A version read from the User-Agent belongs to the OS the User-Agent
+        // named. If the hint says something else, pairing the two would record
+        // an OS that never existed ("macOS 10").
+        if parsed.os.as_deref() != Some(os.as_str()) {
+            parsed.os_version = None;
+        }
         parsed.os = Some(os);
     }
 
@@ -315,6 +321,13 @@ const BOT_MARKERS: &[&str] = &[
     "archive.org_bot",
     "ia_archiver",
     "screaming frog",
+    "storebot",
+    "googleother",
+    "bingpreview",
+    "meta-external",
+    "postmanruntime",
+    "bytespider",
+    "chatgpt-user",
 ];
 
 /// Prefixes that identify command-line and library clients.
@@ -335,9 +348,10 @@ fn is_bot(ua_lower: &str) -> bool {
 
 fn detect_browser(ua: &str) -> Option<String> {
     // Order matters: every Chromium derivative also advertises "Chrome/".
-    if ua.contains("Edg/") || ua.contains("Edge/") || ua.contains("EdgA/") {
+    if ua.contains("Edg/") || ua.contains("Edge/") || ua.contains("EdgA/") || ua.contains("EdgiOS/")
+    {
         Some("Edge".to_string())
-    } else if ua.contains("OPR/") || ua.contains("Opera") {
+    } else if ua.contains("OPR/") || ua.contains("OPT/") || ua.contains("Opera") {
         Some("Opera".to_string())
     } else if ua.contains("Vivaldi/") {
         Some("Vivaldi".to_string())
@@ -353,7 +367,8 @@ fn detect_browser(ua: &str) -> Option<String> {
         Some("DuckDuckGo".to_string())
     } else if ua.contains("Chromium/") {
         Some("Chromium".to_string())
-    } else if ua.contains("Chrome/") {
+    } else if ua.contains("Chrome/") || ua.contains("CriOS/") {
+        // Chrome on iOS wraps WebKit and says CriOS, not Chrome.
         Some("Chrome".to_string())
     } else if ua.contains("FxiOS/") || ua.contains("Firefox/") {
         Some("Firefox".to_string())
@@ -370,8 +385,10 @@ fn detect_browser_version(ua: &str) -> Option<String> {
     const PREFIXES: &[&str] = &[
         "Edg/",
         "EdgA/",
+        "EdgiOS/",
         "Edge/",
         "OPR/",
+        "OPT/",
         "Vivaldi/",
         "Brave/",
         "SamsungBrowser/",
@@ -380,6 +397,7 @@ fn detect_browser_version(ua: &str) -> Option<String> {
         "DuckDuckGo/",
         "Chromium/",
         "Chrome/",
+        "CriOS/",
         "FxiOS/",
         "Firefox/",
         // Safari reports its marketing version in "Version/"; it must come last
@@ -443,7 +461,12 @@ fn detect_os_version(ua: &str) -> Option<String> {
     } else if ua.contains("CPU OS") {
         extract_version_after(ua, "CPU OS ").map(|v| v.replace('_', "."))
     } else if ua.contains("Mac OS X") {
-        extract_version_after(ua, "Mac OS X ").map(|v| v.replace('_', "."))
+        // Every current macOS browser reports the frozen 10.15.x here whatever
+        // the real release, so the value says nothing and would put every Mac
+        // visitor in one "10.15.7" row.
+        extract_version_after(ua, "Mac OS X ")
+            .map(|v| v.replace('_', "."))
+            .filter(|v| v != "10.15.7" && v != "10.15")
     } else if ua.contains("Android") {
         extract_version_after(ua, "Android ")
     } else {
@@ -827,6 +850,81 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    // ── iOS wrappers, frozen versions, bot markers (SI-22) ───────────────
+
+    const CHROME_IOS: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 \
+         (KHTML, like Gecko) CriOS/120.0.6099.119 Mobile/15E148 Safari/604.1";
+    const EDGE_IOS: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 \
+         (KHTML, like Gecko) Version/17.0 EdgiOS/120.0.2210.126 Mobile/15E148 Safari/605.1.15";
+    const OPERA_TOUCH_IOS: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 \
+         (KHTML, like Gecko) Mobile/15E148 Safari/604.1 OPT/4.0.1";
+    const CHROME_MAC: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+         (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+    #[test]
+    fn test_ios_browser_wrappers_are_not_reported_as_safari() {
+        // Chrome, Edge and Opera on iOS carry no "Chrome/", "Edg/" or "OPR/"
+        // token, so they fell through to "Safari/" with no version.
+        for (ua, browser, version) in [
+            (CHROME_IOS, "Chrome", "120.0.6099.119"),
+            (EDGE_IOS, "Edge", "120.0.2210.126"),
+            (OPERA_TOUCH_IOS, "Opera", "4.0.1"),
+        ] {
+            let parsed = parse_user_agent(ua);
+            assert_eq!(parsed.browser.as_deref(), Some(browser), "{ua}");
+            assert_eq!(parsed.browser_version.as_deref(), Some(version), "{ua}");
+            assert_eq!(parsed.os.as_deref(), Some("iOS"));
+            assert_eq!(parsed.os_version.as_deref(), Some("17.2"));
+        }
+    }
+
+    #[test]
+    fn test_frozen_macos_version_is_not_reported() {
+        let parsed = parse_user_agent(CHROME_MAC);
+        assert_eq!(parsed.os.as_deref(), Some("macOS"));
+        assert_eq!(
+            parsed.os_version, None,
+            "10.15.7 is a constant, not a release"
+        );
+        // A genuinely different version is kept.
+        let big_sur = CHROME_MAC.replace("10_15_7", "11_6");
+        assert_eq!(
+            parse_user_agent(&big_sur).os_version.as_deref(),
+            Some("11.6")
+        );
+    }
+
+    #[test]
+    fn test_more_crawlers_are_recognised_and_browsers_are_not() {
+        for bot in [
+            "Mozilla/5.0 (Linux; Android 7.0;) AppleWebKit/537.36 (KHTML, like Gecko) Mobile Safari/537.36 (compatible; Storebot-Google/1.0)",
+            "Mozilla/5.0 (compatible; GoogleOther)",
+            "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/534+ (KHTML, like Gecko) BingPreview/1.0b",
+            "PostmanRuntime/7.36.0",
+            "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ChatGPT-User/1.0; +https://openai.com/bot)",
+        ] {
+            assert!(parse_user_agent(bot).is_bot, "{bot}");
+        }
+        for human in [CHROME_WIN, CHROME_IOS, CHROME_MAC, EDGE_WIN] {
+            assert!(!parse_user_agent(human).is_bot, "{human}");
+        }
+    }
+
+    #[test]
+    fn test_a_platform_hint_that_disagrees_with_the_user_agent_drops_the_stale_version() {
+        let h = headers(&[("sec-ch-ua-platform", "\"macOS\"")]);
+        let parsed = parse_user_agent_with_hints(CHROME_WIN, &ClientHints::from_headers(&h));
+        assert_eq!(parsed.os.as_deref(), Some("macOS"));
+        assert_eq!(
+            parsed.os_version, None,
+            "Windows NT 10 is not a macOS version"
+        );
+
+        let agreeing = headers(&[("sec-ch-ua-platform", "\"Windows\"")]);
+        let parsed = parse_user_agent_with_hints(CHROME_WIN, &ClientHints::from_headers(&agreeing));
+        assert_eq!(parsed.os_version.as_deref(), Some("10"));
     }
 
     #[test]
