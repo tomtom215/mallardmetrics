@@ -299,15 +299,50 @@ async fn run(config_path: Option<&std::path::Path>) {
     // ConnectInfo makes the peer address available to handlers, which is what
     // the client-IP fallback uses when no proxy headers are trusted.
     let service = app.into_make_service_with_connect_info::<SocketAddr>();
-    let shutdown_timeout = config.shutdown_timeout_secs;
+    let shutdown_timeout = std::time::Duration::from_secs(config.shutdown_timeout_secs.max(1));
 
-    if let Err(e) = axum::serve(listener, service)
-        .with_graceful_shutdown(shutdown_signal(Arc::clone(&state), shutdown_timeout))
-        .await
-    {
+    // The final flush has to come after the server has drained, not before.
+    // `with_graceful_shutdown` stops accepting connections when its future
+    // completes, but requests already in flight keep running — and an event
+    // they accept lands in a buffer that a flush started at the signal has
+    // already emptied. So the future below only waits for the signal; the flush
+    // runs once `serve` returns.
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+    let serving = axum::serve(listener, service).with_graceful_shutdown(async move {
+        wait_for_shutdown_signal().await;
+        // The receiver only goes away if `serve` has already returned.
+        let _ = signalled_tx.send(());
+    });
+    let serving = std::future::IntoFuture::into_future(serving);
+    tokio::pin!(serving);
+
+    // A connection that never finishes must not keep the process alive past the
+    // drain budget: orchestrators follow SIGTERM with SIGKILL, and the flush
+    // below still has to run.
+    let outcome = tokio::select! {
+        result = &mut serving => Some(result),
+        () = async {
+            if signalled_rx.await.is_ok() {
+                tokio::time::sleep(shutdown_timeout).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            tracing::warn!(
+                timeout_secs = shutdown_timeout.as_secs(),
+                "Connections did not drain in time; shutting down with some still open"
+            );
+            None
+        }
+    };
+
+    flush_on_shutdown(&state, shutdown_timeout).await;
+
+    if let Some(Err(e)) = outcome {
         tracing::error!(error = %e, "Server error");
         std::process::exit(EXIT_FAILURE);
     }
+    tracing::info!("Shutdown complete");
 }
 
 /// Initialise the tracing subscriber.
@@ -700,8 +735,8 @@ fn spawn_housekeeping_task(state: &Arc<AppState>) {
     });
 }
 
-/// Wait for SIGINT or SIGTERM, then flush buffered events.
-async fn shutdown_signal(state: Arc<AppState>, timeout_secs: u64) {
+/// Wait for SIGINT or SIGTERM.
+async fn wait_for_shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
             tracing::error!(error = %e, "Failed to install the Ctrl+C handler");
@@ -728,19 +763,24 @@ async fn shutdown_signal(state: Arc<AppState>, timeout_secs: u64) {
         () = ctrl_c => tracing::info!("Received SIGINT"),
         () = terminate => tracing::info!("Received SIGTERM"),
     }
+}
 
+/// Flush whatever is still buffered, within `timeout`.
+///
+/// Called after the server has drained, so no handler can add to the buffer
+/// behind it.
+async fn flush_on_shutdown(state: &Arc<AppState>, timeout: std::time::Duration) {
     tracing::info!(
-        timeout_secs,
+        timeout_secs = timeout.as_secs(),
         buffered = state.buffer.len(),
         "Shutting down gracefully, flushing buffered events"
     );
 
     let flush = tokio::task::spawn_blocking({
-        let state = Arc::clone(&state);
+        let state = Arc::clone(state);
         move || state.buffer.flush()
     });
 
-    let timeout = std::time::Duration::from_secs(timeout_secs.max(1));
     match tokio::time::timeout(timeout, flush).await {
         Ok(Ok(Ok(count))) if count > 0 => {
             tracing::info!(count, "Flushed remaining events during shutdown");
@@ -749,10 +789,8 @@ async fn shutdown_signal(state: Arc<AppState>, timeout_secs: u64) {
         Ok(Ok(Err(e))) => tracing::error!(error = %e, "Failed to flush events during shutdown"),
         Ok(Err(e)) => tracing::error!(error = %e, "Flush task panicked during shutdown"),
         Err(_) => tracing::warn!(
-            timeout_secs,
+            timeout_secs = timeout.as_secs(),
             "Graceful shutdown flush timed out; some buffered events may be lost"
         ),
     }
-
-    tracing::info!("Shutdown complete");
 }
