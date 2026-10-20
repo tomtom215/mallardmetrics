@@ -161,6 +161,16 @@ pub fn behavioral_version(conn: &Connection) -> Option<String> {
         .ok()
 }
 
+/// Text DuckDB puts in the error for a glob that matches no file. Checked
+/// against DuckDB 1.5.6 by `test_unmatched_glob_error_has_the_expected_text`;
+/// if an upgrade changes it that test fails rather than the fallback below
+/// silently starting to swallow other errors.
+const NO_FILES_MARKER: &str = "No files found that match the pattern";
+
+/// [`NO_FILES_MARKER`] for the test that pins it.
+#[cfg(test)]
+pub(crate) const NO_FILES_MARKER_FOR_TESTS: &str = NO_FILES_MARKER;
+
 /// Create or refresh the `events_all` view unioning the hot table with Parquet.
 ///
 /// ## Two-tier design
@@ -169,8 +179,12 @@ pub fn behavioral_version(conn: &Connection) -> Option<String> {
 ///
 /// ## Lifecycle
 /// - Called at startup so historical data is queryable immediately.
-/// - Called again after each flush that wrote files, so new Parquet appears.
-/// - Falls back to a passthrough over `events` when no Parquet files exist yet.
+/// - Called again after a flush into a database whose view was built while the
+///   cold tier was empty (see [`ensure_query_view`]).
+/// - Called after retention or erasure removes partitions: a view over a glob
+///   that now matches nothing makes every query fail (F-05).
+/// - Falls back to a passthrough over `events` only when the glob matches no
+///   file at all, which is the normal state of a fresh install.
 ///
 /// `hive_partitioning=false` is required: the Parquet files already contain
 /// `site_id` and `timestamp` columns, and Hive-style inference would add
@@ -178,9 +192,23 @@ pub fn behavioral_version(conn: &Connection) -> Option<String> {
 ///
 /// # Errors
 ///
-/// Returns an error if even the passthrough view cannot be created.
+/// Returns an error if the union view cannot be created for any reason other
+/// than "no files yet" (a corrupt or foreign file in the tree, a schema
+/// conflict, a permission problem, a data directory containing glob
+/// characters). In that case a hot-only view is still installed so ingestion
+/// and the hot tier keep working, but the error is returned and
+/// [`cold_tier_status`] reports `Degraded`: analytics would otherwise silently
+/// lose the entire cold tier (F-04). Also returns an error if even the
+/// passthrough view cannot be created.
 pub fn setup_query_view(conn: &Connection, parquet_dir: &Path) -> Result<(), duckdb::Error> {
     let columns = EVENT_COLUMNS.join(", ");
+    let hot_only = format!("CREATE OR REPLACE VIEW events_all AS SELECT {columns} FROM events");
+
+    if let Err(reason) = crate::storage::parquet::validate_data_dir(parquet_dir) {
+        conn.execute_batch(&hot_only)?;
+        return Err(duckdb::Error::InvalidParameterName(reason));
+    }
+
     let glob = format!(
         "{}/site_id=*/date=*/*.parquet",
         parquet_dir.to_string_lossy()
@@ -194,15 +222,98 @@ pub fn setup_query_view(conn: &Connection, parquet_dir: &Path) -> Result<(), duc
          SELECT {columns} FROM read_parquet('{escaped_glob}', union_by_name=true, hive_partitioning=false)"
     );
 
-    if conn.execute_batch(&union_sql).is_ok() {
-        return Ok(());
+    match conn.execute_batch(&union_sql) {
+        Ok(()) => Ok(()),
+        Err(e) if e.to_string().contains(NO_FILES_MARKER) => conn.execute_batch(&hot_only),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "Could not build the events_all view over the Parquet files; analytics \
+                 will see only unflushed events until this is fixed"
+            );
+            // Keep the hot tier queryable. The failure is returned either way.
+            if let Err(fallback) = conn.execute_batch(&hot_only) {
+                tracing::error!(error = %fallback, "Could not install the hot-only fallback view");
+            }
+            Err(e)
+        }
     }
+}
 
-    // No Parquet files yet (an unmatched glob errors on some builds and returns
-    // zero rows on others) — fall back so queries still compile.
-    conn.execute_batch(&format!(
-        "CREATE OR REPLACE VIEW events_all AS SELECT {columns} FROM events"
-    ))
+/// True when `events_all` currently reads the Parquet tier.
+fn view_has_cold_tier(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM duckdb_views() \
+         WHERE view_name = 'events_all' AND sql ILIKE '%read_parquet%'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .is_ok_and(|n| n > 0)
+}
+
+/// Rebuild `events_all` only if it does not read the Parquet tier yet.
+///
+/// The union view re-expands its glob on every query, so once it includes the
+/// cold tier a flush never needs to touch it, and rebuilding is not free:
+/// `CREATE VIEW` binds the `read_parquet` call, which with `union_by_name`
+/// opens every file's footer. Flush used to do that on each run, under the
+/// exclusive tier lock.
+///
+/// # Errors
+///
+/// As for [`setup_query_view`].
+pub fn ensure_query_view(conn: &Connection, parquet_dir: &Path) -> Result<(), duckdb::Error> {
+    if view_has_cold_tier(conn) {
+        Ok(())
+    } else {
+        setup_query_view(conn, parquet_dir)
+    }
+}
+
+/// Whether the cold tier is reachable from analytics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColdTierStatus {
+    /// `events_all` reads the Parquet files and there are files to read.
+    Healthy,
+    /// No Parquet files exist yet; hot-only is correct.
+    Empty,
+    /// Files exist on disk but `events_all` does not read them (the union view
+    /// could not be built), or it reads a glob that no longer matches anything.
+    /// Analytics results are incomplete or failing. Health checks should
+    /// report this.
+    Degraded,
+}
+
+/// Inspect the view and the data directory. Cheap enough for a health check:
+/// it stops at the first Parquet file it finds.
+pub fn cold_tier_status(conn: &Connection, parquet_dir: &Path) -> ColdTierStatus {
+    match (view_has_cold_tier(conn), has_parquet_files(parquet_dir)) {
+        (true, true) => ColdTierStatus::Healthy,
+        (false, false) => ColdTierStatus::Empty,
+        _ => ColdTierStatus::Degraded,
+    }
+}
+
+/// True if any `site_id=*/date=*/*.parquet` file exists under `dir`.
+fn has_parquet_files(dir: &Path) -> bool {
+    let subdirs = |path: &Path| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(path)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect()
+    };
+    subdirs(dir).into_iter().any(|site| {
+        subdirs(&site).into_iter().any(|date| {
+            std::fs::read_dir(date)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|f| f.path().extension().is_some_and(|ext| ext == "parquet"))
+        })
+    })
 }
 
 #[cfg(test)]
