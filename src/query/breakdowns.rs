@@ -205,7 +205,7 @@ pub fn query_breakdown(
 }
 
 /// The parameters [`breakdown_sql`] binds, in text order.
-fn breakdown_params<'a>(dimension: Dimension, scope: &'a QueryScope) -> Vec<&'a str> {
+fn breakdown_params(dimension: Dimension, scope: &QueryScope) -> Vec<&str> {
     if dimension.requires_behavioral() {
         sessions::per_session_params(scope)
     } else {

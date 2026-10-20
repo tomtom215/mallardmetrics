@@ -167,7 +167,7 @@ impl QueryScope {
     }
 
     /// Site, start and end: the parameters of [`QueryScope::range_clause`].
-    pub fn range_params(&self) -> [&str; 3] {
+    pub const fn range_params(&self) -> [&str; 3] {
         [
             self.site_id.as_str(),
             self.start.as_str(),

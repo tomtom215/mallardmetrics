@@ -134,7 +134,7 @@ pub fn query_core_metrics(
         Err(e) if super::behavioral_loaded(conn) => return Err(e),
         Err(_) => None,
     };
-    Ok(assemble(base, sessions))
+    Ok(assemble(&base, sessions.as_ref()))
 }
 
 /// The same metrics without the session pass.
@@ -150,10 +150,10 @@ pub fn query_event_metrics(
     conn: &Connection,
     scope: &QueryScope,
 ) -> Result<CoreMetrics, duckdb::Error> {
-    Ok(assemble(query_base_counts(conn, scope)?, None))
+    Ok(assemble(&query_base_counts(conn, scope)?, None))
 }
 
-fn assemble(base: BaseCounts, sessions: Option<SessionAggregates>) -> CoreMetrics {
+fn assemble(base: &BaseCounts, sessions: Option<&SessionAggregates>) -> CoreMetrics {
     #[allow(clippy::cast_precision_loss)]
     let views_per_visitor = if base.unique_visitors > 0 {
         base.total_pageviews as f64 / base.unique_visitors as f64
@@ -166,10 +166,10 @@ fn assemble(base: BaseCounts, sessions: Option<SessionAggregates>) -> CoreMetric
         total_pageviews: base.total_pageviews,
         total_events: base.total_events,
         views_per_visitor,
-        total_sessions: sessions.as_ref().map(|s| s.total_sessions),
-        bounce_rate: sessions.as_ref().map(|s| s.bounce_rate),
-        avg_visit_duration_secs: sessions.as_ref().map(|s| s.avg_duration_secs),
-        views_per_visit: sessions.as_ref().map(|s| s.avg_pages),
+        total_sessions: sessions.map(|s| s.total_sessions),
+        bounce_rate: sessions.map(|s| s.bounce_rate),
+        avg_visit_duration_secs: sessions.map(|s| s.avg_duration_secs),
+        views_per_visit: sessions.map(|s| s.avg_pages),
         behavioral_available: sessions.is_some(),
         comparison: None,
     }
