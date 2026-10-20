@@ -102,6 +102,8 @@ fn flush(state: &Arc<AppState>) {
 #[tokio::test]
 async fn test_full_ingest_pipeline() {
     let (state, _dir) = plain_state();
+    // `7d` is the last seven calendar days including today. It used to be
+    // eight (today and the seven before it) under a seven-day label.
     assert_eq!(
         post_event(&state, pageview("example.com", "https://example.com/")).await,
         StatusCode::ACCEPTED
@@ -544,8 +546,8 @@ async fn test_timeseries_has_no_gaps() {
     let buckets = json.as_array().unwrap();
     assert_eq!(
         buckets.len(),
-        8,
-        "7d spans eight daily buckets, gaps filled"
+        7,
+        "7d spans seven daily buckets, gaps filled"
     );
     assert!(buckets.iter().all(|b| b.get("date").is_some()));
 }
@@ -2267,4 +2269,143 @@ fn test_tracking_script_behaviour() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+// ── Query execution and metric definitions ───────────────────────────────
+
+#[tokio::test]
+async fn test_a_cold_dashboard_load_gets_no_429() {
+    // Regression (S-01): a dashboard refresh fires about 31 requests at once
+    // (ten summary panels, twenty breakdowns) against a default cap of ten
+    // concurrent queries, and every request past the tenth was answered 429 on
+    // a cold cache. The cache is disabled here so every request runs a query.
+    let (state, _dir) = state_builder().cache_ttl_secs(0).build();
+    seed(&state).await;
+
+    let mut uris: Vec<String> = [
+        "main?site_id=example.com&period=30d",
+        "main?site_id=example.com&period=30d&compare=previous_period",
+        "sessions?site_id=example.com&period=30d",
+        "timeseries?site_id=example.com&period=30d",
+        "goals?site_id=example.com&period=30d",
+        "revenue?site_id=example.com&period=30d",
+        "properties?site_id=example.com&period=30d",
+        "realtime?site_id=example.com",
+        "funnel?site_id=example.com&period=30d&steps=page:/,page:/about",
+        "retention?site_id=example.com&period=30d&weeks=4",
+    ]
+    .iter()
+    .map(|tail| format!("/api/stats/{tail}"))
+    .collect();
+    for slug in [
+        "pages",
+        "referrers",
+        "sources",
+        "countries",
+        "regions",
+        "cities",
+        "browsers",
+        "browser-versions",
+        "os",
+        "os-versions",
+        "devices",
+        "screen-sizes",
+        "utm-sources",
+        "utm-mediums",
+        "utm-campaigns",
+        "utm-contents",
+        "utm-terms",
+        "events",
+        "entry-pages",
+        "exit-pages",
+    ] {
+        uris.push(format!(
+            "/api/stats/breakdown/{slug}?site_id=example.com&period=30d"
+        ));
+    }
+    assert_eq!(uris.len(), 30);
+
+    let mut tasks = Vec::new();
+    for uri in uris {
+        let state = Arc::clone(&state);
+        tasks.push(tokio::spawn(async move {
+            let status = get(&state, &uri).await.status();
+            (uri, status)
+        }));
+    }
+    for task in tasks {
+        let (uri, status) = task.await.unwrap();
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{uri} was rejected by the concurrency cap during a dashboard load"
+        );
+        assert!(
+            status == StatusCode::OK || status == StatusCode::SERVICE_UNAVAILABLE,
+            "{uri} answered {status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_session_analyses_are_refused_when_timestamps_are_rounded() {
+    // Regression (S-05): gdpr_mode rounds every timestamp to the hour. Sessions,
+    // funnels, sequences and flows then compute from events that can no longer
+    // be ordered, and used to return confident, meaningless numbers. They must
+    // say so instead; analyses that do not depend on intra-hour order must keep
+    // working.
+    let (state, _dir) = state_builder().round_timestamps(true).build();
+    seed(&state).await;
+
+    for uri in [
+        "/api/stats/sessions?site_id=example.com&period=30d",
+        "/api/stats/funnel?site_id=example.com&period=30d&steps=page:/,page:/about",
+        "/api/stats/sequences?site_id=example.com&period=30d&steps=page:/,page:/about",
+        "/api/stats/flow?site_id=example.com&period=30d&page=/",
+        "/api/stats/breakdown/entry-pages?site_id=example.com&period=30d",
+        "/api/stats/breakdown/exit-pages?site_id=example.com&period=30d",
+    ] {
+        let response = get(&state, uri).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{uri} must be refused, not computed from rounded timestamps"
+        );
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rounded"),
+            "{uri}: {body}"
+        );
+    }
+
+    // Headline metrics still answer; only the session-derived fields drop out.
+    let main = body_json(get(&state, "/api/stats/main?site_id=example.com&period=30d").await).await;
+    assert_eq!(main["total_pageviews"], 3);
+    assert_eq!(main["behavioral_available"], false);
+    assert!(main["bounce_rate"].is_null(), "{main}");
+    assert!(main["total_sessions"].is_null(), "{main}");
+
+    // Unaffected analyses.
+    for uri in [
+        "/api/stats/breakdown/pages?site_id=example.com&period=30d",
+        "/api/stats/timeseries?site_id=example.com&period=30d",
+        "/api/stats/goals?site_id=example.com&period=30d",
+    ] {
+        assert_eq!(get(&state, uri).await.status(), StatusCode::OK, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn test_a_lone_start_date_is_a_bad_request() {
+    // Regression (S-09): it used to be ignored and the 30-day default answered.
+    let (state, _dir) = plain_state();
+    let response = get(
+        &state,
+        "/api/stats/main?site_id=example.com&start_date=2024-01-01",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }

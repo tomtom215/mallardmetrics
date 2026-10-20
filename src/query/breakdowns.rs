@@ -1,4 +1,4 @@
-use super::QueryScope;
+use super::{QueryScope, sessions};
 use duckdb::Connection;
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +11,14 @@ pub struct BreakdownRow {
     /// All events, not just pageviews. Distinguishes a page with heavy custom
     /// event traffic from one that is merely viewed.
     pub events: u64,
+    /// Sessions that began (entry pages) or ended (exit pages) on this page.
+    ///
+    /// Only the session-derived dimensions report it. For them `pageviews` and
+    /// `events` are totals over those sessions, and this is the number of
+    /// entrances or exits: the figure `pageviews` used to show under the wrong
+    /// name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<u64>,
 }
 
 /// Dimensions a breakdown can group by.
@@ -157,10 +165,18 @@ impl Dimension {
 
 /// Query a breakdown of events by a dimension.
 ///
+/// Entry and exit pages are session-level: each row counts the sessions that
+/// began (or ended) on that page, with `pageviews` and `events` totalled over
+/// those sessions and `sessions` giving the entrance or exit count. Sessions are
+/// the ones [`crate::query::sessions`] defines, so the totals agree with
+/// `/stats/sessions`. Every other dimension counts events.
+///
 /// # Errors
 ///
 /// Returns an error if the query fails — including when an entry/exit-page
-/// breakdown is requested without the behavioral extension loaded.
+/// breakdown is requested without the behavioral extension loaded — or if a
+/// row cannot be decoded. A row that fails to decode used to be dropped, so a
+/// partly unreadable result came back as a complete-looking report.
 pub fn query_breakdown(
     conn: &Connection,
     scope: &QueryScope,
@@ -169,19 +185,32 @@ pub fn query_breakdown(
 ) -> Result<Vec<BreakdownRow>, duckdb::Error> {
     let sql = breakdown_sql(dimension, scope, limit);
     let mut stmt = conn.prepare(&sql)?;
+    let session_level = dimension.requires_behavioral();
+    let params = breakdown_params(dimension, scope);
 
-    let rows = stmt
-        .query_map(duckdb::params_from_iter(scope.params()), |row| {
-            Ok(BreakdownRow {
-                value: row.get(0)?,
-                visitors: row.get(1)?,
-                pageviews: row.get(2)?,
-                events: row.get(3)?,
-            })
-        })?
-        .filter_map(Result::ok)
-        .collect();
-    Ok(rows)
+    stmt.query_map(duckdb::params_from_iter(params), |row| {
+        Ok(BreakdownRow {
+            value: row.get(0)?,
+            visitors: row.get(1)?,
+            pageviews: row.get(2)?,
+            events: row.get(3)?,
+            sessions: if session_level {
+                Some(row.get(4)?)
+            } else {
+                None
+            },
+        })
+    })?
+    .collect()
+}
+
+/// The parameters [`breakdown_sql`] binds, in text order.
+fn breakdown_params(dimension: Dimension, scope: &QueryScope) -> Vec<&str> {
+    if dimension.requires_behavioral() {
+        sessions::per_session_params(scope)
+    } else {
+        scope.params()
+    }
 }
 
 /// SQL for a breakdown. Split out so it can be unit-tested.
@@ -192,56 +221,42 @@ pub fn query_breakdown(
 /// easy to get wrong and hard to notice.
 fn breakdown_sql(dimension: Dimension, scope: &QueryScope, limit: usize) -> String {
     let col = dimension.column_name();
-    let where_clause = scope.where_clause();
 
     match dimension {
         Dimension::EntryPage | Dimension::ExitPage => {
-            let pick = if dimension == Dimension::EntryPage {
-                "MIN_BY(pathname, timestamp)"
+            let page = if dimension == Dimension::EntryPage {
+                "entry_page"
             } else {
-                "MAX_BY(pathname, timestamp)"
-            };
-            let window = if scope.session_window_is_safe() {
-                scope.session_window.clone()
-            } else {
-                "30 minutes".to_string()
+                "exit_page"
             };
             format!(
-                "WITH scoped AS (
-                     SELECT visitor_id, timestamp, pathname, event_name
-                     FROM events_all
-                     WHERE {where_clause} AND event_name = 'pageview'
-                 ),
-                 sessionized AS (
-                     SELECT *, sessionize(timestamp, INTERVAL '{window}') OVER (
-                         PARTITION BY visitor_id ORDER BY timestamp) AS session_id
-                     FROM scoped
-                 ),
-                 per_session AS (
-                     SELECT visitor_id, session_id, {pick} AS page, COUNT(*) AS views
-                     FROM sessionized GROUP BY visitor_id, session_id
-                 )
-                 SELECT COALESCE(page, '(unknown)'),
+                "{cte}
+                 SELECT {page},
                         COUNT(DISTINCT visitor_id),
-                        COUNT(*),
+                        SUM(page_count)::UBIGINT,
+                        SUM(event_count)::UBIGINT,
                         COUNT(*)
                  FROM per_session
-                 GROUP BY page
-                 ORDER BY COUNT(DISTINCT visitor_id) DESC, page
+                 GROUP BY {page}
+                 ORDER BY COUNT(DISTINCT visitor_id) DESC, {page}
+                 LIMIT {limit}",
+                cte = sessions::per_session_cte(scope)
+            )
+        }
+        _ => {
+            let where_clause = scope.where_clause();
+            format!(
+                "SELECT COALESCE({col}, '(unknown)') AS dim_value,
+                        COUNT(DISTINCT visitor_id) AS visitors,
+                        COUNT(*) FILTER (WHERE event_name = 'pageview') AS pageviews,
+                        COUNT(*) AS events
+                 FROM events_all
+                 WHERE {where_clause}
+                 GROUP BY dim_value
+                 ORDER BY visitors DESC, dim_value
                  LIMIT {limit}"
             )
         }
-        _ => format!(
-            "SELECT COALESCE({col}, '(unknown)') AS dim_value,
-                    COUNT(DISTINCT visitor_id) AS visitors,
-                    COUNT(*) FILTER (WHERE event_name = 'pageview') AS pageviews,
-                    COUNT(*) AS events
-             FROM events_all
-             WHERE {where_clause}
-             GROUP BY dim_value
-             ORDER BY visitors DESC, dim_value
-             LIMIT {limit}"
-        ),
     }
 }
 
@@ -701,6 +716,116 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_entry_pages_under_a_page_filter_report_where_the_visit_began() {
+        // Regression (S-02): sessions were rebuilt from the filtered rows, so
+        // narrowing to `/pricing` made `/pricing` the entry page of every
+        // session, whatever page the visitor actually landed on.
+        let db = TestDb::new();
+        if !db.require_behavioral("entry page under a filter") {
+            return;
+        }
+        insert_pageview(&db.conn, "c", "2024-01-15 10:00:00", "/home");
+        insert_pageview(&db.conn, "c", "2024-01-15 10:05:00", "/pricing");
+        insert_pageview(&db.conn, "d", "2024-01-15 11:00:00", "/pricing");
+
+        let s = crate::query::test_support::filtered_scope(
+            "2024-01-01",
+            "2024-02-01",
+            "pages==/pricing",
+        );
+        let entry = query_breakdown(&db.conn, &s, Dimension::EntryPage, 10).unwrap();
+        let by_page = |rows: &[BreakdownRow], page: &str| {
+            rows.iter().find(|r| r.value == page).map(|r| r.visitors)
+        };
+        assert_eq!(by_page(&entry, "/home"), Some(1), "c landed on /home");
+        assert_eq!(by_page(&entry, "/pricing"), Some(1), "d landed on /pricing");
+
+        let exit = query_breakdown(&db.conn, &s, Dimension::ExitPage, 10).unwrap();
+        assert_eq!(
+            by_page(&exit, "/pricing"),
+            Some(2),
+            "both left from /pricing"
+        );
+        assert_eq!(by_page(&exit, "/home"), None);
+    }
+
+    #[test]
+    fn test_entry_page_session_counts_agree_with_the_session_metrics() {
+        // Regression (S-03): entry/exit sessionised pageviews only while the
+        // session metrics sessionised every event, so the two endpoints counted
+        // different sessions for the same site. Here the visitor's pageviews
+        // are 40 minutes apart: one visit when a custom event bridges them.
+        let db = TestDb::new();
+        if !db.require_behavioral("session agreement") {
+            return;
+        }
+        insert_pageview(&db.conn, "e", "2024-01-15 12:00:00", "/e1");
+        db.insert_event("e", "2024-01-15 12:20:00", "signup", "/e1");
+        insert_pageview(&db.conn, "e", "2024-01-15 12:40:00", "/e2");
+        db.insert_event("orphan", "2024-01-15 13:00:00", "signup", "/e1");
+
+        let s = scope("2024-01-01", "2024-02-01");
+        let sessions = crate::query::metrics::query_session_metrics(&db.conn, &s)
+            .unwrap()
+            .total_sessions;
+        let entry = query_breakdown(&db.conn, &s, Dimension::EntryPage, 10).unwrap();
+        let entered: u64 = entry.iter().map(|r| r.sessions.unwrap_or(0)).sum();
+        assert_eq!(sessions, 1);
+        assert_eq!(entered, sessions, "{entry:?}");
+        assert_eq!(entry[0].value, "/e1");
+    }
+
+    #[test]
+    fn test_entry_page_rows_count_pageviews_and_events_of_their_sessions() {
+        // Regression (S-13): `pageviews` and `events` were both the number of
+        // sessions, so a column labelled "pageviews" showed entrances.
+        let db = TestDb::new();
+        if !db.require_behavioral("entry page columns") {
+            return;
+        }
+        insert_pageview(&db.conn, "a", "2024-01-15 10:00:00", "/landing");
+        insert_pageview(&db.conn, "a", "2024-01-15 10:01:00", "/b");
+        db.insert_event("a", "2024-01-15 10:02:00", "signup", "/b");
+        insert_pageview(&db.conn, "z", "2024-01-15 11:00:00", "/landing");
+
+        let rows = query_breakdown(
+            &db.conn,
+            &scope("2024-01-01", "2024-02-01"),
+            Dimension::EntryPage,
+            10,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        let landing = &rows[0];
+        assert_eq!(landing.visitors, 2);
+        assert_eq!(landing.sessions, Some(2), "entrances");
+        assert_eq!(
+            landing.pageviews, 3,
+            "pageviews in the sessions that began here"
+        );
+        assert_eq!(landing.events, 4, "every event in those sessions");
+    }
+
+    #[test]
+    fn test_only_session_dimensions_report_a_session_count() {
+        let db = TestDb::new();
+        insert_pageview(&db.conn, "a", "2024-01-15 10:00:00", "/");
+        let rows = query_breakdown(
+            &db.conn,
+            &scope("2024-01-01", "2024-02-01"),
+            Dimension::Page,
+            10,
+        )
+        .unwrap();
+        assert_eq!(rows[0].sessions, None);
+        let json = serde_json::to_value(&rows[0]).unwrap();
+        assert!(
+            json.get("sessions").is_none(),
+            "an absent count must not appear as null"
+        );
     }
 
     #[test]

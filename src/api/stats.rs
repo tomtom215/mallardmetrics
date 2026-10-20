@@ -12,6 +12,8 @@ use axum::{Json, http::HeaderValue};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 // ── Shared parameter handling ────────────────────────────────────────────
 
@@ -241,58 +243,92 @@ impl StatsParams {
     ///
     /// An explicit `start_date`/`end_date` pair wins over `period`; both are
     /// parsed as `YYYY-MM-DD` and capped at [`MAX_RANGE_DAYS`] so a request
-    /// cannot ask for an unbounded partition scan.
+    /// cannot ask for an unbounded partition scan. Giving only one of the two is
+    /// an error: it used to be ignored and the default 30-day period answered
+    /// instead, so a client that mistyped one parameter silently got a report
+    /// for a different range.
+    ///
+    /// # Periods
+    ///
+    /// `Nd` is the last N calendar days **including today**, so `7d` is seven
+    /// daily buckets (as in Plausible and Matomo), not eight. It used to start N
+    /// days back and so spanned N+1 days under an N-day label. `12mo` is the
+    /// twelve months ending today, inclusive. All dates are UTC; sites have no
+    /// time zone of their own, so a day boundary is a UTC boundary.
     ///
     /// # Errors
     ///
     /// Returns a `BadRequest` for a malformed date, an inverted range, an
-    /// over-long range, or an unknown period.
+    /// over-long range, an unpaired date, or an unknown period.
     pub fn date_range(&self) -> Result<DateRange, ApiError> {
-        if let (Some(start_str), Some(end_str)) = (&self.start_date, &self.end_date) {
-            let start = parse_date(start_str, "start_date")?;
-            let end = parse_date(end_str, "end_date")?;
-            let days = (end - start).num_days();
-            if days < 0 {
+        self.date_range_on(chrono::Utc::now().date_naive())
+    }
+
+    /// [`StatsParams::date_range`] with today's date supplied, so the period
+    /// arithmetic can be tested exactly (LESSONS L23).
+    ///
+    /// # Errors
+    ///
+    /// As [`StatsParams::date_range`].
+    pub fn date_range_on(&self, today: NaiveDate) -> Result<DateRange, ApiError> {
+        match (&self.start_date, &self.end_date) {
+            (Some(start_str), Some(end_str)) => {
+                let start = parse_date(start_str, "start_date")?;
+                let end = parse_date(end_str, "end_date")?;
+                let days = (end - start).num_days();
+                if days < 0 {
+                    return Err(ApiError::BadRequest(
+                        "end_date must be on or after start_date".to_string(),
+                    ));
+                }
+                if days > MAX_RANGE_DAYS {
+                    return Err(ApiError::BadRequest(format!(
+                        "Date range must not exceed {MAX_RANGE_DAYS} days"
+                    )));
+                }
+                // The stored end bound is exclusive, so an inclusive end_date of
+                // 2024-01-31 must query up to 2024-02-01. Without this the final
+                // day of every explicit range was silently omitted.
+                let exclusive_end = end
+                    .succ_opt()
+                    .ok_or_else(|| ApiError::BadRequest("end_date is out of range".to_string()))?;
+                return Ok(DateRange {
+                    start: start.to_string(),
+                    end: exclusive_end.to_string(),
+                    days: days + 1,
+                });
+            }
+            (Some(_), None) | (None, Some(_)) => {
                 return Err(ApiError::BadRequest(
-                    "end_date must be on or after start_date".to_string(),
+                    "start_date and end_date must be given together".to_string(),
                 ));
             }
-            if days > MAX_RANGE_DAYS {
-                return Err(ApiError::BadRequest(format!(
-                    "Date range must not exceed {MAX_RANGE_DAYS} days"
-                )));
-            }
-            // The stored end bound is exclusive, so an inclusive end_date of
-            // 2024-01-31 must query up to 2024-02-01. Without this the final
-            // day of every explicit range was silently omitted.
-            let exclusive_end = end
-                .succ_opt()
-                .ok_or_else(|| ApiError::BadRequest("end_date is out of range".to_string()))?;
-            return Ok(DateRange {
-                start: start.to_string(),
-                end: exclusive_end.to_string(),
-                days: days + 1,
-            });
+            (None, None) => {}
         }
 
-        let now = chrono::Utc::now().date_naive();
-        let (start, days) = match self.period.as_str() {
-            "day" | "today" => (now, 1),
-            "7d" => (now - chrono::Days::new(7), 8),
-            "30d" => (now - chrono::Days::new(30), 31),
-            "90d" => (now - chrono::Days::new(90), 91),
-            "12mo" => (now - chrono::Days::new(365), 366),
+        let out_of_range = || ApiError::BadRequest("The period is out of range".to_string());
+        let tomorrow = today.succ_opt().ok_or_else(out_of_range)?;
+        let start = match self.period.as_str() {
+            "day" | "today" => Some(today),
+            "7d" => today.checked_sub_days(chrono::Days::new(6)),
+            "30d" => today.checked_sub_days(chrono::Days::new(29)),
+            "90d" => today.checked_sub_days(chrono::Days::new(89)),
+            // Twelve months ending today: from the day after this date last year.
+            "12mo" => today
+                .checked_sub_months(chrono::Months::new(12))
+                .and_then(|d| d.succ_opt()),
             other => {
                 return Err(ApiError::BadRequest(format!(
                     "Invalid period: {other}. Use 'day', '7d', '30d', '90d', '12mo', \
                      or supply start_date and end_date."
                 )));
             }
-        };
+        }
+        .ok_or_else(out_of_range)?;
         Ok(DateRange {
             start: start.to_string(),
-            end: (now + chrono::Days::new(1)).to_string(),
-            days,
+            end: tomorrow.to_string(),
+            days: (tomorrow - start).num_days(),
         })
     }
 
@@ -377,6 +413,118 @@ fn parse_date(raw: &str, field: &str) -> Result<NaiveDate, ApiError> {
 
 // ── Query execution helpers ──────────────────────────────────────────────
 
+/// How long a request may wait for a query slot, and how long a statement may run.
+///
+/// The two budgets add up to less than the 30 s request timeout in `server.rs`,
+/// so a query that overruns is interrupted here, with a message, rather than
+/// being abandoned by the timeout layer while its blocking thread keeps going.
+/// They are constants because `Config` and `AppState` belong to other
+/// workstreams; [`run_query_with`] takes them as a parameter so the lead can
+/// wire configuration in without touching the logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryLimits {
+    /// Longest a request waits for one of `max_concurrent_queries` slots.
+    pub queue_wait: Duration,
+    /// Longest a statement may execute once it holds a reader connection.
+    pub deadline: Duration,
+}
+
+impl QueryLimits {
+    /// 10 s in the queue plus 20 s of execution fits inside the 30 s request
+    /// timeout.
+    pub const DEFAULT: Self = Self {
+        queue_wait: Duration::from_secs(10),
+        deadline: Duration::from_secs(20),
+    };
+}
+
+impl Default for QueryLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// How often the watchdog repeats an interrupt after the deadline has passed.
+///
+/// DuckDB drops an interrupt that arrives while no statement is running, and
+/// some handlers run several statements in a row, so one interrupt fired in the
+/// gap between two of them would be lost and the next would run to completion.
+const INTERRUPT_REPEAT: Duration = Duration::from_millis(50);
+
+/// Shared between the blocking query and its watchdog.
+#[derive(Default)]
+struct Deadline {
+    /// Present only while a statement can be running on the reader.
+    handle: parking_lot::Mutex<Option<Arc<duckdb::InterruptHandle>>>,
+    /// Set by the watchdog before its first interrupt.
+    fired: AtomicBool,
+}
+
+impl Deadline {
+    fn arm(&self, handle: Arc<duckdb::InterruptHandle>) {
+        *self.handle.lock() = Some(handle);
+    }
+
+    /// Called under the connection lock, so an interrupt can never reach the
+    /// connection's next user.
+    fn disarm(&self) {
+        *self.handle.lock() = None;
+    }
+
+    fn interrupt(&self) {
+        self.fired.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.lock().as_ref() {
+            handle.interrupt();
+        }
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+}
+
+/// Run `f` on a reader connection, inside the tier read lock.
+///
+/// # Lock order
+///
+/// Flushes take the exclusive tier lock and then the connection lock
+/// (LESSONS L28), so a reader that waited for the tier lock *while holding its
+/// connection* could deadlock against one when the pool shares the writer
+/// connection (size 1, and every in-memory test database). Readers therefore
+/// never block on the tier lock holding a connection: they take the connection,
+/// try the tier lock, and if a writer has it, release the connection, wait for
+/// the writer to finish, and start again.
+///
+/// The shared side of the tier lock is held only while `f` runs, not while
+/// queued for a connection. It used to be taken first, so every request parked
+/// behind the four reader connections was also holding up the next flush
+/// (finding F-08), and ingest latency was tied to the slowest dashboard query.
+fn execute_on_reader<T>(
+    readers: &crate::storage::ReaderPool,
+    tier_lock: &crate::storage::TierLock,
+    deadline: &Deadline,
+    started: tokio::sync::oneshot::Sender<()>,
+    f: impl FnOnce(&duckdb::Connection) -> Result<T, duckdb::Error>,
+) -> Result<T, duckdb::Error> {
+    let conn = readers.acquire();
+    let (guard, _tier) = loop {
+        let guard = conn.lock();
+        if let Some(tier) = tier_lock.try_read() {
+            break (guard, tier);
+        }
+        drop(guard);
+        drop(tier_lock.read());
+    };
+
+    deadline.arm(guard.interrupt_handle());
+    // The deadline runs from here, not from when the request arrived. The
+    // receiver is gone only if the watchdog was never started, which is fine.
+    let _ = started.send(());
+    let result = f(&guard);
+    deadline.disarm();
+    result
+}
+
 /// Run a blocking DuckDB query on a reader connection, under the concurrency cap.
 ///
 /// Every analytics endpoint goes through here, so the concurrency limit and the
@@ -386,34 +534,156 @@ fn parse_date(raw: &str, field: &str) -> Result<NaiveDate, ApiError> {
 ///
 /// # Errors
 ///
-/// Returns `TooManyRequests` when the cap is reached, or the query's own error.
+/// Returns `TooManyRequests` if no slot frees up within the queue wait,
+/// `BadRequest` if the statement overruns its deadline, or the query's own
+/// error.
 async fn run_query<T, F>(state: &Arc<AppState>, f: F) -> Result<T, ApiError>
 where
     T: Send + 'static,
     F: FnOnce(&duckdb::Connection) -> Result<T, duckdb::Error> + Send + 'static,
 {
-    let semaphore = Arc::clone(&state.query_semaphore);
-    let _permit = semaphore.try_acquire().map_err(|_| {
+    run_query_with(state, QueryLimits::DEFAULT, f).await
+}
+
+/// [`run_query`] with explicit limits.
+///
+/// # Waiting for a slot
+///
+/// A dashboard load fires about 31 requests at once (ten summary panels and
+/// twenty breakdowns) against a cap of ten. The cap used to be enforced with
+/// `try_acquire`, so every request past the tenth answered `429` and its panel
+/// rendered an error on a cold cache. A request now waits for a slot for up to
+/// [`QueryLimits::queue_wait`]: waiting is cheap (an async task, no thread),
+/// the cap still bounds the work in flight, and `429` is reserved for genuine
+/// overload.
+///
+/// # Deadline
+///
+/// DuckDB cannot be cancelled by dropping the future, and a blocking thread
+/// runs to completion once started. A watchdog task interrupts the statement
+/// through DuckDB's interrupt handle when [`QueryLimits::deadline`] passes, so
+/// one pathological query cannot hold a reader connection, a concurrency slot
+/// and the tier read lock (which blocks the next flush) indefinitely. The slot
+/// is released by the blocking task itself, not by the request future, so a
+/// client that disconnects cannot free a slot whose query is still running.
+async fn run_query_with<T, F>(
+    state: &Arc<AppState>,
+    limits: QueryLimits,
+    f: F,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&duckdb::Connection) -> Result<T, duckdb::Error> + Send + 'static,
+{
+    let permit = tokio::time::timeout(
+        limits.queue_wait,
+        Arc::clone(&state.query_semaphore).acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
         ApiError::TooManyRequests(
-            "Too many concurrent queries. Please retry in a moment.".to_string(),
+            "The server is busy running other queries. Please retry in a moment.".to_string(),
         )
-    })?;
+    })?
+    .map_err(|_| ApiError::Internal("The query semaphore was closed".to_string()))?;
+
+    let deadline = Arc::new(Deadline::default());
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let watchdog = Arc::clone(&deadline);
+    tokio::spawn(async move {
+        // Never started (the task panicked or was refused): nothing to watch.
+        if started_rx.await.is_err() {
+            return;
+        }
+        // `finished_tx` is dropped when the blocking task ends, which resolves
+        // this receiver with an error; only a timeout means the query overran.
+        if tokio::time::timeout(limits.deadline, &mut finished_rx)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        tracing::warn!(
+            deadline_secs = limits.deadline.as_secs_f32(),
+            "Analytics query exceeded its deadline; interrupting"
+        );
+        loop {
+            watchdog.interrupt();
+            if tokio::time::timeout(INTERRUPT_REPEAT, &mut finished_rx)
+                .await
+                .is_ok()
+            {
+                return;
+            }
+        }
+    });
 
     let readers = state.readers.clone();
     let tier_lock = state.tier_lock.clone();
-    tokio::task::spawn_blocking(move || {
-        // Taken before the connection lock — the same order flushes use, so the
-        // two cannot deadlock. It keeps this query from landing in the middle
-        // of a flush or a compaction, when the same rows are momentarily
-        // visible in both the hot table and Parquet.
-        let _tier = tier_lock.read();
-        let conn = readers.acquire();
-        let guard = conn.lock();
-        f(&guard)
+    let task_deadline = Arc::clone(&deadline);
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _finished = finished_tx;
+        execute_on_reader(&readers, &tier_lock, &task_deadline, started_tx, f)
     })
     .await
-    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))?
-    .map_err(ApiError::DatabaseError)
+    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))?;
+
+    result.map_err(|e| {
+        if deadline.fired() {
+            deadline_error(limits.deadline)
+        } else {
+            classify_error(e)
+        }
+    })
+}
+
+/// The error for a statement that overran its deadline.
+///
+/// A `400` because the request as posed is too expensive and the remedy is the
+/// caller's (a shorter range, fewer filters). `ApiError` has no timeout variant
+/// yet; a `504` would be the more precise status once it does.
+fn deadline_error(deadline: Duration) -> ApiError {
+    ApiError::BadRequest(format!(
+        "The query did not finish within {} seconds. Try a shorter date range or fewer filters.",
+        deadline.as_secs()
+    ))
+}
+
+/// The `behavioral` functions whose argument errors are the caller's doing.
+const BEHAVIORAL_FUNCTIONS: &[&str] = &[
+    "window_funnel",
+    "retention",
+    "sequence_match",
+    "sequence_count",
+    "sequence_next_node",
+    "sessionize",
+];
+
+/// Map a DuckDB error to the right HTTP error.
+///
+/// The extension rejects a bad argument (a mode combination it does not allow,
+/// a window it cannot use) with an `Invalid Input Error` that names the
+/// function, e.g. `window_funnel: mode 'allow_reentry' requires 'strict_order'`.
+/// That is the caller's input, so it is a `400` carrying the extension's own
+/// message, not a `500` that hides it. The match is deliberately narrow — the
+/// class *and* a behavioral function name — because `Invalid Input Error` also
+/// covers things that are not the caller's fault, such as a stored timestamp
+/// that cannot be subtracted.
+fn classify_error(err: duckdb::Error) -> ApiError {
+    if let duckdb::Error::DuckDBFailure(_, Some(message)) = &err
+        && let Some(detail) = message.strip_prefix("Invalid Input Error: ")
+        && BEHAVIORAL_FUNCTIONS.iter().any(|name| {
+            detail
+                .strip_prefix(name)
+                .is_some_and(|r| r.starts_with(':'))
+        })
+    {
+        return ApiError::BadRequest(detail.to_string());
+    }
+    ApiError::DatabaseError(err)
 }
 
 /// Run a cached, JSON-serialisable query.
@@ -421,6 +691,9 @@ where
 /// Caching now covers every read endpoint. It previously applied to two of
 /// them, so a dashboard load re-ran eleven uncached queries against the
 /// database on every refresh.
+///
+/// The cache epoch is read before the query runs and checked on insert, so a
+/// result computed before a GDPR erasure cannot be cached after it.
 async fn cached_query<T, F>(state: &Arc<AppState>, key: CacheKey, f: F) -> Result<Json<T>, ApiError>
 where
     T: Serialize + serde::de::DeserializeOwned + Send + 'static,
@@ -431,9 +704,10 @@ where
     {
         return Ok(Json(value));
     }
+    let epoch = state.query_cache.epoch();
     let result = run_query(state, f).await?;
     if let Ok(serialized) = serde_json::to_string(&result) {
-        state.query_cache.insert(key, serialized);
+        state.query_cache.insert_at(epoch, key, serialized);
     }
     Ok(Json(result))
 }
@@ -445,6 +719,29 @@ fn behavioral_error(state: &AppState, feature: &str, err: ApiError) -> ApiError 
     } else {
         ApiError::behavioral_required(feature)
     }
+}
+
+/// Refuse an analysis that is meaningless on hour-rounded timestamps.
+///
+/// With `round_timestamps` (enabled by `gdpr_mode`) every event is stored at
+/// the top of its hour. Sessions, funnels, sequences and flows depend on the
+/// order and spacing of events *inside* an hour, which that rounding destroys:
+/// every event in an hour is one tie, so no session can last more than zero
+/// seconds, a visit at 10:59 and one at 11:01 become two sessions, and the order
+/// of funnel steps is decided by tie-breaking rather than by what happened.
+/// The result is not a coarse version of the right answer but an unrelated
+/// number, and it used to be served with nothing to say so.
+///
+/// Counts, breakdowns, time series and weekly retention are unaffected.
+fn require_exact_timestamps(state: &AppState, feature: &str) -> Result<(), ApiError> {
+    if state.round_timestamps {
+        return Err(ApiError::BehavioralUnavailable(format!(
+            "{feature} is not available while timestamps are rounded to the hour \
+             (round_timestamps, enabled by gdpr_mode): events within an hour can no \
+             longer be put in order."
+        )));
+    }
+    Ok(())
 }
 
 // ── Endpoints ────────────────────────────────────────────────────────────
@@ -461,8 +758,7 @@ pub async fn list_sites(State(state): State<Arc<AppState>>) -> Result<impl IntoR
         let mut stmt = conn.prepare("SELECT DISTINCT site_id FROM events_all ORDER BY site_id")?;
         let rows: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))?
-            .filter_map(Result::ok)
-            .collect();
+            .collect::<Result<_, _>>()?;
         Ok(rows)
     })
     .await
@@ -476,6 +772,19 @@ pub async fn list_sites(State(state): State<Arc<AppState>>) -> Result<impl IntoR
     sites.dedup();
 
     Ok(Json(serde_json::json!({ "sites": sites })))
+}
+
+/// The headline metrics, with or without the session pass.
+fn main_metrics(
+    conn: &duckdb::Connection,
+    scope: &crate::query::QueryScope,
+    with_sessions: bool,
+) -> Result<metrics::CoreMetrics, duckdb::Error> {
+    if with_sessions {
+        metrics::query_core_metrics(conn, scope)
+    } else {
+        metrics::query_event_metrics(conn, scope)
+    }
 }
 
 /// GET /api/stats/main — headline metrics.
@@ -514,8 +823,11 @@ pub async fn get_main_stats(
             compare.map_or("none", Compare::slug),
         ],
     );
+    // Session figures computed from hour-rounded timestamps are artefacts of the
+    // rounding; they are reported as unavailable instead.
+    let with_sessions = !state.round_timestamps;
     let Json(mut current) = cached_query(&state, key, move |conn| {
-        metrics::query_core_metrics(conn, &scope)
+        main_metrics(conn, &scope, with_sessions)
     })
     .await?;
 
@@ -533,7 +845,7 @@ pub async fn get_main_stats(
             &[&previous.start, &previous.end, &filter_key, "none"],
         );
         let Json(baseline) = cached_query(&state, previous_key, move |conn| {
-            metrics::query_core_metrics(conn, &previous_scope)
+            main_metrics(conn, &previous_scope, with_sessions)
         })
         .await?;
 
@@ -553,6 +865,7 @@ pub async fn get_sessions(
     Query(params): Query<StatsParams>,
 ) -> Result<Json<metrics::SessionMetrics>, ApiError> {
     let range = params.validated()?;
+    require_exact_timestamps(&state, "Session metrics")?;
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
     let filter_key = filters_cache_key(&filters);
     let scope = state
@@ -619,10 +932,13 @@ pub async fn get_breakdown(
         ))
     })?;
 
-    if dim.requires_behavioral() && !state.behavioral_extension_loaded {
-        return Err(ApiError::behavioral_required(
-            "Entry and exit page breakdowns",
-        ));
+    if dim.requires_behavioral() {
+        require_exact_timestamps(&state, "Entry and exit page breakdowns")?;
+        if !state.behavioral_extension_loaded {
+            return Err(ApiError::behavioral_required(
+                "Entry and exit page breakdowns",
+            ));
+        }
     }
 
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
@@ -919,6 +1235,7 @@ pub async fn get_funnel(
 
     let steps = parse_steps(&params.steps, funnel::MIN_STEPS, funnel::MAX_STEPS)?;
 
+    require_exact_timestamps(&state, "Funnel analysis")?;
     if !state.behavioral_extension_loaded {
         return Err(ApiError::behavioral_required("Funnel analysis"));
     }
@@ -1028,13 +1345,22 @@ pub async fn get_retention(
         .scope(&params.site_id, &range.start, &range.end)
         .with_filters(filters);
     let weeks = params.weeks;
+    // A visitor ID cannot outlive the salt rotation, which bounds how far back
+    // "first seen" has to look.
+    let lookback_days = state.visitor_salt_rotation_days;
     let key = cache_key(
         "retention",
         &params.site_id,
-        &[&range.start, &range.end, &weeks.to_string(), &filter_key],
+        &[
+            &range.start,
+            &range.end,
+            &weeks.to_string(),
+            &lookback_days.to_string(),
+            &filter_key,
+        ],
     );
     let cohorts: Json<Vec<retention::RetentionCohort>> = cached_query(&state, key, move |conn| {
-        retention::query_retention(conn, &scope, weeks)
+        retention::query_retention(conn, &scope, weeks, lookback_days)
     })
     .await
     .map_err(|e| behavioral_error(&state, "Retention cohorts", e))?;
@@ -1082,6 +1408,7 @@ pub async fn get_sequences(
         sequences::MAX_CONDITIONS,
     )?;
 
+    require_exact_timestamps(&state, "Sequence analysis")?;
     if !state.behavioral_extension_loaded {
         return Err(ApiError::behavioral_required("Sequence analysis"));
     }
@@ -1152,6 +1479,7 @@ pub async fn get_flow(
         ApiError::BadRequest("direction must be 'forward' or 'backward'".to_string())
     })?;
 
+    require_exact_timestamps(&state, "Flow analysis")?;
     if !state.behavioral_extension_loaded {
         return Err(ApiError::behavioral_required("Flow analysis"));
     }
@@ -1694,6 +2022,75 @@ mod tests {
         assert!(p.date_range().is_err());
     }
 
+    fn on(period: &str, today: &str) -> DateRange {
+        let today = NaiveDate::parse_from_str(today, "%Y-%m-%d").unwrap();
+        params(period).date_range_on(today).unwrap()
+    }
+
+    #[test]
+    fn test_n_day_periods_span_exactly_n_days_including_today() {
+        // Regression (S-09): `7d` started seven days back and so covered eight
+        // calendar days (30d: 31, 12mo: 366) under an N-day label.
+        let r = on("7d", "2024-03-10");
+        assert_eq!(
+            (r.start.as_str(), r.end.as_str(), r.days),
+            ("2024-03-04", "2024-03-11", 7)
+        );
+        let r = on("30d", "2024-03-10");
+        assert_eq!((r.start.as_str(), r.days), ("2024-02-10", 30));
+        let r = on("90d", "2024-03-10");
+        assert_eq!((r.start.as_str(), r.days), ("2023-12-12", 90));
+        let r = on("day", "2024-03-10");
+        assert_eq!(
+            (r.start.as_str(), r.end.as_str(), r.days),
+            ("2024-03-10", "2024-03-11", 1)
+        );
+        assert_eq!(on("today", "2024-03-10"), r);
+    }
+
+    #[test]
+    fn test_twelve_months_ends_today_inclusive() {
+        let r = on("12mo", "2026-10-20");
+        assert_eq!(
+            (r.start.as_str(), r.end.as_str(), r.days),
+            ("2025-10-21", "2026-10-21", 365)
+        );
+        // Across a leap day the span is a day longer, never over the cap.
+        let r = on("12mo", "2024-10-20");
+        assert_eq!((r.start.as_str(), r.days), ("2023-10-21", 366));
+        assert!(r.days <= MAX_RANGE_DAYS);
+        // A 29 February today clamps its month arithmetic to 28 February.
+        assert_eq!(on("12mo", "2024-02-29").start, "2023-03-01");
+    }
+
+    #[test]
+    fn test_period_ranges_always_fit_the_explicit_range_cap() {
+        for today in ["2024-02-29", "2023-12-31", "2026-10-20"] {
+            for period in ["day", "7d", "30d", "90d", "12mo"] {
+                assert!(
+                    on(period, today).days <= MAX_RANGE_DAYS,
+                    "{period} on {today}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_lone_start_or_end_date_is_rejected_not_ignored() {
+        // Regression (S-09): with only one bound the range silently fell back to
+        // the default period.
+        for (start, end) in [(Some("2024-01-01"), None), (None, Some("2024-01-31"))] {
+            let p = StatsParams {
+                start_date: start.map(str::to_string),
+                end_date: end.map(str::to_string),
+                ..params("30d")
+            };
+            let err = p.date_range().unwrap_err();
+            assert!(matches!(err, ApiError::BadRequest(_)), "{err}");
+            assert!(err.to_string().contains("together"), "{err}");
+        }
+    }
+
     #[test]
     fn test_period_span_drives_granularity() {
         assert_eq!(
@@ -1816,5 +2213,291 @@ mod tests {
         ] {
             assert!(!is_safe_interval(bad), "{bad} must be rejected");
         }
+    }
+
+    // ── Query execution: queueing, deadline, lock scope ──────────────────
+
+    use std::time::Instant;
+
+    fn state_with_permits(permits: usize) -> Arc<AppState> {
+        crate::test_support::state_builder()
+            .query_permits(permits)
+            .build_state()
+    }
+
+    fn short_limits(queue_wait_ms: u64, deadline_ms: u64) -> QueryLimits {
+        QueryLimits {
+            queue_wait: Duration::from_millis(queue_wait_ms),
+            deadline: Duration::from_millis(deadline_ms),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_cold_dashboard_load_is_queued_not_rejected() {
+        // Regression (S-01): the dashboard fires ~31 requests at once against a
+        // default cap of 10, and `try_acquire` answered 429 to everything past
+        // the tenth. With default settings and default limits all of them must
+        // be served.
+        let state = state_with_permits(10);
+        let mut tasks = Vec::new();
+        for i in 0..31u64 {
+            let state = Arc::clone(&state);
+            tasks.push(tokio::spawn(async move {
+                run_query(&state, move |conn| {
+                    std::thread::sleep(Duration::from_millis(15));
+                    conn.query_row("SELECT ?::BIGINT", [i], |row| row.get::<_, u64>(0))
+                })
+                .await
+            }));
+        }
+        for (i, task) in tasks.into_iter().enumerate() {
+            let value = task.await.expect("task").unwrap_or_else(|e| {
+                panic!("request {i} of the dashboard load was rejected: {e}");
+            });
+            assert_eq!(value, i as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_request_that_cannot_get_a_slot_in_time_is_told_to_retry() {
+        let state = state_with_permits(1);
+        let slow_state = Arc::clone(&state);
+        let slow = tokio::spawn(async move {
+            run_query(&slow_state, |_| {
+                std::thread::sleep(Duration::from_millis(600));
+                Ok(())
+            })
+            .await
+        });
+        // Let the slow query take the only slot.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let err = run_query_with(&state, short_limits(50, 5_000), |_| Ok(()))
+            .await
+            .expect_err("no slot frees up inside 50 ms");
+        assert!(matches!(err, ApiError::TooManyRequests(_)), "{err}");
+        assert_eq!(err.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        slow.await.expect("task").expect("the slow query finishes");
+    }
+
+    #[tokio::test]
+    async fn test_a_runaway_statement_is_interrupted_and_the_reader_survives() {
+        // F-08, reader side: no deadline existed, so one pathological query held
+        // a reader, a concurrency slot and the tier read lock indefinitely.
+        let state = state_with_permits(2);
+        let started = Instant::now();
+        let err = run_query_with(&state, short_limits(1_000, 300), |conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM range(100000000000) a, range(1000) b",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+        })
+        .await
+        .expect_err("a query this size cannot finish in 300 ms");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the interrupt did not stop the statement: {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(err, ApiError::BadRequest(_)), "{err}");
+        assert!(err.to_string().contains("did not finish"), "{err}");
+
+        // The interrupt must not leak into the connection's next user.
+        let ok = run_query(&state, |conn| {
+            conn.query_row("SELECT 42", [], |row| row.get::<_, i64>(0))
+        })
+        .await
+        .expect("the reader must still be usable");
+        assert_eq!(ok, 42);
+        // ...and the slot came back.
+        assert_eq!(state.query_semaphore.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_a_fast_query_is_not_interrupted() {
+        let state = state_with_permits(2);
+        let v = run_query_with(&state, short_limits(1_000, 2_000), |conn| {
+            conn.query_row("SELECT 7", [], |row| row.get::<_, i64>(0))
+        })
+        .await
+        .unwrap();
+        assert_eq!(v, 7);
+    }
+
+    #[tokio::test]
+    async fn test_a_request_waiting_for_a_connection_does_not_block_a_flush() {
+        // Regression (F-08): the tier read lock was taken before the wait for a
+        // reader connection, so every request parked behind a busy pool held a
+        // read lock, and the writer-fair lock then queued the next flush behind
+        // all of them. Here the only connection is busy; a request parks on it;
+        // the exclusive lock must still be available immediately.
+        let state = state_with_permits(4);
+        let conn = state.readers.acquire();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _guard = conn.lock();
+            held_tx.send(()).expect("test channel");
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        });
+        held_rx.recv().expect("connection held");
+
+        let waiting_state = Arc::clone(&state);
+        let waiting = tokio::spawn(async move {
+            run_query(&waiting_state, |conn| {
+                conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let tier = state.tier_lock.clone();
+        let (got_tx, got_rx) = std::sync::mpsc::channel::<()>();
+        let flusher = std::thread::spawn(move || {
+            let _write = tier.write();
+            let _ = got_tx.send(());
+        });
+        let acquired = got_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+
+        release_tx.send(()).expect("test channel");
+        holder.join().expect("holder thread");
+        flusher.join().expect("flusher thread");
+        assert!(
+            acquired,
+            "a query queued for a connection held the tier read lock and starved the writer"
+        );
+        assert_eq!(waiting.await.expect("task").expect("query"), 1);
+    }
+
+    #[tokio::test]
+    async fn test_readers_sharing_the_writer_connection_cannot_deadlock_with_a_flush() {
+        // A flush takes the tier lock and then the connection (L28). When the
+        // pool shares the writer connection, a reader that took the connection
+        // first and then blocked on the tier lock would deadlock with it.
+        let state = state_with_permits(8);
+        let tier = state.tier_lock.clone();
+        let writer = state.buffer.conn().clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flusher = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let _write = tier.write();
+                    let guard = writer.lock();
+                    std::thread::sleep(Duration::from_millis(5));
+                    drop(guard);
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        let mut tasks = Vec::new();
+        for _ in 0..24 {
+            let state = Arc::clone(&state);
+            tasks.push(tokio::spawn(async move {
+                run_query(&state, |conn| {
+                    conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                })
+                .await
+            }));
+        }
+        let all = async {
+            for task in tasks {
+                task.await.expect("task").expect("query");
+            }
+        };
+        let finished = tokio::time::timeout(Duration::from_secs(20), all)
+            .await
+            .is_ok();
+        stop.store(true, Ordering::SeqCst);
+        flusher.join().expect("flusher thread");
+        assert!(finished, "readers and the flusher deadlocked");
+    }
+
+    #[tokio::test]
+    async fn test_a_result_computed_before_an_erasure_is_not_cached_after_it() {
+        // Regression (S-10), end to end through `cached_query`.
+        let state = crate::test_support::state_builder()
+            .cache_ttl_secs(60)
+            .build_state();
+        let key = cache_key("t", "a.com", &[]);
+        let key_str = key.as_str().to_string();
+
+        let slow = cached_query(&state, key, |conn| {
+            let v = conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))?;
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(v)
+        });
+        let erase = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            state.query_cache.invalidate_site("a.com");
+        };
+        let (result, ()) = tokio::join!(slow, erase);
+        assert_eq!(result.expect("query").0, 1);
+        assert!(
+            state.query_cache.get(&key_str).is_none(),
+            "pre-erasure data was cached after the invalidation"
+        );
+
+        // Without an erasure in between, the result is cached as before.
+        let key = cache_key("t", "a.com", &[]);
+        let Json(second) = cached_query(&state, key, |_| Ok(2i64))
+            .await
+            .expect("query");
+        assert_eq!(second, 2);
+        assert!(state.query_cache.get(&key_str).is_some());
+    }
+
+    // ── Error classification ─────────────────────────────────────────────
+
+    #[test]
+    fn test_a_behavioral_argument_error_is_a_bad_request() {
+        // The extension rejects `allow_reentry` without `strict_order` at query
+        // time. `normalize_modes` catches it first today; this is the net for the
+        // next rule the extension adds that the whitelist does not know about.
+        let db = crate::query::test_support::TestDb::new();
+        if !db.require_behavioral("behavioral error classification") {
+            return;
+        }
+        // The mode is validated when the aggregate binds, which needs a group.
+        crate::query::test_support::insert_pageview(&db.conn, "v", "2024-01-01 10:00:00", "/");
+        let err = db
+            .conn
+            .query_row(
+                "SELECT window_funnel(INTERVAL '1 day', 'allow_reentry', timestamp,
+                                      pathname = '/', pathname = '/x')
+                 FROM events GROUP BY visitor_id",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect_err("allow_reentry alone is rejected by the extension");
+        match classify_error(err) {
+            ApiError::BadRequest(message) => {
+                assert!(message.starts_with("window_funnel:"), "{message}");
+                assert!(message.contains("strict_order"), "{message}");
+            }
+            other => panic!("expected a 400, got {other}"),
+        }
+    }
+
+    #[test]
+    fn test_an_invalid_input_error_that_is_not_the_callers_fault_stays_a_500() {
+        // Same error class, different cause: a stored infinite timestamp cannot
+        // be subtracted. Blaming the caller for that would be wrong.
+        let conn = duckdb::Connection::open_in_memory().expect("open");
+        let err = conn
+            .query_row(
+                "SELECT CAST('infinity' AS TIMESTAMP) - CAST('2024-01-01' AS TIMESTAMP)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect_err("infinite timestamps cannot be subtracted");
+        assert!(matches!(classify_error(err), ApiError::DatabaseError(_)));
+
+        let plain = conn
+            .execute_batch("SELECT * FROM no_such_table")
+            .expect_err("missing table");
+        assert!(matches!(classify_error(plain), ApiError::DatabaseError(_)));
     }
 }

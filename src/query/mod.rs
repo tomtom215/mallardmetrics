@@ -9,6 +9,7 @@ pub mod realtime;
 pub mod retention;
 pub mod revenue;
 pub mod sequences;
+pub mod sessions;
 pub mod timeseries;
 
 use breakdowns::Dimension;
@@ -21,6 +22,25 @@ pub mod test_support;
 /// Breakdowns render a NULL as `(unknown)`, so a dashboard that turns a
 /// breakdown row into a filter sends back exactly what it displayed.
 pub const UNKNOWN_VALUE: &str = "(unknown)";
+
+/// Whether the `behavioral` extension's functions exist on this connection.
+///
+/// Asked of the function catalog, not inferred from an error message: DuckDB
+/// rewords its errors between releases (1.5.5 began quoting identifiers in them),
+/// and a string match that stops matching turns "extension missing" back into
+/// "every failure". The extension arms the connection that ran `LOAD`, so this
+/// must be asked of the connection that will run the query.
+///
+/// If the catalog itself cannot be read the answer is `true`, which makes the
+/// caller surface the original error rather than hide it.
+pub fn behavioral_loaded(conn: &duckdb::Connection) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM duckdb_functions() WHERE function_name = 'sessionize'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map_or(true, |n| n > 0)
+}
 
 /// One condition narrowing a report to a subset of events.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +157,37 @@ impl QueryScope {
         format!("{}{}", Self::SCOPE_CLAUSE, self.filter_clause())
     }
 
+    /// The `WHERE` fragment for the site and range alone, ignoring filters.
+    ///
+    /// Session metrics need this: a session is defined by *all* of a visitor's
+    /// events, so it must be reconstructed before a filter picks which
+    /// sessions to keep. Bind it with [`QueryScope::range_params`].
+    pub const fn range_clause() -> &'static str {
+        Self::SCOPE_CLAUSE
+    }
+
+    /// Site, start and end: the parameters of [`QueryScope::range_clause`].
+    pub const fn range_params(&self) -> [&str; 3] {
+        [
+            self.site_id.as_str(),
+            self.start.as_str(),
+            self.end.as_str(),
+        ]
+    }
+
+    /// A boolean expression that is true for an event matching *every* filter.
+    ///
+    /// `TRUE` when there are no filters. Bind its values with
+    /// [`QueryScope::filter_params`]; it contains one `?` per value-bearing
+    /// filter and nothing else request-derived.
+    pub fn filter_expr(&self) -> String {
+        if self.filters.is_empty() {
+            return "TRUE".to_string();
+        }
+        let preds: Vec<String> = self.filters.iter().map(Filter::predicate).collect();
+        format!("({})", preds.join(" AND "))
+    }
+
     /// The site-and-range half of [`QueryScope::where_clause`].
     const SCOPE_CLAUSE: &'static str = "site_id = ? \
          AND timestamp >= CAST(? AS TIMESTAMP) \
@@ -181,6 +232,41 @@ mod tests {
             dimension: Dimension::from_slug(slug).unwrap(),
             negated,
             value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_no_query_module_swallows_row_errors() {
+        // Regression (S-06): every row mapper ended in `.filter_map(Result::ok)`,
+        // so a row that failed to decode vanished and the endpoint answered 200
+        // with a plausible, shorter report. `export.rs` is checked by its own
+        // owner; this guards the modules that feed the dashboard.
+        let swallow = [
+            "filter_map(Result::ok)",
+            ".flatten()",
+            "filter_map(|r| r.ok())",
+        ];
+        for (name, source) in [
+            ("breakdowns", include_str!("breakdowns.rs")),
+            ("events", include_str!("events.rs")),
+            ("flow", include_str!("flow.rs")),
+            ("funnel", include_str!("funnel.rs")),
+            ("realtime", include_str!("realtime.rs")),
+            ("retention", include_str!("retention.rs")),
+            ("revenue", include_str!("revenue.rs")),
+            ("sequences", include_str!("sequences.rs")),
+            ("sessions", include_str!("sessions.rs")),
+            ("metrics", include_str!("metrics.rs")),
+            ("timeseries", include_str!("timeseries.rs")),
+        ] {
+            // Code only: the tests below legitimately mention the pattern.
+            let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for pattern in swallow {
+                assert!(
+                    !code.contains(pattern),
+                    "src/query/{name}.rs drops row errors with `{pattern}`; collect into a Result"
+                );
+            }
         }
     }
 
