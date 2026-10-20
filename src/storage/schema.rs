@@ -240,6 +240,39 @@ pub fn setup_query_view(conn: &Connection, parquet_dir: &Path) -> Result<(), duc
     }
 }
 
+/// A parenthesised, aliasable replacement for `events_all` that reads only
+/// `files` from the cold tier, plus the whole hot table (F-06).
+///
+/// `events_all` expands a glob over every site and day on every query, and
+/// `union_by_name` opens every footer to build the schema; at 100 sites x 90
+/// days that is 9,000 files per request however narrow the filter. A request
+/// that knows its site and dates can pass
+/// [`ParquetStorage::files_for_range`](crate::storage::parquet::ParquetStorage::files_for_range)
+/// and read tens of files. Results are identical to `events_all` filtered to
+/// the same site and range, because partitions are keyed by site and event
+/// date. Callers that need history beyond the range (sessions, retention
+/// cohorts) must widen the range, or keep using `events_all`.
+///
+/// The paths are file names built by this crate from validated components and
+/// are quote-escaped; `COPY`/`read_parquet` arguments cannot be bound (L1).
+/// With no files it is the hot table alone, which is correct for a range with
+/// nothing flushed.
+pub fn scoped_events_sql(files: &[std::path::PathBuf]) -> String {
+    let columns = EVENT_COLUMNS.join(", ");
+    if files.is_empty() {
+        return format!("(SELECT {columns} FROM events)");
+    }
+    let list = files
+        .iter()
+        .map(|f| format!("'{}'", f.to_string_lossy().replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "(SELECT {columns} FROM events UNION ALL \
+         SELECT {columns} FROM read_parquet([{list}], union_by_name=true, hive_partitioning=false))"
+    )
+}
+
 /// True when `events_all` currently reads the Parquet tier.
 fn view_has_cold_tier(conn: &Connection) -> bool {
     conn.query_row(

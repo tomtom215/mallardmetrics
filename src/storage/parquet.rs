@@ -345,17 +345,23 @@ impl ParquetStorage {
     ///
     /// A flush stages its Parquet file as `NNNN.parquet.pending`, deletes the
     /// partition's rows from the hot table, and only then publishes the file.
-    /// A crash therefore leaves one of two states, and the hot table says
-    /// which:
+    /// A crash therefore leaves one of two states, and comparing the staged
+    /// file with the hot table says which:
     ///
-    /// - the partition still has hot rows: the `DELETE` never committed, so the
-    ///   staged file is a duplicate and is dropped;
-    /// - the partition has none: the `DELETE` committed and the staged file is
-    ///   the only copy, so it is published.
+    /// - every staged row is still in the hot table: the `DELETE` never
+    ///   committed, so the staged file is a duplicate and is dropped;
+    /// - some staged rows are not hot: the `DELETE` committed and the staged
+    ///   file is the only copy, so it is published.
     ///
-    /// This is sound only while nothing has been inserted since the crash,
-    /// which is why it runs before ingest starts (and why [`EventBuffer`]
-    /// repeats it before its first insert as a safety net).
+    /// The comparison is by row content (`EXCEPT ALL`), not by "does the
+    /// partition have hot rows", so it stays correct if the process kept
+    /// running and ingesting after a failed publish. A staged file that cannot
+    /// be read is dropped if the partition still has hot rows (a crash
+    /// mid-write) and otherwise set aside as `.corrupt`, never deleted.
+    ///
+    /// Run at startup, after opening the database and before building the
+    /// query view ([`EventBuffer`] repeats it before its first insert as a
+    /// safety net).
     ///
     /// [`EventBuffer`]: crate::ingest::buffer::EventBuffer
     ///
@@ -368,45 +374,68 @@ impl ParquetStorage {
         conn: &Connection,
     ) -> Result<RecoveryReport, duckdb::Error> {
         let mut report = RecoveryReport::default();
-        let mut count_stmt = conn.prepare(
-            "SELECT COUNT(*) FROM events \
-             WHERE site_id = ? AND STRFTIME(CAST(timestamp AS DATE), '%Y-%m-%d') = ?",
-        )?;
+        let columns = EVENT_COLUMNS.join(", ");
 
         for (site_id, date, dir) in self.partition_dirs() {
-            let staged = Self::parts_with_suffix(&dir, &format!(".parquet{PENDING_SUFFIX}"));
-            if staged.is_empty() {
-                continue;
-            }
-            let hot_rows: i64 =
-                count_stmt.query_row(duckdb::params![site_id, date], |row| row.get(0))?;
-            for file in staged {
-                if hot_rows > 0 {
-                    match fs::remove_file(&file.path) {
+            for file in Self::parts_with_suffix(&dir, &format!(".parquet{PENDING_SUFFIX}")) {
+                let path = sql_quote(&file.path.to_string_lossy());
+                // Rows the staged file holds that the hot table does not. Bag
+                // semantics: a row that appears twice must be hot twice.
+                let missing = conn.query_row::<i64, _, _>(
+                    &format!(
+                        "SELECT COUNT(*) FROM (\
+                           SELECT {columns} FROM read_parquet('{path}') \
+                           EXCEPT ALL \
+                           SELECT {columns} FROM events WHERE site_id = ? \
+                             AND STRFTIME(CAST(timestamp AS DATE), '%Y-%m-%d') = ?)"
+                    ),
+                    duckdb::params![site_id, date],
+                    |row| row.get(0),
+                );
+                match missing {
+                    // Every staged row is still hot: the DELETE never
+                    // committed, so this is a duplicate.
+                    Ok(0) => match fs::remove_file(&file.path) {
                         Ok(()) => report.discarded += 1,
                         Err(e) => tracing::error!(
                             path = %file.path.display(), error = %e,
-                            "Could not drop a staged Parquet file whose rows are still in the hot table"
+                            "Could not drop a staged Parquet file whose rows are still hot"
                         ),
+                    },
+                    // Rows exist only in the staged file: it is the only copy.
+                    Ok(_) => {
+                        match Self::publish_recovered(&dir, &file.path, file.number, file.level) {
+                            Ok(()) => report.published += 1,
+                            Err(e) => tracing::error!(
+                                path = %file.path.display(), error = %e,
+                                "A staged Parquet file holds the only copy of flushed events \
+                                 and could not be published; it was left in place"
+                            ),
+                        }
                     }
-                    continue;
-                }
-                match Self::publish_recovered(conn, &dir, &file.path, file.number, file.level) {
-                    Ok(()) => report.published += 1,
-                    Err(e) => {
-                        tracing::error!(
-                            path = %file.path.display(), error = %e,
-                            "A staged Parquet file holds the only copy of flushed events \
-                             and could not be published; it was left in place"
-                        );
-                        if Self::quarantine_if_unreadable(conn, &file.path) {
+                    // Not readable. If the partition still has hot rows, the
+                    // crash came mid-write (before the DELETE) and the file is
+                    // just an incomplete duplicate. If it has none, a file that
+                    // was fsynced before the DELETE is unreadable, which must
+                    // never be deleted: set it aside for an operator.
+                    Err(read_error) => {
+                        let hot_rows = Self::hot_rows_in_partition(conn, &site_id, &date)?;
+                        if hot_rows > 0 && fs::remove_file(&file.path).is_ok() {
+                            report.discarded += 1;
+                        } else if hot_rows == 0
+                            && fs::rename(&file.path, with_suffix(&file.path, ".corrupt")).is_ok()
+                        {
+                            tracing::error!(
+                                path = %file.path.display(), error = %read_error,
+                                "A staged Parquet file is unreadable and its rows are not in the \
+                                 hot table; it was set aside as .corrupt"
+                            );
                             report.quarantined += 1;
                         }
                     }
                 }
             }
         }
-        drop(count_stmt);
 
         if report != RecoveryReport::default() {
             tracing::warn!(
@@ -440,23 +469,15 @@ impl ParquetStorage {
     }
 
     /// Publish a staged file found at startup.
+    ///
+    /// The caller has just read the file, so it is known to be valid Parquet
+    /// before it joins the glob (a bad file there fails every query).
     fn publish_recovered(
-        conn: &Connection,
         dir: &Path,
         staged: &Path,
         staged_number: u32,
         level: u32,
     ) -> Result<(), FlushError> {
-        // It must be a readable Parquet file before it joins the glob: a bad
-        // file there fails every query.
-        let path = sql_quote(&staged.to_string_lossy());
-        conn.query_row::<i64, _, _>(
-            &format!("SELECT COUNT(*) FROM read_parquet('{path}')"),
-            [],
-            |row| row.get(0),
-        )
-        .map_err(FlushError::Query)?;
-
         // Keep the number it was staged under unless a later flush has since
         // taken it.
         let name = |number: u32| {
@@ -476,18 +497,17 @@ impl ParquetStorage {
         sync_dir(dir).map_err(FlushError::Durability)
     }
 
-    /// Move a staged file that DuckDB cannot read aside so it stops being
-    /// retried, without destroying what might be the only copy of the rows.
-    fn quarantine_if_unreadable(conn: &Connection, staged: &Path) -> bool {
-        let path = sql_quote(&staged.to_string_lossy());
-        let readable = conn
-            .query_row::<i64, _, _>(
-                &format!("SELECT COUNT(*) FROM read_parquet('{path}')"),
-                [],
-                |row| row.get(0),
-            )
-            .is_ok();
-        readable || fs::rename(staged, with_suffix(staged, ".corrupt")).is_ok()
+    fn hot_rows_in_partition(
+        conn: &Connection,
+        site_id: &str,
+        date: &str,
+    ) -> Result<i64, duckdb::Error> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM events \
+             WHERE site_id = ? AND STRFTIME(CAST(timestamp AS DATE), '%Y-%m-%d') = ?",
+            duckdb::params![site_id, date],
+            |row| row.get(0),
+        )
     }
 
     /// Every `site_id=*/date=*` directory with its site and date.
@@ -1184,6 +1204,36 @@ impl ParquetStorage {
         }
     }
 
+    /// The published Parquet files of one site for an inclusive date range.
+    ///
+    /// This is the input to [`scoped_events_sql`]: a request that names its
+    /// site and dates can read just those files instead of re-expanding a glob
+    /// over every site and day (F-06). Costs one `read_dir` per day in range.
+    /// Returns nothing for an unsafe `site_id`.
+    ///
+    /// [`scoped_events_sql`]: crate::storage::schema::scoped_events_sql
+    pub fn files_for_range(
+        &self,
+        site_id: &str,
+        start: chrono::NaiveDate,
+        end: chrono::NaiveDate,
+    ) -> Vec<PathBuf> {
+        if !is_safe_path_component(site_id) {
+            return Vec::new();
+        }
+        let mut files = Vec::new();
+        let mut current = start;
+        while current <= end {
+            let dir = self.partition_dir(site_id, &current.format("%Y-%m-%d").to_string());
+            files.extend(Self::partition_parts(&dir).into_iter().map(|p| p.path));
+            let Some(next) = current.succ_opt() else {
+                break;
+            };
+            current = next;
+        }
+        files
+    }
+
     /// Site IDs that have at least one on-disk partition.
     pub fn known_site_ids(&self) -> Vec<String> {
         let mut sites: Vec<String> = fs::read_dir(&self.base_dir)
@@ -1856,6 +1906,41 @@ mod safety_tests {
     }
 
     #[test]
+    fn test_a_staged_file_is_published_even_if_the_partition_has_new_hot_rows() {
+        // If a publish and its reinstate both fail the process keeps running
+        // and ingesting. A later restart must not read "the partition has hot
+        // rows" as "the staged file is a duplicate" and delete the only copy.
+        let env = Env::new();
+        let conn = env.open();
+        let storage = env.storage(0);
+        ins(&conn, P.0, "2024-01-15 10:00:00");
+        storage.faults.lock().crash_after = Some(CrashPoint::FlushAfterDelete);
+        let _ = storage.flush_events(&conn);
+        ins(&conn, P.0, "2024-01-15 11:00:00"); // arrives afterwards, same partition
+        let report = storage.recover_pending_flushes(&conn).unwrap();
+        assert_eq!((report.published, report.discarded), (1, 0));
+        setup_query_view(&conn, &env.events).unwrap();
+        assert_eq!(total(&conn), 2);
+    }
+
+    #[test]
+    fn test_a_half_written_staged_file_is_dropped_not_quarantined() {
+        // A crash during the COPY leaves an unreadable staged file while the
+        // hot rows are intact; that is garbage, not evidence.
+        let env = Env::new();
+        let conn = env.open();
+        let storage = env.storage(0);
+        ins(&conn, P.0, "2024-01-15 10:00:00");
+        let dir = storage.partition_dir(P.0, P.1);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("0001.parquet.pending"), b"PAR1 truncated").unwrap();
+        let report = storage.recover_pending_flushes(&conn).unwrap();
+        assert_eq!((report.discarded, report.quarantined), (1, 0));
+        assert!(names(&dir).is_empty());
+        assert_eq!(hot(&conn), 1);
+    }
+
+    #[test]
     fn test_failed_publish_returns_the_rows_to_the_hot_table() {
         let env = Env::new();
         let conn = env.open();
@@ -2436,5 +2521,174 @@ mod safety_tests {
         let storage = env.storage(0).with_max_partitions_per_flush(0);
         ins(&conn, "a.com", "2024-01-15 10:00:00");
         assert_eq!(storage.flush_events_deferred(&conn).unwrap().flushed, 1);
+    }
+
+    // ---- F-06: scoped reads ------------------------------------------------
+
+    #[test]
+    fn test_scoped_source_returns_exactly_what_the_global_view_does() {
+        let env = Env::new();
+        let conn = env.open();
+        let storage = env.storage(0);
+        for (site, day) in [("a.com", 14), ("a.com", 15), ("a.com", 16), ("b.com", 15)] {
+            ins(&conn, site, &format!("2024-01-{day} 10:00:00"));
+            ins(&conn, site, &format!("2024-01-{day} 23:30:00"));
+            storage.flush_events(&conn).unwrap();
+        }
+        // A hot row inside the range, and one for another site.
+        ins(&conn, "a.com", "2024-01-15 12:00:00");
+        ins(&conn, "b.com", "2024-01-15 12:00:00");
+        setup_query_view(&conn, &env.events).unwrap();
+
+        let d = |n| chrono::NaiveDate::from_ymd_opt(2024, 1, n).unwrap();
+        let files = storage.files_for_range("a.com", d(15), d(16));
+        assert_eq!(files.len(), 2);
+        let scoped = crate::storage::schema::scoped_events_sql(&files);
+
+        let fingerprint = |source: &str| -> Vec<(String, String)> {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT site_id, CAST(timestamp AS VARCHAR) FROM {source} \
+                     WHERE site_id = ? AND timestamp >= CAST(? AS TIMESTAMP) \
+                     AND timestamp < CAST(? AS TIMESTAMP) ORDER BY timestamp"
+                ))
+                .unwrap();
+            stmt.query_map(["a.com", "2024-01-15", "2024-01-17"], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+        };
+        let global = fingerprint("events_all");
+        assert_eq!(global.len(), 5, "{global:?}");
+        assert_eq!(fingerprint(&scoped), global);
+
+        // No files in range: the hot tier alone.
+        let none = crate::storage::schema::scoped_events_sql(&[]);
+        let hot_only: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {none}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hot_only, hot(&conn));
+    }
+
+    #[test]
+    fn test_scoped_files_ignore_unsafe_sites_and_staged_files() {
+        let env = Env::new();
+        let storage = env.storage(0);
+        let dir = storage.partition_dir(P.0, P.1);
+        fs::create_dir_all(&dir).unwrap();
+        for n in ["0001.parquet", "0002.parquet.pending", "0003.parquet.del"] {
+            fs::write(dir.join(n), b"x").unwrap();
+        }
+        let day = chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        assert_eq!(storage.files_for_range(P.0, day, day).len(), 1);
+        assert!(storage.files_for_range("../etc", day, day).is_empty());
+    }
+
+    /// Timing harness for F-07, not a correctness test: `cargo test --lib
+    /// compaction_lock_hold -- --ignored --nocapture`. Compares how long the
+    /// exclusive tier lock is held by (a) the old design, which re-reads and
+    /// rewrites the whole day under the lock, with (b) the new one, which
+    /// merges only the 23 small files outside the lock and holds it for the
+    /// rename swap alone. Debug build: compare the ratio, not the absolute ms.
+    #[test]
+    #[ignore = "timing harness"]
+    fn compaction_lock_hold_old_vs_new() {
+        use std::time::Instant;
+        let env = Env::new();
+        let conn = env.open();
+        let storage = env.storage(24);
+        let dir = storage.partition_dir(P.0, P.1);
+        fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, rows: u32| {
+            conn.execute_batch(&format!(
+                "COPY (SELECT 'a.com' AS site_id, 'v' || (i % 997) AS visitor_id, \
+                 TIMESTAMP '2024-01-15 00:00:00' + INTERVAL (i % 86400) SECOND AS timestamp, \
+                 'pageview' AS event_name, '/p' || (i % 50) AS pathname, \
+                 CAST(NULL AS VARCHAR) AS hostname, CAST(NULL AS VARCHAR) AS referrer, \
+                 CAST(NULL AS VARCHAR) AS referrer_source, CAST(NULL AS VARCHAR) AS utm_source, \
+                 CAST(NULL AS VARCHAR) AS utm_medium, CAST(NULL AS VARCHAR) AS utm_campaign, \
+                 CAST(NULL AS VARCHAR) AS utm_content, CAST(NULL AS VARCHAR) AS utm_term, \
+                 'Chrome' AS browser, CAST(NULL AS VARCHAR) AS browser_version, \
+                 'Linux' AS os, CAST(NULL AS VARCHAR) AS os_version, \
+                 'desktop' AS device_type, CAST(NULL AS VARCHAR) AS screen_size, \
+                 'US' AS country_code, CAST(NULL AS VARCHAR) AS region, \
+                 CAST(NULL AS VARCHAR) AS city, CAST(NULL AS VARCHAR) AS props, \
+                 CAST(NULL AS DECIMAL(12,2)) AS revenue_amount, \
+                 CAST(NULL AS VARCHAR) AS revenue_currency FROM range({rows}) t(i)) \
+                 TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+                dir.join(name).display()
+            ))
+            .unwrap();
+        };
+        let big_rows: u32 = std::env::var("BIG_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000_000);
+        // A day already compacted once: one big file at level 1, plus 24 fresh flushes.
+        write("0001.m1.parquet", big_rows);
+        for n in 2..26 {
+            write(&format!("{n:04}.parquet"), 2_000);
+        }
+        let mut old_ms = Vec::new();
+        let mut new_hold_ms = Vec::new();
+        let mut new_total_ms = Vec::new();
+        for _ in 0..3 {
+            // (a) old: everything in the partition, unsorted, under the lock.
+            let t = Instant::now();
+            let tmp = dir.join("old.parquet.tmp");
+            ParquetStorage::stage_parquet(
+                &conn,
+                &format!(
+                    "SELECT * FROM read_parquet('{}/*.parquet', union_by_name=true, hive_partitioning=false)",
+                    dir.display()
+                ),
+                &tmp,
+            )
+            .unwrap();
+            old_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+            fs::remove_file(&tmp).unwrap();
+
+            // (b) new: merge level 0 outside the lock, swap under it.
+            let parts = ParquetStorage::partition_parts(&dir);
+            let sources: Vec<PartFile> = parts.into_iter().filter(|p| p.level == 0).collect();
+            assert_eq!(sources.len(), 24);
+            let t_total = Instant::now();
+            let list = sources
+                .iter()
+                .map(|s| format!("'{}'", s.path.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let staging = dir.join(COMPACT_TMP_NAME);
+            ParquetStorage::stage_parquet(
+                &conn,
+                &format!("SELECT * FROM read_parquet([{list}], union_by_name=true, hive_partitioning=false) ORDER BY timestamp"),
+                &staging,
+            )
+            .unwrap();
+            let t_hold = Instant::now();
+            let moved = storage.swap_in(&dir, &staging, &sources, 1).unwrap();
+            new_hold_ms.push(t_hold.elapsed().as_secs_f64() * 1000.0);
+            new_total_ms.push(t_total.elapsed().as_secs_f64() * 1000.0);
+            for m in moved {
+                fs::remove_file(m).unwrap();
+            }
+            // Restore the 24-small-file state for the next round.
+            let merged: Vec<_> = ParquetStorage::partition_parts(&dir)
+                .into_iter()
+                .filter(|p| p.level == 1 && p.number > 1)
+                .collect();
+            for m in merged {
+                fs::remove_file(m.path).unwrap();
+            }
+            for n in 2..26 {
+                write(&format!("{n:04}.parquet"), 2_000);
+            }
+        }
+        eprintln!("big file rows={big_rows}, 24 small files x 2000 rows (debug build)");
+        eprintln!("OLD exclusive-lock hold (rewrite whole day): {old_ms:.0?} ms");
+        eprintln!("NEW merge outside lock total:                {new_total_ms:.0?} ms");
+        eprintln!("NEW exclusive-lock hold (renames):           {new_hold_ms:.2?} ms");
     }
 }
