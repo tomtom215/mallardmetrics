@@ -161,6 +161,9 @@ pub fn behavioral_version(conn: &Connection) -> Option<String> {
         .ok()
 }
 
+/// Directory keys as explicit types; see [`setup_query_view`].
+const HIVE_OPTIONS: &str = "hive_partitioning=true, hive_types={'site_id': VARCHAR, 'date': DATE}";
+
 /// Text DuckDB puts in the error for a glob that matches no file. Checked
 /// against DuckDB 1.5.6 by `test_unmatched_glob_error_has_the_expected_text`;
 /// if an upgrade changes it that test fails rather than the fallback below
@@ -186,9 +189,17 @@ pub(crate) const NO_FILES_MARKER_FOR_TESTS: &str = NO_FILES_MARKER;
 /// - Falls back to a passthrough over `events` only when the glob matches no
 ///   file at all, which is the normal state of a fresh install.
 ///
-/// `hive_partitioning=false` is required: the Parquet files already contain
-/// `site_id` and `timestamp` columns, and Hive-style inference would add
-/// duplicate `site_id`/`date` columns from the directory names, breaking the union.
+/// ## Hive partitioning
+/// The files carry `site_id` as a column and also sit under `site_id=*/date=*`.
+/// Inferred hive typing is not trusted (it guesses types and would add `date`
+/// to the column set), so the view reads the directory keys with explicit types
+/// and projects the explicit [`EVENT_COLUMNS`] list, which drops `date`. When a
+/// name is in both the file and the path DuckDB keeps the file's column
+/// (checked on DuckDB 1.5.6 and pinned by
+/// `test_hive_view_returns_exactly_what_the_plain_glob_does`), so results are
+/// unchanged; the path keys let the planner skip files for a `site_id`
+/// predicate. Measured at 100 sites x 90 days with the footer cache: 1.36-1.43 s
+/// before, 0.59-0.63 s after (`cargo bench -- query_scale`).
 ///
 /// # Errors
 ///
@@ -219,11 +230,14 @@ pub fn setup_query_view(conn: &Connection, parquet_dir: &Path) -> Result<(), duc
         "CREATE OR REPLACE VIEW events_all AS \
          SELECT {columns} FROM events \
          UNION ALL \
-         SELECT {columns} FROM read_parquet('{escaped_glob}', union_by_name=true, hive_partitioning=false)"
+         SELECT {columns} FROM read_parquet('{escaped_glob}', union_by_name=true, {HIVE_OPTIONS})"
     );
 
     match conn.execute_batch(&union_sql) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            enable_footer_cache(conn);
+            Ok(())
+        }
         Err(e) if e.to_string().contains(NO_FILES_MARKER) => conn.execute_batch(&hot_only),
         Err(e) => {
             tracing::error!(
@@ -271,6 +285,21 @@ pub fn scoped_events_sql(files: &[std::path::PathBuf]) -> String {
         "(SELECT {columns} FROM events UNION ALL \
          SELECT {columns} FROM read_parquet([{list}], union_by_name=true, hive_partitioning=false))"
     )
+}
+
+/// Keep Parquet footers in memory between queries (F-06).
+///
+/// Every query re-reads the footer of every file the view matches, because
+/// `union_by_name` needs each file's schema. With the cache on, a repeat query
+/// skips those reads; DuckDB validates an entry against the file's size and
+/// modification time, so a replaced file is re-read (pinned by
+/// `test_footer_cache_notices_a_replaced_file`). Measured at 100 sites x 90
+/// days: see the `query_scale` benchmark. `GLOBAL` so reader connections
+/// cloned from this one share it. Failure to set it only costs speed.
+fn enable_footer_cache(conn: &Connection) {
+    if let Err(e) = conn.execute_batch("SET GLOBAL parquet_metadata_cache = true") {
+        tracing::warn!(error = %e, "Could not enable the Parquet footer cache");
+    }
 }
 
 /// True when `events_all` currently reads the Parquet tier.

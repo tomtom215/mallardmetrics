@@ -2691,4 +2691,132 @@ mod safety_tests {
         eprintln!("NEW merge outside lock total:                {new_total_ms:.0?} ms");
         eprintln!("NEW exclusive-lock hold (renames):           {new_hold_ms:.2?} ms");
     }
+
+    #[test]
+    fn test_footer_cache_notices_a_replaced_file() {
+        // F-06: the footer cache must never serve a stale footer. Replace a
+        // cached file in place, with different content and size, and then
+        // with different content of the same size.
+        let env = Env::new();
+        let conn = env.open();
+        let storage = env.storage(0);
+        ins(&conn, P.0, "2024-01-15 10:00:00");
+        storage.flush_events(&conn).unwrap();
+        let file = storage.partition_dir(P.0, P.1).join("0001.parquet");
+        setup_query_view(&conn, &env.events).unwrap();
+        let setting: String = conn
+            .query_row(
+                "SELECT CAST(current_setting('parquet_metadata_cache') AS VARCHAR)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(setting, "true");
+        assert_eq!(total(&conn), 1);
+        assert_eq!(total(&conn), 1, "second query served from the cache");
+
+        let write = |rows: u32, minute: u32| {
+            let _ = fs::remove_file(&file);
+            conn.execute_batch(&format!(
+                "COPY (SELECT 'a.com' AS site_id, 'v' AS visitor_id, \
+                 TIMESTAMP '2024-01-15 10:{minute:02}:00' + INTERVAL (i) SECOND AS timestamp, \
+                 'pageview' AS event_name, '/' AS pathname, \
+                 CAST(NULL AS VARCHAR) AS hostname, CAST(NULL AS VARCHAR) AS referrer, \
+                 CAST(NULL AS VARCHAR) AS referrer_source, CAST(NULL AS VARCHAR) AS utm_source, \
+                 CAST(NULL AS VARCHAR) AS utm_medium, CAST(NULL AS VARCHAR) AS utm_campaign, \
+                 CAST(NULL AS VARCHAR) AS utm_content, CAST(NULL AS VARCHAR) AS utm_term, \
+                 CAST(NULL AS VARCHAR) AS browser, CAST(NULL AS VARCHAR) AS browser_version, \
+                 CAST(NULL AS VARCHAR) AS os, CAST(NULL AS VARCHAR) AS os_version, \
+                 CAST(NULL AS VARCHAR) AS device_type, CAST(NULL AS VARCHAR) AS screen_size, \
+                 CAST(NULL AS VARCHAR) AS country_code, CAST(NULL AS VARCHAR) AS region, \
+                 CAST(NULL AS VARCHAR) AS city, CAST(NULL AS VARCHAR) AS props, \
+                 CAST(NULL AS DECIMAL(12,2)) AS revenue_amount, \
+                 CAST(NULL AS VARCHAR) AS revenue_currency FROM range({rows}) t(i)) \
+                 TO '{}' (FORMAT PARQUET)",
+                file.display()
+            ))
+            .unwrap();
+        };
+        write(5, 0);
+        assert_eq!(total(&conn), 5, "a different-size replacement was missed");
+        // Same size, different content, written within the same second.
+        write(5, 30);
+        let min: String = conn
+            .query_row(
+                "SELECT CAST(MIN(timestamp) AS VARCHAR) FROM events_all",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            min, "2024-01-15 10:30:00",
+            "a same-size replacement was missed"
+        );
+    }
+
+    #[test]
+    fn test_hive_view_returns_exactly_what_the_plain_glob_does() {
+        // F-06: the view reads directory keys as hive columns for pruning. It
+        // must return the same rows, columns and values as the plain glob it
+        // replaced, including compacted files and a hot tier.
+        let env = Env::new();
+        let conn = env.open();
+        let storage = env.storage(3);
+        for (site, day, h) in [
+            ("a.com", 14, 9),
+            ("a.com", 14, 10),
+            ("a.com", 14, 11),
+            ("a.com", 15, 9),
+            ("b.com", 15, 9),
+            ("b.com", 16, 9),
+            ("c-1.org", 16, 23),
+        ] {
+            ins(&conn, site, &format!("2024-01-{day} {h:02}:00:00"));
+            storage.flush_events(&conn).unwrap();
+        }
+        ins(&conn, "a.com", "2024-01-15 12:00:00"); // hot
+        setup_query_view(&conn, &env.events).unwrap();
+
+        let columns = crate::storage::schema::EVENT_COLUMNS.join(", ");
+        let plain = format!(
+            "SELECT {columns} FROM events UNION ALL SELECT {columns} FROM \
+             read_parquet('{}/site_id=*/date=*/*.parquet', union_by_name=true, \
+             hive_partitioning=false)",
+            env.events.display()
+        );
+        let dump = |source: &str, filter: &str| -> Vec<String> {
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT CAST(t AS VARCHAR) FROM (SELECT * FROM {source}) t {filter} ORDER BY 1"
+                ))
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let view_cols: Vec<String> = conn
+            .prepare("SELECT column_name FROM (DESCRIBE events_all)")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            view_cols,
+            crate::storage::schema::EVENT_COLUMNS,
+            "no hive column may leak"
+        );
+        let want = dump(&format!("({plain})"), "");
+        assert_eq!(want.len(), 8);
+        assert_eq!(dump("events_all", ""), want);
+        for site in ["a.com", "b.com", "c-1.org", "nope.com"] {
+            let filter = format!("WHERE t.site_id = '{site}'");
+            assert_eq!(
+                dump("events_all", &filter),
+                dump(&format!("({plain})"), &filter),
+                "{site}"
+            );
+        }
+    }
 }
