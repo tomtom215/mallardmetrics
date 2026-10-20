@@ -120,13 +120,50 @@ pub fn query_funnel(
 
     let sql = funnel_sql(scope, window_interval, modes, steps);
     let mut stmt = conn.prepare(&sql)?;
-    let raw: Vec<(u32, u64)> = stmt
+    let by_furthest: Vec<(usize, u64)> = stmt
         .query_map(duckdb::params_from_iter(scope.params()), |row| {
-            Ok((row.get::<_, u32>(0)?, row.get::<_, u64>(1)?))
+            Ok((row.get::<_, usize>(0)?, row.get::<_, u64>(1)?))
         })?
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<_, _>>()?;
 
-    Ok(to_report(&raw))
+    Ok(to_report(&cumulative(&by_furthest, steps.len())?))
+}
+
+/// Turn "visitors whose furthest step was N" into "visitors who reached N".
+///
+/// `window_funnel` returns, per visitor, the furthest step reached (0 when not
+/// even the first). A visitor who got to step 3 also got to steps 1 and 2, so
+/// the count at step `k` is the sum over every `furthest >= k`. Doing this here
+/// rather than in SQL keeps the statement at one row per distinct `furthest`;
+/// the SQL version joined a step list to every visitor, materialising
+/// `steps x visitors` rows (up to 32 x 1M) to produce `steps` numbers.
+///
+/// # Errors
+///
+/// A `furthest` beyond the number of steps cannot come from the extension, and
+/// is reported rather than silently ignored.
+fn cumulative(
+    by_furthest: &[(usize, u64)],
+    steps: usize,
+) -> Result<Vec<(u32, u64)>, duckdb::Error> {
+    let mut exact = vec![0u64; steps + 1];
+    for &(furthest, visitors) in by_furthest {
+        let slot = exact.get_mut(furthest).ok_or_else(|| {
+            duckdb::Error::IntegralValueOutOfRange(0, i128::try_from(furthest).unwrap_or(i128::MAX))
+        })?;
+        *slot += visitors;
+    }
+    let mut out = Vec::with_capacity(steps);
+    let mut reached = 0u64;
+    for step in (1..=steps).rev() {
+        reached += exact[step];
+        let label = u32::try_from(step).map_err(|_| {
+            duckdb::Error::IntegralValueOutOfRange(0, i128::try_from(step).unwrap_or(i128::MAX))
+        })?;
+        out.push((label, reached));
+    }
+    out.reverse();
+    Ok(out)
 }
 
 /// Turn `(step, cumulative_visitors)` pairs into a full report.
@@ -161,13 +198,14 @@ fn to_report(raw: &[(u32, u64)]) -> Vec<FunnelStep> {
 /// SQL for the cumulative funnel. Split out so it can be unit-tested.
 fn funnel_sql(scope: &QueryScope, window_interval: &str, modes: &str, steps: &[&str]) -> String {
     let step_conditions = steps.join(", ");
-    let n = steps.len();
     // `window_funnel(window [, mode], timestamp, cond, ...)`: the mode argument
     // is positional. `effective_modes` is never empty, so it is always present.
     let mode_arg = format!("'{}', ", effective_modes(modes).replace('\'', "''"));
 
+    // One row per distinct "furthest step reached"; `cumulative` does the rest.
     format!(
-        "WITH per_visitor AS (
+        "SELECT furthest, COUNT(*) AS visitors
+         FROM (
              SELECT visitor_id,
                  window_funnel(INTERVAL '{window_interval}', {mode_arg}timestamp,
                      {step_conditions}
@@ -175,14 +213,8 @@ fn funnel_sql(scope: &QueryScope, window_interval: &str, modes: &str, steps: &[&
              FROM events_all
              WHERE {where_clause}
              GROUP BY visitor_id
-         ),
-         step_numbers AS (SELECT UNNEST(generate_series(1, {n})) AS step)
-         SELECT s.step,
-                COUNT(pv.visitor_id) FILTER (WHERE pv.furthest >= s.step) AS visitors
-         FROM step_numbers s
-         LEFT JOIN per_visitor pv ON TRUE
-         GROUP BY s.step
-         ORDER BY s.step",
+         )
+         GROUP BY furthest",
         where_clause = scope.where_clause()
     )
 }
@@ -506,6 +538,34 @@ mod tests {
     fn test_sql_uses_bound_parameters_for_scope() {
         let sql = funnel_sql(&scope("2024-01-01", "2024-02-01"), "1 day", "", STEPS);
         assert_eq!(sql.matches('?').count(), 3);
+    }
+
+    #[test]
+    fn test_sql_does_not_join_steps_to_every_visitor() {
+        // Regression (S-07): the final SELECT was `step_numbers LEFT JOIN
+        // per_visitor ON TRUE`, a cross join that built steps x visitors rows.
+        let sql = funnel_sql(&scope("2024-01-01", "2024-02-01"), "1 day", "", STEPS);
+        assert!(!sql.contains("JOIN"), "{sql}");
+        assert!(!sql.contains("generate_series"), "{sql}");
+    }
+
+    #[test]
+    fn test_cumulative_sums_from_the_furthest_step_down() {
+        // 1 visitor reached nothing, 2 stopped at step 1, 3 at step 2, 4 at 3.
+        let rows = cumulative(&[(0, 1), (1, 2), (2, 3), (3, 4)], 3).unwrap();
+        assert_eq!(rows, vec![(1, 9), (2, 7), (3, 4)]);
+    }
+
+    #[test]
+    fn test_cumulative_keeps_a_row_for_a_step_nobody_reached() {
+        let rows = cumulative(&[(1, 5)], 3).unwrap();
+        assert_eq!(rows, vec![(1, 5), (2, 0), (3, 0)]);
+        assert_eq!(cumulative(&[], 2).unwrap(), vec![(1, 0), (2, 0)]);
+    }
+
+    #[test]
+    fn test_cumulative_rejects_a_furthest_step_beyond_the_funnel() {
+        assert!(cumulative(&[(4, 1)], 3).is_err());
     }
 
     #[test]
