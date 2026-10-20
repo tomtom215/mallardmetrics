@@ -20,6 +20,7 @@ const MAX_EVENT_NAME_LEN: usize = 256;
 const MAX_URL_LEN: usize = 2048;
 const MAX_REFERRER_LEN: usize = 2048;
 const MAX_PROPS_LEN: usize = 4096;
+const MAX_USER_AGENT_LEN: usize = 1024;
 
 /// Largest revenue amount an event may carry.
 ///
@@ -254,6 +255,28 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
     }
 }
 
+/// Number of trusted reverse proxies in front of the server when the operator
+/// has not said otherwise (one proxy: nginx, Caddy, a cloud load balancer).
+pub const DEFAULT_TRUSTED_PROXY_HOPS: usize = 1;
+
+/// Most `X-Forwarded-For` entries read from the right. A chain deeper than this
+/// is not a proxy chain, and refusing it bounds the work done per request.
+const MAX_FORWARDED_ENTRIES: usize = 32;
+
+/// Resolve the client IP for a request, with the default proxy depth.
+///
+/// See [`resolve_client_ip`]; this reads `trust_proxy_headers` from `state` and
+/// assumes [`DEFAULT_TRUSTED_PROXY_HOPS`] proxies until the deployment's hop
+/// count is carried in the application state.
+pub fn client_ip(state: &AppState, headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
+    resolve_client_ip(
+        state.trust_proxy_headers,
+        DEFAULT_TRUSTED_PROXY_HOPS,
+        headers,
+        peer,
+    )
+}
+
 /// Resolve the client IP for a request.
 ///
 /// When `trust_proxy_headers` is off (the default), the peer socket address is
@@ -261,32 +284,72 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for PeerAddr {
 /// reachable server: trusting them unconditionally let any client choose its own
 /// visitor ID, geolocation and rate-limit bucket.
 ///
+/// When they are trusted, `trusted_proxy_hops` says how many reverse proxies sit
+/// in front of the server, and the entry that many places from the **right** of
+/// `X-Forwarded-For` is the client. Every proxy appends the address it received
+/// the connection from, so entries to the right of the client were written by
+/// infrastructure the operator controls and entries to its left were written by
+/// the client. The old rule took the leftmost entry, which is only correct for
+/// a proxy that overwrites the header: behind one that appends (the nginx
+/// `$proxy_add_x_forwarded_for` idiom) the client chose its own address.
+///
+/// A header with fewer entries than hops, or whose selected entry is not an
+/// address, did not traverse the proxies the operator described and is ignored
+/// in favour of the peer address, which cannot be forged. `X-Real-IP` is a
+/// single value set by the proxy; it is consulted only when no
+/// `X-Forwarded-For` is present at all and exactly one proxy is configured.
+///
 /// Falling back to the peer address also fixes a quieter problem. Without a
 /// proxy, neither header is present, and the old code returned the literal
 /// string `"unknown"` for every request — so every visitor sharing a
 /// User-Agent collapsed into a single visitor ID, and unique-visitor counts on
 /// non-proxied deployments were meaningless.
-pub fn client_ip(state: &AppState, headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
-    if state.trust_proxy_headers {
-        // The leftmost entry is the original client; entries to its right were
-        // added by intermediate proxies.
-        if let Some(forwarded) = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.split(',').next())
-            .and_then(parse_forwarded_addr)
-        {
-            return forwarded;
-        }
-        if let Some(real_ip) = headers
-            .get("x-real-ip")
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_forwarded_addr)
+pub fn resolve_client_ip(
+    trust_proxy_headers: bool,
+    trusted_proxy_hops: usize,
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> String {
+    if trust_proxy_headers && trusted_proxy_hops > 0 {
+        let mut forwarded = headers.get_all("x-forwarded-for").iter().peekable();
+        if forwarded.peek().is_some() {
+            if let Some(ip) = forwarded_client(forwarded, trusted_proxy_hops) {
+                return ip;
+            }
+        } else if trusted_proxy_hops == 1
+            && let Some(real_ip) = headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_forwarded_addr)
         {
             return real_ip;
         }
     }
-    peer.map_or_else(|| "unknown".to_string(), |addr| addr.ip().to_string())
+    peer.map_or_else(
+        || "unknown".to_string(),
+        |addr| addr.ip().to_canonical().to_string(),
+    )
+}
+
+/// The client entry of an `X-Forwarded-For` chain: `hops` places from the right.
+///
+/// Repeated header lines form one list, in order, exactly as a proxy that
+/// appends to an existing header would produce.
+fn forwarded_client<'a>(
+    values: impl Iterator<Item = &'a axum::http::HeaderValue>,
+    hops: usize,
+) -> Option<String> {
+    let mut entries: Vec<&str> = Vec::new();
+    for value in values {
+        for entry in value.to_str().ok()?.split(',') {
+            if entries.len() >= MAX_FORWARDED_ENTRIES {
+                return None;
+            }
+            entries.push(entry);
+        }
+    }
+    let index = entries.len().checked_sub(hops)?;
+    parse_forwarded_addr(entries[index])
 }
 
 /// Parse one proxy-header entry into a canonical IP address.
@@ -304,18 +367,18 @@ pub fn client_ip(state: &AppState, headers: &HeaderMap, peer: Option<SocketAddr>
 fn parse_forwarded_addr(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
-        return Some(ip.to_string());
+        return Some(ip.to_canonical().to_string());
     }
     // Some proxies append the source port, and a bracketed IPv6 literal only
     // parses with one.
     if let Ok(addr) = trimmed.parse::<SocketAddr>() {
-        return Some(addr.ip().to_string());
+        return Some(addr.ip().to_canonical().to_string());
     }
     trimmed
         .strip_prefix('[')
         .and_then(|rest| rest.strip_suffix(']'))
         .and_then(|inner| inner.parse::<std::net::Ipv6Addr>().ok())
-        .map(|ip| ip.to_string())
+        .map(|ip| ip.to_canonical().to_string())
 }
 
 /// Validate and enrich a payload into a storable [`Event`].
@@ -374,14 +437,24 @@ pub fn build_event(
 
     let ip = client_ip(state, headers, peer);
 
-    if !state.rate_limiter.check(&payload.domain) || !state.ip_rate_limiter.check(&ip) {
+    // Keyed on the network (an IPv6 /64), not the exact address: one subscriber
+    // owns a whole /64 and could otherwise take a fresh bucket per request.
+    if !state.rate_limiter.check(&payload.domain)
+        || !state
+            .ip_rate_limiter
+            .check(&crate::ingest::ratelimit::network_key(&ip))
+    {
         return Err(RejectReason::RateLimited);
     }
 
+    // Real User-Agent strings are a few hundred bytes. The header is not covered
+    // by the body limit, so the string is bounded before it is lowercased,
+    // scanned for bot markers and hashed. A header value is visible ASCII, so
+    // cutting at a byte offset cannot split a character.
     let user_agent = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .map_or("", |ua| ua.get(..MAX_USER_AGENT_LEN).unwrap_or(ua));
     let hints = ClientHints::from_headers(headers);
     let parsed_ua = useragent::parse_user_agent_with_hints(user_agent, &hints);
     if state.filter_bots && parsed_ua.is_bot {
@@ -712,6 +785,11 @@ fn classify_device(width: u32) -> String {
 
 /// Extract a normalised pathname from a URL.
 fn sanitize_pathname(url: &str) -> String {
+    // The query and fragment go first. Looking for the path's slash before
+    // removing them found one *inside* the query for `https://host?next=/a/b`
+    // and reported `/a/b` as the page.
+    let url = url.split(['?', '#']).next().unwrap_or(url);
+
     let without_scheme = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"));
@@ -719,9 +797,6 @@ fn sanitize_pathname(url: &str) -> String {
     // An absolute URL loses its authority; a relative one is already a path,
     // which is what the tracker sends when given one.
     let path = without_scheme.map_or(url, |rest| rest.find('/').map_or("/", |idx| &rest[idx..]));
-
-    let path = path.split('?').next().unwrap_or(path);
-    let path = path.split('#').next().unwrap_or(path);
 
     let path = if path.is_empty() { "/" } else { path };
     let path = if path.starts_with('/') {
@@ -743,14 +818,61 @@ fn sanitize_pathname(url: &str) -> String {
         path
     };
 
-    sanitize_string(&path, MAX_URL_LEN)
+    // `%2f` and `%2F` are one page, not two rows.
+    sanitize_string(&uppercase_percent_escapes(&path), MAX_URL_LEN)
 }
 
-/// Truncate to `max_len` characters and drop control characters.
+/// Upper-case the hex digits of every `%xx` escape (the RFC 3986 normal form).
+fn uppercase_percent_escapes(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = String::with_capacity(path.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            out.push('%');
+            out.push(char::from(bytes[i + 1].to_ascii_uppercase()));
+            out.push(char::from(bytes[i + 2].to_ascii_uppercase()));
+            i += 3;
+        } else {
+            // Every escape byte above is ASCII, so `i` is on a char boundary
+            // whenever it is reached through that branch; the rest is copied
+            // one scalar value at a time.
+            let ch_len = path[i..].chars().next().map_or(1, char::len_utf8);
+            out.push_str(&path[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    out
+}
+
+/// Characters that render as nothing, or that reorder the text around them.
+///
+/// `char::is_control` covers only the Cc category. The bidirectional overrides
+/// and zero-width characters are Cf: a path ending in U+202E displays
+/// reversed in a dashboard row, and a zero-width space makes two pages look like
+/// one.
+const fn is_invisible_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
+}
+
+/// Truncate to `max_len` characters and drop control and invisible format
+/// characters.
 fn sanitize_string(input: &str, max_len: usize) -> String {
     input
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_invisible_format(*c))
         .take(max_len)
         .collect()
 }
@@ -904,7 +1026,8 @@ mod tests {
         let state = crate::test_support::state_builder()
             .trust_proxy_headers(true)
             .build_state();
-        let headers = headers_with(&[("x-forwarded-for", "203.0.113.1, 10.0.0.1")]);
+        // One trusted proxy, which wrote the only entry.
+        let headers = headers_with(&[("x-forwarded-for", "203.0.113.1")]);
         assert_eq!(
             client_ip(&state, &headers, Some(addr("10.0.0.1:80"))),
             "203.0.113.1"
@@ -962,7 +1085,7 @@ mod tests {
         let state = crate::test_support::state_builder()
             .trust_proxy_headers(true)
             .build_state();
-        let headers = headers_with(&[("x-forwarded-for", "203.0.113.5:41234, 10.0.0.1")]);
+        let headers = headers_with(&[("x-forwarded-for", "198.51.100.9, 203.0.113.5:41234")]);
         assert_eq!(
             client_ip(&state, &headers, Some(addr("10.0.0.1:80"))),
             "203.0.113.5"
@@ -993,18 +1116,158 @@ mod tests {
     }
 
     #[test]
-    fn test_client_ip_falls_through_to_real_ip_when_forwarded_is_bogus() {
+    fn test_client_ip_does_not_fall_back_to_real_ip_when_forwarded_is_present() {
+        // A forwarded chain whose trusted entry is not an address did not pass
+        // through the proxy that was supposed to write it, so a sibling header
+        // from the same request is no more trustworthy. The peer is.
         let state = crate::test_support::state_builder()
             .trust_proxy_headers(true)
             .build_state();
         let headers = headers_with(&[("x-forwarded-for", "garbage"), ("x-real-ip", "203.0.113.7")]);
-        assert_eq!(client_ip(&state, &headers, None), "203.0.113.7");
+        assert_eq!(
+            client_ip(&state, &headers, Some(addr("198.51.100.1:80"))),
+            "198.51.100.1"
+        );
+    }
+
+    #[test]
+    fn test_trusted_hops_are_counted_from_the_right() {
+        let headers = headers_with(&[("x-forwarded-for", "9.9.9.9, 203.0.113.1, 10.1.1.1")]);
+        let peer = Some(addr("10.2.2.2:80"));
+        // A CDN (10.1.1.1 is what it saw) in front of one proxy: two hops.
+        assert_eq!(resolve_client_ip(true, 1, &headers, peer), "10.1.1.1");
+        assert_eq!(resolve_client_ip(true, 2, &headers, peer), "203.0.113.1");
+        assert_eq!(resolve_client_ip(true, 3, &headers, peer), "9.9.9.9");
+    }
+
+    #[test]
+    fn test_a_chain_shorter_than_the_hop_count_is_not_believed() {
+        // Two proxies are configured but only one entry arrived: the request did
+        // not take the path the operator described.
+        let headers = headers_with(&[("x-forwarded-for", "203.0.113.1")]);
+        assert_eq!(
+            resolve_client_ip(true, 2, &headers, Some(addr("198.51.100.1:80"))),
+            "198.51.100.1"
+        );
+    }
+
+    #[test]
+    fn test_repeated_forwarded_header_lines_form_one_chain() {
+        // A proxy that appends a new header line instead of extending the
+        // existing one is still appending: the last line is the proxy's.
+        let mut headers = HeaderMap::new();
+        headers.append("x-forwarded-for", "1.1.1.1".parse().unwrap());
+        headers.append("x-forwarded-for", "2.2.2.2".parse().unwrap());
+        assert_eq!(
+            resolve_client_ip(true, 1, &headers, Some(addr("10.0.0.1:80"))),
+            "2.2.2.2"
+        );
+    }
+
+    #[test]
+    fn test_zero_trusted_hops_means_the_peer() {
+        let headers = headers_with(&[("x-forwarded-for", "1.1.1.1")]);
+        assert_eq!(
+            resolve_client_ip(true, 0, &headers, Some(addr("10.0.0.1:80"))),
+            "10.0.0.1"
+        );
+    }
+
+    #[test]
+    fn test_real_ip_is_only_read_when_no_forwarded_chain_exists() {
+        let headers = headers_with(&[("x-real-ip", "203.0.113.7")]);
+        let peer = Some(addr("10.0.0.1:80"));
+        assert_eq!(resolve_client_ip(true, 1, &headers, peer), "203.0.113.7");
+        // A single X-Real-IP says nothing about a two-proxy chain.
+        assert_eq!(resolve_client_ip(true, 2, &headers, peer), "10.0.0.1");
+    }
+
+    #[test]
+    fn test_an_overlong_forwarded_chain_is_refused() {
+        let chain = vec!["1.1.1.1"; MAX_FORWARDED_ENTRIES + 1].join(", ");
+        let headers = headers_with(&[("x-forwarded-for", chain.as_str())]);
+        assert_eq!(
+            resolve_client_ip(true, 1, &headers, Some(addr("10.0.0.1:80"))),
+            "10.0.0.1"
+        );
+    }
+
+    #[test]
+    fn test_ipv4_mapped_addresses_are_canonicalised() {
+        let headers = headers_with(&[("x-forwarded-for", "::ffff:203.0.113.5")]);
+        assert_eq!(resolve_client_ip(true, 1, &headers, None), "203.0.113.5");
+        assert_eq!(
+            resolve_client_ip(
+                false,
+                1,
+                &HeaderMap::new(),
+                Some(addr("[::ffff:203.0.113.6]:80"))
+            ),
+            "203.0.113.6"
+        );
     }
 
     #[test]
     fn test_client_ip_unknown_without_peer_or_headers() {
         let state = crate::test_support::state_builder().build_state();
         assert_eq!(client_ip(&state, &HeaderMap::new(), None), "unknown");
+    }
+
+    #[test]
+    fn test_client_ip_ignores_a_client_supplied_leftmost_forwarded_entry() {
+        // SI-01 regression: the documented nginx config uses
+        // `$proxy_add_x_forwarded_for`, which APPENDS the peer it saw to
+        // whatever the client sent. The client chooses the leftmost entry, so
+        // trusting it let any visitor pick its own visitor ID, GeoIP country
+        // and rate-limit bucket. Only the entry the trusted proxy added (the
+        // rightmost) is reliable.
+        let state = crate::test_support::state_builder()
+            .trust_proxy_headers(true)
+            .build_state();
+        let headers = headers_with(&[("x-forwarded-for", "1.1.1.1, 2.2.2.2")]);
+        assert_eq!(
+            client_ip(&state, &headers, Some(addr("10.0.0.1:80"))),
+            "2.2.2.2",
+            "the forged leftmost entry must not be believed"
+        );
+    }
+
+    #[test]
+    fn test_per_ip_limit_cannot_be_dodged_by_rotating_within_an_ipv6_prefix() {
+        // SI-04 regression: a /64 is one subscriber, and keying on the full
+        // address gave each of its 2^64 addresses a fresh token bucket.
+        let state = crate::test_support::state_builder()
+            .rate_limit_per_ip(1)
+            .build_state();
+        let first = Some(addr("[2001:db8:1:2::1]:1000"));
+        let same_prefix = Some(addr("[2001:db8:1:2:dead:beef:0:99]:1000"));
+        let other_prefix = Some(addr("[2001:db8:1:3::1]:1000"));
+        assert!(build_event(&state, &HeaderMap::new(), first, &payload("a.com")).is_ok());
+        assert_eq!(
+            build_event(&state, &HeaderMap::new(), same_prefix, &payload("a.com")).unwrap_err(),
+            RejectReason::RateLimited,
+            "another address in the same /64 shares the bucket"
+        );
+        assert!(
+            build_event(&state, &HeaderMap::new(), other_prefix, &payload("a.com")).is_ok(),
+            "a different /64 is a different client"
+        );
+    }
+
+    #[test]
+    fn test_ipv4_mapped_peer_shares_the_ipv4_bucket() {
+        // A dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`; it
+        // must not hold a second bucket next to its plain IPv4 spelling.
+        let state = crate::test_support::state_builder()
+            .rate_limit_per_ip(1)
+            .build_state();
+        let mapped = Some(addr("[::ffff:203.0.113.1]:1000"));
+        let plain = Some(addr("203.0.113.1:1000"));
+        assert!(build_event(&state, &HeaderMap::new(), mapped, &payload("a.com")).is_ok());
+        assert_eq!(
+            build_event(&state, &HeaderMap::new(), plain, &payload("a.com")).unwrap_err(),
+            RejectReason::RateLimited
+        );
     }
 
     // ── UTM parsing ──────────────────────────────────────────────────────
@@ -1190,6 +1453,35 @@ mod tests {
     }
 
     // ── Field sanitisation ───────────────────────────────────────────────
+
+    #[test]
+    fn test_pathname_ignores_a_slash_inside_the_query() {
+        // SI-27 regression: `https://host?next=/a/b` has no path, but the slash
+        // search ran before the query was removed and reported `/a/b`.
+        assert_eq!(sanitize_pathname("https://host?next=/a/b"), "/");
+        assert_eq!(sanitize_pathname("https://host#/a/b"), "/");
+        assert_eq!(sanitize_pathname("https://host/p?next=/a/b#/c"), "/p");
+    }
+
+    #[test]
+    fn test_pathname_percent_escapes_have_one_spelling() {
+        assert_eq!(sanitize_pathname("https://h/a%2fb"), "/a%2Fb");
+        assert_eq!(sanitize_pathname("https://h/a%2Fb"), "/a%2Fb");
+        // A lone or malformed percent sign is left alone, multi-byte text intact.
+        assert_eq!(sanitize_pathname("https://h/100%/é%zz"), "/100%/é%zz");
+    }
+
+    #[test]
+    fn test_invisible_format_characters_are_dropped() {
+        // U+202E reverses the text after it in a dashboard row; zero-width
+        // characters make two different pages look like one.
+        assert_eq!(
+            sanitize_pathname("https://h/ab\u{202e}cd\u{200b}e"),
+            "/abcde"
+        );
+        assert_eq!(sanitize_string("a\u{feff}b\u{2066}c", 10), "abc");
+        assert_eq!(sanitize_string("héllo wörld", 20), "héllo wörld");
+    }
 
     #[test]
     fn test_sanitize_string_truncate() {
