@@ -236,6 +236,41 @@ mod tests {
     }
 
     #[test]
+    fn test_no_query_module_swallows_row_errors() {
+        // Regression (S-06): every row mapper ended in `.filter_map(Result::ok)`,
+        // so a row that failed to decode vanished and the endpoint answered 200
+        // with a plausible, shorter report. `export.rs` is checked by its own
+        // owner; this guards the modules that feed the dashboard.
+        let swallow = [
+            "filter_map(Result::ok)",
+            ".flatten()",
+            "filter_map(|r| r.ok())",
+        ];
+        for (name, source) in [
+            ("breakdowns", include_str!("breakdowns.rs")),
+            ("events", include_str!("events.rs")),
+            ("flow", include_str!("flow.rs")),
+            ("funnel", include_str!("funnel.rs")),
+            ("realtime", include_str!("realtime.rs")),
+            ("retention", include_str!("retention.rs")),
+            ("revenue", include_str!("revenue.rs")),
+            ("sequences", include_str!("sequences.rs")),
+            ("sessions", include_str!("sessions.rs")),
+            ("metrics", include_str!("metrics.rs")),
+            ("timeseries", include_str!("timeseries.rs")),
+        ] {
+            // Code only: the tests below legitimately mention the pattern.
+            let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for pattern in swallow {
+                assert!(
+                    !code.contains(pattern),
+                    "src/query/{name}.rs drops row errors with `{pattern}`; collect into a Result"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_unfiltered_scope_is_unchanged() {
         let scope = QueryScope::new("a.com", "2024-01-01", "2024-02-01", "30 minutes");
         assert_eq!(scope.filter_clause(), "");

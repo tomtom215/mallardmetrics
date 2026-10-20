@@ -80,7 +80,8 @@ pub fn query_retention(
             }
             Ok((cohort_date, retained))
         })?
-        .filter_map(Result::ok)
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
         .map(|(cohort_date, retained)| {
             let cohort_size = retained.first().copied().unwrap_or(0);
             #[allow(clippy::cast_precision_loss)]

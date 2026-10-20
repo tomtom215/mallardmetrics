@@ -461,8 +461,7 @@ pub async fn list_sites(State(state): State<Arc<AppState>>) -> Result<impl IntoR
         let mut stmt = conn.prepare("SELECT DISTINCT site_id FROM events_all ORDER BY site_id")?;
         let rows: Vec<String> = stmt
             .query_map([], |row| row.get::<_, String>(0))?
-            .filter_map(Result::ok)
-            .collect();
+            .collect::<Result<_, _>>()?;
         Ok(rows)
     })
     .await

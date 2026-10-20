@@ -189,8 +189,7 @@ fn query_top(
                 visitors: row.get(1)?,
             })
         })?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
@@ -227,8 +226,7 @@ fn query_per_minute(
     bound.extend(scope.params());
     let rows = stmt
         .query_map(duckdb::params_from_iter(bound), |row| row.get::<_, u64>(0))?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 

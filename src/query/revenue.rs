@@ -95,8 +95,7 @@ fn query_by_currency(
                 average_order_value,
             })
         })?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
@@ -130,8 +129,7 @@ fn query_by_dimension(
                 transactions: row.get(3)?,
             })
         })?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 

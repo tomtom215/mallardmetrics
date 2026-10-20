@@ -101,8 +101,7 @@ pub fn query_flow(
                 share: row.get(2)?,
             })
         })?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 

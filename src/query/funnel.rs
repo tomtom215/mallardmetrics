@@ -122,12 +122,9 @@ pub fn query_funnel(
     let mut stmt = conn.prepare(&sql)?;
     let raw: Vec<(u32, u64)> = stmt
         .query_map(duckdb::params_from_iter(scope.params()), |row| {
-            let step: i64 = row.get(0)?;
-            let visitors: u64 = row.get(1)?;
-            Ok((u32::try_from(step).unwrap_or(0), visitors))
+            Ok((row.get::<_, u32>(0)?, row.get::<_, u64>(1)?))
         })?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(to_report(&raw))
 }
