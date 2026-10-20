@@ -46,6 +46,7 @@ cargo build && scripts/smoke-test.sh
 - [ ] New functionality is covered by unit tests
 - [ ] Integration tests added/updated if HTTP behaviour changed
 - [ ] If the dashboard changed: `node scripts/check-dashboard-browser.mjs` passes
+- [ ] If the Dockerfile or `deploy/` changed: `scripts/docker-smoke.sh <image>` passes (the image must report a `behavioral_version`)
 
 ## Security checklist (if applicable)
 
