@@ -11,12 +11,23 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Per-IP login-attempt tracker for brute-force protection.
+use crate::ingest::ratelimit::network_key;
+
+/// Per-client login-attempt tracker for brute-force protection.
 ///
-/// The map is keyed by client IP, so it is bounded: without a cap an attacker
-/// rotating source addresses grows it without limit. The previous `cleanup`
-/// retained every entry with `fail_count > 0` — which is every entry it ever
-/// created — so it freed nothing at all.
+/// The map is keyed by client network (see [`network_key`]: an IPv4 address or
+/// an IPv6 /64), so it is bounded: without a cap an attacker rotating source
+/// addresses grows it without limit. The previous `cleanup` retained every
+/// entry with `fail_count > 0` — which is every entry it ever created — so it
+/// freed nothing at all.
+///
+/// Attempts are counted when they are *admitted* ([`begin_attempt`]), not when
+/// they fail. Counting afterwards left a gap for the whole of password
+/// verification: a burst of parallel requests all passed the check before any
+/// failure was recorded, and a client that disconnected mid-verification was
+/// never counted although the work still ran.
+///
+/// [`begin_attempt`]: LoginAttemptTracker::begin_attempt
 #[derive(Clone)]
 pub struct LoginAttemptTracker {
     attempts: Arc<Mutex<HashMap<String, LoginAttemptEntry>>>,
@@ -34,6 +45,9 @@ struct LoginAttemptEntry {
 /// How long a non-locked-out failure record is kept.
 const ATTEMPT_RETENTION: Duration = Duration::from_secs(3600);
 
+/// Longest lockout applied when the configured one would overflow `Instant`.
+const MAX_LOCKOUT: Duration = Duration::from_hours(10 * 365 * 24);
+
 impl LoginAttemptTracker {
     /// Create a tracker. `max_attempts == 0` disables brute-force protection.
     pub fn new(max_attempts: u32, lockout_secs: u64) -> Self {
@@ -49,13 +63,18 @@ impl LoginAttemptTracker {
         }
     }
 
-    /// Whether the IP may attempt a login. `false` means it is locked out.
+    /// Whether the client may attempt a login. `false` means it is locked out.
+    ///
+    /// Advisory: a request that passes still has to win [`begin_attempt`].
+    ///
+    /// [`begin_attempt`]: Self::begin_attempt
     pub fn check(&self, ip: &str) -> bool {
         if self.max_attempts == 0 {
             return true;
         }
+        let key = network_key(ip);
         let mut map = self.attempts.lock();
-        let Some(entry) = map.get_mut(ip) else {
+        let Some(entry) = map.get_mut(key.as_ref()) else {
             return true;
         };
         let Some(until) = entry.lockout_until else {
@@ -64,11 +83,83 @@ impl LoginAttemptTracker {
         if Instant::now() < until {
             return false;
         }
-        // The lockout has expired — reset so the IP gets a fresh allowance.
+        // The lockout has expired — reset so the client gets a fresh allowance.
         entry.fail_count = 0;
         entry.lockout_until = None;
         entry.last_seen = Instant::now();
         true
+    }
+
+    /// Admit one attempt and count it, atomically.
+    ///
+    /// Returns the attempt number (1-based), or `None` when the client is locked
+    /// out. The attempt counts as a failure from this moment; a successful login
+    /// calls [`record_success`](Self::record_success), which clears it. The
+    /// attempt that reaches `max_attempts` starts the lockout, so exactly
+    /// `max_attempts` guesses are ever admitted per window however many requests
+    /// arrive at once.
+    pub fn begin_attempt(&self, ip: &str) -> Option<u32> {
+        if self.max_attempts == 0 {
+            return Some(0);
+        }
+        let key = network_key(ip);
+        let now = Instant::now();
+        let mut map = self.attempts.lock();
+        if let Some(entry) = map.get_mut(key.as_ref()) {
+            if let Some(until) = entry.lockout_until {
+                if now < until {
+                    return None;
+                }
+                entry.fail_count = 0;
+                entry.lockout_until = None;
+            }
+            return Some(self.count(entry, now, ip));
+        }
+        if map.len() >= self.max_entries {
+            self.make_room(&mut map, now);
+        }
+        let mut entry = LoginAttemptEntry {
+            fail_count: 0,
+            lockout_until: None,
+            last_seen: now,
+        };
+        let attempt = self.count(&mut entry, now, ip);
+        map.insert(key.into_owned(), entry);
+        Some(attempt)
+    }
+
+    /// Give back an attempt that was admitted but never judged, because the
+    /// server could not run the check (see [`Argon2Busy`]). The client did not
+    /// get a guess, so it must not lose one.
+    pub fn refund_attempt(&self, ip: &str) {
+        if self.max_attempts == 0 {
+            return;
+        }
+        let key = network_key(ip);
+        let mut map = self.attempts.lock();
+        if let Some(entry) = map.get_mut(key.as_ref()) {
+            entry.fail_count = entry.fail_count.saturating_sub(1);
+            if entry.fail_count < self.max_attempts {
+                entry.lockout_until = None;
+            }
+        }
+    }
+
+    /// Count one attempt on `entry`, starting the lockout when it is the last.
+    fn count(&self, entry: &mut LoginAttemptEntry, now: Instant, ip: &str) -> u32 {
+        entry.fail_count = entry.fail_count.saturating_add(1);
+        entry.last_seen = now;
+        if entry.fail_count >= self.max_attempts {
+            let lockout = Duration::from_secs(self.lockout_secs).min(MAX_LOCKOUT);
+            entry.lockout_until = Some(now + lockout);
+            tracing::warn!(
+                ip_prefix = %anonymize_ip(ip),
+                fail_count = entry.fail_count,
+                lockout_secs = lockout.as_secs(),
+                "Login brute-force lockout applied"
+            );
+        }
+        entry.fail_count
     }
 
     /// Record a failed login. Returns the failure count after recording.
@@ -76,52 +167,28 @@ impl LoginAttemptTracker {
         if self.max_attempts == 0 {
             return 0;
         }
+        let key = network_key(ip);
         let now = Instant::now();
-        let fail_count = {
-            let mut map = self.attempts.lock();
-            if !map.contains_key(ip) && map.len() >= self.max_entries {
-                // Reclaim expired records before giving up on tracking this IP.
-                Self::evict_stale(&mut map, now);
-                if map.len() >= self.max_entries {
-                    // Still full: every slot is an active lockout. Refusing to
-                    // track is safe — check() already denies those addresses.
-                    tracing::warn!(
-                        max_entries = self.max_entries,
-                        "Login attempt tracker is at capacity; not tracking a new IP"
-                    );
-                    return self.max_attempts;
-                }
-            }
-            let entry = map.entry(ip.to_string()).or_insert(LoginAttemptEntry {
+        let mut map = self.attempts.lock();
+        if !map.contains_key(key.as_ref()) && map.len() >= self.max_entries {
+            self.make_room(&mut map, now);
+        }
+        let entry = map
+            .entry(key.into_owned())
+            .or_insert_with(|| LoginAttemptEntry {
                 fail_count: 0,
                 lockout_until: None,
                 last_seen: now,
             });
-            entry.fail_count += 1;
-            entry.last_seen = now;
-            if entry.fail_count >= self.max_attempts {
-                entry.lockout_until = Some(now + Duration::from_secs(self.lockout_secs));
-            }
-            entry.fail_count
-        };
-
-        if fail_count >= self.max_attempts {
-            tracing::warn!(
-                ip_prefix = %anonymize_ip(ip),
-                fail_count,
-                lockout_secs = self.lockout_secs,
-                "Login brute-force lockout applied"
-            );
-        }
-        fail_count
+        self.count(entry, now, ip)
     }
 
-    /// Clear an IP's failure history after a successful login.
+    /// Clear a client's failure history after a successful login.
     pub fn record_success(&self, ip: &str) {
         if self.max_attempts == 0 {
             return;
         }
-        self.attempts.lock().remove(ip);
+        self.attempts.lock().remove(network_key(ip).as_ref());
     }
 
     /// Remaining lockout in seconds, or `None` when not locked out.
@@ -129,13 +196,49 @@ impl LoginAttemptTracker {
         if self.max_attempts == 0 {
             return None;
         }
+        let key = network_key(ip);
         let map = self.attempts.lock();
-        map.get(ip).and_then(|entry| {
+        map.get(key.as_ref()).and_then(|entry| {
             entry.lockout_until.and_then(|until| {
                 let now = Instant::now();
                 (until > now).then(|| until.saturating_duration_since(now).as_secs().max(1))
             })
         })
+    }
+
+    /// Free at least an eighth of the table so a new client can be tracked.
+    ///
+    /// Expired records go first, then the least recently seen un-locked clients,
+    /// and only then the locks closest to expiry. Refusing to track a new client
+    /// was the alternative, and it let 10,000 failures from distinct sources
+    /// switch the protection off for everyone else. The eighth is a batch: the
+    /// scan is paid once per batch, not once per attacker request, under the lock
+    /// every login needs.
+    fn make_room(&self, map: &mut HashMap<String, LoginAttemptEntry>, now: Instant) {
+        let target = (self.max_entries / 8).max(1);
+        let before = map.len();
+        Self::evict_stale(map, now);
+        let freed = before - map.len();
+        if freed >= target {
+            return;
+        }
+        let need = (target - freed).min(map.len());
+        if need == 0 {
+            return;
+        }
+        // Un-locked entries rank below locked ones; within a group, older first.
+        let rank = |e: &LoginAttemptEntry| match e.lockout_until {
+            Some(until) if until > now => (true, until),
+            _ => (false, e.last_seen),
+        };
+        let mut ranks: Vec<(bool, Instant)> = map.values().map(rank).collect();
+        let (_, cutoff, _) = ranks.select_nth_unstable(need - 1);
+        let cutoff = *cutoff;
+        map.retain(|_, e| rank(e) > cutoff);
+        tracing::warn!(
+            max_entries = self.max_entries,
+            "Login attempt tracker is at capacity; dropped the oldest records"
+        );
     }
 
     /// Drop entries that are neither locked out nor recently active.
@@ -151,7 +254,7 @@ impl LoginAttemptTracker {
         Self::evict_stale(&mut self.attempts.lock(), Instant::now());
     }
 
-    /// Number of tracked IPs (for metrics and tests).
+    /// Number of tracked clients (for metrics and tests).
     pub fn tracked_ips(&self) -> usize {
         self.attempts.lock().len()
     }
@@ -228,24 +331,93 @@ pub fn hash_password(password: &str) -> Result<String, argon2::password_hash::Er
     Ok(hash.to_string())
 }
 
+/// Most Argon2 operations allowed to run at once.
+///
+/// Each one holds the algorithm's working memory (about 19 MiB at the crate
+/// defaults) and a full core for 50-100 ms. Bounded only by the blocking pool,
+/// 512 concurrent logins would pin roughly 10 GiB, and a container memory limit
+/// turns that into an OOM kill that also discards the in-memory event buffer.
+pub const MAX_CONCURRENT_ARGON2: usize = 4;
+
+/// How long a request waits for an Argon2 slot before giving up.
+const ARGON2_QUEUE_WAIT: Duration = Duration::from_secs(10);
+
+static ARGON2_PERMITS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ARGON2)));
+
+/// The server is already running as many password operations as it allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Argon2Busy;
+
+/// Wait up to `wait` for a slot in `permits`.
+async fn acquire_within(
+    permits: &Arc<tokio::sync::Semaphore>,
+    wait: Duration,
+) -> Result<tokio::sync::OwnedSemaphorePermit, Argon2Busy> {
+    tokio::time::timeout(wait, Arc::clone(permits).acquire_owned())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .ok_or(Argon2Busy)
+}
+
+/// Wait (briefly) for an Argon2 slot.
+async fn acquire_argon2_permit() -> Result<tokio::sync::OwnedSemaphorePermit, Argon2Busy> {
+    acquire_within(&ARGON2_PERMITS, ARGON2_QUEUE_WAIT).await
+}
+
 /// Hash a password on the blocking thread pool.
 ///
 /// Argon2 is deliberately CPU-expensive. Running it directly on an async worker
 /// pins that worker for the duration, so a handful of concurrent login attempts
-/// could stall every other request on the server.
+/// could stall every other request on the server. At most
+/// [`MAX_CONCURRENT_ARGON2`] run at once; a request that cannot get a slot in
+/// time fails like any other hashing error.
 ///
 /// # Errors
 ///
-/// Returns an error if hashing fails or the blocking task panics.
+/// Returns an error if hashing fails, the server is saturated, or the blocking
+/// task panics.
 pub async fn hash_password_async(password: String) -> Result<String, argon2::password_hash::Error> {
-    tokio::task::spawn_blocking(move || hash_password(&password))
+    let permit = acquire_argon2_permit()
         .await
-        .unwrap_or(Err(argon2::password_hash::Error::Crypto))
+        .map_err(|Argon2Busy| argon2::password_hash::Error::Crypto)?;
+    tokio::task::spawn_blocking(move || {
+        let hashed = hash_password(&password);
+        drop(permit);
+        hashed
+    })
+    .await
+    .unwrap_or(Err(argon2::password_hash::Error::Crypto))
+}
+
+/// Verify a password on the blocking thread pool, within the Argon2 limit.
+///
+/// The slot is released by the blocking task itself, not by this future: a
+/// client that disconnects drops the future, but the hashing it started still
+/// runs to completion and must keep counting against the limit until it does.
+///
+/// # Errors
+///
+/// Returns [`Argon2Busy`] when no slot became free in time. The password was not
+/// checked, so the caller must not treat it as a wrong guess.
+pub async fn verify_password_limited(password: String, hash: String) -> Result<bool, Argon2Busy> {
+    let permit = acquire_argon2_permit().await?;
+    Ok(tokio::task::spawn_blocking(move || {
+        let ok = verify_password(&password, &hash);
+        drop(permit);
+        ok
+    })
+    .await
+    .unwrap_or(false))
 }
 
 /// Verify a password on the blocking thread pool. See [`hash_password_async`].
+///
+/// A saturated server answers `false`; use [`verify_password_limited`] to tell
+/// that apart from a wrong password.
 pub async fn verify_password_async(password: String, hash: String) -> bool {
-    tokio::task::spawn_blocking(move || verify_password(&password, &hash))
+    verify_password_limited(password, hash)
         .await
         .unwrap_or(false)
 }
@@ -317,6 +489,9 @@ pub struct StoredApiKey {
     pub revoked: bool,
 }
 
+/// Longest session lifetime applied when the configured one overflows `Instant`.
+const MAX_SESSION_TTL: Duration = Duration::from_hours(10 * 365 * 24);
+
 /// Thread-safe session store for dashboard authentication.
 ///
 /// Bounded: every successful login mints a token, and nothing but the periodic
@@ -378,7 +553,9 @@ impl SessionStore {
             token.clone(),
             SessionEntry {
                 username: username.to_string(),
-                expires_at: now + self.ttl,
+                // A TTL too large for `Instant` is "never expires in practice";
+                // adding it unchecked panicked on a config value.
+                expires_at: now.checked_add(self.ttl).unwrap_or(now + MAX_SESSION_TTL),
             },
         );
         token
@@ -757,12 +934,6 @@ pub struct AuthStatusResponse {
     pub authenticated: bool,
 }
 
-/// Response from login/setup containing session info.
-#[derive(Debug, Serialize)]
-struct LoginResponse {
-    token: String,
-}
-
 // --- HTTP Handlers ---
 
 use crate::ingest::handler::AppState;
@@ -805,17 +976,20 @@ fn validate_password(password: &str) -> Result<(), String> {
 }
 
 /// Build the login/setup success response, including the session cookie.
-fn session_response(state: &AppState, token: String) -> Response {
+fn session_response(state: &AppState, token: &str) -> Response {
     let secure = state.secure_cookies
         || state
             .dashboard_origin
             .as_deref()
             .is_some_and(|o| o.starts_with("https://"));
-    let cookie = build_session_cookie(&token, state.sessions.ttl_secs(), secure);
+    let cookie = build_session_cookie(token, state.sessions.ttl_secs(), secure);
+    // The token travels only in the HttpOnly cookie. Repeating it in the body
+    // handed the credential to any script or log that could see the response,
+    // which is exactly what HttpOnly exists to prevent.
     (
         StatusCode::OK,
         [(axum::http::header::SET_COOKIE, cookie)],
-        Json(serde_json::json!(LoginResponse { token })),
+        Json(serde_json::json!({"status": "ok"})),
     )
         .into_response()
 }
@@ -833,14 +1007,19 @@ pub async fn auth_setup(
 ) -> impl IntoResponse {
     let ip = extract_client_ip_from(&state, &headers, peer);
 
-    if !state.login_attempt_tracker.check(&ip) {
+    if !csrf_ok(&state, &headers) {
+        return csrf_refused();
+    }
+
+    // Counted on the way in: a rejected attempt costs the caller one try, and
+    // an attempt that never finishes (the client hung up) still cost one.
+    if state.login_attempt_tracker.begin_attempt(&ip).is_none() {
         return too_many_attempts(&state, &ip);
     }
 
     if let Err(message) = validate_password(&body.password) {
-        // A rejected attempt still counts: setup is unauthenticated, so without
-        // this an attacker could probe it without limit.
-        state.login_attempt_tracker.record_failure(&ip);
+        // Setup is unauthenticated, so without counting rejections an attacker
+        // could probe it without limit.
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": message })),
@@ -851,12 +1030,14 @@ pub async fn auth_setup(
     // Check-then-hash, re-checking after: hashing takes ~50-100 ms and must not
     // hold the lock, but two concurrent setup requests must not both succeed.
     if state.admin_password.is_configured() {
+        state.login_attempt_tracker.refund_attempt(&ip);
         return already_configured();
     }
 
     let hash = match hash_password_async(body.password).await {
         Ok(h) => h,
         Err(e) => {
+            state.login_attempt_tracker.refund_attempt(&ip);
             tracing::error!(error = %e, "Failed to hash password during setup");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -868,7 +1049,10 @@ pub async fn auth_setup(
 
     match state.admin_password.set_if_unset(hash) {
         Ok(true) => {}
-        Ok(false) => return already_configured(),
+        Ok(false) => {
+            state.login_attempt_tracker.refund_attempt(&ip);
+            return already_configured();
+        }
         Err(e) => {
             // Accepting the password without storing it would leave the
             // instance claimable again after the next restart, which is exactly
@@ -888,7 +1072,7 @@ pub async fn auth_setup(
     state.login_attempt_tracker.record_success(&ip);
     tracing::info!("Admin password configured via the setup endpoint");
 
-    session_response(&state, state.sessions.create_session("admin"))
+    session_response(&state, &state.sessions.create_session("admin"))
 }
 
 fn already_configured() -> Response {
@@ -932,6 +1116,11 @@ pub async fn auth_login(
 ) -> impl IntoResponse {
     let ip = extract_client_ip_from(&state, &headers, peer);
 
+    if !csrf_ok(&state, &headers) {
+        return csrf_refused();
+    }
+
+    // Cheap early refusal for a client that is already locked out.
     if !state.login_attempt_tracker.check(&ip) {
         return too_many_attempts(&state, &ip);
     }
@@ -951,27 +1140,75 @@ pub async fn auth_login(
             .into_response();
     };
 
-    if !verify_password_async(body.password, stored_hash).await {
-        let fail_count = state.login_attempt_tracker.record_failure(&ip);
-        state
-            .login_failures_total
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        tracing::warn!(
-            ip_prefix = %anonymize_ip(&ip),
-            fail_count,
-            "Admin login failed: invalid password"
-        );
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Invalid password"})),
-        )
-            .into_response();
+    // The attempt is counted *before* the password is checked. Counting after
+    // let a burst of parallel requests all pass the lockout check before any
+    // failure was recorded, and let a client that disconnected mid-check keep
+    // its guess for free.
+    let Some(attempt) = state.login_attempt_tracker.begin_attempt(&ip) else {
+        return too_many_attempts(&state, &ip);
+    };
+
+    match verify_password_limited(body.password, stored_hash).await {
+        Err(Argon2Busy) => {
+            // The password was never checked, so the client keeps its attempt.
+            state.login_attempt_tracker.refund_attempt(&ip);
+            return busy_response();
+        }
+        Ok(false) => {
+            state
+                .login_failures_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                ip_prefix = %anonymize_ip(&ip),
+                fail_count = attempt,
+                "Admin login failed: invalid password"
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid password"})),
+            )
+                .into_response();
+        }
+        Ok(true) => {}
     }
 
     state.login_attempt_tracker.record_success(&ip);
     tracing::info!(ip_prefix = %anonymize_ip(&ip), "Admin login successful");
 
-    session_response(&state, state.sessions.create_session("admin"))
+    session_response(&state, &state.sessions.create_session("admin"))
+}
+
+/// 503 for a request the server could not run a password check for.
+fn busy_response() -> Response {
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": "Server is busy. Try again shortly."})),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert("retry-after", axum::http::HeaderValue::from_static("1"));
+    response
+}
+
+/// Whether a login, setup or logout request passes the origin check.
+///
+/// These endpoints are not behind [`require_admin_auth`], so the CSRF check
+/// that guards the other state-changing routes has to be applied here too:
+/// a cross-site login request can bind a victim's browser to an attacker's
+/// session. A request with neither `Origin` nor `Referer` (curl, a script) is
+/// still allowed, as everywhere else.
+fn csrf_ok(state: &AppState, headers: &HeaderMap) -> bool {
+    validate_csrf_origin(headers, state.dashboard_origin.as_ref())
+}
+
+fn csrf_refused() -> Response {
+    tracing::warn!("CSRF check failed on an authentication endpoint");
+    (
+        StatusCode::FORBIDDEN,
+        Json(serde_json::json!({"error": "Cross-origin request refused"})),
+    )
+        .into_response()
 }
 
 /// POST /api/auth/logout — Invalidate the current session.
@@ -979,6 +1216,10 @@ pub async fn auth_logout(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    if !csrf_ok(&state, &headers) {
+        return csrf_refused();
+    }
+
     if let Some(token) = extract_session_token(&headers) {
         state.sessions.remove_session(&token);
         tracing::info!("Admin session logged out");
@@ -1001,6 +1242,7 @@ pub async fn auth_logout(
         [(axum::http::header::SET_COOKIE, cookie)],
         Json(serde_json::json!({"status": "logged_out"})),
     )
+        .into_response()
 }
 
 /// GET /api/auth/status — Check authentication state.
@@ -1186,6 +1428,25 @@ fn extract_origin_from_referer(referer: &str) -> Option<&str> {
     Some(&referer[..scheme_len + host_len])
 }
 
+/// Canonical form of an origin for comparison: lower-case, no default port.
+///
+/// Browsers send `Origin` lower-cased and without `:443`/`:80`, so a configured
+/// `https://Dashboard.example.com:443` never matched byte for byte and every
+/// session-authenticated admin call was refused. Scheme and host are
+/// case-insensitive (RFC 3986), and a default port names the same origin.
+fn normalise_origin(origin: &str) -> String {
+    let lowered = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+    lowered
+        .strip_suffix(":443")
+        .filter(|rest| rest.starts_with("https://"))
+        .or_else(|| {
+            lowered
+                .strip_suffix(":80")
+                .filter(|rest| rest.starts_with("http://"))
+        })
+        .map_or_else(|| lowered.clone(), str::to_string)
+}
+
 /// Validate that the request Origin or Referer matches the configured dashboard origin.
 ///
 /// This prevents CSRF attacks on session-authenticated state-changing endpoints.
@@ -1195,9 +1456,11 @@ fn validate_csrf_origin(headers: &HeaderMap, dashboard_origin: Option<&String>) 
         return true; // No restriction configured
     };
 
+    let expected = normalise_origin(expected);
+
     if let Some(origin) = headers.get("origin") {
         if let Ok(origin_str) = origin.to_str() {
-            return origin_str == expected.as_str();
+            return normalise_origin(origin_str) == expected;
         }
         return false;
     }
@@ -1208,7 +1471,7 @@ fn validate_csrf_origin(headers: &HeaderMap, dashboard_origin: Option<&String>) 
             // Using starts_with() would allow "https://example.com.evil.com/…" to bypass
             // a rule for "https://example.com".
             let referer_origin = extract_origin_from_referer(referer_str).unwrap_or("");
-            return referer_origin == expected.as_str();
+            return normalise_origin(referer_origin) == expected;
         }
         return false;
     }
@@ -1807,6 +2070,249 @@ mod tests {
         let tracker = LoginAttemptTracker::new(0, 300);
         // Tracker disabled — remaining is always None
         assert!(tracker.remaining_lockout_secs("10.0.0.9").is_none());
+    }
+
+    #[test]
+    fn test_login_tracker_still_tracks_new_ips_when_full() {
+        // SI-05 regression: with the table full of ordinary one-failure records
+        // the tracker refused to track anyone new, and `check()` allows an
+        // untracked address, so after 10,000 failures from distinct sources
+        // every further source could guess without limit.
+        let tracker = LoginAttemptTracker::with_capacity(3, 300, 4);
+        for i in 0..4 {
+            tracker.record_failure(&format!("198.51.100.{i}"));
+        }
+        for _ in 0..3 {
+            tracker.record_failure("203.0.113.99");
+        }
+        assert!(
+            !tracker.check("203.0.113.99"),
+            "an address that keeps failing must lock out even when the table was full"
+        );
+        assert!(tracker.tracked_ips() <= 4);
+    }
+
+    #[test]
+    fn test_login_lockout_covers_the_whole_ipv6_64() {
+        // SI-04 regression: one /64 is one subscriber. Keyed on the full
+        // address, each guess from a fresh /128 started a new allowance.
+        let tracker = LoginAttemptTracker::new(3, 300);
+        tracker.record_failure("2001:db8:1:2::1");
+        tracker.record_failure("2001:db8:1:2::2");
+        tracker.record_failure("2001:db8:1:2:abcd::3");
+        assert!(!tracker.check("2001:db8:1:2::ffff"));
+        assert!(
+            tracker.check("2001:db8:1:3::1"),
+            "a neighbouring /64 is unaffected"
+        );
+    }
+
+    #[test]
+    fn test_begin_attempt_admits_exactly_the_allowed_number() {
+        let tracker = LoginAttemptTracker::new(3, 300);
+        assert_eq!(tracker.begin_attempt("192.0.2.1"), Some(1));
+        assert_eq!(tracker.begin_attempt("192.0.2.1"), Some(2));
+        assert_eq!(tracker.begin_attempt("192.0.2.1"), Some(3));
+        assert_eq!(
+            tracker.begin_attempt("192.0.2.1"),
+            None,
+            "a fourth guess is refused before any password is checked"
+        );
+        assert_eq!(tracker.begin_attempt("192.0.2.2"), Some(1));
+    }
+
+    #[test]
+    fn test_begin_attempt_is_atomic_under_contention() {
+        // SI-06: with check-then-record, N threads all passed `check` before any
+        // of them recorded. One lock acquisition must decide each.
+        let tracker = LoginAttemptTracker::new(5, 300);
+        let admitted = std::sync::atomic::AtomicU32::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..32 {
+                scope.spawn(|| {
+                    if tracker.begin_attempt("198.51.100.7").is_some() {
+                        admitted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(admitted.load(std::sync::atomic::Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn test_success_after_begin_attempt_clears_the_count_and_lockout() {
+        let tracker = LoginAttemptTracker::new(2, 300);
+        tracker.begin_attempt("192.0.2.9");
+        // The last allowed attempt starts the lockout as it is admitted...
+        assert_eq!(tracker.begin_attempt("192.0.2.9"), Some(2));
+        assert!(!tracker.check("192.0.2.9"));
+        // ...and a correct password on it still clears everything.
+        tracker.record_success("192.0.2.9");
+        assert!(tracker.check("192.0.2.9"));
+        assert_eq!(tracker.begin_attempt("192.0.2.9"), Some(1));
+    }
+
+    #[test]
+    fn test_refund_returns_an_attempt_the_client_never_got_to_use() {
+        let tracker = LoginAttemptTracker::new(2, 300);
+        tracker.begin_attempt("192.0.2.5");
+        assert_eq!(tracker.begin_attempt("192.0.2.5"), Some(2));
+        assert!(!tracker.check("192.0.2.5"), "locked by the second attempt");
+        tracker.refund_attempt("192.0.2.5");
+        assert!(tracker.check("192.0.2.5"), "the refund lifts that lockout");
+        assert_eq!(tracker.begin_attempt("192.0.2.5"), Some(2));
+    }
+
+    #[test]
+    fn test_full_table_keeps_active_lockouts_and_drops_idle_records() {
+        let tracker = LoginAttemptTracker::with_capacity(2, 300, 8);
+        tracker.record_failure("203.0.113.1");
+        tracker.record_failure("203.0.113.1");
+        for i in 0..7 {
+            tracker.record_failure(&format!("198.51.100.{i}"));
+        }
+        // Eight tracked, one of them locked. A newcomer must still be tracked,
+        // at the expense of an un-locked record.
+        tracker.record_failure("192.0.2.200");
+        assert!(
+            !tracker.check("203.0.113.1"),
+            "the lockout survives pressure"
+        );
+        assert!(tracker.attempts.lock().contains_key("192.0.2.200"));
+        assert!(tracker.tracked_ips() <= 8);
+    }
+
+    #[test]
+    fn test_table_pressure_is_relieved_in_batches() {
+        let tracker = LoginAttemptTracker::with_capacity(5, 300, 80);
+        for i in 0..80 {
+            tracker.record_failure(&format!("10.0.{}.{}", i / 250, i % 250));
+        }
+        tracker.record_failure("192.0.2.1");
+        assert!(
+            tracker.tracked_ips() <= 80 - 10 + 1,
+            "an eighth of the table was freed, not one slot ({} left)",
+            tracker.tracked_ips()
+        );
+    }
+
+    #[test]
+    fn test_enormous_lockout_does_not_panic() {
+        // SI-20: `Instant::now() + Duration::from_secs(u64::MAX)` panics, and
+        // `record_failure` runs this on the fifth failed login from the network.
+        let tracker = LoginAttemptTracker::new(1, u64::MAX);
+        tracker.record_failure("192.0.2.77");
+        assert!(!tracker.check("192.0.2.77"));
+        assert!(tracker.remaining_lockout_secs("192.0.2.77").is_some());
+    }
+
+    #[test]
+    fn test_enormous_session_ttl_does_not_panic() {
+        let sessions = SessionStore::new(u64::MAX);
+        let token = sessions.create_session("admin");
+        assert!(sessions.validate_session(&token).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_argon2_slots_are_bounded() {
+        // SI-06: with no cap, 512 concurrent logins held ~10 GiB of Argon2
+        // memory. A caller that cannot get a slot in time is turned away.
+        let permits = Arc::new(tokio::sync::Semaphore::new(2));
+        let a = acquire_within(&permits, Duration::from_millis(50))
+            .await
+            .unwrap();
+        let b = acquire_within(&permits, Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert_eq!(
+            acquire_within(&permits, Duration::from_millis(50))
+                .await
+                .unwrap_err(),
+            Argon2Busy
+        );
+        drop(a);
+        assert!(
+            acquire_within(&permits, Duration::from_millis(50))
+                .await
+                .is_ok()
+        );
+        drop(b);
+    }
+
+    #[tokio::test]
+    async fn test_verify_password_limited_checks_the_password() {
+        let hash = hash_password("a-correct-password").unwrap();
+        assert_eq!(
+            verify_password_limited("a-correct-password".into(), hash.clone()).await,
+            Ok(true)
+        );
+        assert_eq!(
+            verify_password_limited("a-wrong-password".into(), hash).await,
+            Ok(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_login_abandoned_mid_flight_still_costs_an_attempt() {
+        // SI-06 path C: the guess is counted when it is admitted, so hanging up
+        // before the answer arrives cannot make it free. Every Argon2 slot is
+        // held so the request is certainly still in flight when it is dropped.
+        let state = crate::test_support::state_builder()
+            .admin_password("correct-horse-battery")
+            .login_limits(1, 300)
+            .build_state();
+        let held = ARGON2_PERMITS
+            .clone()
+            .acquire_many_owned(u32::try_from(MAX_CONCURRENT_ARGON2).unwrap())
+            .await
+            .unwrap();
+
+        let attempt = auth_login(
+            State(Arc::clone(&state)),
+            crate::ingest::handler::PeerAddr(None),
+            HeaderMap::new(),
+            Json(PasswordRequest {
+                password: "a guess".to_string(),
+            }),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), attempt)
+                .await
+                .is_err(),
+            "the request must still be waiting for a slot"
+        );
+        drop(held);
+
+        assert!(
+            !state.login_attempt_tracker.check("unknown"),
+            "the abandoned guess used up the only attempt"
+        );
+    }
+
+    #[test]
+    fn test_origin_comparison_ignores_case_and_default_ports() {
+        let expected = "https://Dashboard.Example.com:443".to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert("origin", "https://dashboard.example.com".parse().unwrap());
+        assert!(validate_csrf_origin(&headers, Some(&expected)));
+        headers.insert(
+            "origin",
+            "https://dashboard.example.com.evil.com".parse().unwrap(),
+        );
+        assert!(!validate_csrf_origin(&headers, Some(&expected)));
+        headers.insert("origin", "http://dashboard.example.com".parse().unwrap());
+        assert!(
+            !validate_csrf_origin(&headers, Some(&expected)),
+            "scheme matters"
+        );
+        headers.insert(
+            "origin",
+            "https://dashboard.example.com:8443".parse().unwrap(),
+        );
+        assert!(
+            !validate_csrf_origin(&headers, Some(&expected)),
+            "port matters"
+        );
     }
 
     // CSRF validation tests

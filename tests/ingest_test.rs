@@ -1553,6 +1553,45 @@ async fn test_login_lockout_after_repeated_failures() {
     assert!(locked.headers().contains_key("retry-after"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_login_guesses_cannot_exceed_the_attempt_limit() {
+    // SI-06 regression: attempts were counted after verification, so a burst of
+    // parallel requests all passed the lockout check before any failure was
+    // recorded, and every one of them got its own password guess.
+    let (state, _dir) = state_builder()
+        .admin_password("correct-horse-battery")
+        .login_limits(3, 300)
+        .build();
+
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..12 {
+        let state = Arc::clone(&state);
+        set.spawn(async move {
+            post_json(
+                &state,
+                "/api/auth/login",
+                serde_json::json!({"password": "wrong"}),
+            )
+            .await
+            .status()
+        });
+    }
+    let mut verified = 0;
+    let mut refused = 0;
+    while let Some(status) = set.join_next().await {
+        match status.unwrap() {
+            StatusCode::UNAUTHORIZED => verified += 1,
+            StatusCode::TOO_MANY_REQUESTS => refused += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(
+        verified, 3,
+        "exactly the allowed number of guesses is checked"
+    );
+    assert_eq!(refused, 9);
+}
+
 #[tokio::test]
 async fn test_setup_is_rate_limited_too() {
     // Setup is unauthenticated; without a limit it could be probed freely
@@ -1573,6 +1612,135 @@ async fn test_setup_is_rate_limited_too() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_login_body_does_not_repeat_the_session_token() {
+    // SI-23: the token is a bearer-equivalent credential. It belongs in the
+    // HttpOnly cookie only; echoing it in the body defeats HttpOnly.
+    let (state, _dir) = state_builder()
+        .admin_password("correct-horse-battery")
+        .build();
+    let response = post_json(
+        &state,
+        "/api/auth/login",
+        serde_json::json!({"password": "correct-horse-battery"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = session_cookie(&response).expect("a session cookie is set");
+    let body = body_text(response).await;
+    assert!(
+        !body.contains(&cookie),
+        "the token must not appear in the body: {body}"
+    );
+    assert!(!body.contains("token"));
+}
+
+async fn post_json_from(
+    state: &Arc<AppState>,
+    uri: &str,
+    payload: serde_json::Value,
+    peer: &str,
+    origin: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(origin) = origin {
+        builder = builder.header("origin", origin);
+    }
+    let mut request = builder.body(Body::from(payload.to_string())).unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        peer.parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    send(state, request).await
+}
+
+#[tokio::test]
+async fn test_login_lockout_cannot_be_dodged_by_rotating_ipv6_addresses() {
+    // SI-04 end to end: every guess comes from a different /128 of one /64.
+    let (state, _dir) = state_builder()
+        .admin_password("correct-horse-battery")
+        .login_limits(3, 300)
+        .build();
+    for i in 1..=3 {
+        let response = post_json_from(
+            &state,
+            "/api/auth/login",
+            serde_json::json!({"password": "wrong"}),
+            &format!("[2001:db8:7:7::{i}]:4000"),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let fourth = post_json_from(
+        &state,
+        "/api/auth/login",
+        serde_json::json!({"password": "correct-horse-battery"}),
+        "[2001:db8:7:7:aaaa::9]:4000",
+        None,
+    )
+    .await;
+    assert_eq!(fourth.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let neighbour = post_json_from(
+        &state,
+        "/api/auth/login",
+        serde_json::json!({"password": "correct-horse-battery"}),
+        "[2001:db8:7:8::1]:4000",
+        None,
+    )
+    .await;
+    assert_eq!(
+        neighbour.status(),
+        StatusCode::OK,
+        "another /64 is another client"
+    );
+}
+
+#[tokio::test]
+async fn test_auth_endpoints_refuse_a_foreign_origin() {
+    // SI-29: login, setup and logout were outside the CSRF check that guards
+    // the other state-changing routes.
+    let (state, _dir) = state_builder()
+        .admin_password("correct-horse-battery")
+        .dashboard_origin(Some("https://stats.example.com".to_string()))
+        .build();
+    let body = serde_json::json!({"password": "correct-horse-battery"});
+
+    let foreign = post_json_from(
+        &state,
+        "/api/auth/login",
+        body.clone(),
+        "203.0.113.5:1",
+        Some("https://evil.example"),
+    )
+    .await;
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+    assert!(session_cookie(&foreign).is_none());
+
+    let logout = post_json_from(
+        &state,
+        "/api/auth/logout",
+        serde_json::json!({}),
+        "203.0.113.5:1",
+        Some("https://evil.example"),
+    )
+    .await;
+    assert_eq!(logout.status(), StatusCode::FORBIDDEN);
+
+    let own = post_json_from(
+        &state,
+        "/api/auth/login",
+        body,
+        "203.0.113.5:1",
+        Some("https://stats.example.com"),
+    )
+    .await;
+    assert_eq!(own.status(), StatusCode::OK);
 }
 
 // ── API keys ─────────────────────────────────────────────────────────────
