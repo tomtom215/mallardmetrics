@@ -41,9 +41,17 @@ rate_limit_per_ip = 0          # MALLARD_RATE_LIMIT_PER_IP
 # Trust X-Forwarded-For / X-Real-IP for the client address.
 #
 # Leave false unless EVERY request reaches this server through a reverse proxy
-# that overwrites those headers (the bundled Caddy config does). On a directly
-# reachable server they are attacker-controlled: trusting them lets a client
-# choose its own visitor ID, geolocation and rate-limit bucket.
+# that OVERWRITES those headers with the address it accepted the connection
+# from (the bundled Caddy config does, and deploy/docker-compose.production.yml
+# turns this on). On a directly reachable server they are attacker-controlled:
+# trusting them lets a client choose its own visitor ID, geolocation,
+# rate-limit bucket and login-lockout key. A proxy that APPENDS to a
+# client-supplied X-Forwarded-For (nginx's $proxy_add_x_forwarded_for) is not
+# safe with this on; set the header to $remote_addr instead.
+#
+# Behind exactly one proxy, also set MALLARD_TRUSTED_PROXY_HOPS=1 (the number of
+# trusted proxies in front of Mallard) in builds that support it; the address is
+# then taken from that many entries from the right of X-Forwarded-For.
 #
 # When false, the peer socket address is used.
 trust_proxy_headers = false    # MALLARD_TRUST_PROXY_HEADERS
@@ -165,12 +173,16 @@ geoip_precision = "city"       # MALLARD_GEOIP_PRECISION
 # Where DuckDB installs and loads community extensions from.
 # Default: data_dir/extensions.
 #
-# DuckDB's own default is $HOME/.duckdb/extensions, which does not exist in the
-# shipped container: the FROM scratch image sets no HOME, and the production
-# compose file runs with a read-only root filesystem. Keeping this on the data
-# volume is what makes `INSTALL behavioral FROM community` succeed there — and
+# DuckDB's own default is $HOME/.duckdb/extensions, which is not writable in the
+# shipped container: its root filesystem is read-only (the compose files set
+# read_only: true) and the non-root user's home is not on the data volume. The
+# image therefore sets HOME and this variable to /data, the one writable path.
+# That is what makes `INSTALL behavioral FROM community` succeed there — and
 # therefore what makes funnels, retention, sessions, sequences and flow answer
 # with data rather than 503.
+#
+# The extension exists only for glibc platforms (linux_amd64, linux_arm64,
+# osx_amd64, osx_arm64). A musl/Alpine build cannot install it at all.
 # extension_directory = "/data/extensions"   # MALLARD_EXTENSION_DIR
 
 # Cap on the memory a DuckDB query may use, e.g. "512MB" or "2GB".

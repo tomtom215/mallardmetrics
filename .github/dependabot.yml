@@ -14,7 +14,23 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "deps"
+    # Wait a few days after a release before proposing it: most compromised or
+    # yanked crate versions are caught within that window. Security updates
+    # ignore the cooldown.
+    cooldown:
+      default-days: 5
     groups:
+      # DuckDB is first so it is never folded into the routine group (a
+      # dependency joins the first group it matches). The crate version is the
+      # bundled DuckDB version, which decides which build of the `behavioral`
+      # extension a fresh install downloads, and a new DuckDB can change query
+      # results. Review that PR with MALLARD_REQUIRE_BEHAVIORAL=1 and the smoke
+      # test, never as a drive-by.
+      duckdb:
+        applies-to: version-updates
+        patterns:
+          - "duckdb"
+          - "libduckdb-sys"
       rust-patch-and-minor:
         applies-to: version-updates
         update-types:
@@ -33,11 +49,16 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: "ci"
+    cooldown:
+      default-days: 5
     groups:
       github-actions:
         patterns:
           - "*"
 
+  # The builder image (rust:<MSRV>-bookworm) and the distroless runtime. Bumping
+  # the Rust tag must be matched by rust-toolchain.toml, Cargo.toml's
+  # rust-version and the workflows; CI's static-checks job fails until they agree.
   - package-ecosystem: docker
     directory: "/"
     schedule:
@@ -45,3 +66,21 @@ updates:
       day: monday
     commit-message:
       prefix: "docker"
+    groups:
+      docker-base-images:
+        patterns:
+          - "*"
+
+  # deploy/Dockerfile.caddy (Caddy builder and runtime) and deploy/Dockerfile.release
+  # (alpine skeleton stage and the distroless runtime).
+  - package-ecosystem: docker
+    directory: "/deploy"
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "docker"
+    groups:
+      deploy-base-images:
+        patterns:
+          - "*"

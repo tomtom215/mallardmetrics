@@ -10,6 +10,18 @@
 #
 # Usage:  scripts/smoke-test.sh [path-to-binary]
 # Exit:   0 when every check passes, 1 otherwise.
+#
+# Environment:
+#   MALLARD_REQUIRE_BEHAVIORAL=1  Fail unless the DuckDB `behavioral` extension
+#                                 is loaded and reports a version, and the five
+#                                 behavioral endpoints answer 200. Without it
+#                                 they may answer 503 (an offline machine is a
+#                                 legitimate way to run this script). CI sets it:
+#                                 a binary that cannot install the extension is
+#                                 a broken release, not a skipped test (musl
+#                                 builds cannot, because the community
+#                                 repository has no linux_*_musl build).
+#   MALLARD_SMOKE_PORT            Port to listen on (default 18321).
 
 set -uo pipefail
 
@@ -29,6 +41,7 @@ SITE="smoke.test"
 UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 curl() { command curl -A "$UA" "$@"; }
 
+# shellcheck disable=SC2329  # invoked through the EXIT trap
 cleanup() {
   [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null
   rm -rf "$WORK"
@@ -77,6 +90,10 @@ absent() { # name unwanted-extended-regex actual
 }
 code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 
+# 200 when the extension is required, otherwise 503 (not installed) is also fine.
+REQUIRE_BEHAVIORAL="${MALLARD_REQUIRE_BEHAVIORAL:-0}"
+if [ "$REQUIRE_BEHAVIORAL" = "1" ]; then BEHAVIORAL_OK='^200$'; else BEHAVIORAL_OK='^(200|503)$'; fi
+
 # ── Service surface ───────────────────────────────────────────────────────
 check health          'ok'                          "$(curl -sS "$BASE/health")"
 check ready           'ready|ok'                    "$(curl -sS "$BASE/health/ready")"
@@ -90,6 +107,16 @@ check dashboard       '<div id="app">'              "$(curl -sS "$BASE/")"
 check robots          'User-agent'                  "$(curl -sS "$BASE/robots.txt")"
 check security_txt    'Contact'                     "$(curl -sS "$BASE/.well-known/security.txt")"
 check security_header 'nosniff'                     "$(curl -sSI "$BASE/health")"
+
+# ── The behavioral extension ──────────────────────────────────────────────
+# The in-process tests load it from a normal home directory on glibc; only the
+# assembled binary shows whether it can install where it is actually deployed.
+if [ "$REQUIRE_BEHAVIORAL" = "1" ]; then
+  DETAILED="$(curl -sS "$BASE/health/detailed")"
+  check behavioral_loaded  '"behavioral_extension_loaded":true' "$DETAILED"
+  check behavioral_version  '"behavioral_version":"[0-9]+\.[0-9]+' "$DETAILED"
+  check behavioral_metric  'mallard_behavioral_extension 1'     "$(curl -sS "$BASE/metrics")"
+fi
 
 # ── Admin routes must be shut before setup ────────────────────────────────
 # A key minted here would keep working after the operator sets a password.
@@ -173,7 +200,8 @@ check filter_injection  '200' \
   "$(code "$BASE/api/stats/main?$Q&filters=pages%3D%3D%27%20OR%201%3D1%20--")"
 
 # ── Behavioral endpoints ──────────────────────────────────────────────────
-# They answer 503 without the extension, which is correct rather than a failure.
+# They answer 503 without the extension, which is correct rather than a failure
+# unless MALLARD_REQUIRE_BEHAVIORAL=1, where anything but 200 is one.
 for name in sessions funnel retention sequences flow; do
   case $name in
     sessions)  uri="$BASE/api/stats/sessions?$Q" ;;
@@ -182,7 +210,7 @@ for name in sessions funnel retention sequences flow; do
     sequences) uri="$BASE/api/stats/sequences?$Q&steps=page%3A%2F%2Cpage%3A%2Fpricing" ;;
     flow)      uri="$BASE/api/stats/flow?$Q&page=%2F" ;;
   esac
-  check "$name" '200|503' "$(code "$uri")"
+  check "$name" "$BEHAVIORAL_OK" "$(code "$uri")"
 done
 
 # ── Setup opens the admin surface ─────────────────────────────────────────

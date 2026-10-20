@@ -2,7 +2,7 @@
 # Mallard Metrics — Caddyfile
 # =============================================================================
 #
-# Environment variables (injected by Docker Compose from .env):
+# Environment variables (injected by Docker Compose from deploy/.env):
 #   DOMAIN                — analytics.example.com (or apex: example.com)
 #   ACME_EMAIL            — Let's Encrypt registration email
 #   CLOUDFLARE_API_TOKEN  — Cloudflare API token with Zone:DNS:Edit permission
@@ -10,98 +10,159 @@
 # Caddy automatically obtains and renews a TLS certificate via the ACME DNS-01
 # challenge. DNS-01 does not require inbound port 80 and supports wildcard certs.
 # The Cloudflare token only needs permissions on the zone that DOMAIN belongs to.
+#
+# PRIVACY: this file never writes a visitor's IP address, User-Agent, cookies or
+# query string to any log. Caddy's JSON log encodes all of them by default
+# (`request.remote_ip`, `request.headers`, `request.uri`), which would contradict
+# the claim that visitor IPs are used only transiently for hashing. The
+# `privacy_log_format` snippet below deletes them from every logger. Do not
+# remove it without updating PRIVACY.md and SECURITY.md.
 # =============================================================================
+
+# ── Log format shared by every logger (reusable) ──────────────────────────────
+# Keeps method, host, path (without query), status, size and duration — enough
+# to debug a deployment. Removes everything that identifies a visitor. The
+# whole query string is replaced: the tracker's pixel fallback carries page URLs
+# and referrers in it (`u=`, `r=`), and those can contain personal data.
+(privacy_log_format) {
+	format filter {
+		wrap json
+		fields {
+			request>remote_ip delete
+			request>remote_port delete
+			request>client_ip delete
+			request>headers delete
+			request>tls delete
+			request>uri regexp \?.* ?[redacted]
+			user_id delete
+			resp_headers delete
+		}
+	}
+}
 
 # ── Global options ────────────────────────────────────────────────────────────
 {
-    # Let's Encrypt registration email (required for cert issuance)
-    email {$ACME_EMAIL}
+	# Let's Encrypt registration email (required for cert issuance)
+	email {$ACME_EMAIL}
 
-    # DNS-01 challenge via Cloudflare — works behind NAT, no port 80 needed
-    acme_dns cloudflare {$CLOUDFLARE_API_TOKEN}
+	# DNS-01 challenge via Cloudflare — works behind NAT, no port 80 needed
+	acme_dns cloudflare {$CLOUDFLARE_API_TOKEN}
 
-    # Uncomment to use Let's Encrypt STAGING during initial setup/testing.
-    # Rate limits are much higher on staging; switch to production once working.
-    # acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+	# Uncomment to use Let's Encrypt STAGING during initial setup/testing.
+	# Rate limits are much higher on staging; switch to production once working.
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
 
-    # OCSP stapling — reduces handshake latency
-    ocsp_stapling on
+	# Admin API disabled (not needed in production container)
+	admin off
 
-    # Admin API disabled (not needed in production container)
-    admin off
+	# Serve HTTP/3 (QUIC) in addition to HTTP/1.1 and HTTP/2
+	servers {
+		protocols h1 h2 h3
+	}
 
-    # Serve HTTP/3 (QUIC) in addition to HTTP/1.1 and HTTP/2
-    servers {
-        protocols h1 h2 h3
-    }
+	# Runtime and error log (reverse-proxy failures, certificate renewals). Its
+	# default encoding includes the failing request, remote IP and headers, so
+	# it gets the same scrubbing as the access log. Goes to stderr, where the
+	# container's log driver rotates it by size (see the compose file).
+	log {
+		output stderr
+		import privacy_log_format
+		level WARN
+	}
 }
 
 # ── Security header snippet (reusable) ────────────────────────────────────────
 (security_headers) {
-    header {
-        # Strip upstream server identity
-        -Server
-        -X-Powered-By
+	header {
+		# Strip upstream server identity
+		-Server
+		-X-Powered-By
 
-        # HSTS: 1 year, include subdomains, eligible for preload list
-        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		# HSTS: 1 year. includeSubDomains and preload are deliberately NOT set:
+		# they bind every sibling subdomain of the apex, which is not this
+		# deployment's decision to make. Add them yourself if you own the zone.
+		Strict-Transport-Security "max-age=31536000"
 
-        # These are also set by Mallard; enforcing here at the proxy layer
-        # provides defence-in-depth if the backend ever changes.
-        X-Content-Type-Options    nosniff
-        X-Frame-Options           DENY
-        Referrer-Policy           strict-origin-when-cross-origin
-        Permissions-Policy        "geolocation=(), microphone=(), camera=(), interest-cohort=()"
+		# These are also set by Mallard; enforcing here at the proxy layer
+		# provides defence-in-depth if the backend ever changes.
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy strict-origin-when-cross-origin
+		Permissions-Policy "geolocation=(), microphone=(), camera=(), interest-cohort=()"
 
-        # Only allow scripts/styles/images from self (and inline — needed by Preact HTM)
-        # Adjust if you embed Mallard in an iframe from another domain.
-        Content-Security-Policy   "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';"
-    }
+		# Only allow scripts/styles/images from self (and inline — needed by Preact HTM)
+		# Adjust if you embed Mallard in an iframe from another domain.
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';"
+	}
+}
+
+# ── Container health endpoint ─────────────────────────────────────────────────
+# Caddy has no health endpoint of its own and the admin API is off, so the
+# compose healthcheck probes this loopback-only listener. It proves the HTTP
+# server is up and serving the loaded configuration; it is not reachable from
+# any network.
+http://127.0.0.1:8081 {
+	bind 127.0.0.1
+	respond /healthz 200
+	respond 404
 }
 
 # ── Main site ─────────────────────────────────────────────────────────────────
 {$DOMAIN} {
-    import security_headers
+	import security_headers
 
-    # ── Reverse proxy to Mallard Metrics ──
-    reverse_proxy mallard:8000 {
-        # Active upstream health check — Caddy marks mallard down if this fails.
-        health_uri     /health/ready
-        health_interval 30s
-        health_timeout  5s
-        health_status   200
+	# ── Reverse proxy to Mallard Metrics ──
+	reverse_proxy mallard:8000 {
+		# Active upstream health check — Caddy marks mallard down if this fails.
+		health_uri /health/ready
+		health_interval 30s
+		health_timeout 5s
+		health_status 200
 
-        # Forward real client IP so Mallard's rate limiter and IP anonymisation
-        # work on the actual visitor address, not the Caddy container IP.
-        header_up X-Real-IP        {remote_host}
-        header_up X-Forwarded-For  {remote_host}
-        header_up X-Forwarded-Proto {scheme}
-        header_up X-Forwarded-Host  {host}
+		# Forward the real client address.
+		#
+		# X-Forwarded-For is set by reverse_proxy itself: with no
+		# `trusted_proxies` configured, Caddy discards whatever a client sent
+		# and passes exactly one entry, the address of the connection it
+		# accepted (checked against Caddy 2.9.1 with a spoofed header). Do NOT
+		# add `trusted_proxies` here unless a CDN really sits in front, or
+		# clients regain control of the header. X-Real-IP is set the same way.
+		#
+		# Mallard must be started with MALLARD_TRUST_PROXY_HEADERS=true and
+		# MALLARD_TRUSTED_PROXY_HOPS=1 (the production compose file does) or it
+		# ignores these headers and sees only Caddy's container address.
+		#
+		# If a CDN such as Cloudflare's orange-cloud proxy sits in front of
+		# Caddy, {remote_host} is the CDN's address; use the CDN's own header
+		# instead (e.g. `header_up X-Forwarded-For {header.CF-Connecting-IP}`)
+		# and restrict the firewall to the CDN's published ranges.
+		header_up X-Real-IP {remote_host}
 
-        # Remove hop-by-hop headers
-        header_up -X-Forwarded-Port
+		# Remove hop-by-hop headers
+		header_up -X-Forwarded-Port
 
-        # Transport hardening
-        transport http {
-            # Keep-alive to backend (avoids TCP handshake per request)
-            keepalive 30s
-            # Cap individual request timeout to match Mallard's 30s limit
-            dial_timeout 5s
-            response_header_timeout 35s
-        }
-    }
+		# Transport hardening
+		transport http {
+			# Keep-alive to backend (avoids TCP handshake per request)
+			keepalive 30s
+			# Cap individual request timeout to match Mallard's 30s limit
+			dial_timeout 5s
+			response_header_timeout 35s
+		}
+	}
 
-    # ── Access logging ─────────────────────────────────────────────────────
-    log {
-        output file /logs/caddy-access.log {
-            roll_size    50MiB
-            roll_keep    7
-            roll_keep_for 336h   # 14 days
-        }
-        format json
-        level  INFO
-
-        # Suppress noisy health-check log noise
-        except path /health/*
-    }
+	# ── Access log ─────────────────────────────────────────────────────────
+	# To stdout, scrubbed by privacy_log_format (no IP, User-Agent, cookie or
+	# query string). Docker's json-file driver rotates it by size
+	# (docker-compose.production.yml), so there is no log file to retain, no
+	# volume to clean up and no time-based retention to forget.
+	#
+	# Delete this block to log no requests at all. To debug a specific problem
+	# with full detail, run `caddy` with `--debug` temporarily instead of
+	# editing this file, and remove the output afterwards.
+	log {
+		output stdout
+		import privacy_log_format
+		level INFO
+	}
 }

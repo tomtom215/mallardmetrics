@@ -2,17 +2,22 @@
 target/
 docs/book/
 
-# Version control
+# Version control, CI and deployment files (none are needed to compile)
 .git/
 .github/
+deploy/
+.devcontainer/
 
 # Runtime data and secrets
 data/
 *.parquet
 *.duckdb
 *.duckdb.wal
+admin.json
+api_keys.json
 .secret
 .env
+**/.env
 *.mmdb
 lcov.info
 
@@ -32,3 +37,7 @@ Thumbs.db
 *.bak
 *.orig
 *.log
+
+# The Dockerfile pins the toolchain through the builder image's tag. Leaving
+# rust-toolchain.toml out stops rustup from downloading the musl target it lists.
+rust-toolchain.toml

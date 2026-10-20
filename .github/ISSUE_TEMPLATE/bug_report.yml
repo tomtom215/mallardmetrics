@@ -66,14 +66,25 @@ body:
     attributes:
       label: Rust version (if building from source)
       description: Output of `rustc --version`
-      placeholder: "rustc 1.94.1 (e408947bf 2026-03-25)"
+      placeholder: "rustc 1.98.0 (…)"
+
+  - type: input
+    id: behavioral
+    attributes:
+      label: Behavioral extension version (funnels, retention, sessions, flow)
+      description: >-
+        The `behavioral_version` field of `GET /health/detailed`. `null` means the
+        extension is not loaded, which is itself worth reporting with your platform
+        (the extension is not published for musl/Alpine).
+      placeholder: "0.10.0"
 
   - type: dropdown
     id: deployment
     attributes:
       label: Deployment method
       options:
-        - Docker (`FROM scratch` image)
+        - Docker (published GHCR image)
+        - Docker (built from the repository Dockerfile)
         - Docker Compose
         - Binary from source (`cargo build --release`)
         - VPS via deploy/setup.sh

@@ -1,0 +1,54 @@
+# Dependency vulnerability audit (RustSec advisories via cargo-deny).
+#
+# Why a separate workflow: advisories are published on the RustSec schedule, not
+# ours. Checking them inside ci.yml means a new advisory for a dependency we
+# cannot fix yet (RUSTSEC-2026-0285 against rustls, reached through DuckDB's
+# build script) turns every unrelated pull request red, which teaches people to
+# ignore red. Here it:
+#   * runs weekly, so a new advisory surfaces within days even when nobody is
+#     pushing code (a failed scheduled run notifies the repository admins);
+#   * runs on any pull request or push that changes the dependency graph or the
+#     policy, where a new vulnerable dependency must block the merge;
+#   * can be run by hand.
+# Licences, bans and sources are still checked on every push by ci.yml (policy).
+#
+# cargo-deny is installed at an explicit version: releases before 0.19 fail to
+# parse the CVSS 4.0 vectors that the RustSec database now contains, so the
+# version the pinned cargo-deny-action happens to bundle is not under our control.
+
+name: Security
+
+on:
+  schedule:
+    - cron: "41 5 * * 1"   # Mondays 05:41 UTC
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/security.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/security.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: RustSec advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+        with:
+          tool: cargo-deny@0.19.4
+      - name: cargo deny check advisories
+        run: cargo deny --all-features check advisories
