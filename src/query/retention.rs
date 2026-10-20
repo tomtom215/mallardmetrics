@@ -1,4 +1,5 @@
 use super::QueryScope;
+use chrono::{Days, NaiveDate, NaiveDateTime};
 use duckdb::Connection;
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +22,21 @@ pub struct RetentionCohort {
     pub retained: Vec<u64>,
     /// `retained[i] / cohort_size`, 0.0–1.0.
     pub retention_rates: Vec<f64>,
+    /// How many leading weeks of `retained` are fully observed.
+    ///
+    /// Week `i` is complete when it ended on or before the earlier of the
+    /// report's end and the moment the query ran. Weeks from `complete_weeks`
+    /// onwards are either in the future or only partly elapsed, so a low count
+    /// there means "not yet", not "did not return". Without this a cohort from
+    /// last week showed 0% retention for the weeks that had not happened.
+    #[serde(default)]
+    pub complete_weeks: u32,
+    /// Whether the cohort's first week began before the report's start date.
+    ///
+    /// Visitors first seen earlier in that week are not in the report, so the
+    /// cohort is smaller than the week's true new-visitor count.
+    #[serde(default)]
+    pub partial_first_week: bool,
 }
 
 /// Whether the configured visitor-ID rotation can support `weeks` of cohorts.
@@ -42,6 +58,15 @@ pub const fn rotation_supports_weeks(rotation_days: u32, weeks: u32) -> bool {
 /// returned that week. That is a "did anybody come back" flag, not retention,
 /// and for any active site it was `true` almost everywhere.
 ///
+/// `lookback_days` is how far before the report's start a visitor ID can have
+/// been seen: the configured `visitor_salt_rotation_days`. A `visitor_id` is an
+/// HMAC over a salt that rotates, so one ID cannot span more than that many
+/// days, and "first seen on or after the start" can be decided by reading only
+/// `[start - lookback_days, end)` instead of the site's whole history. If the
+/// operator *shortens* the rotation later, IDs minted under the old, longer
+/// period can be older than the lookback and are counted as new in the first
+/// report that no longer reaches back far enough.
+///
 /// # Errors
 ///
 /// Returns an error if the query fails, e.g. when the behavioral extension is
@@ -50,6 +75,29 @@ pub fn query_retention(
     conn: &Connection,
     scope: &QueryScope,
     weeks: u32,
+    lookback_days: u32,
+) -> Result<Vec<RetentionCohort>, duckdb::Error> {
+    query_retention_at(
+        conn,
+        scope,
+        weeks,
+        lookback_days,
+        chrono::Utc::now().naive_utc(),
+    )
+}
+
+/// [`query_retention`] with the current instant supplied, so which weeks are
+/// complete can be tested exactly (LESSONS L23).
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn query_retention_at(
+    conn: &Connection,
+    scope: &QueryScope,
+    weeks: u32,
+    lookback_days: u32,
+    now: NaiveDateTime,
 ) -> Result<Vec<RetentionCohort>, duckdb::Error> {
     if !(MIN_PERIODS..=MAX_PERIODS).contains(&weeks) {
         return Ok(Vec::new());
@@ -59,11 +107,18 @@ pub fn query_retention(
     let mut stmt = conn.prepare(&sql)?;
     let weeks_usize = weeks as usize;
 
-    // Bind order follows the statement text: the cohort CTE takes site and end,
-    // then its filters, then start for the HAVING; the event scan takes site,
-    // start, end and its filters. Filters apply to both halves, so a segmented
-    // report defines its cohorts from the same subset it measures.
-    let mut bound: Vec<&str> = vec![&scope.site_id, &scope.end];
+    // `first_seen` reads from `start - lookback_days`; an unparsable start
+    // falls back to the whole history, which is slower but never wrong.
+    let scan_from = parse_bound(&scope.start)
+        .and_then(|t| t.checked_sub_days(Days::new(u64::from(lookback_days.max(1)))))
+        .map_or_else(|| "-infinity".to_string(), |t| t.to_string());
+
+    // Bind order follows the statement text: the cohort CTE takes site, scan
+    // lower bound and end, then its filters, then start for the HAVING; the
+    // event scan takes site, start, end and its filters. Filters apply to both
+    // halves, so a segmented report defines its cohorts from the same subset it
+    // measures.
+    let mut bound: Vec<&str> = vec![&scope.site_id, &scan_from, &scope.end];
     bound.extend(scope.filter_params());
     bound.push(&scope.start);
     bound.push(&scope.site_id);
@@ -71,7 +126,10 @@ pub fn query_retention(
     bound.push(&scope.end);
     bound.extend(scope.filter_params());
 
-    let rows = stmt
+    let observed_until = parse_bound(&scope.end).map_or(now, |end| end.min(now));
+    let window_start = parse_bound(&scope.start);
+
+    let raw = stmt
         .query_map(duckdb::params_from_iter(bound), |row| {
             let cohort_date: String = row.get(0)?;
             let mut retained = Vec::with_capacity(weeks_usize);
@@ -80,7 +138,9 @@ pub fn query_retention(
             }
             Ok((cohort_date, retained))
         })?
-        .collect::<Result<Vec<_>, _>>()?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(raw
         .into_iter()
         .map(|(cohort_date, retained)| {
             let cohort_size = retained.first().copied().unwrap_or(0);
@@ -95,16 +155,43 @@ pub fn query_retention(
                     }
                 })
                 .collect();
+            let week_start = NaiveDate::parse_from_str(&cohort_date, "%Y-%m-%d")
+                .ok()
+                .and_then(|d| d.and_hms_opt(0, 0, 0));
             RetentionCohort {
+                complete_weeks: week_start
+                    .map_or(0, |ws| complete_weeks(ws, weeks, observed_until)),
+                partial_first_week: week_start
+                    .zip(window_start)
+                    .is_some_and(|(ws, start)| ws < start),
                 cohort_date,
                 cohort_size,
                 retained,
                 retention_rates,
             }
         })
-        .collect();
+        .collect())
+}
 
-    Ok(rows)
+/// A date (`YYYY-MM-DD`) or timestamp (`YYYY-MM-DD HH:MM:SS`) as a timestamp.
+fn parse_bound(raw: &str) -> Option<NaiveDateTime> {
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .or_else(|| NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").ok())
+}
+
+/// How many of a cohort's `weeks` weeks ended on or before `observed_until`.
+fn complete_weeks(cohort_week: NaiveDateTime, weeks: u32, observed_until: NaiveDateTime) -> u32 {
+    (0..weeks)
+        .take_while(|i| {
+            cohort_week
+                .checked_add_days(Days::new(7 * u64::from(i + 1)))
+                .is_some_and(|week_end| week_end <= observed_until)
+        })
+        .count()
+        .try_into()
+        .unwrap_or(weeks)
 }
 
 /// SQL for the per-visitor retention report. Split out so it can be unit-tested.
@@ -126,16 +213,20 @@ fn retention_sql(weeks: u32, scope: &QueryScope) -> String {
         .collect();
     let counts = count_columns.join(",\n                ");
 
-    // `first_seen` is bounded above by the query's end so it is not a full-history
-    // scan, and filtered below by the query's start so only cohorts that actually
-    // formed inside the window are reported. Without the lower bound, visitors
-    // whose first visit predates the window produce cohorts with size 0 and
-    // non-zero later weeks.
+    // `first_seen` is read from `start - lookback` (the longest a visitor ID can
+    // live) up to the query's end, and its HAVING keeps only visitors first seen
+    // from the start onwards, so only cohorts that actually formed inside the
+    // window are reported. Without the HAVING, visitors whose first visit
+    // predates the window produce cohorts with size 0 and non-zero later weeks;
+    // without the scan's lower bound, every request read the site's entire
+    // history, and with it every Parquet file.
     format!(
         "WITH first_seen AS (
              SELECT visitor_id, MIN(timestamp) AS first_ts
              FROM events_all
-             WHERE site_id = ? AND timestamp < CAST(? AS TIMESTAMP){filters}
+             WHERE site_id = ?
+               AND timestamp >= CAST(? AS TIMESTAMP)
+               AND timestamp <  CAST(? AS TIMESTAMP){filters}
              GROUP BY visitor_id
              HAVING MIN(timestamp) >= CAST(? AS TIMESTAMP)
          ),
@@ -164,6 +255,25 @@ fn retention_sql(weeks: u32, scope: &QueryScope) -> String {
 mod tests {
     use super::*;
     use crate::query::test_support::{TestDb, insert_pageview, scope};
+
+    /// A "now" long after every fixture, so no week is cut short by the clock.
+    fn far_future() -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(2030, 1, 1)
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .expect("valid date")
+    }
+
+    /// The tests' usual entry point: a lookback longer than any fixture's
+    /// history and a clock after all of it. Shadows the glob-imported function
+    /// deliberately; the tests that exercise those two inputs call
+    /// [`query_retention_at`] themselves.
+    fn query_retention(
+        conn: &Connection,
+        scope: &QueryScope,
+        weeks: u32,
+    ) -> Result<Vec<RetentionCohort>, duckdb::Error> {
+        query_retention_at(conn, scope, weeks, 365, far_future())
+    }
 
     /// A four-visitor cohort in the week of 2024-01-01:
     /// r1 returns in weeks 1 and 2, r2 in week 1, r3 and r4 never.
@@ -327,6 +437,81 @@ mod tests {
     }
 
     #[test]
+    fn test_weeks_that_have_not_happened_are_marked_incomplete() {
+        // Regression (S-08): a cohort near the end of the report showed 0%
+        // retention for weeks that were still in the future, which read as
+        // "nobody came back". `complete_weeks` says how much of the row is
+        // real. Week 0 is 2024-01-01..08, week 1 ends 01-15, week 2 ends 01-22.
+        let db = TestDb::new();
+        if !db.require_behavioral("retention censoring") {
+            return;
+        }
+        seed(&db);
+
+        // The report window ends on 2024-01-20: weeks 0 and 1 are whole.
+        let c = &query_retention(&db.conn, &scope("2024-01-01", "2024-01-20"), 4).unwrap()[0];
+        assert_eq!(c.complete_weeks, 2);
+
+        // The window is wide but the query runs on 2024-01-12: only week 0.
+        let now = parse_bound("2024-01-12 09:00:00").unwrap();
+        let c = &query_retention_at(&db.conn, &scope("2024-01-01", "2024-03-01"), 4, 365, now)
+            .unwrap()[0];
+        assert_eq!(c.complete_weeks, 1, "the clock caps the observed range");
+
+        // Long after: every week requested is complete.
+        let c = &query_retention(&db.conn, &scope("2024-01-01", "2024-03-01"), 4).unwrap()[0];
+        assert_eq!(c.complete_weeks, 4);
+    }
+
+    #[test]
+    fn test_a_cohort_week_that_starts_before_the_window_is_flagged() {
+        // Regression (S-08): visitors first seen on Monday and Tuesday of the
+        // cohort week are not in a report starting on Wednesday 2024-01-03, so
+        // the cohort is smaller than the week's real intake. It was reported as
+        // if it were whole.
+        let db = TestDb::new();
+        if !db.require_behavioral("partial cohort") {
+            return;
+        }
+        insert_pageview(&db.conn, "mon", "2024-01-01 10:00:00", "/");
+        insert_pageview(&db.conn, "thu", "2024-01-04 10:00:00", "/");
+        insert_pageview(&db.conn, "next", "2024-01-10 10:00:00", "/");
+
+        let cohorts = query_retention(&db.conn, &scope("2024-01-03", "2024-03-01"), 2).unwrap();
+        assert_eq!(cohorts.len(), 2);
+        assert!(cohorts[0].partial_first_week, "week of 2024-01-01 is cut");
+        assert_eq!(cohorts[0].cohort_size, 1, "only thu is in the report");
+        assert!(!cohorts[1].partial_first_week);
+
+        let whole = query_retention(&db.conn, &scope("2024-01-01", "2024-03-01"), 2).unwrap();
+        assert!(!whole[0].partial_first_week);
+    }
+
+    #[test]
+    fn test_the_first_seen_scan_reads_only_the_identity_lifetime() {
+        // Regression (S-08): `first_seen` had only an upper bound, so every
+        // request read the site's whole history. A visitor ID cannot outlive
+        // the salt rotation, so `lookback_days` bounds the scan.
+        let db = TestDb::new();
+        if !db.require_behavioral("retention lookback") {
+            return;
+        }
+        // Seen 3 days before the window and again inside it: not a new visitor
+        // while the lookback reaches back that far...
+        insert_pageview(&db.conn, "id", "2023-12-29 10:00:00", "/");
+        insert_pageview(&db.conn, "id", "2024-01-10 10:00:00", "/");
+        let s = scope("2024-01-01", "2024-03-01");
+        let reaches = query_retention_at(&db.conn, &s, 2, 7, far_future()).unwrap();
+        assert!(reaches.is_empty(), "{reaches:?}");
+
+        // ...and, by construction, counted as new when it does not. That is the
+        // documented cost of bounding the scan, and why the lookback must be
+        // the rotation period rather than a convenient constant.
+        let blind = query_retention_at(&db.conn, &s, 2, 1, far_future()).unwrap();
+        assert_eq!(blind.len(), 1);
+    }
+
+    #[test]
     fn test_rotation_support_check() {
         // A daily-rotating salt cannot support even week 1.
         assert!(!rotation_supports_weeks(1, 2));
@@ -351,13 +536,17 @@ mod tests {
         // Without the upper bound this scanned the site's entire history on
         // every request.
         let sql = retention_sql(4, &scope("2024-01-01", "2024-02-01"));
-        assert!(sql.contains("timestamp < CAST(? AS TIMESTAMP)"));
+        assert!(sql.contains("timestamp <  CAST(? AS TIMESTAMP)"));
+        assert!(
+            sql.contains("timestamp >= CAST(? AS TIMESTAMP)\n               AND timestamp <  CAST(? AS TIMESTAMP)"),
+            "first_seen needs a lower bound too: {sql}"
+        );
         assert!(sql.contains("HAVING MIN(timestamp) >= CAST(? AS TIMESTAMP)"));
     }
 
     #[test]
     fn test_sql_uses_bound_parameters() {
         let sql = retention_sql(4, &scope("2024-01-01", "2024-02-01"));
-        assert_eq!(sql.matches('?').count(), 6);
+        assert_eq!(sql.matches('?').count(), 7);
     }
 }

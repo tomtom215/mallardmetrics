@@ -1027,13 +1027,22 @@ pub async fn get_retention(
         .scope(&params.site_id, &range.start, &range.end)
         .with_filters(filters);
     let weeks = params.weeks;
+    // A visitor ID cannot outlive the salt rotation, which bounds how far back
+    // "first seen" has to look.
+    let lookback_days = state.visitor_salt_rotation_days;
     let key = cache_key(
         "retention",
         &params.site_id,
-        &[&range.start, &range.end, &weeks.to_string(), &filter_key],
+        &[
+            &range.start,
+            &range.end,
+            &weeks.to_string(),
+            &lookback_days.to_string(),
+            &filter_key,
+        ],
     );
     let cohorts: Json<Vec<retention::RetentionCohort>> = cached_query(&state, key, move |conn| {
-        retention::query_retention(conn, &scope, weeks)
+        retention::query_retention(conn, &scope, weeks, lookback_days)
     })
     .await
     .map_err(|e| behavioral_error(&state, "Retention cohorts", e))?;
