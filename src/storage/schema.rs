@@ -75,15 +75,80 @@ pub fn init_schema(conn: &Connection) -> Result<(), duckdb::Error> {
     conn.execute_batch(CREATE_EVENTS_TABLE)
 }
 
-/// Install and load the `behavioral` community extension.
+/// Oldest `behavioral` release whose results Mallard's reports are written
+/// against. 0.10.0 changed `window_funnel` to follow ClickHouse, and the funnel
+/// SQL depends on the modes that release defines.
+pub const MIN_BEHAVIORAL_VERSION: (u32, u32, u32) = (0, 10, 0);
+
+/// Why the `behavioral` extension could not be put to use.
+#[derive(Debug)]
+pub enum BehavioralLoadError {
+    /// `INSTALL` or `LOAD` failed: no network, no build for this platform, or
+    /// an unwritable extension directory.
+    Duckdb(duckdb::Error),
+    /// The extension loaded, but it is older than [`MIN_BEHAVIORAL_VERSION`].
+    ///
+    /// `INSTALL` does nothing when a file is already present, so a data volume
+    /// that cached an older build keeps serving it. The funnel results of an
+    /// older build differ, so it is refused rather than used.
+    TooOld(Option<String>),
+}
+
+impl std::fmt::Display for BehavioralLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Duckdb(e) => write!(f, "{e}"),
+            Self::TooOld(found) => {
+                let (a, b, c) = MIN_BEHAVIORAL_VERSION;
+                write!(
+                    f,
+                    "behavioral extension {} is older than the required {a}.{b}.{c}; \
+                     delete the cached behavioral.duckdb_extension from the extension \
+                     directory so it is downloaded again",
+                    found.as_deref().unwrap_or("(version unknown)")
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BehavioralLoadError {}
+
+impl From<duckdb::Error> for BehavioralLoadError {
+    fn from(e: duckdb::Error) -> Self {
+        Self::Duckdb(e)
+    }
+}
+
+/// Parse `0.10.0` or `v0.10.0` (the extension has reported both spellings).
+fn parse_version(raw: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = raw.trim().trim_start_matches('v').splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts
+        .next()?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()?;
+    Some((major, minor, patch))
+}
+
+/// Install and load the `behavioral` community extension, and check its version.
 ///
 /// # Errors
 ///
 /// Returns an error if the extension cannot be downloaded or loaded — for
 /// example when the host has no network access, or no build exists for the
-/// running DuckDB version.
-pub fn load_behavioral_extension(conn: &Connection) -> Result<(), duckdb::Error> {
-    conn.execute_batch("INSTALL behavioral FROM community; LOAD behavioral;")
+/// running platform — or if the loaded build is older than
+/// [`MIN_BEHAVIORAL_VERSION`].
+pub fn load_behavioral_extension(conn: &Connection) -> Result<(), BehavioralLoadError> {
+    conn.execute_batch("INSTALL behavioral FROM community; LOAD behavioral;")?;
+    let version = behavioral_version(conn);
+    match version.as_deref().and_then(parse_version) {
+        Some(v) if v >= MIN_BEHAVIORAL_VERSION => Ok(()),
+        _ => Err(BehavioralLoadError::TooOld(version)),
+    }
 }
 
 /// Version string reported by the loaded `behavioral` extension.
@@ -239,6 +304,23 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_parse_version_accepts_both_spellings() {
+        assert_eq!(parse_version("0.10.0"), Some((0, 10, 0)));
+        assert_eq!(parse_version("v0.10.0"), Some((0, 10, 0)));
+        assert_eq!(parse_version("0.9.1"), Some((0, 9, 1)));
+        assert_eq!(parse_version("v1.2.3-rc1"), Some((1, 2, 3)));
+        assert_eq!(parse_version("garbage"), None);
+        assert_eq!(parse_version(""), None);
+    }
+
+    #[test]
+    fn test_versions_compare_numerically_not_lexically() {
+        assert!(parse_version("0.9.1") < Some(MIN_BEHAVIORAL_VERSION));
+        assert!(parse_version("0.10.0") >= Some(MIN_BEHAVIORAL_VERSION));
+        assert!(parse_version("0.100.0") > Some(MIN_BEHAVIORAL_VERSION));
     }
 
     #[test]

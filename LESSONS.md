@@ -38,9 +38,16 @@ Cheapest recovery, in order: delete `target/debug/incremental` (~1.4 GB, costs o
 
 Four commands in one session accumulated four such directories — `cargo check`, `cargo test`, `cargo build` and `cargo doc` each unify features differently — for about 18 GB. Prefer `cargo test --all-targets` over a separate `cargo check` (it type-checks the same code), and expect `cargo build` and `cargo doc` to want a directory each.
 
-### L22: The `behavioral` extension is version-gated on DuckDB
+`Cargo.toml` now sets `debug = false` for `libduckdb-sys` in the dev profile. The C++ objects carry most of the debug info; with it off the directory measured 1.1 GB instead of 4.4 GB, with our own crate keeping full debug info. This does not remove the per-feature-set copies, only shrinks each.
 
-The community extension is built per DuckDB version. `INSTALL behavioral FROM community` returns 404 for a DuckDB release the extension has not been published for — so the `duckdb` crate version is not a free choice: bumping or pinning it can silently disable every behavioral endpoint. Before changing the crate version, confirm the extension resolves for the DuckDB version it bundles (v1.5.5 and v1.5.1 do; v1.4.1 does not).
+### L22: The `behavioral` extension was version-gated on DuckDB; 0.10.0 no longer is, but its results changed
+
+Through 0.9.x the extension was built against DuckDB's unstable C API, so each release served one DuckDB version, and `INSTALL behavioral FROM community` returned 404 for any other. From 0.10.0 it uses the stable C API and loads on DuckDB 1.3.2 and later. Two things still bite:
+
+1. **`INSTALL` is a no-op when a file is already present**, so a data volume keeps whatever build it first cached. The community repo serves 0.9.1 for DuckDB 1.5.5 and 0.10.0 for 1.5.6, so bumping the `duckdb` crate changes funnel behaviour for new installs only. `load_behavioral_extension` therefore checks `behavioral_version()` against `MIN_BEHAVIORAL_VERSION` and refuses an older build.
+2. **0.10.0 changed `window_funnel`** to follow ClickHouse: one event that satisfies several steps fills all of them. Steps built from `page:` and `event:` specifications overlap routinely, so funnels default to `strict_once` (one event, one step). Verified by a test that fails when that default is removed.
+
+Before changing the crate version, install the extension for the target DuckDB version and run the suite with `MALLARD_REQUIRE_BEHAVIORAL=1`.
 
 ---
 

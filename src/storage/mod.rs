@@ -150,9 +150,9 @@ impl ReaderPool {
     /// # Errors
     ///
     /// Returns the first error encountered.
-    pub fn for_each<F>(&self, mut f: F) -> Result<(), duckdb::Error>
+    pub fn for_each<F, E>(&self, mut f: F) -> Result<(), E>
     where
-        F: FnMut(&Connection) -> Result<(), duckdb::Error>,
+        F: FnMut(&Connection) -> Result<(), E>,
     {
         for conn in self.connections.iter() {
             f(&conn.lock())?;
@@ -460,7 +460,7 @@ mod tests {
         let mut visited = 0;
         pool.for_each(|_| {
             visited += 1;
-            Ok(())
+            Ok::<(), duckdb::Error>(())
         })
         .unwrap();
         assert_eq!(visited, 3);

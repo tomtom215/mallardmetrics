@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum funnel steps.
 ///
-/// The behavioral extension accepts 2–32 boolean conditions, matching
+/// The behavioral extension accepts up to 32 boolean conditions, matching
 /// ClickHouse. Asking for more produces a binder error rather than a result.
 pub const MAX_STEPS: usize = 32;
 /// Minimum funnel steps accepted by `window_funnel`.
@@ -39,7 +39,9 @@ pub const VALID_MODES: &[&str] = &[
 
 /// Validate a comma-separated mode list, returning the normalised form.
 ///
-/// Returns `None` if any mode is unrecognised.
+/// Returns `None` if any mode is unrecognised, or if `allow_reentry` is given
+/// without `strict_order`: the extension rejects that combination at query time
+/// (`behavioral` 0.10.0), which would otherwise surface as a 500 instead of a 400.
 pub fn normalize_modes(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -55,7 +57,33 @@ pub fn normalize_modes(raw: &str) -> Option<String> {
             modes.push(mode);
         }
     }
+    let has = |m: &str| modes.iter().any(|x| x == m);
+    if has("allow_reentry") && !has("strict_order") {
+        return None;
+    }
     Some(modes.join(", "))
+}
+
+/// Add `strict_once` unless the caller already chose a mode that gives each
+/// event a single step.
+///
+/// `behavioral` 0.10.0 follows ClickHouse: one event that satisfies several
+/// steps fills all of them. Steps built from `page:` and `event:` specifications
+/// overlap routinely (a `pageview` step followed by a `page:/` step), so without
+/// this a single pageview would count as having completed both. `strict_once`
+/// and `strict_increase` restore one event, one step.
+fn effective_modes(modes: &str) -> String {
+    let one_event_per_step = modes
+        .split(',')
+        .map(str::trim)
+        .any(|m| m == "strict_once" || m == "strict_increase");
+    if one_event_per_step {
+        modes.to_string()
+    } else if modes.trim().is_empty() {
+        "strict_once".to_string()
+    } else {
+        format!("{modes}, strict_once")
+    }
 }
 
 /// Run a funnel query.
@@ -138,12 +166,8 @@ fn funnel_sql(scope: &QueryScope, window_interval: &str, modes: &str, steps: &[&
     let step_conditions = steps.join(", ");
     let n = steps.len();
     // `window_funnel(window [, mode], timestamp, cond, ...)`: the mode argument
-    // is positional and must be omitted entirely when empty.
-    let mode_arg = if modes.trim().is_empty() {
-        String::new()
-    } else {
-        format!("'{}', ", modes.replace('\'', "''"))
-    };
+    // is positional. `effective_modes` is never empty, so it is always present.
+    let mode_arg = format!("'{}', ", effective_modes(modes).replace('\'', "''"));
 
     format!(
         "WITH per_visitor AS (
@@ -341,20 +365,69 @@ mod tests {
         if !db.require_behavioral("funnel modes") {
             return;
         }
+        // "direct" goes straight from step 1 to step 2. "detour" views a page
+        // that matches no step in between, which strict_order treats as a break.
+        insert_pageview(&db.conn, "direct", "2024-01-15 10:00:00", "/");
+        insert_pageview(&db.conn, "direct", "2024-01-15 10:01:00", "/pricing");
+        insert_pageview(&db.conn, "detour", "2024-01-15 11:00:00", "/");
+        insert_pageview(&db.conn, "detour", "2024-01-15 11:01:00", "/about");
+        insert_pageview(&db.conn, "detour", "2024-01-15 11:02:00", "/pricing");
+        let two_steps = ["pathname = '/'", "pathname = '/pricing'"];
+        let s = scope("2024-01-01", "2024-02-01");
+
+        let relaxed = query_funnel(&db.conn, &s, "1 day", "", &two_steps).unwrap();
+        assert_eq!(
+            relaxed[1].visitors, 2,
+            "unrelated pages do not break a funnel"
+        );
+
+        let strict = query_funnel(&db.conn, &s, "1 day", "strict_order", &two_steps).unwrap();
+        assert_eq!(strict[0].visitors, 2);
+        assert_eq!(
+            strict[1].visitors, 1,
+            "strict_order must break the detour's chain"
+        );
+    }
+
+    #[test]
+    fn test_one_event_fills_only_one_step_by_default() {
+        let db = TestDb::new();
+        if !db.require_behavioral("overlapping steps") {
+            return;
+        }
+        // One pageview at "/" satisfies both `event_name = 'pageview'` and
+        // `pathname = '/'`. Left to the extension's ClickHouse semantics it would
+        // fill both steps and report a completed funnel from a single event.
+        insert_pageview(&db.conn, "once", "2024-01-15 10:00:00", "/");
+        insert_pageview(&db.conn, "twice", "2024-01-15 11:00:00", "/");
+        insert_pageview(&db.conn, "twice", "2024-01-15 11:01:00", "/");
+        let overlapping = ["event_name = 'pageview'", "pathname = '/'"];
+        let s = scope("2024-01-01", "2024-02-01");
+
+        let rows = query_funnel(&db.conn, &s, "1 day", "", &overlapping).unwrap();
+        assert_eq!(rows[0].visitors, 2);
+        assert_eq!(
+            rows[1].visitors, 1,
+            "only the visitor with two events converts"
+        );
+    }
+
+    #[test]
+    fn test_strict_order_and_allow_reentry_run_together() {
+        let db = TestDb::new();
+        if !db.require_behavioral("funnel mode combinations") {
+            return;
+        }
         seed(&db);
-        // v1's signup event also satisfies step 2 (same pathname), so under
-        // strict_order the chain cannot advance to step 3.
         let rows = query_funnel(
             &db.conn,
             &scope("2024-01-01", "2024-02-01"),
             "1 day",
-            "strict_order",
+            "strict_order, allow_reentry",
             STEPS,
         )
-        .unwrap();
-        assert_eq!(rows[0].visitors, 4);
-        assert_eq!(rows[1].visitors, 2);
-        assert_eq!(rows[2].visitors, 0, "strict_order must break v1's chain");
+        .expect("a mode combination normalize_modes accepts must execute");
+        assert_eq!(rows.len(), 3);
     }
 
     #[test]
@@ -390,23 +463,46 @@ mod tests {
             Some("strict_order".to_string()),
             "duplicates are collapsed"
         );
+        assert!(
+            normalize_modes("allow_reentry").is_none(),
+            "the extension rejects allow_reentry without strict_order"
+        );
+        assert_eq!(
+            normalize_modes("allow_reentry, strict_order"),
+            Some("allow_reentry, strict_order".to_string())
+        );
         assert!(normalize_modes("drop_tables").is_none());
         assert!(normalize_modes("strict_order; DROP TABLE events").is_none());
     }
 
     #[test]
-    fn test_sql_omits_the_mode_argument_when_empty() {
-        // window_funnel's mode is positional; passing an empty string would be
-        // read as the timestamp argument.
+    fn test_effective_modes_adds_strict_once_unless_the_caller_chose_one() {
+        assert_eq!(effective_modes(""), "strict_once");
+        assert_eq!(effective_modes("strict_order"), "strict_order, strict_once");
+        assert_eq!(effective_modes("strict_once"), "strict_once");
+        assert_eq!(
+            effective_modes("strict_order, strict_increase"),
+            "strict_order, strict_increase"
+        );
+    }
+
+    #[test]
+    fn test_sql_always_passes_a_mode_argument() {
+        // window_funnel's mode is positional, and the default has to be explicit
+        // because the extension's own default lets one event fill several steps.
         let sql = funnel_sql(&scope("2024-01-01", "2024-02-01"), "1 day", "", STEPS);
-        assert!(sql.contains("window_funnel(INTERVAL '1 day', timestamp,"));
+        assert!(sql.contains("window_funnel(INTERVAL '1 day', 'strict_once', timestamp,"));
         let with_mode = funnel_sql(
             &scope("2024-01-01", "2024-02-01"),
             "1 day",
             "strict_order",
             STEPS,
         );
-        assert!(with_mode.contains("window_funnel(INTERVAL '1 day', 'strict_order', timestamp,"));
+        assert!(
+            with_mode.contains(
+                "window_funnel(INTERVAL '1 day', 'strict_order, strict_once', timestamp,"
+            )
+        );
     }
 
     #[test]

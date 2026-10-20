@@ -20,8 +20,8 @@ Built in Rust for predictable, low resource usage. The embedded DuckDB database 
 |---|---|
 | Language | Rust 1.98.0, edition 2024 |
 | Web framework | Axum 0.8.x |
-| Database | DuckDB 1.5.5 (disk-based, embedded, in-process; `duckdb` crate 1.10505.0) |
-| Analytics | `behavioral` extension 0.9.1 (installed and loaded at runtime) |
+| Database | DuckDB 1.5.6 (disk-based, embedded, in-process; `duckdb` crate 1.10506.1) |
+| Analytics | `behavioral` extension 0.10.0+ (installed and loaded at runtime) |
 | Storage | DuckDB hot table plus date-partitioned Parquet (ZSTD-compressed) |
 | Frontend | Preact + HTM (no build step, embedded in binary) |
 | Deployment | Static musl binary, `FROM scratch` Docker image |

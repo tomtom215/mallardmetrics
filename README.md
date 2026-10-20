@@ -461,8 +461,8 @@ The dashboard is a single-page application built with Preact + HTM, embedded dir
 |---|---|---|
 | Language | Rust | 1.98.0 (edition 2024) |
 | Web Framework | Axum | 0.8 |
-| Database | DuckDB (disk-based, embedded) | 1.5.5 (crate 1.10505.0) |
-| Analytics Engine | `behavioral` extension | 0.9.1, runtime-loaded; published per DuckDB version, currently 1.5.5 |
+| Database | DuckDB (disk-based, embedded) | 1.5.6 (crate 1.10506.1) |
+| Analytics Engine | `behavioral` extension | 0.10.0 or newer, runtime-loaded |
 | Storage Format | Parquet (ZSTD compressed) | date-partitioned, compacted |
 | Frontend | Preact + HTM | no build step |
 | Password Hashing | Argon2id | `argon2` 0.6 |
@@ -575,7 +575,7 @@ somewhere with a route, against the same data directory:
 
 ```bash
 mallard-metrics --install-extension
-# Installed the behavioral extension (version 0.9.1) into data/extensions
+# Installed the behavioral extension (version 0.10.0) into data/extensions
 ```
 
 It writes the extension to the data volume and exits without creating a

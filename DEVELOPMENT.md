@@ -8,8 +8,8 @@ Mallard Metrics is a self-hosted, privacy-focused web analytics platform powered
 
 - **Language**: Rust, edition 2024 (MSRV 1.98.0)
 - **Web framework**: Axum 0.8.x
-- **Database**: DuckDB 1.5.5 (embedded, via the `duckdb` crate 1.10505.0 with `bundled` + `parquet` + `chrono` features)
-- **Analytics**: `behavioral` community extension 0.9.1 (installed and loaded at runtime; published per DuckDB version, so the crate version is not a free choice)
+- **Database**: DuckDB 1.5.6 (embedded, via the `duckdb` crate 1.10506.1 with `bundled` + `parquet` + `chrono` features)
+- **Analytics**: `behavioral` community extension 0.10.0 or newer (installed and loaded at runtime; startup refuses an older cached build, see `MIN_BEHAVIORAL_VERSION` in `storage/schema.rs`)
 - **Storage**: Two-tier — a DuckDB hot table plus date-partitioned Parquet, unioned by the `events_all` view
 - **Frontend**: Preact + HTM (no build step, embedded in the binary)
 - **Deployment**: Static musl binary in a distroless-style image, running as UID 65532

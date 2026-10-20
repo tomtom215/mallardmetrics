@@ -245,7 +245,7 @@ sudo docker run --rm \
   -v /srv/mallard/data:/data \
   mallard-metrics:latest --install-extension
 
-# Installed the behavioral extension (version 0.9.1) into /data/extensions
+# Installed the behavioral extension (version 0.10.0) into /data/extensions
 # Start the server normally; it will load the extension from disk.
 ```
 
@@ -260,7 +260,7 @@ curl -s https://analytics.example.com/health/detailed | grep behavioral
 
 The extension is version-matched to DuckDB, so repeat this after an upgrade that
 changes the bundled DuckDB version. The paths under `extensions/` name both
-(`v1.5.5/linux_amd64/`), so a stale one is easy to spot.
+(`v1.5.6/linux_amd64/`), so a stale one is easy to spot.
 
 If you would rather not give the container a route even once, copy
 `/srv/mallard/data/extensions/` from any machine running the same release. It is

@@ -18,7 +18,7 @@ testing = ["dep:tempfile"]
 
 [dependencies]
 axum = { version = "0.8.9", features = ["macros"] }
-duckdb = { version = "1.10505.0", features = ["bundled", "parquet", "chrono"] }
+duckdb = { version = "1.10506.1", features = ["bundled", "parquet", "chrono"] }
 hmac = "0.13"
 sha2 = "0.11"
 # Constant-time primitives for secret comparison; see api::auth::constant_time_eq.
@@ -56,6 +56,14 @@ http-body-util = "0.1.5"
 [[bench]]
 name = "ingest_bench"
 harness = false
+
+# The bundled DuckDB is built once per distinct feature set and profile
+# (`cargo test`, `clippy`, `build` and `doc` each get their own copy). With debug
+# info each copy is about 4.4 GB, enough to fill a CI runner or a small
+# development disk and stall the C++ compile rather than fail it. Our own code
+# keeps full debug info.
+[profile.dev.package.libduckdb-sys]
+debug = false
 
 [profile.release]
 lto = true
