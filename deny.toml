@@ -1,6 +1,16 @@
+# Evaluate every feature, matching the `--all-features` CI passes explicitly, so
+# a bare `cargo deny check` on a laptop sees the same graph.
+[graph]
+all-features = true
+
 [advisories]
 unmaintained = "workspace"
 yanked = "warn"
+# Do not add an `ignore` entry to get a build green. Fix the dependency (the
+# RustSec advisories open at the time of writing are all in rustls, rustls-webpki
+# and webpki-roots, reached through DuckDB's build script, and `cargo update -p`
+# resolves them) or, if there is genuinely no fix, ignore the single advisory
+# ID with a comment saying why it cannot affect us and when to revisit.
 
 [licenses]
 allow = [
@@ -20,13 +30,16 @@ allow = [
     "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
+# The allow list above is a policy, not an inventory: it names licences the
+# project accepts even when no current dependency uses them.
+unused-allowed-license = "allow"
 
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
 
 [sources]
-unknown-registry = "warn"
-unknown-git = "warn"
+unknown-registry = "deny"
+unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
