@@ -506,10 +506,12 @@ async fn test_timeseries_has_no_gaps() {
     )
     .await;
     let buckets = json.as_array().unwrap();
+    // `7d` is the last seven calendar days including today. It used to be
+    // eight (today and the seven before it) under a seven-day label.
     assert_eq!(
         buckets.len(),
-        8,
-        "7d spans eight daily buckets, gaps filled"
+        7,
+        "7d spans seven daily buckets, gaps filled"
     );
     assert!(buckets.iter().all(|b| b.get("date").is_some()));
 }
@@ -1921,3 +1923,14 @@ async fn test_a_cold_dashboard_load_gets_no_429() {
     }
 }
 
+#[tokio::test]
+async fn test_a_lone_start_date_is_a_bad_request() {
+    // Regression (S-09): it used to be ignored and the 30-day default answered.
+    let (state, _dir) = plain_state();
+    let response = get(
+        &state,
+        "/api/stats/main?site_id=example.com&start_date=2024-01-01",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

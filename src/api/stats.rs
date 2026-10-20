@@ -243,58 +243,92 @@ impl StatsParams {
     ///
     /// An explicit `start_date`/`end_date` pair wins over `period`; both are
     /// parsed as `YYYY-MM-DD` and capped at [`MAX_RANGE_DAYS`] so a request
-    /// cannot ask for an unbounded partition scan.
+    /// cannot ask for an unbounded partition scan. Giving only one of the two is
+    /// an error: it used to be ignored and the default 30-day period answered
+    /// instead, so a client that mistyped one parameter silently got a report
+    /// for a different range.
+    ///
+    /// # Periods
+    ///
+    /// `Nd` is the last N calendar days **including today**, so `7d` is seven
+    /// daily buckets (as in Plausible and Matomo), not eight. It used to start N
+    /// days back and so spanned N+1 days under an N-day label. `12mo` is the
+    /// twelve months ending today, inclusive. All dates are UTC; sites have no
+    /// time zone of their own, so a day boundary is a UTC boundary.
     ///
     /// # Errors
     ///
     /// Returns a `BadRequest` for a malformed date, an inverted range, an
-    /// over-long range, or an unknown period.
+    /// over-long range, an unpaired date, or an unknown period.
     pub fn date_range(&self) -> Result<DateRange, ApiError> {
-        if let (Some(start_str), Some(end_str)) = (&self.start_date, &self.end_date) {
-            let start = parse_date(start_str, "start_date")?;
-            let end = parse_date(end_str, "end_date")?;
-            let days = (end - start).num_days();
-            if days < 0 {
+        self.date_range_on(chrono::Utc::now().date_naive())
+    }
+
+    /// [`StatsParams::date_range`] with today's date supplied, so the period
+    /// arithmetic can be tested exactly (LESSONS L23).
+    ///
+    /// # Errors
+    ///
+    /// As [`StatsParams::date_range`].
+    pub fn date_range_on(&self, today: NaiveDate) -> Result<DateRange, ApiError> {
+        match (&self.start_date, &self.end_date) {
+            (Some(start_str), Some(end_str)) => {
+                let start = parse_date(start_str, "start_date")?;
+                let end = parse_date(end_str, "end_date")?;
+                let days = (end - start).num_days();
+                if days < 0 {
+                    return Err(ApiError::BadRequest(
+                        "end_date must be on or after start_date".to_string(),
+                    ));
+                }
+                if days > MAX_RANGE_DAYS {
+                    return Err(ApiError::BadRequest(format!(
+                        "Date range must not exceed {MAX_RANGE_DAYS} days"
+                    )));
+                }
+                // The stored end bound is exclusive, so an inclusive end_date of
+                // 2024-01-31 must query up to 2024-02-01. Without this the final
+                // day of every explicit range was silently omitted.
+                let exclusive_end = end
+                    .succ_opt()
+                    .ok_or_else(|| ApiError::BadRequest("end_date is out of range".to_string()))?;
+                return Ok(DateRange {
+                    start: start.to_string(),
+                    end: exclusive_end.to_string(),
+                    days: days + 1,
+                });
+            }
+            (Some(_), None) | (None, Some(_)) => {
                 return Err(ApiError::BadRequest(
-                    "end_date must be on or after start_date".to_string(),
+                    "start_date and end_date must be given together".to_string(),
                 ));
             }
-            if days > MAX_RANGE_DAYS {
-                return Err(ApiError::BadRequest(format!(
-                    "Date range must not exceed {MAX_RANGE_DAYS} days"
-                )));
-            }
-            // The stored end bound is exclusive, so an inclusive end_date of
-            // 2024-01-31 must query up to 2024-02-01. Without this the final
-            // day of every explicit range was silently omitted.
-            let exclusive_end = end
-                .succ_opt()
-                .ok_or_else(|| ApiError::BadRequest("end_date is out of range".to_string()))?;
-            return Ok(DateRange {
-                start: start.to_string(),
-                end: exclusive_end.to_string(),
-                days: days + 1,
-            });
+            (None, None) => {}
         }
 
-        let now = chrono::Utc::now().date_naive();
-        let (start, days) = match self.period.as_str() {
-            "day" | "today" => (now, 1),
-            "7d" => (now - chrono::Days::new(7), 8),
-            "30d" => (now - chrono::Days::new(30), 31),
-            "90d" => (now - chrono::Days::new(90), 91),
-            "12mo" => (now - chrono::Days::new(365), 366),
+        let out_of_range = || ApiError::BadRequest("The period is out of range".to_string());
+        let tomorrow = today.succ_opt().ok_or_else(out_of_range)?;
+        let start = match self.period.as_str() {
+            "day" | "today" => Some(today),
+            "7d" => today.checked_sub_days(chrono::Days::new(6)),
+            "30d" => today.checked_sub_days(chrono::Days::new(29)),
+            "90d" => today.checked_sub_days(chrono::Days::new(89)),
+            // Twelve months ending today: from the day after this date last year.
+            "12mo" => today
+                .checked_sub_months(chrono::Months::new(12))
+                .and_then(|d| d.succ_opt()),
             other => {
                 return Err(ApiError::BadRequest(format!(
                     "Invalid period: {other}. Use 'day', '7d', '30d', '90d', '12mo', \
                      or supply start_date and end_date."
                 )));
             }
-        };
+        }
+        .ok_or_else(out_of_range)?;
         Ok(DateRange {
             start: start.to_string(),
-            end: (now + chrono::Days::new(1)).to_string(),
-            days,
+            end: tomorrow.to_string(),
+            days: (tomorrow - start).num_days(),
         })
     }
 
@@ -1940,6 +1974,75 @@ mod tests {
             ..params("custom")
         };
         assert!(p.date_range().is_err());
+    }
+
+    fn on(period: &str, today: &str) -> DateRange {
+        let today = NaiveDate::parse_from_str(today, "%Y-%m-%d").unwrap();
+        params(period).date_range_on(today).unwrap()
+    }
+
+    #[test]
+    fn test_n_day_periods_span_exactly_n_days_including_today() {
+        // Regression (S-09): `7d` started seven days back and so covered eight
+        // calendar days (30d: 31, 12mo: 366) under an N-day label.
+        let r = on("7d", "2024-03-10");
+        assert_eq!(
+            (r.start.as_str(), r.end.as_str(), r.days),
+            ("2024-03-04", "2024-03-11", 7)
+        );
+        let r = on("30d", "2024-03-10");
+        assert_eq!((r.start.as_str(), r.days), ("2024-02-10", 30));
+        let r = on("90d", "2024-03-10");
+        assert_eq!((r.start.as_str(), r.days), ("2023-12-12", 90));
+        let r = on("day", "2024-03-10");
+        assert_eq!(
+            (r.start.as_str(), r.end.as_str(), r.days),
+            ("2024-03-10", "2024-03-11", 1)
+        );
+        assert_eq!(on("today", "2024-03-10"), r);
+    }
+
+    #[test]
+    fn test_twelve_months_ends_today_inclusive() {
+        let r = on("12mo", "2026-10-20");
+        assert_eq!(
+            (r.start.as_str(), r.end.as_str(), r.days),
+            ("2025-10-21", "2026-10-21", 365)
+        );
+        // Across a leap day the span is a day longer, never over the cap.
+        let r = on("12mo", "2024-10-20");
+        assert_eq!((r.start.as_str(), r.days), ("2023-10-21", 366));
+        assert!(r.days <= MAX_RANGE_DAYS);
+        // A 29 February today clamps its month arithmetic to 28 February.
+        assert_eq!(on("12mo", "2024-02-29").start, "2023-03-01");
+    }
+
+    #[test]
+    fn test_period_ranges_always_fit_the_explicit_range_cap() {
+        for today in ["2024-02-29", "2023-12-31", "2026-10-20"] {
+            for period in ["day", "7d", "30d", "90d", "12mo"] {
+                assert!(
+                    on(period, today).days <= MAX_RANGE_DAYS,
+                    "{period} on {today}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_lone_start_or_end_date_is_rejected_not_ignored() {
+        // Regression (S-09): with only one bound the range silently fell back to
+        // the default period.
+        for (start, end) in [(Some("2024-01-01"), None), (None, Some("2024-01-31"))] {
+            let p = StatsParams {
+                start_date: start.map(str::to_string),
+                end_date: end.map(str::to_string),
+                ..params("30d")
+            };
+            let err = p.date_range().unwrap_err();
+            assert!(matches!(err, ApiError::BadRequest(_)), "{err}");
+            assert!(err.to_string().contains("together"), "{err}");
+        }
     }
 
     #[test]
