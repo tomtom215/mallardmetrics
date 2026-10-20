@@ -245,7 +245,13 @@ fn bench_visitor_id(c: &mut Criterion) {
 /// the audit (F-06) is 100 sites x 90 days = 9,000 one-file partitions, which
 /// is what compaction leaves behind. Overridable so a laptop can try a smaller
 /// shape: `MALLARD_BENCH_SITES=20 MALLARD_BENCH_DAYS=30`.
+///
+/// `cargo test --all-targets` also runs this binary, without `--bench`. Writing
+/// 18,000 files there would add minutes to every test run, so that mode uses a
+/// token shape that still exercises the code.
 fn scale_shape() -> (usize, usize) {
+    let measuring = std::env::args().any(|a| a == "--bench");
+    let (default_sites, default_days) = if measuring { (100, 90) } else { (5, 4) };
     let read = |key: &str, default: usize| {
         std::env::var(key)
             .ok()
@@ -253,8 +259,8 @@ fn scale_shape() -> (usize, usize) {
             .unwrap_or(default)
     };
     (
-        read("MALLARD_BENCH_SITES", 100),
-        read("MALLARD_BENCH_DAYS", 90),
+        read("MALLARD_BENCH_SITES", default_sites),
+        read("MALLARD_BENCH_DAYS", default_days),
     )
 }
 
@@ -313,6 +319,19 @@ fn write_scale_dataset(root: &std::path::Path, with_site_id: bool) {
 /// each view definition, so the claim about what pruning buys is a measurement.
 /// Setup is outside `b.iter()` (L21).
 fn bench_query_scale(c: &mut Criterion) {
+    // A site in the middle of the dataset and a week from the middle of its
+    // history (2026-08-15..22 at the default 90 days).
+    let (sites, days) = scale_shape();
+    let target_site = format!("site{:03}.example.com", sites / 2);
+    let first_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()
+        + chrono::Duration::days(i64::try_from(days.saturating_sub(7) / 2).unwrap());
+    let last_day = first_day + chrono::Duration::days(6);
+    let range = (
+        first_day.format("%Y-%m-%d").to_string(),
+        (last_day + chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string(),
+    );
     let legacy = tempfile::tempdir().unwrap();
     let lean = tempfile::tempdir().unwrap();
     write_scale_dataset(legacy.path(), true);
@@ -388,7 +407,7 @@ fn bench_query_scale(c: &mut Criterion) {
                     .query_row(
                         "SELECT COUNT(*) FROM events_all WHERE site_id = ? \
                          AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)",
-                        duckdb::params!["site042.example.com", "2026-08-15", "2026-08-22"],
+                        duckdb::params![target_site, range.0, range.1],
                         |row| row.get(0),
                     )
                     .unwrap();
@@ -402,14 +421,13 @@ fn bench_query_scale(c: &mut Criterion) {
         let conn = Connection::open_in_memory().unwrap();
         schema::init_schema(&conn).unwrap();
         let storage = ParquetStorage::new(legacy.path(), 0);
-        let day = |d: u32| chrono::NaiveDate::from_ymd_opt(2026, 8, d).unwrap();
         group.bench_function("scoped_file_list", |b| {
             b.iter(|| {
                 // The file list is rebuilt per request, as a handler would.
                 let source = schema::scoped_events_sql(&storage.files_for_range(
-                    "site042.example.com",
-                    day(15),
-                    day(21),
+                    &target_site,
+                    first_day,
+                    last_day,
                 ));
                 let sql = format!(
                     "SELECT COUNT(*) FROM {source} WHERE site_id = ? \
@@ -418,7 +436,7 @@ fn bench_query_scale(c: &mut Criterion) {
                 let n: i64 = conn
                     .query_row(
                         &sql,
-                        duckdb::params!["site042.example.com", "2026-08-15", "2026-08-22"],
+                        duckdb::params![target_site, range.0, range.1],
                         |row| row.get(0),
                     )
                     .unwrap();
