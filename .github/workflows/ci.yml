@@ -184,6 +184,9 @@ jobs:
           done
           exit "$status"
 
+      - name: Check the demo-data script still matches the events schema
+        run: python3 scripts/check-seed-schema.py
+
       - name: Check JavaScript syntax
         run: |
           set -euo pipefail
@@ -300,8 +303,8 @@ jobs:
 
 # ── Job 8: Deployment configuration ───────────────────────────────────────────
 #
-# Nothing else parses the compose files or the Caddyfile, so a typo in either
-# reached production before. The Caddy image is built from deploy/Dockerfile.caddy
+# Nothing else parses the compose files, the Caddyfile or the monitoring files,
+# so a typo in any of them reached production before. The Caddy image is built from deploy/Dockerfile.caddy
 # because the Caddyfile uses the Cloudflare DNS module, which stock Caddy lacks.
   deploy-config:
     name: Deployment config
@@ -317,6 +320,17 @@ jobs:
           CLOUDFLARE_API_TOKEN=ci MALLARD_SECRET=ci MALLARD_ADMIN_PASSWORD=ci \
           MALLARD_METRICS_TOKEN=ci \
             docker compose -f deploy/docker-compose.production.yml config --quiet
+      - name: Validate the Grafana dashboard JSON
+        run: jq empty deploy/monitoring/grafana-dashboard.json
+      # The rules are tested, not just parsed: the tests assert which alerts fire
+      # for given series and what their text says.
+      - name: Check and unit-test the Prometheus alert rules
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint promtool -v "$PWD/deploy/monitoring:/m:ro" \
+            prom/prometheus:v3.7.0 check rules /m/prometheus-rules.yml
+          docker run --rm --entrypoint promtool -v "$PWD/deploy/monitoring:/m:ro" \
+            prom/prometheus:v3.7.0 test rules /m/prometheus-rules.test.yml
       - name: Build Caddy with the Cloudflare module
         run: docker build -f deploy/Dockerfile.caddy -t mallard-caddy:ci .
       - name: Validate the Caddyfile

@@ -1,0 +1,88 @@
+# systemd unit for running the mallard-metrics binary directly (no Docker).
+#
+# Install:
+#   sudo install -m 0755 mallard-metrics /usr/local/bin/mallard-metrics
+#   sudo install -d -m 0700 /etc/mallard-metrics
+#   sudo install -m 0600 /dev/null /etc/mallard-metrics/mallard.env   # then edit
+#   sudo install -m 0644 deploy/systemd/mallard-metrics.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now mallard-metrics
+#
+# /etc/mallard-metrics/mallard.env holds the secrets and settings, one VAR=value
+# per line (no quotes, no `export`):
+#   MALLARD_SECRET=<openssl rand -base64 48>
+#   MALLARD_ADMIN_PASSWORD=<at least 12 characters>
+#   MALLARD_METRICS_TOKEN=<openssl rand -hex 32>
+#   MALLARD_SECURE_COOKIES=true
+#   MALLARD_DASHBOARD_ORIGIN=https://analytics.example.com
+# Behind a reverse proxy that OVERWRITES X-Forwarded-For (Caddy's default does;
+# nginx needs `proxy_set_header X-Forwarded-For $remote_addr;`) also set
+#   MALLARD_TRUST_PROXY_HEADERS=true
+#   MALLARD_TRUSTED_PROXY_HOPS=1
+#
+# Use a glibc build of the binary (the *-unknown-linux-gnu release archive). A
+# musl build runs but cannot install the DuckDB `behavioral` extension, so
+# funnels, retention, sessions, sequences and flow answer 503. The first start
+# downloads the extension into the state directory and needs outbound HTTPS to
+# community-extensions.duckdb.org; afterwards it loads from disk.
+#
+# Backups: stop the service, copy /var/lib/mallard-metrics, start it again. A
+# copy of the live DuckDB file is not guaranteed to open (see deploy/backup.sh).
+
+[Unit]
+Description=Mallard Metrics (privacy-focused web analytics)
+Documentation=https://github.com/tomtom215/mallardmetrics
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mallard-metrics
+EnvironmentFile=/etc/mallard-metrics/mallard.env
+
+# Listen on loopback only; a reverse proxy terminates TLS.
+Environment=MALLARD_HOST=127.0.0.1
+Environment=MALLARD_PORT=8000
+Environment=MALLARD_DATA_DIR=/var/lib/mallard-metrics
+Environment=MALLARD_LOG_FORMAT=json
+Environment=RUST_LOG=mallard_metrics=info,tower_http=warn
+# DuckDB would otherwise look for extensions under $HOME/.duckdb.
+Environment=HOME=/var/lib/mallard-metrics
+
+# A transient user with no entry in /etc/passwd; /var/lib/mallard-metrics is
+# created, owned by it and the only writable path.
+DynamicUser=yes
+StateDirectory=mallard-metrics
+StateDirectoryMode=0700
+
+Restart=on-failure
+RestartSec=5
+# Mallard flushes its in-memory event buffer on SIGTERM (up to
+# MALLARD_SHUTDOWN_TIMEOUT, 30 s by default); do not SIGKILL it sooner.
+TimeoutStopSec=45
+LimitNOFILE=65536
+# Uncomment to cap memory; also set MALLARD_DUCKDB_MEMORY_LIMIT to about 60% of it.
+#MemoryMax=2G
+
+# Sandboxing
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target
