@@ -1,20 +1,29 @@
 # Continuous integration — enforces all quality gates.
 #
 # Jobs: test + clippy + fmt + doc (matrix), behavioral-extension tests,
-#       static checks, security audit, code coverage, Docker build,
-#       release-build smoke test.
+#       smoke test, static checks, supply-chain policy, code coverage, Docker
+#       image build + container smoke test, deployment config, release-binary
+#       build + smoke test.
 #
 # Job dependency graph (all jobs run in parallel):
 #
 #   ci (4-entry matrix)
 #   behavioral     # runs the DuckDB behavioral-extension-backed tests with
 #                  # MALLARD_REQUIRE_BEHAVIORAL=1 so they fail rather than skip.
-#   static-checks  # actionlint + JS syntax + tracker drift + MSRV drift
-#   security
+#   smoke          # the real binary on a real socket (behavioral required).
+#   static-checks  # actionlint + shellcheck + JS syntax + tracker drift +
+#                  # toolchain drift (Cargo.toml, rust-toolchain.toml, Dockerfile)
+#   policy         # cargo-deny bans, licenses and sources. Advisories live in
+#                  # security.yml so a new RustSec entry does not turn every
+#                  # unrelated PR red; that workflow also runs weekly.
 #   coverage
-#   docker
-#   release-build  # catches target-specific build failures (e.g. musl C++
-#                  # toolchain) before they slip into the release workflow.
+#   docker         # builds the image and runs scripts/docker-smoke.sh against it
+#   deploy-config  # `docker compose config` for both compose files and
+#                  # `caddy validate` of deploy/Caddyfile
+#   release-build  # builds the glibc release binaries exactly as release.yml
+#                  # does and smoke-tests them with the behavioral extension
+#                  # required. A binary that cannot install the extension (a
+#                  # musl build) fails here, not after the tag is pushed.
 
 name: CI
 
@@ -23,6 +32,7 @@ on:
     branches: [main, "claude/**"]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 # Cancel in-progress runs for the same branch/PR — saves CI minutes when
 # multiple commits are pushed in quick succession.  Main-branch pushes
@@ -45,6 +55,7 @@ jobs:
   ci:
     name: ${{ matrix.name }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -58,7 +69,7 @@ jobs:
             components: rustfmt
             command: cargo fmt -- --check
           - name: Documentation
-            command: cargo doc --no-deps
+            command: cargo doc --locked --no-deps
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -79,6 +90,7 @@ jobs:
   behavioral:
     name: Behavioral extension tests
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -99,6 +111,7 @@ jobs:
   smoke:
     name: Smoke test
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -107,13 +120,19 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build the binary
         run: cargo build --locked
+      # MALLARD_REQUIRE_BEHAVIORAL=1: the extension must install and the five
+      # behavioral endpoints must answer 200. Without it a binary that cannot
+      # install the extension still passes (the endpoints answer 503).
       - name: Run the smoke test
+        env:
+          MALLARD_REQUIRE_BEHAVIORAL: "1"
         run: scripts/smoke-test.sh target/debug/mallard-metrics
 
 # ── Job 4: Static checks (workflows, JS, asset drift) ─────────────────────────
   static-checks:
     name: Static checks
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -121,6 +140,12 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/repo" --workdir /repo \
             rhysd/actionlint:1.7.7 -color
+
+      - name: Lint shell scripts
+        run: |
+          set -euo pipefail
+          # shellcheck is preinstalled on GitHub's Ubuntu runners.
+          shellcheck scripts/*.sh deploy/*.sh
 
       - name: Check the declared MSRV matches every place it is pinned
         run: |
@@ -140,6 +165,15 @@ jobs:
           fi
 
           status=0
+
+          # The Dockerfile selects its compiler by the builder image's tag.
+          DOCKER_RUST=$(grep -m1 -oE '^FROM rust:[0-9]+\.[0-9]+\.[0-9]+' Dockerfile | sed 's/.*://')
+          echo "Dockerfile builder:      ${DOCKER_RUST:-<none>}"
+          if [ "$DOCKER_RUST" != "$CARGO_MSRV" ]; then
+            echo "::error file=Dockerfile::builder image pins Rust ${DOCKER_RUST:-<none>} but the MSRV is $CARGO_MSRV"
+            status=1
+          fi
+
           for wf in .github/workflows/*.yml; do
             while IFS= read -r version; do
               if [ "$version" != "$CARGO_MSRV" ]; then
@@ -193,22 +227,34 @@ jobs:
           fi
           grep -q 'include_str!' src/dashboard/mod.rs
 
-# ── Job 5: Security audit ─────────────────────────────────────────────────────
-  security:
-    name: Security audit
+# ── Job 5: Supply-chain policy (licenses, bans, sources) ──────────────────────
+#
+# Advisories are checked separately (security.yml): a freshly published RustSec
+# entry for a dependency we cannot fix yet must not block unrelated work, but it
+# must still be visible, so that workflow runs weekly and on any change to the
+# lockfile.
+#
+# cargo-deny is installed at an explicit version rather than through
+# EmbarkStudios/cargo-deny-action: releases before 0.19 cannot parse the
+# CVSS 4.0 vectors that the RustSec database now contains, and the version the
+# action bundles is not under our control.
+  policy:
+    name: Supply-chain policy
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: EmbarkStudios/cargo-deny-action@82eb9f621fbc699dd0918f3ea06864c14cc84246 # v2
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
-          log-level: warn
-          command: check
-          arguments: --all-features
+          tool: cargo-deny@0.19.4
+      - name: cargo deny check bans licenses sources
+        run: cargo deny --all-features check bans licenses sources
 
 # ── Job 6: Code coverage ──────────────────────────────────────────────────────
   coverage:
     name: Code coverage
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -225,44 +271,102 @@ jobs:
           name: coverage-report
           path: lcov.info
 
-# ── Job 7: Docker build ───────────────────────────────────────────────────────
+# ── Job 7: Docker image build + container smoke test ──────────────────────────
+#
+# Builds the image from the Dockerfile and starts it with the production
+# restrictions (read-only root, no capabilities, UID 65532, a fresh named
+# volume), then asserts /health/detailed reports a behavioral extension version
+# and that the extension still loads after a restart with no network.
+# Building is the slow part (it compiles DuckDB); the GitHub Actions layer cache
+# makes later runs fast.
   docker:
-    name: Docker build
+    name: Docker image
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Build Docker image
-        run: docker build -t mallard-metrics:test .
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: mallard-metrics:test
+          cache-from: type=gha,scope=docker-image
+          cache-to: type=gha,scope=docker-image,mode=max
+      - name: Smoke-test the container
+        run: scripts/docker-smoke.sh mallard-metrics:test
 
-# ── Job 8: Release build smoke test ───────────────────────────────────────────
+# ── Job 8: Deployment configuration ───────────────────────────────────────────
 #
-# Exercises the same cross-compilation path the release workflow uses so that
-# target-specific build breakage (e.g. a missing musl C++ toolchain for
-# `libduckdb-sys`) is caught on every push — not on the first release tag.
-#
-# Runs both musl targets via `cross`, matching release.yml exactly.  The
-# aarch64 leg is the slow one; x86_64 is fast and catches the vast majority of
-# issues, so we mark the matrix `fail-fast: false` to get full coverage.
-  release-build:
-    name: Release build / ${{ matrix.target }}
+# Nothing else parses the compose files or the Caddyfile, so a typo in either
+# reached production before. The Caddy image is built from deploy/Dockerfile.caddy
+# because the Caddyfile uses the Cloudflare DNS module, which stock Caddy lacks.
+  deploy-config:
+    name: Deployment config
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Validate the compose files
+        run: |
+          set -euo pipefail
+          MALLARD_SECRET=ci docker compose -f docker-compose.yml config --quiet
+          DOMAIN=analytics.example.com ACME_EMAIL=ops@example.com \
+          CLOUDFLARE_API_TOKEN=ci MALLARD_SECRET=ci MALLARD_ADMIN_PASSWORD=ci \
+          MALLARD_METRICS_TOKEN=ci \
+            docker compose -f deploy/docker-compose.production.yml config --quiet
+      - name: Build Caddy with the Cloudflare module
+        run: docker build -f deploy/Dockerfile.caddy -t mallard-caddy:ci .
+      - name: Validate the Caddyfile
+        run: |
+          docker run --rm \
+            -e DOMAIN=analytics.example.com -e ACME_EMAIL=ops@example.com \
+            -e CLOUDFLARE_API_TOKEN=ci \
+            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            mallard-caddy:ci caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+# ── Job 9: Release binaries ───────────────────────────────────────────────────
+#
+# Builds the Linux release binaries the way release.yml does and smoke-tests
+# them with the behavioral extension REQUIRED.
+#
+# glibc, not musl: the DuckDB community repository publishes no linux_*_musl
+# build of `behavioral`, so a musl binary starts and ingests but answers 503 on
+# every funnel, retention, session, sequence and flow request.
+#
+# The runner images are the oldest available (ubuntu-22.04, glibc 2.35) so the
+# binary also runs on Debian 12 / distroless (glibc 2.36). check-binary-abi.sh
+# verifies that and rejects any unexpected shared library.
+#
+# Each architecture builds and runs on a native runner, which also exercises the
+# linux_arm64 extension.
+  release-build:
+    name: Release binary / ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: "1.98.0"
-          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-${{ matrix.target }}
-      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
-        with:
-          tool: cross
-      - name: Build release (cross)
-        run: cross build --locked --release --target ${{ matrix.target }}
+      - name: Build release
+        run: cargo build --locked --release
+      - name: Check the binary runs on the container's C library
+        run: scripts/check-binary-abi.sh target/release/mallard-metrics 2.36 3.4.30
+      - name: Smoke-test the release binary
+        env:
+          MALLARD_REQUIRE_BEHAVIORAL: "1"
+        run: scripts/smoke-test.sh target/release/mallard-metrics

@@ -7,6 +7,12 @@
 #
 #   validate ──┬──► ci (matrix) ──┬──► build-binaries (matrix) ──┬──► docker-image ────┬──► github-release
 #              └──► security ────┘                               └────────────────────┘
+#
+# Linux binaries are glibc builds on the oldest runner image (ubuntu-22.04) and
+# are smoke-tested with the DuckDB `behavioral` extension REQUIRED before they
+# are archived. There are deliberately no musl builds: the extension is not
+# published for musl, so such a binary would answer 503 on funnels, retention,
+# sessions, sequences and flow.
 
 name: Release
 
@@ -35,6 +41,7 @@ jobs:
   validate:
     name: Validate release tag
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       version:       ${{ steps.meta.outputs.version }}
       is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
@@ -110,6 +117,7 @@ jobs:
     name: CI / ${{ matrix.name }}
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: true
       matrix:
@@ -118,12 +126,12 @@ jobs:
             command: cargo test --locked --all-targets
           - name: "clippy"
             components: clippy
-            command: cargo clippy --all-targets --all-features -- -D warnings
+            command: cargo clippy --locked --all-targets --all-features -- -D warnings
           - name: "fmt"
             components: rustfmt
             command: cargo fmt -- --check
           - name: "doc"
-            command: cargo doc --no-deps
+            command: cargo doc --locked --no-deps
             rustdocflags: "-D warnings"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -136,37 +144,50 @@ jobs:
         run: ${{ matrix.command }}
         env:
           RUSTDOCFLAGS: ${{ matrix.rustdocflags || '' }}
+          # Behavioral tests skip when the extension cannot be downloaded; a
+          # release must not be cut from a run in which they were skipped.
+          MALLARD_REQUIRE_BEHAVIORAL: "1"
 
 # ── Job 3: Security audit ─────────────────────────────────────────────────────
+#
+# Unlike ci.yml, advisories ARE part of this gate: a release must not ship a
+# dependency with a known vulnerability. cargo-deny is installed at an explicit
+# version because releases before 0.19 cannot parse the CVSS 4.0 vectors now
+# present in the RustSec database.
   security:
     name: Security audit (cargo-deny)
     needs: validate
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: EmbarkStudios/cargo-deny-action@82eb9f621fbc699dd0918f3ea06864c14cc84246 # v2
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
         with:
-          command: check
-          arguments: --all-features
+          tool: cargo-deny@0.19.4
+      - name: cargo deny check
+        run: cargo deny --all-features check
 
 # ── Job 4: Build release binaries (cross-platform matrix) ─────────────────────
   build-binaries:
     name: Build / ${{ matrix.target }}
     needs: [ci, security]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: true
       matrix:
         include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            archive: mallard-metrics-x86_64-unknown-linux-musl.tar.gz
-            cross: true
+          # Linux: glibc, built natively on the oldest available runner image so
+          # the binary runs on anything from Ubuntu 22.04 / Debian 12 up (it
+          # needs glibc >= 2.35) and in the distroless cc-debian12 image.
+          # check-binary-abi.sh enforces the ceiling. No musl: see the header.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            archive: mallard-metrics-x86_64-unknown-linux-gnu.tar.gz
             docker_arch: amd64
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            archive: mallard-metrics-aarch64-unknown-linux-musl.tar.gz
-            cross: true
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            archive: mallard-metrics-aarch64-unknown-linux-gnu.tar.gz
             docker_arch: arm64
           # Both Darwin builds run on macos-14 (Apple Silicon).  The aarch64
           # build is native; the x86_64 build cross-compiles using Apple's
@@ -190,26 +211,22 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Install `cross` for Linux targets.  We use cross for BOTH musl targets
-      # (x86_64 and aarch64) because libduckdb-sys compiles bundled C++ via
-      # `cc-rs`, which requires a full `*-linux-musl-g++` toolchain — not
-      # provided by Ubuntu's `musl-tools` apt package.  The cross Docker images
-      # ship a complete musl C/C++ toolchain, so a single path handles both.
-      - name: Install cross
-        if: matrix.cross
-        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
-        with:
-          tool: cross
-
-      # Native build (x86_64-linux, macOS targets)
-      - name: Build (native)
-        if: "!matrix.cross"
+      - name: Build
         run: cargo build --locked --release --target ${{ matrix.target }}
 
-      # Cross-compiled build (aarch64-linux)
-      - name: Build (cross)
-        if: matrix.cross
-        run: cross build --locked --release --target ${{ matrix.target }}
+      # Linux only: prove the binary can run on the container's C library, and
+      # that it really serves the behavioral endpoints (installing the extension
+      # over the network, as the container does on first start). The smoke test
+      # uses GNU `date`, so it does not run on the macOS legs.
+      - name: Check the binary's C library requirements
+        if: matrix.docker_arch
+        run: scripts/check-binary-abi.sh target/${{ matrix.target }}/release/mallard-metrics 2.36 3.4.30
+
+      - name: Smoke-test the release binary
+        if: matrix.docker_arch
+        env:
+          MALLARD_REQUIRE_BEHAVIORAL: "1"
+        run: scripts/smoke-test.sh target/${{ matrix.target }}/release/mallard-metrics
 
       - name: Create archive
         shell: bash
@@ -258,6 +275,7 @@ jobs:
     name: Docker image (GHCR)
     needs: [validate, build-binaries]
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     # Expose the immutable image digest to downstream jobs (github-release
     # embeds it in release notes for verifiable pulls).
     outputs:
@@ -294,9 +312,6 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
-      - name: Set up QEMU (for multi-arch manifest)
-        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
-
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
@@ -315,65 +330,37 @@ jobs:
             type=semver,pattern={{major}}
             type=sha,prefix=
 
-      # Inline Dockerfile using pre-built static binaries.
-      # No compilation happens here — just copies the correct binary for each
-      # target platform into a FROM scratch image.
-      - name: Write release Dockerfile
-        run: |
-          cat > Dockerfile.release <<'EOF'
-          # A `scratch` image has no trust store, and DuckDB downloads the
-          # `behavioral` community extension over HTTPS on first run. Alpine is
-          # here only to supply those roots; nothing from it ships in the final
-          # image except the ~200 KB bundle.
-          # Pinned to the build platform: the bundle is a text file with no
-          # architecture, so emulating an arm64 Alpine just to read it would
-          # cost QEMU time for nothing.
-          FROM --platform=$BUILDPLATFORM alpine:3.22 AS certs
-          RUN apk add --no-cache ca-certificates
+      # Gate: build the amd64 image exactly as it will be published (see
+      # deploy/Dockerfile.release), load it locally and run the container smoke
+      # test: production restrictions, behavioral extension installed and
+      # reported by /health/detailed, and still loaded after a restart with no
+      # network. Nothing is pushed unless this passes.
+      - name: Build the amd64 image for the pre-push gate
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/Dockerfile.release
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: mallard-metrics:gate
 
-          FROM scratch
-          ARG TARGETARCH
+      - name: Smoke-test the image before publishing it
+        run: scripts/docker-smoke.sh mallard-metrics:gate
 
-          COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-
-          # Mirrors the from-source Dockerfile exactly. It previously did not:
-          # the released image carried no OCI labels (so GHCR could not link it
-          # back to this repository or state its licence) and no HEALTHCHECK
-          # (so `docker run` and Swarm had no readiness signal, even though the
-          # binary ships one specifically because `scratch` has no shell).
-          LABEL org.opencontainers.image.title="Mallard Metrics" \
-                org.opencontainers.image.description="Self-hosted, privacy-focused web analytics powered by DuckDB and the behavioral extension" \
-                org.opencontainers.image.source="https://github.com/tomtom215/mallardmetrics" \
-                org.opencontainers.image.licenses="AGPL-3.0-only"
-
-          COPY dist/${TARGETARCH}/mallard-metrics /mallard-metrics
-
-          # Non-root uid; `scratch` has no /etc/passwd, so it must be numeric.
-          USER 65532:65532
-
-          ENV MALLARD_DATA_DIR=/data
-          # DuckDB's default extension directory is $HOME/.duckdb, and this
-          # image has no home directory; the data volume is the writable one.
-          ENV MALLARD_EXTENSION_DIR=/data/extensions
-          EXPOSE 8000
-          VOLUME ["/data"]
-
-          # Exec form: there is no shell in the image to parse a string form.
-          HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-              CMD ["/mallard-metrics", "--healthcheck"]
-
-          ENTRYPOINT ["/mallard-metrics"]
-          EOF
-          sed -i 's/^          //' Dockerfile.release
-
+      # SBOM and max-mode build provenance are attached to the image index by
+      # BuildKit (no extra action). The SLSA attestation below is signed and
+      # stored by GitHub on top of that.
       - name: Build and push multi-arch image
         id: push
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
-          file: Dockerfile.release
+          file: deploy/Dockerfile.release
           platforms: linux/amd64,linux/arm64
           push: true
+          sbom: true
+          provenance: mode=max
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
@@ -410,8 +397,11 @@ jobs:
     name: Create GitHub release
     needs: [validate, build-binaries, docker-image]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -434,6 +424,11 @@ jobs:
           cat ./*.sha256 > SHA256SUMS
           sha256sum -c SHA256SUMS
           echo "::notice::All checksums verified"
+
+      - name: Attest binary provenance (SLSA)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release-artifacts/mallard-metrics-*.tar.gz
 
       - name: Extract CHANGELOG section for this version
         id: notes
@@ -486,13 +481,27 @@ jobs:
             echo "docker pull ghcr.io/${{ github.repository }}:${VERSION}"
             echo "\`\`\`"
             echo ""
-            echo "Platforms: \`linux/amd64\`, \`linux/arm64\`"
+            echo "Platforms: \`linux/amd64\`, \`linux/arm64\`. The image is based on"
+            echo "distroless \`cc-debian12\` (glibc, UID 65532, no shell)."
             echo ""
             echo "Immutable digest (pin this in production):"
             echo ""
             echo "\`\`\`"
             echo "ghcr.io/${{ github.repository }}@${DIGEST}"
             echo "\`\`\`"
+            echo ""
+            echo "### Binaries"
+            echo ""
+            echo "- Linux \`x86_64\` and \`aarch64\` (\`*-unknown-linux-gnu\`): dynamically linked"
+            echo "  against glibc 2.35 or newer (Debian 12+, Ubuntu 22.04+). Smoke-tested in CI"
+            echo "  with the \`behavioral\` extension required."
+            echo "- There is **no musl / Alpine build**. DuckDB's \`behavioral\` community extension"
+            echo "  is not published for musl, so such a binary would serve everything except"
+            echo "  funnels, retention, sessions, sequences and flow, which would answer 503."
+            echo "  On Alpine, use the Docker image."
+            echo "- macOS \`x86_64\` and \`aarch64\`: built, but not covered by the CI smoke test."
+            echo "- Archives carry a build-provenance attestation:"
+            echo "  \`gh attestation verify <archive> --repo ${{ github.repository }}\`"
             echo ""
             echo "### Checksums"
             echo ""

@@ -1,0 +1,50 @@
+# Release image: the same runtime as the repository Dockerfile, assembled from
+# the glibc binaries release.yml has already built and smoke-tested, so nothing
+# is compiled here.
+#
+#   docker buildx build -f deploy/Dockerfile.release \
+#     --platform linux/amd64,linux/arm64 .      # needs dist/<arch>/mallard-metrics
+#
+# Keep this file in step with ../Dockerfile (runtime stage: labels, USER, ENV,
+# HEALTHCHECK). release.yml runs scripts/docker-smoke.sh against the image built
+# from it before anything is pushed, which catches drift that matters.
+#
+# The binaries are built on ubuntu-22.04 (glibc 2.35, libstdc++ 3.4.29) and run
+# on Debian 12 (glibc 2.36, libstdc++ 3.4.30): a binary needs a C library at
+# least as new as the one it was linked against, never older.
+
+# /data must exist in the image and belong to the runtime uid, or a fresh named
+# volume is created root-owned and the non-root process cannot write to it.
+# Pinned to the build platform: it only runs mkdir, so emulating arm64 for it
+# would cost QEMU time for nothing, and the directory has no architecture.
+FROM --platform=$BUILDPLATFORM alpine:3.22 AS skeleton
+RUN mkdir /rootfs-data
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+ARG TARGETARCH
+
+LABEL org.opencontainers.image.title="Mallard Metrics" \
+      org.opencontainers.image.description="Self-hosted, privacy-focused web analytics powered by DuckDB and the behavioral extension" \
+      org.opencontainers.image.source="https://github.com/tomtom215/mallardmetrics" \
+      org.opencontainers.image.licenses="AGPL-3.0-only"
+
+COPY --from=skeleton --chown=65532:65532 /rootfs-data /data
+COPY dist/${TARGETARCH}/mallard-metrics /mallard-metrics
+
+USER 65532:65532
+WORKDIR /data
+
+# HOME and the extension directory point at the data volume: DuckDB would
+# otherwise install community extensions under $HOME/.duckdb, which is not
+# writable on a read-only root filesystem (LESSONS.md, L29).
+ENV HOME=/data \
+    MALLARD_DATA_DIR=/data \
+    MALLARD_EXTENSION_DIR=/data/extensions
+EXPOSE 8000
+VOLUME ["/data"]
+
+# No shell in the image: the binary probes itself, in exec form.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["/mallard-metrics", "--healthcheck"]
+
+ENTRYPOINT ["/mallard-metrics"]
