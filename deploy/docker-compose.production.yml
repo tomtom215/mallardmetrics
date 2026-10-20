@@ -14,7 +14,12 @@
 #                                     → mallard-metrics (no internet access)
 #
 # Data is stored on the host at MALLARD_DATA_HOST_DIR (default: /srv/mallard/data).
-# Run deploy/setup.sh first — it mounts that path on a LUKS-encrypted container.
+# Run deploy/setup.sh first — it mounts that path on a LUKS-encrypted container
+# and makes it writable by the container's uid (65532).
+#
+# Backups: see deploy/backup.sh. Do NOT copy the live data directory with
+# rsync/cp while the mallard container runs: DuckDB's file and WAL are not
+# consistent on disk until the process stops or checkpoints.
 # =============================================================================
 
 name: mallard-production
@@ -64,46 +69,83 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
-      # Caddy access logs land beside mallard data so they rotate together.
-      - ${MALLARD_DATA_HOST_DIR:-/srv/mallard/data}/logs:/logs
 
     environment:
       DOMAIN:               ${DOMAIN}
       ACME_EMAIL:           ${ACME_EMAIL}
       CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
 
+    # Caddy's access and error logs go to stdout/stderr with the visitor's IP,
+    # User-Agent, headers and query string removed (see the Caddyfile), so the
+    # only retention is this size-based rotation.
     logging:
       driver: "json-file"
       options:
         max-size: "20m"
         max-file: "5"
 
+    # Probes the loopback-only listener declared in the Caddyfile. The previous
+    # check ran `caddy validate`, which only re-parses the file and succeeds
+    # whether or not the server is up.
     healthcheck:
-      test: ["CMD", "caddy", "validate", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
-      interval: 60s
-      timeout: 15s
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8081/healthz"]
+      interval: 30s
+      timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 15s
+
+    # Wait for the backend so Caddy's first requests are not 502s, and so a
+    # `up -d` reports a failed backend instead of hiding it.
+    depends_on:
+      mallard:
+        condition: service_healthy
+
+    mem_limit: 256m
+    cpus: 1
+    pids_limit: 256
 
   # ── Mallard Metrics ────────────────────────────────────────────────────────
-  # The analytics backend. Built from the repo root Dockerfile (FROM scratch,
-  # statically linked musl binary). No port is published to the host — all
-  # traffic goes through Caddy on the internal `proxy` network.
+  # The analytics backend. Built from the repo root Dockerfile (glibc,
+  # distroless, UID 65532) or pulled from GHCR when MALLARD_IMAGE is set. No
+  # port is published to the host — all traffic goes through Caddy on the
+  # internal `proxy` network.
+  #
+  # A DuckDB build on a 1 GB VPS can run out of memory; set
+  # MALLARD_IMAGE=ghcr.io/tomtom215/mallardmetrics:<version> in deploy/.env to
+  # pull a released image instead (running setup.sh with MM_IMAGE=<image> does this).
   mallard:
     build:
       context: ..
       dockerfile: Dockerfile
-    image: mallard-metrics:latest
+    image: ${MALLARD_IMAGE:-mallard-metrics:latest}
     container_name: mallard-metrics
     restart: unless-stopped
+
+    # The image already runs as 65532:65532; stating it here keeps it true if the
+    # image is ever replaced, and matches the ownership setup.sh gives the data
+    # directory.
+    user: "65532:65532"
 
     cap_drop: [ALL]
     security_opt:
       - no-new-privileges:true
 
-    # FROM scratch has no shell, so read_only is effectively the default.
     # The only writable path is /data (bind-mounted from the LUKS volume).
     read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+
+    # Resource limits. DuckDB defaults to ~80% of host RAM, so cap it below the
+    # container limit: a heavy query then fails with an error instead of getting
+    # the whole process, and with it event ingestion, OOM-killed.
+    mem_limit: ${MALLARD_MEM_LIMIT:-2g}
+    cpus: ${MALLARD_CPUS:-2}
+    pids_limit: 256
+
+    # The shutdown path flushes the in-memory event buffer, which can take up to
+    # MALLARD_SHUTDOWN_TIMEOUT (30 s by default); Docker's default 10 s grace
+    # period would SIGKILL the process mid-flush and lose the buffered events.
+    stop_grace_period: 45s
 
     # Mallard is ONLY on the internal network — it has no internet access.
     # Caddy reaches it via the shared `proxy` network; the internet cannot
@@ -113,17 +155,23 @@ services:
     # dashboard says "Not available": the DuckDB `behavioral` extension is
     # downloaded on first run, and there is nowhere to download it from here, so
     # funnels, retention, sessions, sequences and flow answer 503. Seed it once
-    # onto the data volume and it is loaded from disk from then on:
+    # onto the data volume (setup.sh does this for you) and it is loaded from
+    # disk from then on:
     #
-    #   docker run --rm -v ${MALLARD_DATA_HOST_DIR:-/srv/mallard/data}:/data \
+    #   docker run --rm --user 65532:65532 \
+    #     -v ${MALLARD_DATA_HOST_DIR:-/srv/mallard/data}:/data \
     #     mallard-metrics:latest --install-extension
     #
-    # See docs/src/deploy-vps.md, "Seed the behavioral extension".
+    # The image must be glibc-based: the extension is not published for musl.
+    # Re-run this after any DuckDB upgrade (check /health/detailed for
+    # `behavioral_version`). See docs/src/deploy-vps.md, "Seed the behavioral
+    # extension".
     networks:
       - proxy
 
     volumes:
-      # Bind-mount the LUKS-decrypted directory. setup.sh creates and mounts it.
+      # Bind-mount the LUKS-decrypted directory. setup.sh creates it, mounts it
+      # and chowns it to 65532:65532.
       - type: bind
         source: ${MALLARD_DATA_HOST_DIR:-/srv/mallard/data}
         target: /data
@@ -140,6 +188,19 @@ services:
       MALLARD_SECURE_COOKIES:   "true"
       MALLARD_METRICS_TOKEN:    ${MALLARD_METRICS_TOKEN}
 
+      # ---- Client address (behind the bundled Caddy) ----
+      # Mallard's only peer is the Caddy container. Without these, every
+      # visitor shares Caddy's address: the login lockout is keyed by it (five
+      # wrong passwords from anyone lock the admin out), unique visitors
+      # collapse to distinct User-Agents, and GeoIP never resolves
+      # (LESSONS.md, L31). Caddy overwrites X-Forwarded-For with the single
+      # address it accepted the connection from, so exactly one hop is trusted.
+      # MALLARD_TRUSTED_PROXY_HOPS requires a Mallard build that reads it;
+      # older builds ignore it and take the leftmost entry, which is the same
+      # address when Caddy is the only proxy.
+      MALLARD_TRUST_PROXY_HEADERS: "true"
+      MALLARD_TRUSTED_PROXY_HOPS:  "1"
+
       # ---- Behaviour ----
       # IMPORTANT: env var names must match config.rs exactly.
       # MALLARD_RATE_LIMIT       → config.rate_limit_per_site
@@ -153,6 +214,10 @@ services:
       MALLARD_MAX_CONCURRENT_QUERIES: ${MALLARD_MAX_CONCURRENT_QUERIES:-10}
       MALLARD_MAX_LOGIN_ATTEMPTS:     ${MALLARD_MAX_LOGIN_ATTEMPTS:-5}
       MALLARD_LOGIN_LOCKOUT:          ${MALLARD_LOGIN_LOCKOUT:-300}
+      MALLARD_SITE_IDS:               ${MALLARD_SITE_IDS:-}
+      MALLARD_GEOIP_DB:               ${MALLARD_GEOIP_DB:-}
+      MALLARD_DUCKDB_MEMORY_LIMIT:    ${MALLARD_DUCKDB_MEMORY_LIMIT:-1280MB}
+      MALLARD_DUCKDB_THREADS:         ${MALLARD_DUCKDB_THREADS:-2}
 
       RUST_LOG: "mallard_metrics=info,tower_http=warn"
 
@@ -162,15 +227,17 @@ services:
         max-size: "50m"
         max-file: "7"
 
-    # FROM scratch has no executables for a shell-based health check.
-    # Caddy performs active health checks against /health/ready instead.
+    # The binary probes itself (`--healthcheck` -> /health/ready), so the
+    # distroless image needs no shell or curl. The previous "disabled" setting
+    # dated from the FROM scratch image, where the same exec-form check already
+    # worked; disabling it only hid an unhealthy backend from `docker ps` and
+    # from Caddy's depends_on.
     healthcheck:
-      disable: true
-
-    # Mallard does not depend on Caddy — it starts independently and accepts
-    # connections as soon as it binds. Caddy's upstream health check marks
-    # Mallard as "up" once /health/ready returns 200.
-    # No depends_on here — either service can (re)start independently.
+      test: ["CMD", "/mallard-metrics", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
 
 # ---------------------------------------------------------------------------
 # Networks
