@@ -7,20 +7,56 @@ use std::time::Instant;
 /// Idle time after which a bucket is eligible for removal.
 const BUCKET_IDLE_SECS: u64 = 300;
 
+/// The key under which a client address is rate limited or locked out.
+///
+/// IPv4 addresses are used as they are. An IPv6 address is reduced to its /64:
+/// a single subscriber or VPS routinely owns a whole /64 and can send each
+/// request from a different /128, which gave every request a fresh token bucket
+/// and a fresh login-attempt record. An IPv4-mapped IPv6 address
+/// (`::ffff:192.0.2.1`, what a dual-stack socket reports for an IPv4 peer) is
+/// the IPv4 address it wraps, so one client does not hold two keys. Text that is
+/// not an address (the `"unknown"` placeholder) is returned unchanged.
+///
+/// The full address stays in use for the visitor hash and GeoIP, which want
+/// the most specific value; only the abuse-control keys are coarsened.
+pub fn network_key(ip: &str) -> std::borrow::Cow<'_, str> {
+    use std::net::IpAddr;
+    match ip.parse::<IpAddr>().map(|a| a.to_canonical()) {
+        Ok(IpAddr::V6(v6)) => {
+            let [a, b, c, d, ..] = v6.segments();
+            std::borrow::Cow::Owned(format!("{a:x}:{b:x}:{c:x}:{d:x}::/64"))
+        }
+        Ok(IpAddr::V4(v4)) => {
+            let canonical = v4.to_string();
+            if canonical == ip {
+                std::borrow::Cow::Borrowed(ip)
+            } else {
+                std::borrow::Cow::Owned(canonical)
+            }
+        }
+        Err(_) => std::borrow::Cow::Borrowed(ip),
+    }
+}
+
 /// Token-bucket rate limiter keyed by an arbitrary string (site ID or client IP).
 ///
 /// Each key gets `capacity` tokens per second, refilled continuously.
 ///
 /// The bucket map is capped: its keys come from attacker-influenced values, so
 /// relying on the 15-minute cleanup sweep alone would let a flood of distinct
-/// keys grow it without bound between sweeps.
+/// keys grow it without bound between sweeps. At the cap the limiter makes room
+/// instead of refusing new keys: refusing meant that 10,000 cheap requests with
+/// distinct keys turned every genuine new visitor away with a 429 for as long as
+/// the attacker kept it up. Room is made in batches (an eighth of the cap at a
+/// time), so the scan over the map is paid once per batch rather than once per
+/// request while holding the lock every ingest request needs.
 #[derive(Clone)]
 pub struct RateLimiter {
     buckets: Arc<Mutex<HashMap<String, Bucket>>>,
     capacity: u32,
     max_keys: usize,
-    /// Number of times a new key was refused because the map was full.
-    pub capacity_rejections: Arc<AtomicU64>,
+    /// Number of buckets dropped early because the map was full.
+    pub capacity_evictions: Arc<AtomicU64>,
 }
 
 struct Bucket {
@@ -51,7 +87,7 @@ impl RateLimiter {
             buckets: Arc::new(Mutex::new(HashMap::new())),
             capacity,
             max_keys,
-            capacity_rejections: Arc::new(AtomicU64::new(0)),
+            capacity_evictions: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -73,42 +109,60 @@ impl RateLimiter {
             return true;
         }
 
-        let mut buckets = self.buckets.lock();
         let now = Instant::now();
         let cap = f64::from(self.capacity);
+        let mut buckets = self.buckets.lock();
 
-        if !buckets.contains_key(key) {
-            if self.max_keys > 0 && buckets.len() >= self.max_keys {
-                // Drop idle buckets first; only refuse if every tracked key is active.
-                buckets.retain(|_, b| !is_idle(b, now));
-                if buckets.len() >= self.max_keys {
-                    self.capacity_rejections.fetch_add(1, Ordering::Relaxed);
-                    return false;
-                }
-            }
-            buckets.insert(
-                key.to_string(),
-                Bucket {
-                    tokens: cap,
-                    last_refill: now,
-                },
-            );
+        if let Some(bucket) = buckets.get_mut(key) {
+            let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+            bucket.tokens = elapsed.mul_add(cap, bucket.tokens).min(cap);
+            bucket.last_refill = now;
+            return if bucket.tokens >= 1.0 {
+                bucket.tokens -= 1.0;
+                true
+            } else {
+                false
+            };
         }
 
-        let bucket = buckets
-            .get_mut(key)
-            .expect("bucket was just inserted if absent");
-
-        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
-        bucket.tokens = elapsed.mul_add(cap, bucket.tokens).min(cap);
-        bucket.last_refill = now;
-
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            true
-        } else {
-            false
+        if self.max_keys > 0 && buckets.len() >= self.max_keys {
+            self.make_room(&mut buckets, now);
         }
+        // A new key starts with a full bucket, less the request being checked.
+        buckets.insert(
+            key.to_string(),
+            Bucket {
+                tokens: cap - 1.0,
+                last_refill: now,
+            },
+        );
+        true
+    }
+
+    /// Free at least an eighth of the cap: idle buckets first, then the least
+    /// recently used.
+    fn make_room(&self, buckets: &mut HashMap<String, Bucket>, now: Instant) {
+        let target = (self.max_keys / 8).max(1);
+        let before = buckets.len();
+        buckets.retain(|_, b| !is_idle(b, now));
+        let freed = before - buckets.len();
+        if freed >= target {
+            return;
+        }
+
+        let need = (target - freed).min(buckets.len());
+        if need == 0 {
+            return;
+        }
+        let mut stamps: Vec<Instant> = buckets.values().map(|b| b.last_refill).collect();
+        let (_, cutoff, _) = stamps.select_nth_unstable(need - 1);
+        let cutoff = *cutoff;
+        let before = buckets.len();
+        buckets.retain(|_, b| b.last_refill > cutoff);
+        self.capacity_evictions.fetch_add(
+            u64::try_from(before - buckets.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// Remove buckets untouched for longer than the idle threshold.
@@ -198,11 +252,11 @@ mod tests {
             "tracked keys ({}) must not exceed the cap",
             rl.tracked_keys()
         );
-        assert!(rl.capacity_rejections.load(Ordering::Relaxed) > 0);
+        assert!(rl.capacity_evictions.load(Ordering::Relaxed) > 0);
     }
 
     #[test]
-    fn test_key_cap_reclaims_idle_buckets_before_refusing() {
+    fn test_key_cap_reclaims_idle_buckets_before_evicting() {
         let rl = RateLimiter::new(10, 2);
         rl.check("a.com");
         rl.check("b.com");
@@ -216,9 +270,11 @@ mod tests {
                 );
             }
         }
-        assert!(
-            rl.check("c.com"),
-            "idle buckets must be reclaimed rather than refusing a new key"
+        assert!(rl.check("c.com"));
+        assert_eq!(
+            rl.capacity_evictions.load(Ordering::Relaxed),
+            0,
+            "idle buckets are reclaimed first; nothing active is sacrificed"
         );
     }
 
@@ -226,9 +282,8 @@ mod tests {
     fn test_existing_key_still_works_when_map_is_full() {
         let rl = RateLimiter::new(10, 1);
         assert!(rl.check("a.com"));
-        // b.com cannot get a bucket, but a.com must keep working.
-        assert!(!rl.check("b.com"));
         assert!(rl.check("a.com"));
+        assert_eq!(rl.tracked_keys(), 1);
     }
 
     #[test]
@@ -238,6 +293,86 @@ mod tests {
             rl.check(&format!("s{i}"));
         }
         assert_eq!(rl.tracked_keys(), 50);
+    }
+
+    #[test]
+    fn test_new_key_is_admitted_when_the_map_is_full_of_active_keys() {
+        // SI-07 regression: at the cap every new key was refused, so 10,000
+        // cheap requests with distinct keys turned genuine new visitors away
+        // with a 429 for as long as the attacker kept it up.
+        let rl = RateLimiter::new(10, 8);
+        for i in 0..8 {
+            assert!(rl.check(&format!("active-{i}")));
+        }
+        assert!(
+            rl.check("a-real-visitor"),
+            "a new key must get a bucket even when every tracked key is active"
+        );
+        assert!(rl.tracked_keys() <= 8, "the cap still holds");
+    }
+
+    #[test]
+    fn test_pressure_evicts_the_least_recently_used_bucket() {
+        let rl = RateLimiter::new(10, 8);
+        for i in 0..8 {
+            rl.check(&format!("k{i}"));
+        }
+        // Age everything except k5, so k5 is the one worth keeping.
+        {
+            let mut buckets = rl.buckets.lock();
+            for (key, bucket) in buckets.iter_mut() {
+                if key != "k5" {
+                    age(bucket, std::time::Duration::from_secs(10));
+                }
+            }
+        }
+        rl.check("newcomer");
+        let buckets = rl.buckets.lock();
+        assert!(buckets.contains_key("k5"), "the recently used key survives");
+        assert!(buckets.contains_key("newcomer"));
+        assert!(buckets.len() <= 8);
+    }
+
+    #[test]
+    fn test_eviction_is_batched_not_per_request() {
+        // The scan that makes room is O(n) while the lock every ingest request
+        // needs is held. It must free a batch, so a flood of new keys pays it
+        // once per batch rather than once per request.
+        let rl = RateLimiter::new(10, 800);
+        for i in 0..800 {
+            rl.check(&format!("seed-{i}"));
+        }
+        let before = rl.capacity_evictions.load(Ordering::Relaxed);
+        rl.check("overflow-1");
+        let first_batch = rl.capacity_evictions.load(Ordering::Relaxed) - before;
+        assert!(
+            first_batch >= 100,
+            "freed {first_batch}, expected an eighth of the cap"
+        );
+        for i in 0..50 {
+            rl.check(&format!("overflow-b{i}"));
+        }
+        assert_eq!(
+            rl.capacity_evictions.load(Ordering::Relaxed) - before,
+            first_batch,
+            "the next 50 new keys fit in the room already made"
+        );
+    }
+
+    #[test]
+    fn test_network_key_collapses_ipv6_to_its_64() {
+        assert_eq!(network_key("2001:db8:1:2::1"), "2001:db8:1:2::/64");
+        assert_eq!(
+            network_key("2001:db8:1:2:ffff:ffff:ffff:ffff"),
+            "2001:db8:1:2::/64"
+        );
+        assert_ne!(
+            network_key("2001:db8:1:2::1"),
+            network_key("2001:db8:1:3::1")
+        );
+        assert_eq!(network_key("203.0.113.9"), "203.0.113.9");
+        assert_eq!(network_key("::ffff:203.0.113.9"), "203.0.113.9");
+        assert_eq!(network_key("unknown"), "unknown");
     }
 
     #[test]

@@ -342,6 +342,42 @@ async fn test_pixel_endpoint_records_an_event() {
 }
 
 #[tokio::test]
+async fn test_pixel_always_answers_with_a_gif() {
+    // SI-21: a missing or malformed parameter failed the Query extractor with a
+    // text 400 before the handler ran, a broken-image icon in an email client.
+    let (state, _dir) = plain_state();
+    for uri in [
+        "/api/event",
+        "/api/event?d=example.com",
+        "/api/event?u=https%3A%2F%2Fexample.com%2F",
+        "/api/event?d=example.com&u=%2F&w=wide",
+        "/api/event?d=bad%20domain&u=%2F",
+    ] {
+        let response = get(&state, uri).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("image/gif"),
+            "{uri}"
+        );
+    }
+    // Only the request that named a site and page (and merely mangled `w`) counts.
+    assert_eq!(state.buffer.len(), 1);
+    flush(&state);
+    let width: Option<String> = {
+        let conn = state.buffer.conn().lock();
+        conn.query_row("SELECT screen_size FROM events_all LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(width, None, "a non-numeric width is no width");
+}
+
+#[tokio::test]
 async fn test_rate_limiting() {
     let (state, _dir) = state_builder().rate_limit_per_site(2).build();
     let payload = pageview("example.com", "https://example.com/");
@@ -1553,6 +1589,45 @@ async fn test_login_lockout_after_repeated_failures() {
     assert!(locked.headers().contains_key("retry-after"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_login_guesses_cannot_exceed_the_attempt_limit() {
+    // SI-06 regression: attempts were counted after verification, so a burst of
+    // parallel requests all passed the lockout check before any failure was
+    // recorded, and every one of them got its own password guess.
+    let (state, _dir) = state_builder()
+        .admin_password("correct-horse-battery")
+        .login_limits(3, 300)
+        .build();
+
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..12 {
+        let state = Arc::clone(&state);
+        set.spawn(async move {
+            post_json(
+                &state,
+                "/api/auth/login",
+                serde_json::json!({"password": "wrong"}),
+            )
+            .await
+            .status()
+        });
+    }
+    let mut verified = 0;
+    let mut refused = 0;
+    while let Some(status) = set.join_next().await {
+        match status.unwrap() {
+            StatusCode::UNAUTHORIZED => verified += 1,
+            StatusCode::TOO_MANY_REQUESTS => refused += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(
+        verified, 3,
+        "exactly the allowed number of guesses is checked"
+    );
+    assert_eq!(refused, 9);
+}
+
 #[tokio::test]
 async fn test_setup_is_rate_limited_too() {
     // Setup is unauthenticated; without a limit it could be probed freely
@@ -1573,6 +1648,135 @@ async fn test_setup_is_rate_limited_too() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_login_body_does_not_repeat_the_session_token() {
+    // SI-23: the token is a bearer-equivalent credential. It belongs in the
+    // HttpOnly cookie only; echoing it in the body defeats HttpOnly.
+    let (state, _dir) = state_builder()
+        .admin_password("correct-horse-battery")
+        .build();
+    let response = post_json(
+        &state,
+        "/api/auth/login",
+        serde_json::json!({"password": "correct-horse-battery"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = session_cookie(&response).expect("a session cookie is set");
+    let body = body_text(response).await;
+    assert!(
+        !body.contains(&cookie),
+        "the token must not appear in the body: {body}"
+    );
+    assert!(!body.contains("token"));
+}
+
+async fn post_json_from(
+    state: &Arc<AppState>,
+    uri: &str,
+    payload: serde_json::Value,
+    peer: &str,
+    origin: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(origin) = origin {
+        builder = builder.header("origin", origin);
+    }
+    let mut request = builder.body(Body::from(payload.to_string())).unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        peer.parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    send(state, request).await
+}
+
+#[tokio::test]
+async fn test_login_lockout_cannot_be_dodged_by_rotating_ipv6_addresses() {
+    // SI-04 end to end: every guess comes from a different /128 of one /64.
+    let (state, _dir) = state_builder()
+        .admin_password("correct-horse-battery")
+        .login_limits(3, 300)
+        .build();
+    for i in 1..=3 {
+        let response = post_json_from(
+            &state,
+            "/api/auth/login",
+            serde_json::json!({"password": "wrong"}),
+            &format!("[2001:db8:7:7::{i}]:4000"),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let fourth = post_json_from(
+        &state,
+        "/api/auth/login",
+        serde_json::json!({"password": "correct-horse-battery"}),
+        "[2001:db8:7:7:aaaa::9]:4000",
+        None,
+    )
+    .await;
+    assert_eq!(fourth.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let neighbour = post_json_from(
+        &state,
+        "/api/auth/login",
+        serde_json::json!({"password": "correct-horse-battery"}),
+        "[2001:db8:7:8::1]:4000",
+        None,
+    )
+    .await;
+    assert_eq!(
+        neighbour.status(),
+        StatusCode::OK,
+        "another /64 is another client"
+    );
+}
+
+#[tokio::test]
+async fn test_auth_endpoints_refuse_a_foreign_origin() {
+    // SI-29: login, setup and logout were outside the CSRF check that guards
+    // the other state-changing routes.
+    let (state, _dir) = state_builder()
+        .admin_password("correct-horse-battery")
+        .dashboard_origin(Some("https://stats.example.com".to_string()))
+        .build();
+    let body = serde_json::json!({"password": "correct-horse-battery"});
+
+    let foreign = post_json_from(
+        &state,
+        "/api/auth/login",
+        body.clone(),
+        "203.0.113.5:1",
+        Some("https://evil.example"),
+    )
+    .await;
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+    assert!(session_cookie(&foreign).is_none());
+
+    let logout = post_json_from(
+        &state,
+        "/api/auth/logout",
+        serde_json::json!({}),
+        "203.0.113.5:1",
+        Some("https://evil.example"),
+    )
+    .await;
+    assert_eq!(logout.status(), StatusCode::FORBIDDEN);
+
+    let own = post_json_from(
+        &state,
+        "/api/auth/login",
+        body,
+        "203.0.113.5:1",
+        Some("https://stats.example.com"),
+    )
+    .await;
+    assert_eq!(own.status(), StatusCode::OK);
 }
 
 // ── API keys ─────────────────────────────────────────────────────────────
@@ -1843,4 +2047,224 @@ async fn test_metrics_endpoint_honours_its_token() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ── Tracking script ──────────────────────────────────────────────────────
+
+/// Drives `tracking/script.js` against a minimal fake browser (no dependencies,
+/// plain Node) and checks what it would send.
+const TRACKER_HARNESS: &str = r"// Drives tracking/script.js against a minimal fake browser and checks what it
+// would send. Usage: node harness.js <path-to-script.js>
+'use strict';
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+
+const source = fs.readFileSync(process.argv[2], 'utf8');
+
+/** A fake page: returns { sent, win, doc, fire(target, type, ev) }. */
+function page(opts) {
+  const attrs = Object.assign({ 'data-domain': 'site.test' }, opts.attrs || {});
+  const sent = [];
+  const listeners = { window: {}, document: {} };
+  const add = (who) => (type, fn) => {
+    (listeners[who][type] = listeners[who][type] || []).push(fn);
+  };
+  const remove = (who) => (type, fn) => {
+    listeners[who][type] = (listeners[who][type] || []).filter((f) => f !== fn);
+  };
+  let url = new URL(opts.url);
+  const location = {};
+  const syncLocation = () => {
+    location.href = url.href;
+    location.origin = url.origin;
+    location.protocol = url.protocol;
+    location.host = url.host;
+    location.hostname = url.hostname;
+    location.pathname = url.pathname;
+    location.search = url.search;
+    location.hash = url.hash;
+  };
+  syncLocation();
+  const history = {
+    pushState(_s, _t, to) { url = new URL(to, url); syncLocation(); },
+    replaceState(_s, _t, to) { url = new URL(to, url); syncLocation(); },
+  };
+  class FakeBlob { constructor(parts) { this.text = parts.join(''); } }
+  const doc = {
+    currentScript: { getAttribute: (n) => (n in attrs ? attrs[n] : null), src: 'https://stats.test/mallard.js' },
+    baseURI: url.href,
+    referrer: opts.referrer || '',
+    visibilityState: opts.visibility || 'visible',
+    prerendering: !!opts.prerendering,
+    addEventListener: add('document'),
+    removeEventListener: remove('document'),
+    querySelector: () => null,
+  };
+  const win = {
+    location,
+    history,
+    document: doc,
+    navigator: {
+      sendBeacon(endpoint, blob) { sent.push(JSON.parse(blob.text)); return true; },
+    },
+    innerWidth: 1280,
+    localStorage: { getItem: () => null },
+    addEventListener: add('window'),
+    removeEventListener: remove('window'),
+  };
+  win.window = win;
+  const ctx = vm.createContext({
+    window: win, document: doc, navigator: win.navigator, URL, Blob: FakeBlob, JSON,
+    XMLHttpRequest: function () { throw new Error('XHR not expected'); }, RegExp,
+  });
+  vm.runInContext(source, ctx);
+  const fire = (who, type, ev) => (listeners[who][type] || []).slice().forEach((f) => f(ev || {}));
+  return {
+    sent, win, doc, fire,
+    go(to) { history.pushState(null, '', to); },
+    click(link) { fire('document', 'click', { target: { closest: () => link } }); },
+  };
+}
+
+const tests = [];
+const test = (name, fn) => tests.push([name, fn]);
+
+test('SI-10: the external referrer is sent once, not on every SPA route', () => {
+  const p = page({ url: 'https://site.test/', referrer: 'https://www.google.com/search?q=x' });
+  assert.strictEqual(p.sent.length, 1);
+  assert.strictEqual(p.sent[0].r, 'https://www.google.com/search?q=x');
+  p.go('/b');
+  p.go('/c');
+  assert.strictEqual(p.sent.length, 3);
+  assert.strictEqual(p.sent[1].r, null, 'second route');
+  assert.strictEqual(p.sent[2].r, null, 'third route');
+  p.win.mallard('signup');
+  assert.strictEqual(p.sent[3].r, null, 'custom events after navigation');
+});
+
+test('SI-10: a custom event before any navigation still carries the referrer', () => {
+  const p = page({ url: 'https://site.test/', referrer: 'https://www.google.com/' });
+  p.win.mallard('signup');
+  assert.strictEqual(p.sent[1].r, 'https://www.google.com/');
+});
+
+test('SI-11: a hash route is reported as the path', () => {
+  const p = page({ url: 'https://site.test/app/#/pricing', attrs: { 'data-hash': 'true' } });
+  assert.strictEqual(p.sent[0].u, 'https://site.test/app/pricing');
+  p.win.location.hash = '#/docs';
+  p.win.history.pushState(null, '', '#/docs');
+  p.fire('window', 'hashchange');
+  p.fire('window', 'popstate');
+  assert.strictEqual(p.sent.length, 2, 'one pageview for one navigation');
+  assert.strictEqual(p.sent[1].u, 'https://site.test/app/docs');
+});
+
+test('SI-11: the search string survives on a hash route, and a bare fragment is not a route', () => {
+  const p = page({ url: 'https://site.test/?utm_source=x#/pricing', attrs: { 'data-hash': 'true' } });
+  assert.strictEqual(p.sent[0].u, 'https://site.test/pricing?utm_source=x');
+  const q = page({ url: 'https://site.test/page#section', attrs: { 'data-hash': 'true' } });
+  assert.strictEqual(q.sent[0].u, 'https://site.test/page#section');
+});
+
+test('SI-11: hashchange counts a route change once even with popstate', () => {
+  const p = page({ url: 'https://site.test/#/a', attrs: { 'data-hash': 'true' } });
+  p.win.history.pushState(null, '', '#/b');
+  p.fire('window', 'hashchange');
+  p.fire('window', 'hashchange');
+  assert.strictEqual(p.sent.length, 2);
+});
+
+test('SI-17: a page restored from the back/forward cache is counted', () => {
+  const p = page({ url: 'https://site.test/' });
+  assert.strictEqual(p.sent.length, 1);
+  p.fire('window', 'pageshow', { persisted: false });
+  assert.strictEqual(p.sent.length, 1, 'the initial pageshow is not a restore');
+  p.fire('window', 'pageshow', { persisted: true });
+  assert.strictEqual(p.sent.length, 2);
+  assert.strictEqual(p.sent[1].r, null, 'a restore is not a new acquisition');
+});
+
+test('SI-18: a document.prerendering page is counted only when activated', () => {
+  const p = page({ url: 'https://site.test/', prerendering: true });
+  assert.strictEqual(p.sent.length, 0, 'not counted while prerendering');
+  p.doc.prerendering = false;
+  p.fire('document', 'prerenderingchange');
+  p.fire('document', 'visibilitychange');
+  assert.strictEqual(p.sent.length, 1, 'counted exactly once on activation');
+});
+
+test('SI-18: the legacy prerender visibility state still defers the pageview', () => {
+  const p = page({ url: 'https://site.test/', visibility: 'prerender' });
+  assert.strictEqual(p.sent.length, 0, 'not counted while prerendering');
+  p.doc.visibilityState = 'visible';
+  p.fire('document', 'visibilitychange');
+  assert.strictEqual(p.sent.length, 1);
+});
+
+const link = (href, abs) => ({
+  getAttribute: (n) => (n === 'href' ? href : null),
+  href: abs === undefined ? new URL(href, 'https://site.test/').href : abs,
+});
+
+test('SI-19: outbound and download URLs lose their query and fragment', () => {
+  const p = page({ url: 'https://site.test/', attrs: { 'data-outbound': 'true', 'data-downloads': 'true' } });
+  p.click(link('https://other.test/path?email=a@b.c&token=s3cret#frag'));
+  p.click(link('/files/report.pdf?session=abc#page=2'));
+  assert.strictEqual(JSON.parse(p.sent[1].p).url, 'https://other.test/path');
+  assert.strictEqual(JSON.parse(p.sent[2].p).url, 'https://site.test/files/report.pdf');
+});
+
+test('SI-19: data-link-query opts back in', () => {
+  const p = page({
+    url: 'https://site.test/',
+    attrs: { 'data-outbound': 'true', 'data-link-query': 'true' },
+  });
+  p.click(link('https://other.test/path?a=1'));
+  assert.strictEqual(JSON.parse(p.sent[1].p).url, 'https://other.test/path?a=1');
+});
+
+test('SI-19: an SVG link (href is an SVGAnimatedString) is classified by its attribute', () => {
+  const p = page({ url: 'https://site.test/', attrs: { 'data-outbound': 'true' } });
+  p.click(link('https://other.test/x', { baseVal: 'https://other.test/x', animVal: 'https://other.test/x' }));
+  assert.strictEqual(p.sent.length, 2, 'the outbound click was recognised');
+  assert.strictEqual(JSON.parse(p.sent[1].p).url, 'https://other.test/x');
+});
+
+let failed = 0;
+for (const [name, fn] of tests) {
+  try { fn(); console.log('ok   ' + name); }
+  catch (e) { failed++; console.log('FAIL ' + name + '\n     ' + String(e.message).split('\n')[0]); }
+}
+process.exit(failed ? 1 : 0);
+";
+
+/// Run the tracker harness, skipping where Node is not installed unless the
+/// environment says it must be (CI, or `MALLARD_REQUIRE_NODE=1`).
+#[test]
+fn test_tracking_script_behaviour() {
+    let required =
+        std::env::var_os("MALLARD_REQUIRE_NODE").is_some() || std::env::var_os("CI").is_some();
+    let dir = tempfile::tempdir().unwrap();
+    let harness = dir.path().join("tracker_harness.js");
+    std::fs::write(&harness, TRACKER_HARNESS).unwrap();
+
+    let output = match std::process::Command::new("node")
+        .arg(&harness)
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tracking/script.js"))
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) if !required => {
+            eprintln!("skipping the tracker harness: node is not available ({e})");
+            return;
+        }
+        Err(e) => panic!("node is required for the tracker harness: {e}"),
+    };
+    assert!(
+        output.status.success(),
+        "tracker harness failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
