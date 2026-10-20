@@ -1,0 +1,35 @@
+# Optional local hooks: `pip install pre-commit && pre-commit install --hook-type pre-commit --hook-type pre-push`
+#
+# Every hook is local and runs the same command CI does, so there is no third-party
+# hook repository to pin or trust. The fast checks run on commit; the slow ones
+# (clippy compiles the whole tree) run on push.
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt --check
+        entry: cargo fmt -- --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: shellcheck
+        name: shellcheck
+        entry: shellcheck
+        language: system
+        types: [shell]
+
+      - id: js-syntax
+        name: node --check (tracker and dashboard)
+        entry: bash -c 'for f in tracking/script.js src/dashboard/assets/app.js; do node --check "$f" || exit 1; done'
+        language: system
+        files: ^(tracking/script\.js|src/dashboard/assets/.*\.js)$
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy -D warnings
+        entry: cargo clippy --locked --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-push]
