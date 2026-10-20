@@ -342,6 +342,42 @@ async fn test_pixel_endpoint_records_an_event() {
 }
 
 #[tokio::test]
+async fn test_pixel_always_answers_with_a_gif() {
+    // SI-21: a missing or malformed parameter failed the Query extractor with a
+    // text 400 before the handler ran, a broken-image icon in an email client.
+    let (state, _dir) = plain_state();
+    for uri in [
+        "/api/event",
+        "/api/event?d=example.com",
+        "/api/event?u=https%3A%2F%2Fexample.com%2F",
+        "/api/event?d=example.com&u=%2F&w=wide",
+        "/api/event?d=bad%20domain&u=%2F",
+    ] {
+        let response = get(&state, uri).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("image/gif"),
+            "{uri}"
+        );
+    }
+    // Only the request that named a site and page (and merely mangled `w`) counts.
+    assert_eq!(state.buffer.len(), 1);
+    flush(&state);
+    let width: Option<String> = {
+        let conn = state.buffer.conn().lock();
+        conn.query_row("SELECT screen_size FROM events_all LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(width, None, "a non-numeric width is no width");
+}
+
+#[tokio::test]
 async fn test_rate_limiting() {
     let (state, _dir) = state_builder().rate_limit_per_site(2).build();
     let payload = pageview("example.com", "https://example.com/");
@@ -2017,7 +2053,7 @@ async fn test_metrics_endpoint_honours_its_token() {
 
 /// Drives `tracking/script.js` against a minimal fake browser (no dependencies,
 /// plain Node) and checks what it would send.
-const TRACKER_HARNESS: &str = r####"// Drives tracking/script.js against a minimal fake browser and checks what it
+const TRACKER_HARNESS: &str = r"// Drives tracking/script.js against a minimal fake browser and checks what it
 // would send. Usage: node harness.js <path-to-script.js>
 'use strict';
 const fs = require('fs');
@@ -2201,7 +2237,7 @@ for (const [name, fn] of tests) {
   catch (e) { failed++; console.log('FAIL ' + name + '\n     ' + String(e.message).split('\n')[0]); }
 }
 process.exit(failed ? 1 : 0);
-"####;
+";
 
 /// Run the tracker harness, skipping where Node is not installed unless the
 /// environment says it must be (CI, or `MALLARD_REQUIRE_NODE=1`).

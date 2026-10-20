@@ -96,36 +96,47 @@ pub struct EventPayload {
 ///
 /// A subset of [`EventPayload`]: props and revenue are omitted because a plain
 /// query string cannot carry them safely.
-#[derive(Debug, Deserialize)]
+///
+/// Every field is optional and lenient. The pixel answers with a GIF whatever
+/// the query says, because it is embedded in HTML email and `<img>` tags where
+/// an error response is a broken-image icon. A missing `d` or `u`, or a
+/// non-numeric `w`, used to fail the extractor with a text 400 before the
+/// handler ran; now such a request is simply not recorded.
+#[derive(Debug, Default, Deserialize)]
 pub struct PixelParams {
-    #[serde(rename = "d")]
-    pub domain: String,
-    #[serde(rename = "n", default = "default_event_name")]
-    pub name: String,
-    #[serde(rename = "u")]
-    pub url: String,
-    #[serde(rename = "r")]
+    #[serde(rename = "d", default)]
+    pub domain: Option<String>,
+    #[serde(rename = "n", default)]
+    pub name: Option<String>,
+    #[serde(rename = "u", default)]
+    pub url: Option<String>,
+    #[serde(rename = "r", default)]
     pub referrer: Option<String>,
-    #[serde(rename = "w")]
+    #[serde(rename = "w", default, deserialize_with = "lenient_width")]
     pub screen_width: Option<u32>,
 }
 
-fn default_event_name() -> String {
-    "pageview".to_string()
+/// A viewport width that is not a number is "no width", not an error.
+fn lenient_width<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.and_then(|w| w.trim().parse().ok()))
 }
 
-impl From<PixelParams> for EventPayload {
-    fn from(p: PixelParams) -> Self {
-        Self {
-            domain: p.domain,
-            name: p.name,
-            url: p.url,
-            referrer: p.referrer,
-            screen_width: p.screen_width,
+impl PixelParams {
+    /// The event this query describes, or `None` when it names no site or page.
+    fn into_payload(self) -> Option<EventPayload> {
+        Some(EventPayload {
+            domain: self.domain?,
+            name: self.name.unwrap_or_else(|| "pageview".to_string()),
+            url: self.url?,
+            referrer: self.referrer,
+            screen_width: self.screen_width,
             props: None,
             revenue_amount: None,
             revenue_currency: None,
-        }
+        })
     }
 }
 
@@ -613,7 +624,10 @@ pub async fn process_pixel_event(
     peer: Option<SocketAddr>,
     params: PixelParams,
 ) {
-    let payload: EventPayload = params.into();
+    let Some(payload) = params.into_payload() else {
+        record_rejection(state, RejectReason::Invalid);
+        return;
+    };
     match build_event(state, headers, peer, &payload) {
         Ok(event) => {
             buffer_event(state, event).await;
@@ -1484,6 +1498,26 @@ mod tests {
     }
 
     #[test]
+    fn test_pixel_params_need_a_site_and_a_page() {
+        let full = PixelParams {
+            domain: Some("a.com".into()),
+            url: Some("/".into()),
+            ..PixelParams::default()
+        };
+        let payload = full.into_payload().unwrap();
+        assert_eq!(payload.name, "pageview", "the event name defaults");
+        assert!(PixelParams::default().into_payload().is_none());
+        assert!(
+            PixelParams {
+                domain: Some("a.com".into()),
+                ..PixelParams::default()
+            }
+            .into_payload()
+            .is_none()
+        );
+    }
+
+    #[test]
     fn test_sanitize_string_truncate() {
         assert_eq!(sanitize_string(&"a".repeat(500), 256).len(), 256);
     }
@@ -1729,14 +1763,15 @@ mod tests {
         )]);
 
         let via_post = build_event(&state, &headers, None, &payload("example.com")).unwrap();
-        let pixel_payload: EventPayload = PixelParams {
-            domain: "example.com".to_string(),
-            name: "pageview".to_string(),
-            url: "https://example.com/".to_string(),
+        let pixel_payload = PixelParams {
+            domain: Some("example.com".to_string()),
+            name: Some("pageview".to_string()),
+            url: Some("https://example.com/".to_string()),
             referrer: None,
             screen_width: Some(1920),
         }
-        .into();
+        .into_payload()
+        .unwrap();
         let via_pixel = build_event(&state, &headers, None, &pixel_payload).unwrap();
 
         for event in [&via_post, &via_pixel] {
