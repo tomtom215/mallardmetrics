@@ -1844,3 +1844,80 @@ async fn test_metrics_endpoint_honours_its_token() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+// ── Query execution and metric definitions ───────────────────────────────
+
+#[tokio::test]
+async fn test_a_cold_dashboard_load_gets_no_429() {
+    // Regression (S-01): a dashboard refresh fires about 31 requests at once
+    // (ten summary panels, twenty breakdowns) against a default cap of ten
+    // concurrent queries, and every request past the tenth was answered 429 on
+    // a cold cache. The cache is disabled here so every request runs a query.
+    let (state, _dir) = state_builder().cache_ttl_secs(0).build();
+    seed(&state).await;
+
+    let mut uris: Vec<String> = [
+        "main?site_id=example.com&period=30d",
+        "main?site_id=example.com&period=30d&compare=previous_period",
+        "sessions?site_id=example.com&period=30d",
+        "timeseries?site_id=example.com&period=30d",
+        "goals?site_id=example.com&period=30d",
+        "revenue?site_id=example.com&period=30d",
+        "properties?site_id=example.com&period=30d",
+        "realtime?site_id=example.com",
+        "funnel?site_id=example.com&period=30d&steps=page:/,page:/about",
+        "retention?site_id=example.com&period=30d&weeks=4",
+    ]
+    .iter()
+    .map(|tail| format!("/api/stats/{tail}"))
+    .collect();
+    for slug in [
+        "pages",
+        "referrers",
+        "sources",
+        "countries",
+        "regions",
+        "cities",
+        "browsers",
+        "browser-versions",
+        "os",
+        "os-versions",
+        "devices",
+        "screen-sizes",
+        "utm-sources",
+        "utm-mediums",
+        "utm-campaigns",
+        "utm-contents",
+        "utm-terms",
+        "events",
+        "entry-pages",
+        "exit-pages",
+    ] {
+        uris.push(format!(
+            "/api/stats/breakdown/{slug}?site_id=example.com&period=30d"
+        ));
+    }
+    assert_eq!(uris.len(), 30);
+
+    let mut tasks = Vec::new();
+    for uri in uris {
+        let state = Arc::clone(&state);
+        tasks.push(tokio::spawn(async move {
+            let status = get(&state, &uri).await.status();
+            (uri, status)
+        }));
+    }
+    for task in tasks {
+        let (uri, status) = task.await.unwrap();
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{uri} was rejected by the concurrency cap during a dashboard load"
+        );
+        assert!(
+            status == StatusCode::OK || status == StatusCode::SERVICE_UNAVAILABLE,
+            "{uri} answered {status}"
+        );
+    }
+}
+

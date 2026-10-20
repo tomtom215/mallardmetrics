@@ -21,6 +21,8 @@ struct Inner {
     entries: HashMap<String, CacheEntry>,
     /// Monotonic counter used to order entries by last access for LRU eviction.
     clock: u64,
+    /// Bumped by every invalidation. See [`QueryCache::epoch`].
+    epoch: u64,
 }
 
 struct CacheEntry {
@@ -41,6 +43,7 @@ impl QueryCache {
             inner: Arc::new(Mutex::new(Inner {
                 entries: HashMap::new(),
                 clock: 0,
+                epoch: 0,
             })),
             ttl: Duration::from_secs(ttl_secs),
             max_entries,
@@ -95,9 +98,41 @@ impl QueryCache {
         if self.is_disabled() {
             return;
         }
-        let CacheKey { key, site_id } = key;
-        let value = value.into();
         let mut inner = self.inner.lock();
+        self.insert_locked(&mut inner, key, value.into());
+    }
+
+    /// The invalidation epoch, to be read *before* computing a result.
+    ///
+    /// A query that starts before [`QueryCache::invalidate_site`] (a GDPR
+    /// erasure) and finishes after it holds pre-erasure data; a plain
+    /// [`QueryCache::insert`] would put that back in the cache for a full TTL,
+    /// serving deleted personal data after the erasure reported success.
+    /// Reading the epoch first and inserting with [`QueryCache::insert_at`]
+    /// makes the late result a no-op instead.
+    pub fn epoch(&self) -> u64 {
+        self.inner.lock().epoch
+    }
+
+    /// Insert a value only if no invalidation has happened since `epoch` was read.
+    ///
+    /// Returns whether the value was stored. The epoch is global rather than
+    /// per site: an erasure is rare, and the cost of dropping an unrelated
+    /// insert that raced with it is one recomputation.
+    pub fn insert_at(&self, epoch: u64, key: CacheKey, value: impl Into<Arc<str>>) -> bool {
+        if self.is_disabled() {
+            return false;
+        }
+        let mut inner = self.inner.lock();
+        if inner.epoch != epoch {
+            return false;
+        }
+        self.insert_locked(&mut inner, key, value.into());
+        true
+    }
+
+    fn insert_locked(&self, inner: &mut Inner, key: CacheKey, value: Arc<str>) {
+        let CacheKey { key, site_id } = key;
         inner.clock += 1;
         let now = inner.clock;
 
@@ -151,15 +186,16 @@ impl QueryCache {
     /// `b.com` also cleared entries for `a.com:b.com`, and erasing `a.com`
     /// missed them.
     pub fn invalidate_site(&self, site_id: &str) {
-        self.inner
-            .lock()
-            .entries
-            .retain(|_, entry| &*entry.site_id != site_id);
+        let mut inner = self.inner.lock();
+        inner.epoch += 1;
+        inner.entries.retain(|_, entry| &*entry.site_id != site_id);
     }
 
     /// Remove every entry.
     pub fn clear(&self) {
-        self.inner.lock().entries.clear();
+        let mut inner = self.inner.lock();
+        inner.epoch += 1;
+        inner.entries.clear();
     }
 
     /// Number of entries currently held.
@@ -359,6 +395,41 @@ mod tests {
         }
         assert!(cache.get("k").is_none());
         assert_eq!(cache.len(), 0, "an expired entry must not linger");
+    }
+
+    #[test]
+    fn test_a_result_computed_before_an_invalidation_is_not_cached_after_it() {
+        // Regression (S-10): `cached_query` read the cache, ran the query and
+        // inserted, with nothing tying the insert to an erasure that happened in
+        // between. The erasure's invalidation ran, then the in-flight query put
+        // its pre-erasure rows back for a full TTL.
+        let cache = QueryCache::new(60, 0);
+        let epoch = cache.epoch();
+        cache.invalidate_site("a.com"); // the erasure lands mid-query
+        assert!(
+            !cache.insert_at(epoch, cache_key("main", "a.com", &[]), "stale"),
+            "a result older than the invalidation must be dropped"
+        );
+        assert!(cache.is_empty());
+
+        // A query that started afterwards is fine.
+        let epoch = cache.epoch();
+        assert!(cache.insert_at(epoch, cache_key("main", "a.com", &[]), "fresh"));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_clear_also_invalidates_in_flight_results() {
+        let cache = QueryCache::new(60, 0);
+        let epoch = cache.epoch();
+        cache.clear();
+        assert!(!cache.insert_at(epoch, k("x"), "stale"));
+    }
+
+    #[test]
+    fn test_insert_at_is_a_no_op_when_caching_is_disabled() {
+        let cache = QueryCache::new(0, 0);
+        assert!(!cache.insert_at(cache.epoch(), k("x"), "v"));
     }
 
     #[test]
