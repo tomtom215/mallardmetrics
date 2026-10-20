@@ -2012,3 +2012,223 @@ async fn test_metrics_endpoint_honours_its_token() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+// ── Tracking script ──────────────────────────────────────────────────────
+
+/// Drives `tracking/script.js` against a minimal fake browser (no dependencies,
+/// plain Node) and checks what it would send.
+const TRACKER_HARNESS: &str = r####"// Drives tracking/script.js against a minimal fake browser and checks what it
+// would send. Usage: node harness.js <path-to-script.js>
+'use strict';
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+
+const source = fs.readFileSync(process.argv[2], 'utf8');
+
+/** A fake page: returns { sent, win, doc, fire(target, type, ev) }. */
+function page(opts) {
+  const attrs = Object.assign({ 'data-domain': 'site.test' }, opts.attrs || {});
+  const sent = [];
+  const listeners = { window: {}, document: {} };
+  const add = (who) => (type, fn) => {
+    (listeners[who][type] = listeners[who][type] || []).push(fn);
+  };
+  const remove = (who) => (type, fn) => {
+    listeners[who][type] = (listeners[who][type] || []).filter((f) => f !== fn);
+  };
+  let url = new URL(opts.url);
+  const location = {};
+  const syncLocation = () => {
+    location.href = url.href;
+    location.origin = url.origin;
+    location.protocol = url.protocol;
+    location.host = url.host;
+    location.hostname = url.hostname;
+    location.pathname = url.pathname;
+    location.search = url.search;
+    location.hash = url.hash;
+  };
+  syncLocation();
+  const history = {
+    pushState(_s, _t, to) { url = new URL(to, url); syncLocation(); },
+    replaceState(_s, _t, to) { url = new URL(to, url); syncLocation(); },
+  };
+  class FakeBlob { constructor(parts) { this.text = parts.join(''); } }
+  const doc = {
+    currentScript: { getAttribute: (n) => (n in attrs ? attrs[n] : null), src: 'https://stats.test/mallard.js' },
+    baseURI: url.href,
+    referrer: opts.referrer || '',
+    visibilityState: opts.visibility || 'visible',
+    prerendering: !!opts.prerendering,
+    addEventListener: add('document'),
+    removeEventListener: remove('document'),
+    querySelector: () => null,
+  };
+  const win = {
+    location,
+    history,
+    document: doc,
+    navigator: {
+      sendBeacon(endpoint, blob) { sent.push(JSON.parse(blob.text)); return true; },
+    },
+    innerWidth: 1280,
+    localStorage: { getItem: () => null },
+    addEventListener: add('window'),
+    removeEventListener: remove('window'),
+  };
+  win.window = win;
+  const ctx = vm.createContext({
+    window: win, document: doc, navigator: win.navigator, URL, Blob: FakeBlob, JSON,
+    XMLHttpRequest: function () { throw new Error('XHR not expected'); }, RegExp,
+  });
+  vm.runInContext(source, ctx);
+  const fire = (who, type, ev) => (listeners[who][type] || []).slice().forEach((f) => f(ev || {}));
+  return {
+    sent, win, doc, fire,
+    go(to) { history.pushState(null, '', to); },
+    click(link) { fire('document', 'click', { target: { closest: () => link } }); },
+  };
+}
+
+const tests = [];
+const test = (name, fn) => tests.push([name, fn]);
+
+test('SI-10: the external referrer is sent once, not on every SPA route', () => {
+  const p = page({ url: 'https://site.test/', referrer: 'https://www.google.com/search?q=x' });
+  assert.strictEqual(p.sent.length, 1);
+  assert.strictEqual(p.sent[0].r, 'https://www.google.com/search?q=x');
+  p.go('/b');
+  p.go('/c');
+  assert.strictEqual(p.sent.length, 3);
+  assert.strictEqual(p.sent[1].r, null, 'second route');
+  assert.strictEqual(p.sent[2].r, null, 'third route');
+  p.win.mallard('signup');
+  assert.strictEqual(p.sent[3].r, null, 'custom events after navigation');
+});
+
+test('SI-10: a custom event before any navigation still carries the referrer', () => {
+  const p = page({ url: 'https://site.test/', referrer: 'https://www.google.com/' });
+  p.win.mallard('signup');
+  assert.strictEqual(p.sent[1].r, 'https://www.google.com/');
+});
+
+test('SI-11: a hash route is reported as the path', () => {
+  const p = page({ url: 'https://site.test/app/#/pricing', attrs: { 'data-hash': 'true' } });
+  assert.strictEqual(p.sent[0].u, 'https://site.test/app/pricing');
+  p.win.location.hash = '#/docs';
+  p.win.history.pushState(null, '', '#/docs');
+  p.fire('window', 'hashchange');
+  p.fire('window', 'popstate');
+  assert.strictEqual(p.sent.length, 2, 'one pageview for one navigation');
+  assert.strictEqual(p.sent[1].u, 'https://site.test/app/docs');
+});
+
+test('SI-11: the search string survives on a hash route, and a bare fragment is not a route', () => {
+  const p = page({ url: 'https://site.test/?utm_source=x#/pricing', attrs: { 'data-hash': 'true' } });
+  assert.strictEqual(p.sent[0].u, 'https://site.test/pricing?utm_source=x');
+  const q = page({ url: 'https://site.test/page#section', attrs: { 'data-hash': 'true' } });
+  assert.strictEqual(q.sent[0].u, 'https://site.test/page#section');
+});
+
+test('SI-11: hashchange counts a route change once even with popstate', () => {
+  const p = page({ url: 'https://site.test/#/a', attrs: { 'data-hash': 'true' } });
+  p.win.history.pushState(null, '', '#/b');
+  p.fire('window', 'hashchange');
+  p.fire('window', 'hashchange');
+  assert.strictEqual(p.sent.length, 2);
+});
+
+test('SI-17: a page restored from the back/forward cache is counted', () => {
+  const p = page({ url: 'https://site.test/' });
+  assert.strictEqual(p.sent.length, 1);
+  p.fire('window', 'pageshow', { persisted: false });
+  assert.strictEqual(p.sent.length, 1, 'the initial pageshow is not a restore');
+  p.fire('window', 'pageshow', { persisted: true });
+  assert.strictEqual(p.sent.length, 2);
+  assert.strictEqual(p.sent[1].r, null, 'a restore is not a new acquisition');
+});
+
+test('SI-18: a document.prerendering page is counted only when activated', () => {
+  const p = page({ url: 'https://site.test/', prerendering: true });
+  assert.strictEqual(p.sent.length, 0, 'not counted while prerendering');
+  p.doc.prerendering = false;
+  p.fire('document', 'prerenderingchange');
+  p.fire('document', 'visibilitychange');
+  assert.strictEqual(p.sent.length, 1, 'counted exactly once on activation');
+});
+
+test('SI-18: the legacy prerender visibility state still defers the pageview', () => {
+  const p = page({ url: 'https://site.test/', visibility: 'prerender' });
+  assert.strictEqual(p.sent.length, 0, 'not counted while prerendering');
+  p.doc.visibilityState = 'visible';
+  p.fire('document', 'visibilitychange');
+  assert.strictEqual(p.sent.length, 1);
+});
+
+const link = (href, abs) => ({
+  getAttribute: (n) => (n === 'href' ? href : null),
+  href: abs === undefined ? new URL(href, 'https://site.test/').href : abs,
+});
+
+test('SI-19: outbound and download URLs lose their query and fragment', () => {
+  const p = page({ url: 'https://site.test/', attrs: { 'data-outbound': 'true', 'data-downloads': 'true' } });
+  p.click(link('https://other.test/path?email=a@b.c&token=s3cret#frag'));
+  p.click(link('/files/report.pdf?session=abc#page=2'));
+  assert.strictEqual(JSON.parse(p.sent[1].p).url, 'https://other.test/path');
+  assert.strictEqual(JSON.parse(p.sent[2].p).url, 'https://site.test/files/report.pdf');
+});
+
+test('SI-19: data-link-query opts back in', () => {
+  const p = page({
+    url: 'https://site.test/',
+    attrs: { 'data-outbound': 'true', 'data-link-query': 'true' },
+  });
+  p.click(link('https://other.test/path?a=1'));
+  assert.strictEqual(JSON.parse(p.sent[1].p).url, 'https://other.test/path?a=1');
+});
+
+test('SI-19: an SVG link (href is an SVGAnimatedString) is classified by its attribute', () => {
+  const p = page({ url: 'https://site.test/', attrs: { 'data-outbound': 'true' } });
+  p.click(link('https://other.test/x', { baseVal: 'https://other.test/x', animVal: 'https://other.test/x' }));
+  assert.strictEqual(p.sent.length, 2, 'the outbound click was recognised');
+  assert.strictEqual(JSON.parse(p.sent[1].p).url, 'https://other.test/x');
+});
+
+let failed = 0;
+for (const [name, fn] of tests) {
+  try { fn(); console.log('ok   ' + name); }
+  catch (e) { failed++; console.log('FAIL ' + name + '\n     ' + String(e.message).split('\n')[0]); }
+}
+process.exit(failed ? 1 : 0);
+"####;
+
+/// Run the tracker harness, skipping where Node is not installed unless the
+/// environment says it must be (CI, or `MALLARD_REQUIRE_NODE=1`).
+#[test]
+fn test_tracking_script_behaviour() {
+    let required =
+        std::env::var_os("MALLARD_REQUIRE_NODE").is_some() || std::env::var_os("CI").is_some();
+    let dir = tempfile::tempdir().unwrap();
+    let harness = dir.path().join("tracker_harness.js");
+    std::fs::write(&harness, TRACKER_HARNESS).unwrap();
+
+    let output = match std::process::Command::new("node")
+        .arg(&harness)
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tracking/script.js"))
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) if !required => {
+            eprintln!("skipping the tracker harness: node is not available ({e})");
+            return;
+        }
+        Err(e) => panic!("node is required for the tracker harness: {e}"),
+    };
+    assert!(
+        output.status.success(),
+        "tracker harness failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
