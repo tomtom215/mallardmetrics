@@ -1924,6 +1924,57 @@ async fn test_a_cold_dashboard_load_gets_no_429() {
 }
 
 #[tokio::test]
+async fn test_session_analyses_are_refused_when_timestamps_are_rounded() {
+    // Regression (S-05): gdpr_mode rounds every timestamp to the hour. Sessions,
+    // funnels, sequences and flows then compute from events that can no longer
+    // be ordered, and used to return confident, meaningless numbers. They must
+    // say so instead; analyses that do not depend on intra-hour order must keep
+    // working.
+    let (state, _dir) = state_builder().round_timestamps(true).build();
+    seed(&state).await;
+
+    for uri in [
+        "/api/stats/sessions?site_id=example.com&period=30d",
+        "/api/stats/funnel?site_id=example.com&period=30d&steps=page:/,page:/about",
+        "/api/stats/sequences?site_id=example.com&period=30d&steps=page:/,page:/about",
+        "/api/stats/flow?site_id=example.com&period=30d&page=/",
+        "/api/stats/breakdown/entry-pages?site_id=example.com&period=30d",
+        "/api/stats/breakdown/exit-pages?site_id=example.com&period=30d",
+    ] {
+        let response = get(&state, uri).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{uri} must be refused, not computed from rounded timestamps"
+        );
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rounded"),
+            "{uri}: {body}"
+        );
+    }
+
+    // Headline metrics still answer; only the session-derived fields drop out.
+    let main = body_json(get(&state, "/api/stats/main?site_id=example.com&period=30d").await).await;
+    assert_eq!(main["total_pageviews"], 3);
+    assert_eq!(main["behavioral_available"], false);
+    assert!(main["bounce_rate"].is_null(), "{main}");
+    assert!(main["total_sessions"].is_null(), "{main}");
+
+    // Unaffected analyses.
+    for uri in [
+        "/api/stats/breakdown/pages?site_id=example.com&period=30d",
+        "/api/stats/timeseries?site_id=example.com&period=30d",
+        "/api/stats/goals?site_id=example.com&period=30d",
+    ] {
+        assert_eq!(get(&state, uri).await.status(), StatusCode::OK, "{uri}");
+    }
+}
+
+#[tokio::test]
 async fn test_a_lone_start_date_is_a_bad_request() {
     // Regression (S-09): it used to be ignored and the 30-day default answered.
     let (state, _dir) = plain_state();

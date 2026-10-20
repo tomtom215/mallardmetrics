@@ -721,6 +721,29 @@ fn behavioral_error(state: &AppState, feature: &str, err: ApiError) -> ApiError 
     }
 }
 
+/// Refuse an analysis that is meaningless on hour-rounded timestamps.
+///
+/// With `round_timestamps` (enabled by `gdpr_mode`) every event is stored at
+/// the top of its hour. Sessions, funnels, sequences and flows depend on the
+/// order and spacing of events *inside* an hour, which that rounding destroys:
+/// every event in an hour is one tie, so no session can last more than zero
+/// seconds, a visit at 10:59 and one at 11:01 become two sessions, and the order
+/// of funnel steps is decided by tie-breaking rather than by what happened.
+/// The result is not a coarse version of the right answer but an unrelated
+/// number, and it used to be served with nothing to say so.
+///
+/// Counts, breakdowns, time series and weekly retention are unaffected.
+fn require_exact_timestamps(state: &AppState, feature: &str) -> Result<(), ApiError> {
+    if state.round_timestamps {
+        return Err(ApiError::BehavioralUnavailable(format!(
+            "{feature} is not available while timestamps are rounded to the hour \
+             (round_timestamps, enabled by gdpr_mode): events within an hour can no \
+             longer be put in order."
+        )));
+    }
+    Ok(())
+}
+
 // ── Endpoints ────────────────────────────────────────────────────────────
 
 /// GET /api/sites — site IDs that have data.
@@ -749,6 +772,19 @@ pub async fn list_sites(State(state): State<Arc<AppState>>) -> Result<impl IntoR
     sites.dedup();
 
     Ok(Json(serde_json::json!({ "sites": sites })))
+}
+
+/// The headline metrics, with or without the session pass.
+fn main_metrics(
+    conn: &duckdb::Connection,
+    scope: &crate::query::QueryScope,
+    with_sessions: bool,
+) -> Result<metrics::CoreMetrics, duckdb::Error> {
+    if with_sessions {
+        metrics::query_core_metrics(conn, scope)
+    } else {
+        metrics::query_event_metrics(conn, scope)
+    }
 }
 
 /// GET /api/stats/main — headline metrics.
@@ -787,8 +823,11 @@ pub async fn get_main_stats(
             compare.map_or("none", Compare::slug),
         ],
     );
+    // Session figures computed from hour-rounded timestamps are artefacts of the
+    // rounding; they are reported as unavailable instead.
+    let with_sessions = !state.round_timestamps;
     let Json(mut current) = cached_query(&state, key, move |conn| {
-        metrics::query_core_metrics(conn, &scope)
+        main_metrics(conn, &scope, with_sessions)
     })
     .await?;
 
@@ -806,7 +845,7 @@ pub async fn get_main_stats(
             &[&previous.start, &previous.end, &filter_key, "none"],
         );
         let Json(baseline) = cached_query(&state, previous_key, move |conn| {
-            metrics::query_core_metrics(conn, &previous_scope)
+            main_metrics(conn, &previous_scope, with_sessions)
         })
         .await?;
 
@@ -826,6 +865,7 @@ pub async fn get_sessions(
     Query(params): Query<StatsParams>,
 ) -> Result<Json<metrics::SessionMetrics>, ApiError> {
     let range = params.validated()?;
+    require_exact_timestamps(&state, "Session metrics")?;
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
     let filter_key = filters_cache_key(&filters);
     let scope = state
@@ -892,10 +932,13 @@ pub async fn get_breakdown(
         ))
     })?;
 
-    if dim.requires_behavioral() && !state.behavioral_extension_loaded {
-        return Err(ApiError::behavioral_required(
-            "Entry and exit page breakdowns",
-        ));
+    if dim.requires_behavioral() {
+        require_exact_timestamps(&state, "Entry and exit page breakdowns")?;
+        if !state.behavioral_extension_loaded {
+            return Err(ApiError::behavioral_required(
+                "Entry and exit page breakdowns",
+            ));
+        }
     }
 
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
@@ -1192,6 +1235,7 @@ pub async fn get_funnel(
 
     let steps = parse_steps(&params.steps, funnel::MIN_STEPS, funnel::MAX_STEPS)?;
 
+    require_exact_timestamps(&state, "Funnel analysis")?;
     if !state.behavioral_extension_loaded {
         return Err(ApiError::behavioral_required("Funnel analysis"));
     }
@@ -1364,6 +1408,7 @@ pub async fn get_sequences(
         sequences::MAX_CONDITIONS,
     )?;
 
+    require_exact_timestamps(&state, "Sequence analysis")?;
     if !state.behavioral_extension_loaded {
         return Err(ApiError::behavioral_required("Sequence analysis"));
     }
@@ -1434,6 +1479,7 @@ pub async fn get_flow(
         ApiError::BadRequest("direction must be 'forward' or 'backward'".to_string())
     })?;
 
+    require_exact_timestamps(&state, "Flow analysis")?;
     if !state.behavioral_extension_loaded {
         return Err(ApiError::behavioral_required("Flow analysis"));
     }
