@@ -597,6 +597,9 @@ impl SessionStore {
     }
 }
 
+/// Distinguishes the temporary files of concurrent writers in one process.
+static TEMP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Write `contents` to `path` atomically, readable only by the owner.
 ///
 /// Used for both `api_keys.json` and the visitor-ID secret. Both were
@@ -604,10 +607,14 @@ impl SessionStore {
 /// mid-write loses the file) and inherits the process umask (so on a typical
 /// system they landed world-readable).
 ///
+/// Each call writes its own temporary file (process ID plus a sequence number).
+/// A name shared between calls let two concurrent writers truncate and
+/// interleave into one file, and rename the garbled result into place.
+///
 /// # Errors
 ///
 /// Returns an error if the file cannot be written, its permissions cannot be
-/// set, or the rename into place fails.
+/// set, the rename into place fails, or the directory entry cannot be flushed.
 pub fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
@@ -616,10 +623,11 @@ pub fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::R
 
     // Same directory as the target, so the rename below stays within one
     // filesystem and is therefore atomic.
-    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    let sequence = TEMP_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = path.with_extension(format!("tmp.{}.{sequence}", std::process::id()));
 
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -642,7 +650,70 @@ pub fn write_private_file(path: &std::path::Path, contents: &[u8]) -> std::io::R
 
     std::fs::rename(&tmp_path, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp_path);
-    })
+    })?;
+
+    // The rename is only durable once the directory entry is. Directories
+    // cannot be opened for this on every platform, so it is a unix step.
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+/// Remove leftovers of interrupted [`write_private_file`] calls next to `path`.
+///
+/// A crash between creating the temporary file and renaming it leaves a 0600
+/// copy of the secret or key file that nothing ever deleted. Call this at
+/// startup, before anything is written. Returns the number of files removed.
+pub fn remove_stale_temp_files(path: &std::path::Path) -> usize {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_stem().and_then(|n| n.to_str())) else {
+        return 0;
+    };
+    let prefix = format!("{name}.tmp.");
+    let Ok(entries) = std::fs::read_dir(if dir.as_os_str().is_empty() {
+        std::path::Path::new(".")
+    } else {
+        dir
+    }) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+        .filter(|entry| std::fs::remove_file(entry.path()).is_ok())
+        .count()
+}
+
+/// Restrict an existing secret file to its owner.
+///
+/// [`write_private_file`] creates files 0600, but one written by an older
+/// version, or restored from a backup, keeps whatever mode it had. Returns
+/// whether the mode had to be changed.
+pub fn restrict_to_owner(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = std::fs::metadata(path) else {
+            return false;
+        };
+        // Any group or other permission bit set: 0o077 reads better than a
+        // trailing-zeros count for a file mode.
+        #[allow(clippy::verbose_bit_mask)]
+        let private = metadata.permissions().mode() & 0o077 == 0;
+        if private {
+            return false;
+        }
+        let changed =
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).is_ok();
+        if changed {
+            tracing::warn!(path = %path.display(), "Tightened a secret file's permissions to 0600");
+        }
+        changed
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 /// The admin password hash, with optional disk persistence.
@@ -694,6 +765,8 @@ impl AdminPasswordStore {
             };
         }
 
+        remove_stale_temp_files(&path);
+        restrict_to_owner(&path);
         let stored = match std::fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str::<StoredAdminPassword>(&contents) {
                 Ok(record) if PasswordHash::new(&record.password_hash).is_ok() => {
@@ -778,14 +851,19 @@ impl AdminPasswordStore {
 
 /// Thread-safe API key store with optional disk persistence.
 ///
-/// When `persist_path` is set, any mutation (`add_key`, `revoke_key`) is
-/// immediately written to disk as a JSON array of `StoredApiKey` records.
-/// On startup the caller should use `ApiKeyStore::load_from_disk` to restore
-/// keys written by previous runs.
+/// When `persist_path` is set, any mutation (`try_add_key`, `try_revoke_key`) is
+/// written to disk as a JSON array of `StoredApiKey` records before it is
+/// reported as done. On startup the caller should use
+/// `ApiKeyStore::load_from_disk` to restore keys written by previous runs.
 #[derive(Clone)]
 pub struct ApiKeyStore {
     keys: Arc<Mutex<Vec<StoredApiKey>>>,
     persist_path: Option<Arc<std::path::PathBuf>>,
+    /// Held while the key list is snapshotted *and* written, so the last write
+    /// to reach the disk is always the newest state. Snapshotting under one lock
+    /// and writing after releasing it let an older snapshot be renamed into
+    /// place last, which silently undid a revocation.
+    persist_lock: Arc<Mutex<()>>,
 }
 
 impl Default for ApiKeyStore {
@@ -793,6 +871,7 @@ impl Default for ApiKeyStore {
         Self {
             keys: Arc::new(Mutex::new(Vec::new())),
             persist_path: None,
+            persist_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -800,15 +879,34 @@ impl Default for ApiKeyStore {
 impl ApiKeyStore {
     /// Create a store that loads existing keys from `path` and persists
     /// mutations back to the same file.  Missing file is treated as empty.
+    ///
+    /// A file that cannot be parsed is moved aside (`api_keys.json.corrupt-<time>`)
+    /// rather than left in place: the store starts empty, and the next mutation
+    /// would otherwise overwrite the only copy of every key.
     pub fn load_from_disk(path: std::path::PathBuf) -> Self {
+        remove_stale_temp_files(&path);
+        restrict_to_owner(&path);
         let keys = match std::fs::read_to_string(&path) {
             Ok(contents) => {
                 serde_json::from_str::<Vec<StoredApiKey>>(&contents).unwrap_or_else(|e| {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "Failed to parse api_keys.json; starting with empty key store"
-                    );
+                    let aside = path.with_extension(format!(
+                        "json.corrupt-{}",
+                        chrono::Utc::now().timestamp()
+                    ));
+                    match std::fs::rename(&path, &aside) {
+                        Ok(()) => tracing::error!(
+                            path = %path.display(),
+                            moved_to = %aside.display(),
+                            error = %e,
+                            "Failed to parse api_keys.json; moved it aside and starting with an empty key store"
+                        ),
+                        Err(rename_error) => tracing::error!(
+                            path = %path.display(),
+                            error = %e,
+                            rename_error = %rename_error,
+                            "Failed to parse api_keys.json and could not move it aside; starting with an empty key store"
+                        ),
+                    }
                     Vec::new()
                 })
             }
@@ -829,6 +927,7 @@ impl ApiKeyStore {
         Self {
             keys: Arc::new(Mutex::new(keys)),
             persist_path: Some(Arc::new(path)),
+            persist_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -840,30 +939,30 @@ impl ApiKeyStore {
     /// created with owner-only permissions: it holds the SHA-256 of each key,
     /// which is exactly what an attacker needs to mount an offline search.
     ///
-    /// Never panics; failures are logged.
-    fn persist(&self) {
+    /// Blocks on file I/O, so async callers must use `spawn_blocking`.
+    fn persist(&self) -> std::io::Result<()> {
         let Some(path) = &self.persist_path else {
-            return;
+            return Ok(());
         };
+        let _serialised = self.persist_lock.lock();
         let snapshot = self.keys.lock().clone();
-        let json = match serde_json::to_string_pretty(&snapshot) {
-            Ok(j) => j,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to serialize API keys for persistence");
-                return;
-            }
-        };
-        if let Err(e) = write_private_file(path.as_ref(), json.as_bytes()) {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "Failed to persist API keys to disk"
-            );
-        }
+        let json = serde_json::to_vec_pretty(&snapshot).map_err(std::io::Error::other)?;
+        write_private_file(path.as_ref(), &json)
     }
 
-    /// Store a new API key (hashed). Returns the key hash for identification.
-    pub fn add_key(&self, name: &str, plaintext_key: &str, scope: ApiKeyScope) -> String {
+    /// Store a new API key (hashed) and persist it. Returns the key hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error if the key could not be written to disk. The key
+    /// is then not stored at all: answering "created" for a key that vanishes
+    /// on the next restart is worse than failing.
+    pub fn try_add_key(
+        &self,
+        name: &str,
+        plaintext_key: &str,
+        scope: ApiKeyScope,
+    ) -> std::io::Result<String> {
         let key_hash = hash_api_key(plaintext_key);
         let stored = StoredApiKey {
             key_hash: key_hash.clone(),
@@ -873,8 +972,31 @@ impl ApiKeyStore {
             revoked: false,
         };
         self.keys.lock().push(stored);
-        self.persist();
-        key_hash
+        if let Err(e) = self.persist() {
+            self.keys.lock().retain(|k| k.key_hash != key_hash);
+            return Err(e);
+        }
+        Ok(key_hash)
+    }
+
+    /// Store a new API key (hashed). Returns the key hash for identification.
+    ///
+    /// A persistence failure is logged and the key stays in memory only; use
+    /// [`try_add_key`](Self::try_add_key) where the caller can report it.
+    pub fn add_key(&self, name: &str, plaintext_key: &str, scope: ApiKeyScope) -> String {
+        self.try_add_key(name, plaintext_key, scope)
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Failed to persist API keys to disk");
+                let key_hash = hash_api_key(plaintext_key);
+                self.keys.lock().push(StoredApiKey {
+                    key_hash: key_hash.clone(),
+                    name: name.to_string(),
+                    scope,
+                    created_at: chrono::Utc::now().naive_utc(),
+                    revoked: false,
+                });
+                key_hash
+            })
     }
 
     /// Validate an API key. Returns the scope if valid and not revoked.
@@ -888,7 +1010,38 @@ impl ApiKeyStore {
             .map(|k| k.scope)
     }
 
-    /// Revoke an API key by hash.
+    /// Revoke an API key by hash and persist the revocation.
+    ///
+    /// Returns `Ok(false)` when no such key exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O error if the revocation could not be written. The key is
+    /// then left valid: reporting "revoked" for a key that is live again after
+    /// a restart is the dangerous direction to fail in.
+    pub fn try_revoke_key(&self, key_hash: &str) -> std::io::Result<bool> {
+        let was_live = {
+            let mut keys = self.keys.lock();
+            let Some(key) = keys.iter_mut().find(|k| k.key_hash == key_hash) else {
+                return Ok(false);
+            };
+            let was_live = !key.revoked;
+            key.revoked = true;
+            was_live
+        };
+        if let Err(e) = self.persist() {
+            if was_live
+                && let Some(key) = self.keys.lock().iter_mut().find(|k| k.key_hash == key_hash)
+            {
+                key.revoked = false;
+            }
+            return Err(e);
+        }
+        Ok(true)
+    }
+
+    /// Revoke an API key by hash. A persistence failure is logged; the key is
+    /// revoked in memory regardless. Prefer [`try_revoke_key`](Self::try_revoke_key).
     pub fn revoke_key(&self, key_hash: &str) -> bool {
         let found = self
             .keys
@@ -899,8 +1052,8 @@ impl ApiKeyStore {
                 key.revoked = true;
                 true
             });
-        if found {
-            self.persist();
+        if found && let Err(e) = self.persist() {
+            tracing::warn!(error = %e, "Failed to persist API keys to disk");
         }
         found
     }
@@ -962,7 +1115,14 @@ const OBVIOUS_PASSWORDS: &[&str] = &[
 ];
 
 /// Reject a password that is too short or obviously guessable.
-fn validate_password(password: &str) -> Result<(), String> {
+///
+/// Public so that every route a password enters by (the setup endpoint and
+/// `MALLARD_ADMIN_PASSWORD` at startup) applies the same policy.
+///
+/// # Errors
+///
+/// Returns the message explaining why the password was refused.
+pub fn validate_password(password: &str) -> Result<(), String> {
     if password.chars().count() < MIN_PASSWORD_LEN {
         return Err(format!(
             "Password must be at least {MIN_PASSWORD_LEN} characters"
@@ -1047,7 +1207,11 @@ pub async fn auth_setup(
         }
     };
 
-    match state.admin_password.set_if_unset(hash) {
+    let store = state.admin_password.clone();
+    let persisted = tokio::task::spawn_blocking(move || store.set_if_unset(hash))
+        .await
+        .unwrap_or_else(|e| Err(std::io::Error::other(e)));
+    match persisted {
         Ok(true) => {}
         Ok(false) => {
             state.login_attempt_tracker.refund_attempt(&ip);
@@ -1299,7 +1463,7 @@ struct ApiKeyListItem {
 pub async fn create_api_key(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateApiKeyRequest>,
-) -> impl IntoResponse {
+) -> Response {
     if body.name.is_empty() || body.name.len() > 128 {
         return (
             StatusCode::BAD_REQUEST,
@@ -1309,9 +1473,19 @@ pub async fn create_api_key(
     }
 
     let plaintext_key = generate_api_key();
-    let key_hash = state
-        .api_keys
-        .add_key(&body.name, &plaintext_key, body.scope);
+    // The write is an fsync; it must not run on an async worker (L19).
+    let store = state.api_keys.clone();
+    let (name, scope, key) = (body.name.clone(), body.scope, plaintext_key.clone());
+    let key_hash = match tokio::task::spawn_blocking(move || store.try_add_key(&name, &key, scope))
+        .await
+    {
+        Ok(Ok(hash)) => hash,
+        Ok(Err(e)) => return persistence_failed("create the API key", &e),
+        Err(e) => {
+            tracing::error!(error = %e, "API key persistence task panicked");
+            return persistence_failed("create the API key", &std::io::Error::other("task failed"));
+        }
+    };
 
     tracing::info!(
         name = %body.name,
@@ -1353,18 +1527,47 @@ pub async fn list_api_keys(State(state): State<Arc<AppState>>) -> impl IntoRespo
 pub async fn revoke_api_key_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(key_hash): axum::extract::Path<String>,
-) -> Result<impl IntoResponse, crate::api::errors::ApiError> {
-    if state.api_keys.revoke_key(&key_hash) {
-        tracing::info!(key_hash_prefix = %key_hash.get(..8).unwrap_or(&key_hash), "API key revoked");
-        Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({"status": "revoked"})),
-        ))
-    } else {
-        Err(crate::api::errors::ApiError::NotFound(
+) -> Result<Response, crate::api::errors::ApiError> {
+    let store = state.api_keys.clone();
+    let target = key_hash.clone();
+    match tokio::task::spawn_blocking(move || store.try_revoke_key(&target)).await {
+        Ok(Ok(true)) => {
+            tracing::info!(key_hash_prefix = %key_hash.get(..8).unwrap_or(&key_hash), "API key revoked");
+            Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "revoked"})),
+            )
+                .into_response())
+        }
+        Ok(Ok(false)) => Err(crate::api::errors::ApiError::NotFound(
             "Key not found".to_string(),
-        ))
+        )),
+        Ok(Err(e)) => Ok(persistence_failed("revoke the API key", &e)),
+        Err(e) => {
+            tracing::error!(error = %e, "API key persistence task panicked");
+            Ok(persistence_failed(
+                "revoke the API key",
+                &std::io::Error::other("task failed"),
+            ))
+        }
     }
+}
+
+/// 500 for a key-store change that could not be written to disk.
+///
+/// The change has been rolled back, so the response and the on-disk state agree.
+fn persistence_failed(action: &str, error: &std::io::Error) -> Response {
+    tracing::error!(error = %error, action, "Could not persist the API key store");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({
+            "error": format!(
+                "Could not {action}: the key store is not writable. Check that the data \
+                 directory is writable, then try again."
+            )
+        })),
+    )
+        .into_response()
 }
 
 // --- Auth Middleware ---
@@ -2313,6 +2516,213 @@ mod tests {
             !validate_csrf_origin(&headers, Some(&expected)),
             "port matters"
         );
+    }
+
+    // API key persistence (SI-16)
+
+    #[test]
+    fn test_concurrent_key_changes_all_reach_the_disk_intact() {
+        // Snapshots were taken under one lock and written after releasing it, to
+        // a temp file whose name was shared, so concurrent mutations could
+        // rename an older snapshot last or interleave into a garbled file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api_keys.json");
+        let store = ApiKeyStore::load_from_disk(path.clone());
+        std::thread::scope(|scope| {
+            for i in 0..16 {
+                let store = &store;
+                scope.spawn(move || {
+                    store
+                        .try_add_key(
+                            &format!("key-{i}"),
+                            &format!("mm_secret_{i}"),
+                            ApiKeyScope::ReadOnly,
+                        )
+                        .unwrap();
+                });
+            }
+        });
+        let on_disk: Vec<StoredApiKey> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.len(), 16, "the last write holds every key");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files are renamed or removed");
+    }
+
+    #[test]
+    fn test_a_revocation_is_not_undone_by_a_racing_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api_keys.json");
+        let store = ApiKeyStore::load_from_disk(path.clone());
+        let hash = store
+            .try_add_key("victim", "mm_victim", ApiKeyScope::Admin)
+            .unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(|| assert!(store.try_revoke_key(&hash).unwrap()));
+            for i in 0..8 {
+                let store = &store;
+                scope.spawn(move || {
+                    store
+                        .try_add_key(
+                            &format!("other-{i}"),
+                            &format!("mm_other_{i}"),
+                            ApiKeyScope::ReadOnly,
+                        )
+                        .unwrap();
+                });
+            }
+        });
+        let reloaded = ApiKeyStore::load_from_disk(path);
+        assert_eq!(
+            reloaded.validate_key("mm_victim"),
+            None,
+            "still revoked after a restart"
+        );
+        assert_eq!(reloaded.list_keys().len(), 9);
+    }
+
+    #[test]
+    fn test_a_failed_write_is_reported_and_rolled_back() {
+        // The parent of the key file is a regular file, so every write fails
+        // whatever user the tests run as.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        let store = ApiKeyStore::load_from_disk(blocker.join("api_keys.json"));
+
+        assert!(
+            store
+                .try_add_key("lost", "mm_lost", ApiKeyScope::Admin)
+                .is_err()
+        );
+        assert_eq!(
+            store.validate_key("mm_lost"),
+            None,
+            "a key that could not be stored must not authenticate"
+        );
+        assert!(store.list_keys().is_empty());
+
+        // Revocation fails the other way round: the key must stay as it was.
+        let memory_only = ApiKeyStore::default();
+        let hash = memory_only
+            .try_add_key("live", "mm_live", ApiKeyScope::Admin)
+            .unwrap();
+        assert!(!memory_only.try_revoke_key("no-such-hash").unwrap());
+        assert!(memory_only.try_revoke_key(&hash).unwrap());
+        assert_eq!(memory_only.validate_key("mm_live"), None);
+    }
+
+    #[test]
+    fn test_a_failed_revocation_leaves_the_key_valid_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+        let store = ApiKeyStore {
+            keys: Arc::new(Mutex::new(vec![StoredApiKey {
+                key_hash: hash_api_key("mm_k"),
+                name: "k".to_string(),
+                scope: ApiKeyScope::Admin,
+                created_at: chrono::Utc::now().naive_utc(),
+                revoked: false,
+            }])),
+            persist_path: Some(Arc::new(blocker.join("api_keys.json"))),
+            persist_lock: Arc::new(Mutex::new(())),
+        };
+        assert!(store.try_revoke_key(&hash_api_key("mm_k")).is_err());
+        assert_eq!(
+            store.validate_key("mm_k"),
+            Some(ApiKeyScope::Admin),
+            "a revocation that did not persist must not be reported as done"
+        );
+    }
+
+    #[test]
+    fn test_an_unreadable_key_file_is_kept_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api_keys.json");
+        std::fs::write(&path, b"{ this is not json").unwrap();
+
+        let store = ApiKeyStore::load_from_disk(path.clone());
+        assert!(store.list_keys().is_empty());
+        store
+            .try_add_key("fresh", "mm_fresh", ApiKeyScope::ReadOnly)
+            .unwrap();
+
+        let kept: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .collect();
+        assert_eq!(kept.len(), 1, "the unparseable file was moved aside");
+        assert_eq!(
+            std::fs::read(kept[0].path()).unwrap(),
+            b"{ this is not json",
+            "and its contents are intact"
+        );
+        assert!(
+            ApiKeyStore::load_from_disk(path)
+                .validate_key("mm_fresh")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_concurrent_private_writes_never_interleave() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret");
+        std::thread::scope(|scope| {
+            for i in 0..8u8 {
+                let path = &path;
+                scope.spawn(move || {
+                    let payload = vec![b'a' + i; 64 * 1024];
+                    write_private_file(path, &payload).unwrap();
+                });
+            }
+        });
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 64 * 1024);
+        assert!(
+            bytes.iter().all(|b| *b == bytes[0]),
+            "one writer's content, whole"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_existing_secret_files_are_restricted_on_load() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api_keys.json");
+        std::fs::write(&path, b"[]").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let _ = ApiKeyStore::load_from_disk(path.clone());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a file written by an older version is tightened"
+        );
+        assert!(!restrict_to_owner(&path), "already private: nothing to do");
+    }
+
+    #[test]
+    fn test_stale_temp_files_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api_keys.json");
+        std::fs::write(dir.path().join("api_keys.tmp.4242.0"), b"secret").unwrap();
+        std::fs::write(dir.path().join("api_keys.tmp.4242"), b"secret").unwrap();
+        std::fs::write(dir.path().join("unrelated.txt"), b"keep").unwrap();
+        assert_eq!(remove_stale_temp_files(&path), 2);
+        assert!(dir.path().join("unrelated.txt").exists());
+
+        // The same sweep covers the visitor-ID secret, which has no extension.
+        let secret = dir.path().join(".secret");
+        std::fs::write(dir.path().join(".secret.tmp.1.0"), b"s").unwrap();
+        assert_eq!(remove_stale_temp_files(&secret), 1);
     }
 
     // CSRF validation tests
