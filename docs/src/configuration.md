@@ -1,272 +1,188 @@
 # Configuration
 
-Mallard Metrics is configured through a TOML file and environment variables. All settings have sensible defaults; you can start without any configuration file.
+Mallard Metrics reads an optional TOML file and `MALLARD_*` environment
+variables. Everything has a default, so it starts with no configuration.
+This page lists every setting; it was checked against `src/config.rs`,
+`src/main.rs` and `mallard-metrics.toml.example`.
 
-## Loading Configuration
-
-Pass the path to a TOML file as the first command-line argument:
+## Loading rules
 
 ```bash
-mallard-metrics /etc/mallard-metrics/config.toml
+mallard-metrics                      # defaults + environment
+mallard-metrics /etc/mallard/mallard-metrics.toml
 ```
 
-With no argument, defaults apply.
+- **Precedence:** environment variable > TOML file > default.
+- **A named file that cannot be read or parsed is a startup error**, never
+  silently replaced by defaults.
+- **Unknown TOML keys are a startup error** (`unknown field ... expected one of
+  ...`), so `retention_dayz = 30` cannot be ignored.
+- **A malformed environment value is a warning, not an error:** the log says
+  `MALLARD_PORT="abc" is not a valid u16; keeping 8000` and the previous value
+  stays. Check the first lines of the log after changing a variable.
+  Booleans accept `1/true/yes/on` and `0/false/no/off`, case-insensitive.
+- Validation runs before the server binds. A failure prints
+  `Configuration error: ...` and exits with status 1.
+- `--healthcheck` and `--install-extension` read **only the environment**; a
+  TOML file path is not honoured by them (see
+  [Troubleshooting](troubleshooting.md#running-the-extension-install-step-offline)).
 
-Two loading rules are worth knowing:
+## Secrets (environment only)
 
-- **A named file that cannot be read or parsed is a startup error.** It is not
-  silently replaced with defaults, because that could quietly disable retention
-  or drop the site allowlist with nothing but a log line to say so.
-- **Unknown keys are rejected.** A typo such as `retention_dayz = 30` fails at
-  startup rather than leaving the real setting at its default while appearing
-  configured.
+These are never read from the TOML file, so the file can be committed or baked
+into an image.
 
-Environment variables override file values. Validation runs before the server
-binds, so a malformed `dashboard_origin` or `geoip_precision` is reported
-immediately rather than surfacing on the first request.
-
-## Environment Variables
-
-These two values are secrets and must not be stored in files committed to source control. Set them in your shell or a `.env` file:
-
-| Variable | Required | Description |
+| Variable | Default | Validation and effect |
 |---|---|---|
-| `MALLARD_SECRET` | Recommended | HMAC key for visitor ID hashing. If unset, a UUID is auto-generated on first start and persisted to `data_dir/.secret` (survives restarts). Set explicitly in production for portability across hosts. |
-| `MALLARD_ADMIN_PASSWORD` | Recommended | Dashboard password. If unset, the dashboard is unauthenticated. |
-| `MALLARD_MAX_LOGIN_ATTEMPTS` | Optional | Override `max_login_attempts` at runtime. |
-| `MALLARD_LOGIN_LOCKOUT` | Optional | Override `login_lockout_secs` at runtime. |
-| `MALLARD_LOG_FORMAT` | Optional | Set to `json` for structured JSON log output. Omit or set to any other value for human-readable text logs. |
-| `MALLARD_SECURE_COOKIES` | Optional | Set to `true` to add the `Secure` flag to session cookies (required behind TLS). |
-| `MALLARD_METRICS_TOKEN` | Optional | Bearer token protecting the `/metrics` endpoint. |
-| `MALLARD_GEOIP_DB` | Optional | Path to MaxMind GeoLite2-City `.mmdb` file. |
-| `MALLARD_DASHBOARD_ORIGIN` | Optional | Restrict dashboard CORS and enable CSRF protection. |
-| `MALLARD_MAX_CONCURRENT_QUERIES` | Optional | Max concurrent analytical queries (default 10). Returns 429 when exhausted. |
-| `MALLARD_CACHE_MAX_ENTRIES` | Optional | Max query cache entries (default 10000). |
-| `MALLARD_GDPR_MODE` | Optional | Enable GDPR-friendly preset (see [PRIVACY.md](https://github.com/tomtom215/mallardmetrics/blob/main/PRIVACY.md)). |
-| `MALLARD_GEOIP_PRECISION` | Optional | GeoIP precision: `city`, `region`, `country`, or `none`. |
-| `MALLARD_HOST` | Optional | Server bind address (default `0.0.0.0`). |
-| `MALLARD_PORT` | Optional | Server listen port (default `8000`). |
-| `MALLARD_DATA_DIR` | Optional | Data directory for Parquet files and DuckDB (default `data`). |
-| `MALLARD_FLUSH_COUNT` | Optional | Events buffered before flushing to disk (default `1000`). |
-| `MALLARD_FLUSH_INTERVAL` | Optional | Seconds between periodic buffer flushes (default `60`). |
-| `MALLARD_FILTER_BOTS` | Optional | Filter known bot User-Agents (default `true`). |
-| `MALLARD_RETENTION_DAYS` | Optional | Auto-delete data older than N days; 0 = unlimited (default `0`). |
-| `MALLARD_SESSION_TTL` | Optional | Dashboard session TTL in seconds (default `86400`). |
-| `MALLARD_SHUTDOWN_TIMEOUT` | Optional | Graceful shutdown timeout in seconds (default `30`). |
-| `MALLARD_RATE_LIMIT` | Optional | Max events/sec per site; 0 = unlimited (default `0`). |
-| `MALLARD_CACHE_TTL` | Optional | Query cache TTL in seconds (default `60`). |
-| `MALLARD_STRIP_REFERRER_QUERY` | Optional | Strip query/fragment from stored referrers (default `false`). |
-| `MALLARD_ROUND_TIMESTAMPS` | Optional | Round timestamps to the nearest hour (default `false`). |
-| `MALLARD_SUPPRESS_VISITOR_ID` | Optional | Replace HMAC hash with per-request UUID (default `false`). |
-| `MALLARD_SUPPRESS_BROWSER_VERSION` | Optional | Store browser name only (default `false`). |
-| `MALLARD_SUPPRESS_OS_VERSION` | Optional | Store OS name only (default `false`). |
-| `MALLARD_SUPPRESS_SCREEN_SIZE` | Optional | Omit screen width and device type (default `false`). |
-| `MALLARD_SITE_IDS` | Optional | Comma-separated site allowlist, enforced against the Origin header *and* the event payload. |
-| `MALLARD_TRUST_PROXY_HEADERS` | Optional | Trust `X-Forwarded-For` / `X-Real-IP` (default `false`). See below. |
-| `MALLARD_VISITOR_SALT_ROTATION_DAYS` | Optional | Days a visitor-ID salt stays valid (default `1`). See below. |
-| `MALLARD_SESSION_WINDOW_MINUTES` | Optional | Inactivity gap that ends a session (default `30`). |
-| `MALLARD_REALTIME_WINDOW_MINUTES` | Optional | Window the realtime endpoint treats as "now" (default `5`). |
-| `MALLARD_COMPACT_AFTER_FILES` | Optional | Merge a partition's Parquet files past this count; 0 disables (default `24`). |
-| `MALLARD_READ_CONNECTIONS` | Optional | Read-only DuckDB connections for queries (default `4`). |
-| `MALLARD_MAX_BUFFERED_EVENTS` | Optional | Cap on buffered events; 0 = unbounded (default `100000`). |
-| `MALLARD_MAX_TRACKED_KEYS` | Optional | Cap on rate-limit buckets and login-attempt records (default `10000`). |
-| `MALLARD_MAX_SESSIONS` | Optional | Cap on concurrent dashboard sessions (default `10000`). |
-| `MALLARD_RATE_LIMIT_PER_IP` | Optional | Max events/sec per client IP; 0 = unlimited (default `0`). |
-| `MALLARD_EXTENSION_DIR` | Optional | Where DuckDB installs community extensions (default `data_dir/extensions`). |
-| `MALLARD_DUCKDB_MEMORY_LIMIT` | Optional | Cap on query memory, e.g. `1GB`. Unset means DuckDB's default of roughly 80% of system RAM. |
-| `MALLARD_DUCKDB_THREADS` | Optional | DuckDB worker threads. Unset means one per core. |
+| `MALLARD_SECRET` | auto-generated | Key material for visitor IDs. **At least 16 characters** (counted as characters, after trimming whitespace); a shorter value stops startup with `MALLARD_SECRET is shorter than 16 characters. Use a random value, e.g. openssl rand -hex 32.` Empty or unset: a random UUID is generated once and stored in `data_dir/.secret` (mode 0600); an unreadable existing file also stops startup rather than silently replacing the secret. Changing the secret re-identifies every visitor. |
+| `MALLARD_ADMIN_PASSWORD` | unset | At least 12 characters and not one of a short list of obvious values; otherwise startup stops with `MALLARD_ADMIN_PASSWORD rejected: ...`. Takes precedence over a password stored by `/api/auth/setup`; never written to disk. Unset with no stored hash means **reads are open** until someone completes setup. |
+| `MALLARD_METRICS_TOKEN` | unset | Bearer token required by `GET /metrics`. Empty counts as unset. |
+| `RUST_LOG` | `mallard_metrics=info,tower_http=info` | `tracing` filter. |
 
-### Why the extension directory is not DuckDB's default
+## Server and storage
 
-DuckDB installs community extensions under `$HOME/.duckdb/extensions`. The
-shipped `FROM scratch` image sets no `HOME`, and the production compose file
-runs with a read-only root filesystem, so `INSTALL behavioral FROM community`
-failed with `IO Error: Can't find the home directory at ''` — and funnels,
-retention, sessions, sequences and flow all answered `503` on a deployment that
-looked healthy in every other respect.
+| Variable / TOML key | Type | Default | Validation | Effect |
+|---|---|---|---|---|
+| `MALLARD_HOST` / `host` | string | `0.0.0.0` | bind must succeed | Listen address. Use `127.0.0.1` behind a proxy on the same host. |
+| `MALLARD_PORT` / `port` | u16 | `8000` | | Listen port. |
+| `MALLARD_DATA_DIR` / `data_dir` | path | `data` | must not contain `* ? [ ]` | Holds `mallard.duckdb`, `events/`, `extensions/`, `.secret`, `admin.json`, `api_keys.json`. The characters are refused because DuckDB would treat them as a glob. |
+| `MALLARD_EXTENSION_DIR` / `extension_directory` | path | `data_dir/extensions` | empty = unset | Where `INSTALL behavioral` writes and loads from. The image sets it to `/data/extensions`. DuckDB's `home_directory` is set to `data_dir` too. |
+| `MALLARD_RETENTION_DAYS` / `retention_days` | u32 | `0` | | Delete `date=` partitions older than N days; `0` keeps everything. Runs at startup and every 24 hours, clears the query cache and refreshes the view. |
+| `MALLARD_COMPACT_AFTER_FILES` / `compact_after_files` | usize | `24` | `0` disables; values below 2 act as 2 | Merge a partition's files of one level once it holds at least this many. |
+| `MALLARD_READ_CONNECTIONS` / `read_connections` | usize | `4` | `0` or `1` shares the writer connection | Read-only DuckDB connections serving queries. With a pool a slow dashboard query cannot block ingestion. |
+| `MALLARD_DUCKDB_MEMORY_LIMIT` / `duckdb_memory_limit` | string | unset (about 80% of RAM) | number plus `B/KB/KiB/MB/MiB/GB/GiB/TB/TiB` | Cap on query memory, e.g. `1GB`. Set it below the container limit. |
+| `MALLARD_DUCKDB_THREADS` / `duckdb_threads` | u32 | unset (one per core) | `0` is an error in TOML; a non-positive env value is a warning | DuckDB worker threads. |
+| `MALLARD_GEOIP_DB` / `geoip_db_path` | path | unset | empty = unset; a missing file is not an error | MaxMind GeoLite2-City database; geography is `NULL` without it. |
 
-The server sets DuckDB's `home_directory` to the data directory as well. DuckDB
-resolves the home directory while installing an extension even when
-`extension_directory` names somewhere else, so setting only the extension
-directory does not fix it.
-Keeping the directory on the data volume, which is writable by definition, is
-what makes those endpoints work in a container. It also puts the downloaded
-extension somewhere an operator can find and back up.
+## Ingestion
 
-Boolean variables accept `1/true/yes/on` and `0/false/no/off`, case-insensitively.
-Anything else logs a warning and leaves the setting unchanged, rather than being
-read as "true" because it is not the literal string `false`.
+| Variable / TOML key | Type | Default | Validation | Effect |
+|---|---|---|---|---|
+| `MALLARD_FLUSH_COUNT` / `flush_event_count` | usize | `1000` | `> 0` | Flush when the buffer holds this many events. |
+| `MALLARD_FLUSH_INTERVAL` / `flush_interval_secs` | u64 | `60` | `> 0` | Also flush at least this often. This is the **delay before an event becomes visible in reports**. |
+| `MALLARD_MAX_BUFFERED_EVENTS` / `max_buffered_events` | usize | `100000` | `0` = unbounded; otherwise `>= flush_event_count` | Cap on memory held while flushes fail. Beyond it new events get `503` and `mallard_events_dropped_total` counts them. |
+| `MALLARD_FILTER_BOTS` / `filter_bots` | bool | `true` | | Drop known-bot User-Agents (answered `202`). |
+| `MALLARD_SITE_IDS` / `site_ids` | comma list / array | empty (any site) | each entry: letters, digits, `. - _ :`, at most 256 characters | Ingest allowlist, enforced against the `Origin` header **and** the payload's `d`. |
+| `MALLARD_RATE_LIMIT` / `rate_limit_per_site` | u32 | `0` (off) | | Events per second per site ID; token bucket whose burst equals the rate. |
+| `MALLARD_RATE_LIMIT_PER_IP` / `rate_limit_per_ip` | u32 | `0` (off) | | Events per second per client (IPv4 address or IPv6 /64). |
+| `MALLARD_MAX_TRACKED_KEYS` / `max_tracked_keys` | usize | `10000` | | Cap on rate-limit buckets and login-attempt records. At the cap, idle entries are dropped first, then the least recently used, in batches (counted in `mallard_rate_limiter_evictions_total`); new keys are never refused. |
+
+## Reverse proxy and cookies
+
+| Variable / TOML key | Type | Default | Validation | Effect |
+|---|---|---|---|---|
+| `MALLARD_TRUST_PROXY_HEADERS` / `trust_proxy_headers` | bool | `false` | | Take the client address from `X-Forwarded-For` (or `X-Real-IP` when no chain exists) instead of the socket. |
+| `MALLARD_TRUSTED_PROXY_HOPS` / `trusted_proxy_hops` | usize | `1` | `1..=8` when `trust_proxy_headers` is on; otherwise unused | The client is entry N **from the right** of `X-Forwarded-For`. |
+| `MALLARD_DASHBOARD_ORIGIN` / `dashboard_origin` | string | unset | `http(s)://host[:port]`, no path, no credentials | Restricts dashboard CORS to that origin (with credentials) and enables the CSRF check on login, setup, logout and admin routes. |
+| `MALLARD_SECURE_COOKIES` / `secure_cookies` | bool | `false` | | Add `Secure` to the session cookie. Also implied by an `https://` `dashboard_origin`. |
+
+## Queries and sessions
+
+| Variable / TOML key | Type | Default | Validation | Effect |
+|---|---|---|---|---|
+| `MALLARD_CACHE_TTL` / `cache_ttl_secs` | u64 | `60` | `0` disables | Lifetime of cached report results (all read endpoints except realtime and export). |
+| `MALLARD_CACHE_MAX_ENTRIES` / `cache_max_entries` | usize | `10000` | `0` = unbounded | LRU cap on the cache. |
+| `MALLARD_MAX_CONCURRENT_QUERIES` / `max_concurrent_queries` | usize | `10` | `0` = unlimited | Query slots. Waiters queue for up to 10 s, then get `429`. |
+| `MALLARD_SESSION_WINDOW_MINUTES` / `session_window_minutes` | u32 | `30` | `> 0` | Inactivity gap that ends a visit. |
+| `MALLARD_REALTIME_WINDOW_MINUTES` / `realtime_window_minutes` | u32 | `5` | `> 0` | Window `/api/stats/realtime` treats as "now". |
+
+## Dashboard authentication
+
+| Variable / TOML key | Type | Default | Validation | Effect |
+|---|---|---|---|---|
+| `MALLARD_SESSION_TTL` / `session_ttl_secs` | u64 | `86400` | `> 0` | Session lifetime (sessions are in memory; a restart logs everyone out). |
+| `MALLARD_MAX_SESSIONS` / `max_sessions` | usize | `10000` | | Cap on concurrent sessions. |
+| `MALLARD_MAX_LOGIN_ATTEMPTS` / `max_login_attempts` | u32 | `5` | `0` disables lockout (logged as an advisory) | Failures before a client is locked out. |
+| `MALLARD_LOGIN_LOCKOUT` / `login_lockout_secs` | u64 | `300` | `> 0` (0 is a startup error) | Lockout length. |
+
+## Operations
+
+| Variable / TOML key | Type | Default | Validation | Effect |
+|---|---|---|---|---|
+| `MALLARD_SHUTDOWN_TIMEOUT` / `shutdown_timeout_secs` | u64 | `30` | at least 1 is used | Bound for connection draining, **and separately** for the final flush. Worst case a stop takes twice this. |
+| `MALLARD_LOG_FORMAT` / `log_format` | string | `text` | `text` or `json` | Log encoding. |
+
+## Visitor identity and privacy
+
+| Variable / TOML key | Type | Default | Validation | Effect |
+|---|---|---|---|---|
+| `MALLARD_VISITOR_SALT_ROTATION_DAYS` / `visitor_salt_rotation_days` | u32 | `1` | `>= 1` | Days a visitor-ID salt stays in use. Also the retention report's lookback. See below. |
+| `MALLARD_GDPR_MODE` / `gdpr_mode` | bool | `false` | | Preset: forces `strip_referrer_query`, `round_timestamps`, `suppress_browser_version`, `suppress_os_version`, `suppress_screen_size` on and lowers `geoip_precision` to at most `country`. Not `suppress_visitor_id`. |
+| `MALLARD_STRIP_REFERRER_QUERY` / `strip_referrer_query` | bool | `false` | | Store referrers without `?query` and `#fragment`. |
+| `MALLARD_ROUND_TIMESTAMPS` / `round_timestamps` | bool | `false` | | Round event time down to the hour. **Disables** session, funnel, sequence, flow and entry/exit reports (`503`). |
+| `MALLARD_SUPPRESS_VISITOR_ID` / `suppress_visitor_id` | bool | `false` | | Replace the ID with a random UUID per request: unique visitors become page loads and every visit is one page. |
+| `MALLARD_SUPPRESS_BROWSER_VERSION` / `suppress_browser_version` | bool | `false` | | Keep the browser name only. |
+| `MALLARD_SUPPRESS_OS_VERSION` / `suppress_os_version` | bool | `false` | | Keep the OS name only. |
+| `MALLARD_SUPPRESS_SCREEN_SIZE` / `suppress_screen_size` | bool | `false` | | Drop the width **and** the device type. |
+| `MALLARD_GEOIP_PRECISION` / `geoip_precision` | string | `city` | `city`, `region`, `country`, `none` | How much of a GeoIP result is stored. |
+
+## Startup advisories
+
+These are logged as warnings and never block startup:
+
+- `gdpr_mode` with `retention_days = 0`.
+- `visitor_salt_rotation_days = 1` (explains the cost for multi-day reports).
+- `trust_proxy_headers` on (restates the hop rule).
+- `max_login_attempts = 0`.
+- `site_ids` empty **and** `rate_limit_per_ip = 0`: anyone who can reach the
+  server can create sites and write events without limit.
+- `suppress_visitor_id` on.
 
 ## Two settings that need a decision
 
-### `trust_proxy_headers`
+### `trust_proxy_headers` and `trusted_proxy_hops`
 
-Defaults to `false`, which means the client address comes from the connection.
+The client address feeds the visitor ID, GeoIP, the rate limiters and the login
+lockout. Default `false`: the socket's peer address is used.
 
-Turn it on **only** when every request reaches the server through a reverse
-proxy that overwrites `X-Forwarded-For` (the bundled Caddy config does). On a
-directly reachable server those headers are attacker-controlled, and trusting
-them lets any client pick its own visitor ID, geolocation and rate-limit bucket.
+Behind a reverse proxy that is wrong in the other direction: every visitor
+appears to come from the proxy, so unique visitors collapse to distinct
+User-Agents, GeoIP never resolves, and five wrong passwords from anyone lock the
+admin out. Turn `trust_proxy_headers` on **only** when every request really
+passes through your proxy, and tell Mallard how many proxies that is:
 
-Leaving it off on a proxied deployment is also wrong, just less dangerously: every
-visitor is then attributed to the proxy's address.
+> Every proxy **appends** the address it received the connection from to
+> `X-Forwarded-For`. Entries to the left were written by whoever came before, so
+> only the entries your own infrastructure appended can be believed. Mallard
+> takes entry `trusted_proxy_hops` **counting from the right**.
 
-Even when the headers are trusted, their value must parse as an IP address —
-with or without a port, bracketed or not. Anything else falls through to the
-peer address, so a request that reaches the server without traversing the proxy
-cannot inject arbitrary text into the rate-limit key, the GeoIP lookup or the
-visitor-ID input. The parsed form is also canonical, so `::1` and
-`0:0:0:0:0:0:0:1` are one visitor rather than two.
+| Topology | `trusted_proxy_hops` |
+|---|---|
+| Client → Caddy → Mallard (the bundled setup) | `1` |
+| Client → nginx with `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;` → Mallard | `1` |
+| Client → CDN → nginx → Mallard | `2` |
+
+Verified against a running server with `trusted_proxy_hops = 1`:
+`X-Forwarded-For: 9.9.9.9, 203.0.113.7` is rate-limited as `203.0.113.7`, and
+replacing the spoofable left entry (`1.2.3.4, 203.0.113.7`) does not change the
+client. Too small a value attributes traffic to a proxy; too large a value lets
+a client choose its own address. A chain shorter than the hop count is not
+believed (the peer address is used), and the value must parse as an IP address
+(optionally with a port, bracketed IPv6 allowed); anything else falls back to the
+peer. `X-Real-IP` is read only when there is no `X-Forwarded-For` at all.
 
 ### `visitor_salt_rotation_days`
 
-Defaults to `1`, the most privacy-protective setting — and the one that limits
-what can be measured. A visitor seen on two days carries two unrelated IDs, so:
+Default `1`: the most private setting, and the one that limits what can be
+measured. A visitor seen on two UTC days has two unrelated IDs, so
 
-- "Unique visitors" over a multi-day range counts visitor-days, not people.
-- Weekly retention cohorts are structurally impossible;
-  `/api/stats/retention` reports this in a `caveat` field.
-- A visit spanning UTC midnight is recorded as two visits.
+- "Unique visitors" over several days counts visitor-days, not people.
+- Weekly retention cohorts read zero past week 0;
+  `/api/stats/retention` says so in its `caveat` field.
+- A visit spanning UTC midnight is two visits.
 
-Raise it (7, 30) if you need cross-day analysis, and record the reasoning: it
-lengthens the life of a pseudonymous identifier, which is a privacy decision.
-Retention over *N* weeks needs at least `(N - 1) * 7` days.
+Raising it (7, 30) lengthens the life of a pseudonymous identifier, which is a
+privacy decision to record. Retention over *N* weeks needs at least `(N - 1) * 7`.
+Periods are aligned to the Unix epoch, so every instance sharing a secret agrees
+on the boundaries. See [Privacy and GDPR](privacy-gdpr.md#salt-rotation).
 
-## TOML Configuration Reference
+## The extension directory
 
-A complete example is shipped as `mallard-metrics.toml.example`. Every field has a default and is optional.
-
-```toml
-# Network binding
-host = "0.0.0.0"   # default
-port = 8000         # default
-
-# Storage
-data_dir = "data"   # relative or absolute path; events and Parquet files are stored here
-
-# Event buffer
-flush_event_count = 1000   # flush buffer to Parquet when this many events accumulate
-flush_interval_secs = 60   # also flush on this interval (seconds)
-
-# Site allowlist — leave empty to accept events from any origin
-# site_ids = ["example.com", "other-site.org"]
-site_ids = []
-
-# GeoIP database (optional — gracefully skipped if missing)
-# geoip_db_path = "/path/to/GeoLite2-City.mmdb"
-
-# Dashboard CORS origin (optional — set when dashboard is on a different origin)
-# dashboard_origin = "https://analytics.example.com"
-
-# Bot filtering (default: true — filters known bot User-Agents from event ingestion)
-filter_bots = true
-
-# Data retention: delete Parquet partitions older than this many days
-# Set to 0 for unlimited retention (default)
-retention_days = 0
-
-# Session authentication TTL in seconds (default: 86400 = 24 hours)
-session_ttl_secs = 86400
-
-# Brute-force protection: lock out an IP after this many failed login attempts (0 = disabled)
-max_login_attempts = 5
-
-# Duration in seconds to lock out an IP after exceeding max_login_attempts
-login_lockout_secs = 300
-
-# Graceful shutdown timeout in seconds (default: 30)
-shutdown_timeout_secs = 30
-
-# Ingestion rate limit per site_id (events/second, 0 = unlimited)
-rate_limit_per_site = 0
-
-# Query cache TTL in seconds (0 = no caching, default: 60)
-cache_ttl_secs = 60
-
-# Log format: "text" (default) or "json"
-log_format = "text"
-
-# Query cache max entries (0 = unlimited, default: 10000)
-cache_max_entries = 10000
-
-# Max concurrent analytics queries (0 = unlimited, default: 10)
-# Excess requests receive HTTP 429
-max_concurrent_queries = 10
-
-# Cookie Secure flag (set to true when behind TLS)
-secure_cookies = false
-
-# ── GDPR / Privacy Flags ──────────────────────────────────────────────
-# gdpr_mode = false            # convenience preset — enables all flags below
-# strip_referrer_query = false  # strip ?query and #fragment from referrers
-# round_timestamps = false      # round timestamps to the nearest hour
-# suppress_visitor_id = false   # replace HMAC hash with per-request UUID
-# suppress_browser_version = false
-# suppress_os_version = false
-# suppress_screen_size = false
-# geoip_precision = "city"      # city | region | country | none
-```
-
-## Configuration Field Details
-
-### `host` / `port`
-
-The address and port the HTTP server listens on.
-
-- Default: `0.0.0.0:8000`
-- To restrict to localhost: `host = "127.0.0.1"`
-
-### `data_dir`
-
-Root directory for all persistent data. Mallard Metrics creates subdirectories:
-
-```
-data/
-└── events/
-    └── site_id=example.com/
-        └── date=2024-01-15/
-            ├── 0001.parquet
-            └── 0002.parquet
-```
-
-Parquet files are ZSTD-compressed. The directory is created automatically.
-
-### `flush_event_count` / `flush_interval_secs`
-
-Events arrive into a memory buffer before being flushed to Parquet. Flushing happens when either threshold is reached. The buffer is also flushed on graceful shutdown.
-
-- Lower values reduce data loss on crash; higher values reduce I/O.
-- Queries always see both buffered (hot) and persisted (cold) data via the `events_all` view.
-
-### `site_ids`
-
-An allowlist of site identifiers. If non-empty, the `Origin` header of each ingestion request must exactly match one of the listed values. Requests from unlisted origins receive a `403 Forbidden` response.
-
-The comparison is **exact**: `example.com` matches `https://example.com` and `http://example.com:8080` (with explicit port) but not `example.com.other.io`.
-
-### `geoip_db_path`
-
-Path to a MaxMind GeoLite2-City `.mmdb` file. GeoLite2 databases are free for non-commercial use and available at [maxmind.com](https://www.maxmind.com/en/geolite2/signup).
-
-If the file is not specified or does not exist, country/region/city fields are stored as `NULL`. This is the default behavior and does not cause any errors.
-
-### `rate_limit_per_site`
-
-Maximum events per second accepted per `site_id`. Uses a token-bucket algorithm. Set to `0` (default) for no limit.
-
-### `cache_ttl_secs`
-
-Query results for `/api/stats/main` and `/api/stats/timeseries` are cached in memory for this duration. Setting to `0` disables caching (useful for development). Default is 60 seconds.
-
-### `retention_days`
-
-Parquet partition directories older than `retention_days` days are deleted automatically by a background task that runs daily. Set to `0` (default) for unlimited retention.
-
-### `max_login_attempts` / `login_lockout_secs`
-
-Brute-force protection for the dashboard login endpoint. After `max_login_attempts` consecutive failures from the same IP, that IP is blocked for `login_lockout_secs` seconds. The server responds with `429 Too Many Requests` and a `Retry-After` header during the lockout period.
-
-- `max_login_attempts`: Default `5`. Set to `0` to disable brute-force protection entirely.
-- `login_lockout_secs`: Default `300` (5 minutes).
-
-These can also be set via `MALLARD_MAX_LOGIN_ATTEMPTS` and `MALLARD_LOGIN_LOCKOUT` environment variables.
+DuckDB installs community extensions under `$HOME/.duckdb/extensions`. The
+shipped image has a read-only root filesystem and no writable home, so the image
+sets `HOME=/data` and `MALLARD_EXTENSION_DIR=/data/extensions`, and the server
+also points DuckDB's `home_directory` at `data_dir`. Without that,
+`INSTALL behavioral` fails and funnels, retention, sessions, sequences and flow
+answer `503` on an otherwise healthy deployment. Keeping the extension on the data
+volume also means it survives container replacement and can be seeded once for a
+network that has no outbound route.
