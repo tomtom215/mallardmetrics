@@ -2,20 +2,30 @@ import { h, render, Component, createRef } from '/preact.js';
 import htm from '/htm.js';
 import {
   DASH, num, compact, tick, pct, fixed, duration, money, fmtDate, fmtDay, fmtMonth, fmtHour, hasTime,
-  todayUTC, shiftDay, rangePreset, periodRange, validateRange, serializeFilters, readViewState,
+  todayUTC, shiftDay, rangePreset, periodRange, validateRange, serializeFilters, parseFilters, readViewState,
   writeViewState, niceMax, axisTicks, retentionCellState, MAX_RANGE_DAYS,
 } from '/format.js';
 import { Api } from '/api.js';
+import { readShareToken, wantsSharedView, makeShareFetch, shareLink, EXPIRY_CHOICES, expiryDays, linkStatusLabel } from '/share.js';
 
 const html = htm.bind(h);
-const api = new Api();
+// A shared view is opened with  /#share=<token>.  The token lives in the URL
+// fragment, which no browser sends to a server, and in memory here; the API
+// client then speaks for the link (see share.js). Anything else is the ordinary
+// dashboard.
+const shareToken = readShareToken(location.hash);
+const shareRequested = wantsSharedView(location.hash);
+const api = new Api(shareToken ? { fetchImpl: makeShareFetch(shareToken) } : {});
 // The browser check reads this to prove a cold load stayed within the server's
 // concurrency cap and never had to fall back on retries.
 window.__mallardApi = api.stats;
 
 /* ── Preferences ───────────────────────────────────────────────────────── */
 
-const STORAGE_KEY = 'mallard.dashboard.v2';
+// A viewer of a shared link shares this origin with the admin dashboard, so it
+// gets its own key, and keeps only its theme: no site, filters or other state
+// of the admin's browser is read or overwritten.
+const STORAGE_KEY = shareRequested ? 'mallard.share.v1' : 'mallard.dashboard.v2';
 
 /** Read persisted UI state. Storage can throw in private mode. */
 function loadPrefs() {
@@ -28,7 +38,7 @@ function loadPrefs() {
 
 function savePrefs(prefs) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(shareRequested ? { theme: prefs.theme } : prefs));
   } catch (e) {
     /* storage unavailable; preferences simply do not persist */
   }
@@ -573,12 +583,14 @@ function BreakdownList({ rows, label = 'Value', columns, onFilter, caption, empt
 }
 
 /** The active segment, with a chip per condition. */
-function FilterBar({ filters, onRemove, onToggle, onClear }) {
-  if (!filters || filters.length === 0) return null;
+function FilterBar({ filters, onRemove, onToggle, onClear, menu }) {
+  const active = filters && filters.length > 0;
+  if (!active && !menu) return null;
   return html`
     <div class="filter-bar" role="region" aria-label="Active filters">
-      <span class="filter-bar-label">Filtered by</span>
-      ${filters.map(
+      ${menu}
+      ${active && html`<span class="filter-bar-label">Filtered by</span>`}
+      ${(active ? filters : []).map(
         (f, i) => html`
           <span class="filter-chip">
             <span class="filter-chip-dim">${FILTER_LABELS[f.dimension] || f.dimension}</span>
@@ -598,7 +610,7 @@ function FilterBar({ filters, onRemove, onToggle, onClear }) {
           </span>
         `,
       )}
-      <button type="button" class="filter-clear" onClick=${onClear}>Clear all</button>
+      ${active && html`<button type="button" class="filter-clear" onClick=${onClear}>Clear all</button>`}
     </div>
   `;
 }
@@ -1224,6 +1236,239 @@ class KeysPanel extends Component {
   }
 }
 
+/** "Oct 21, 2026, 2:05 PM" in UTC, for when something last happened. */
+const fmtWhen = (text) => (text ? `${fmtDate(text)}, ${fmtHour(text)}` : DASH);
+
+/** The filters of a saved segment as a sentence fragment: "Browser is Chrome · Country is not US". */
+function describeSegment(text) {
+  const filters = parseFilters(text, null);
+  if (filters.length === 0) return text;
+  return filters.map((f) => `${FILTER_LABELS[f.dimension] || f.dimension} ${f.negated ? 'is not' : 'is'} ${f.value}`).join(' · ');
+}
+
+/**
+ * Saved segments for the selected site. A segment is a named set of filters
+ * kept on the server; the toolbar's Segment menu applies one, and a share link
+ * can be limited to one. Saving takes the filters currently on screen.
+ */
+class SegmentsPanel extends Component {
+  constructor() {
+    super();
+    this.state = { name: '', busy: false, error: null, editing: null, editName: '' };
+  }
+
+  async call(method, url, payload) {
+    this.setState({ busy: true, error: null });
+    const res = await api.send(method, url, payload);
+    if (res.kind === 'unauthorized') {
+      this.props.onAuthExpired();
+      return false;
+    }
+    this.setState({ busy: false, error: res.kind === 'ok' ? null : res.message });
+    if (res.kind === 'ok') await this.props.onChanged();
+    return res.kind === 'ok';
+  }
+
+  async save(event) {
+    event.preventDefault();
+    const name = this.state.name.trim();
+    const { site, filters } = this.props;
+    if (!name || filters.length === 0) return;
+    if (await this.call('POST', '/api/segments', { site_id: site, name, filters: serializeFilters(filters) })) this.setState({ name: '' });
+  }
+
+  async rename(segment, event) {
+    event.preventDefault();
+    const name = this.state.editName.trim();
+    if (!name) return;
+    if (await this.call('POST', `/api/segments/${encodeURIComponent(segment.id)}`, { name })) this.setState({ editing: null });
+  }
+
+  overwrite(segment) {
+    return this.call('POST', `/api/segments/${encodeURIComponent(segment.id)}`, { filters: serializeFilters(this.props.filters) });
+  }
+
+  remove(segment) {
+    // Links already made from a segment keep the filters they were made with.
+    if (!window.confirm(`Delete the segment "${segment.name}"? Share links already made from it keep working.`)) return;
+    return this.call('DELETE', `/api/segments/${encodeURIComponent(segment.id)}`);
+  }
+
+  render({ site, segments, filters, onApply, onClose }, { name, busy, error, editing, editName }) {
+    const hasFilters = filters.length > 0;
+    return html`
+      <${ToolPanel} id="segments" title="Segments" onClose=${onClose}
+        subtitle=${`Named sets of filters for ${site}. Pick one from the Segment menu to apply it, or limit a share link to one.`}>
+        <form class="inline-controls" onSubmit=${(e) => this.save(e)}>
+          <label>Name
+            <input type="text" value=${name} maxlength="64" placeholder="Desktop Chrome" autocomplete="off" onInput=${(e) => this.setState({ name: e.target.value })} required />
+          </label>
+          <button type="submit" disabled=${busy || !name.trim() || !hasFilters}>Save current filters</button>
+        </form>
+        ${!hasFilters && html`<p class="muted">Click a value in any breakdown to add a filter, then save the filters as a segment.</p>`}
+        ${hasFilters && html`<p class="muted">Saves: ${describeSegment(serializeFilters(filters))}</p>`}
+        ${error && html`<div class="placeholder placeholder-error" role="alert">${error}</div>`}
+        ${segments === null
+          ? html`<${SkelRows} rows=${2} />`
+          : segments.length === 0
+            ? html`<${Empty}>No segments for this site yet</${Empty}>`
+            : html`
+                <div class="table-scroll" tabindex="0" role="region" aria-label="Saved segments">
+                  <table class="data-table">
+                    <thead><tr><th scope="col">Name</th><th scope="col">Filters</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+                    <tbody>
+                      ${segments.map((segment) => html`
+                        <tr>
+                          <td class="cell-text" title=${segment.name}>
+                            ${editing === segment.id
+                              ? html`<form class="inline-controls inline-edit" onSubmit=${(e) => this.rename(segment, e)}>
+                                  <label><span class="sr-only">New name for ${segment.name}</span>
+                                    <input type="text" value=${editName} maxlength="64" autocomplete="off" onInput=${(e) => this.setState({ editName: e.target.value })} required />
+                                  </label>
+                                  <button type="submit" disabled=${busy || !editName.trim()}>Save</button>
+                                  <button type="button" class="btn-secondary" onClick=${() => this.setState({ editing: null })}>Cancel</button>
+                                </form>`
+                              : segment.name}
+                          </td>
+                          <td class="cell-wrap">${describeSegment(segment.filters)}</td>
+                          <td>
+                            <div class="row-actions">
+                              <button type="button" class="btn-secondary" onClick=${() => onApply(segment)}>Apply<span class="sr-only"> ${segment.name}</span></button>
+                              <button type="button" class="btn-secondary" disabled=${busy} onClick=${() => this.setState({ editing: segment.id, editName: segment.name })}>Rename<span class="sr-only"> ${segment.name}</span></button>
+                              <button type="button" class="btn-secondary" disabled=${busy || !hasFilters} title=${hasFilters ? 'Replace its filters with the ones on screen' : 'Add a filter first'} onClick=${() => this.overwrite(segment)}>Use current filters<span class="sr-only"> for ${segment.name}</span></button>
+                              <button type="button" class="btn-secondary" disabled=${busy} onClick=${() => this.remove(segment)}>Delete<span class="sr-only"> ${segment.name}</span></button>
+                            </div>
+                          </td>
+                        </tr>
+                      `)}
+                    </tbody>
+                  </table>
+                </div>
+              `}
+      </${ToolPanel}>
+    `;
+  }
+}
+
+/**
+ * Share links: a revocable, read-only, no-login view of one site, optionally
+ * limited to a saved segment. The link is shown once, at creation; the server
+ * keeps only a hash, so it cannot be shown again.
+ */
+class SharePanel extends Component {
+  constructor() {
+    super();
+    this.state = { links: null, label: '', segmentId: '', expiry: '30', created: null, error: null, busy: false };
+    this.linkRef = createRef();
+  }
+
+  componentDidMount() {
+    this.load();
+  }
+
+  async load() {
+    const res = await api.get('/api/share-links');
+    if (res.kind === 'unauthorized') return this.props.onAuthExpired();
+    if (res.kind === 'ok') this.setState({ links: res.data, error: null });
+    else this.setState({ links: this.state.links || [], error: res.message });
+  }
+
+  async create(event) {
+    event.preventDefault();
+    const label = this.state.label.trim();
+    if (!label) return;
+    const body = { label, site_id: this.props.site };
+    if (this.state.segmentId) body.segment_id = this.state.segmentId;
+    const days = expiryDays(this.state.expiry);
+    if (days) body.expires_in_days = days;
+    this.setState({ busy: true, error: null });
+    const res = await api.send('POST', '/api/share-links', body);
+    if (res.kind === 'unauthorized') return this.props.onAuthExpired();
+    if (res.kind === 'ok') {
+      const { token, ...link } = res.data;
+      this.setState({ created: { ...link, url: shareLink(location.origin, token) }, label: '', busy: false });
+      await this.load();
+    } else {
+      this.setState({ error: res.message, busy: false });
+    }
+  }
+
+  async revoke(link) {
+    if (!window.confirm(`Revoke the share link "${link.label}"? Anyone using it loses access on their next request.`)) return;
+    this.setState({ busy: true, error: null });
+    const res = await api.send('DELETE', `/api/share-links/${encodeURIComponent(link.id)}`);
+    if (res.kind === 'unauthorized') return this.props.onAuthExpired();
+    this.setState({ busy: false, error: res.kind === 'ok' ? null : res.message });
+    await this.load();
+  }
+
+  render({ site, segments, onClose }, { links, label, segmentId, expiry, created, error, busy }) {
+    const available = (segments || []).filter((s) => s.site_id === site);
+    return html`
+      <${ToolPanel} id="share" title="Share links" onClose=${onClose}
+        subtitle="Give someone a read-only view of one site without a login. The link is shown once; revoke it here at any time.">
+        ${created && html`
+          <div class="banner banner-key" role="alert">
+            <strong>Copy this link now — it is not shown again.</strong>
+            <code class="key-value" ref=${this.linkRef}>${created.url}</code>
+            <${CopyButton} text=${created.url} source=${this.linkRef} label="Copy link" />
+            <button type="button" class="btn-secondary" onClick=${() => this.setState({ created: null })}>Done</button>
+            <span class="banner-note">Anyone who has this link can see ${created.site_id}${created.segment ? ` (segment: ${created.segment})` : ''} until ${created.expires_at ? fmtDate(created.expires_at) : 'it is revoked'}. Treat it like a password.</span>
+          </div>
+        `}
+        <form class="inline-controls" onSubmit=${(e) => this.create(e)}>
+          <label>Label (private)
+            <input type="text" value=${label} maxlength="128" placeholder="Q4 board pack" autocomplete="off" onInput=${(e) => this.setState({ label: e.target.value })} required />
+          </label>
+          <label>Segment
+            <select value=${segmentId} onChange=${(e) => this.setState({ segmentId: e.target.value })}>
+              <option value="">All traffic of ${site}</option>
+              ${available.map((s) => html`<option value=${s.id}>${s.name}</option>`)}
+            </select>
+          </label>
+          <label>Expires
+            <select value=${expiry} onChange=${(e) => this.setState({ expiry: e.target.value })}>
+              ${EXPIRY_CHOICES.map((c) => html`<option value=${c.value}>${c.label}</option>`)}
+            </select>
+          </label>
+          <button type="submit" disabled=${busy || !label.trim() || !site}>Create link</button>
+        </form>
+        ${error && html`<div class="placeholder placeholder-error" role="alert">${error}</div>`}
+        ${links === null
+          ? html`<${SkelRows} rows=${2} />`
+          : links.length === 0
+            ? html`<${Empty}>No share links yet</${Empty}>`
+            : html`
+                <div class="table-scroll" tabindex="0" role="region" aria-label="Share links">
+                  <table class="data-table share-table">
+                    <thead><tr>
+                      <th scope="col">Label</th><th scope="col">Site</th><th scope="col">Segment</th><th scope="col">Created</th>
+                      <th scope="col">Expires</th><th scope="col">Last used</th><th scope="col">Status</th><th scope="col"><span class="sr-only">Actions</span></th>
+                    </tr></thead>
+                    <tbody>
+                      ${links.map((link) => html`
+                        <tr>
+                          <td class="cell-text" title=${link.label}>${link.label}</td>
+                          <td class="cell-text" title=${link.site_id}>${link.site_id}</td>
+                          <td class="cell-text" title=${link.filters || ''}>${link.segment || 'All traffic'}</td>
+                          <td>${fmtDate(link.created_at)}</td>
+                          <td>${link.expires_at ? fmtDate(link.expires_at) : 'Never'}</td>
+                          <td>${link.last_used_at ? fmtWhen(link.last_used_at) : 'Never'}</td>
+                          <td><span class=${`status status-${link.status}`}>${linkStatusLabel(link.status)}</span></td>
+                          <td>${link.status === 'active'
+                            ? html`<button type="button" class="btn-secondary" disabled=${busy} onClick=${() => this.revoke(link)}>Revoke<span class="sr-only"> ${link.label}</span></button>`
+                            : null}</td>
+                        </tr>
+                      `)}
+                    </tbody>
+                  </table>
+                </div>
+              `}
+      </${ToolPanel}>
+    `;
+  }
+}
+
 class LoginForm extends Component {
   constructor() {
     super();
@@ -1340,8 +1585,10 @@ class Dashboard extends Component {
       sites: null,
       siteEvents: {},
       // The address bar names a site; otherwise the busiest one is chosen once
-      // the list arrives (a remembered site would hide that default).
-      siteId: url.siteId || '',
+      // the list arrives (a remembered site would hide that default). A shared
+      // view has exactly one site and ignores the address bar's.
+      siteId: props.share ? props.share.site_id : url.siteId || '',
+      segments: props.share ? [] : null,
       siteDraft: '',
       period: period === 'today' ? 'day' : period,
       startDate: url.startDate || prefs.startDate || '',
@@ -1368,6 +1615,7 @@ class Dashboard extends Component {
       updatedAt: null,
     };
     this.res = {};
+    this.segmentsFor = null;
     this.gen = 0;
     this.abort = null;
     this.wanted = new Set();
@@ -1383,6 +1631,14 @@ class Dashboard extends Component {
 
   async componentDidMount() {
     this.applyTheme();
+    if (this.props.share) {
+      // Whatever a viewer follows from here learns nothing about where it was
+      // opened, on top of the server's own Referrer-Policy on every response.
+      const meta = document.createElement('meta');
+      meta.name = 'referrer';
+      meta.content = 'no-referrer';
+      document.head.appendChild(meta);
+    }
     window.addEventListener('popstate', this.onPop);
     document.addEventListener('visibilitychange', this.onVisibility);
     await this.loadSites();
@@ -1530,7 +1786,8 @@ class Dashboard extends Component {
     this.reason = null;
     this.persist();
     this.syncUrl(push);
-    document.title = `${this.state.siteId} · Mallard Metrics`;
+    document.title = `${this.state.siteId} · ${this.props.share ? 'Shared view' : 'Mallard Metrics'}`;
+    if (!this.props.share && this.segmentsFor !== this.state.siteId) this.loadSegments();
 
     // Only the tab each group is showing is reloaded; the others were fetched
     // for a different view and would be stale if the operator switched to them.
@@ -1544,9 +1801,10 @@ class Dashboard extends Component {
   }
 
   syncUrl(push) {
-    const qs = writeViewState(this.state);
-    const next = `${location.pathname}${qs ? `?${qs}` : ''}`;
-    if (next === `${location.pathname}${location.search}`) return;
+    // A shared view keeps its fragment: it is the link, and a reload needs it.
+    const qs = writeViewState(this.props.share ? { ...this.state, siteId: '' } : this.state);
+    const next = `${location.pathname}${qs ? `?${qs}` : ''}${location.hash}`;
+    if (next === `${location.pathname}${location.search}${location.hash}`) return;
     try {
       history[push ? 'pushState' : 'replaceState'](null, '', next);
     } catch (e) {
@@ -1558,7 +1816,7 @@ class Dashboard extends Component {
     const url = readViewState(location.search, FILTERABLE_SLUGS);
     this.setState(
       {
-        siteId: url.siteId || this.state.siteId,
+        siteId: this.props.share ? this.props.share.site_id : url.siteId || this.state.siteId,
         period: url.period || '30d',
         startDate: url.startDate || this.state.startDate,
         endDate: url.endDate || this.state.endDate,
@@ -1593,7 +1851,38 @@ class Dashboard extends Component {
     if (this.state.filters.length > 0) this.change({ filters: [] });
   }
 
+  /** The saved segments of the selected site, for the Segment menu and the panels. */
+  async loadSegments() {
+    const site = this.state.siteId;
+    if (!site) return;
+    this.segmentsFor = site;
+    // Another site's segments must not linger in the menu while these load.
+    if (this.state.segments && this.state.segments.some((x) => x.site_id !== site)) this.setState({ segments: null });
+    const result = await api.get(`/api/segments?site_id=${encodeURIComponent(site)}`);
+    if (result.kind === 'unauthorized') return this.props.onAuthExpired();
+    if (this.state.siteId !== site) return;
+    // A failure leaves the menu empty rather than blocking the reports.
+    this.setState({ segments: result.kind === 'ok' ? result.data : [] });
+  }
+
+  /** Apply a saved segment as the active filters. */
+  applySegment(segment) {
+    this.change({ filters: parseFilters(segment.filters, FILTERABLE_SLUGS) });
+  }
+
+  /** The Segment menu: pick a saved one, or clear back to all traffic. */
+  pickSegment(id) {
+    if (id === '') return this.clearFilters();
+    const segment = (this.state.segments || []).find((s) => s.id === id);
+    if (segment) this.applySegment(segment);
+  }
+
   async loadSites() {
+    if (this.props.share) {
+      // A viewer is shown the one site its link is for, and is never told of others.
+      this.setState({ sites: [this.props.share.site_id], siteEvents: {} });
+      return;
+    }
     const result = await api.get('/api/sites');
     if (result.kind === 'unauthorized') return this.props.onAuthExpired();
     if (result.kind !== 'ok') {
@@ -1739,7 +2028,9 @@ class Dashboard extends Component {
     const today = todayUTC();
     return html`
       <div class="toolbar" role="group" aria-label="Report settings">
-        ${sites && sites.length > 0
+        ${this.props.share
+          ? html`<div class="field"><span class="field-label">Site</span><span class="field-static" title=${siteId}>${siteId}</span></div>`
+          : sites && sites.length > 0
           ? html`
               <label class="field"><span class="field-label">Site</span>
                 <select value=${siteId} onChange=${(e) => this.change({ siteId: e.target.value })}>
@@ -1790,6 +2081,30 @@ class Dashboard extends Component {
     `;
   }
 
+  /** The Segment menu, shown with the active filters: pick a saved set, or go back to all traffic. */
+  renderSegmentMenu() {
+    const { segments, filters } = this.state;
+    if (this.props.share || !segments || segments.length === 0) return null;
+    const matched = this.activeSegmentId();
+    const custom = filters.length > 0 && matched === '';
+    return html`
+      <label class="segment-menu"><span class="filter-bar-label">Segment</span>
+        <select value=${matched || (custom ? '__custom' : '')} onChange=${(e) => this.pickSegment(e.target.value)}>
+          <option value="">${custom ? 'Clear filters (all traffic)' : 'All traffic'}</option>
+          ${segments.map((s) => html`<option value=${s.id}>${s.name}</option>`)}
+          ${custom && html`<option value="__custom" disabled>Unsaved filters</option>`}
+        </select>
+      </label>`;
+  }
+
+  /** The saved segment whose filters are exactly the active ones, or ''. */
+  activeSegmentId() {
+    const { segments, filters } = this.state;
+    if (!segments || filters.length === 0) return '';
+    const current = serializeFilters(filters);
+    return segments.find((s) => s.filters === current)?.id ?? '';
+  }
+
   /** The exact dates on screen, so "7D" is never ambiguous about whether it includes today. */
   rangeSummary() {
     const { period } = this.state;
@@ -1807,7 +2122,7 @@ class Dashboard extends Component {
     const q = this.query();
     return html`
       <${Panel} id="overview" title="Overview"
-        actions=${html`
+        actions=${this.props.share ? null : html`
           <div class="panel-actions" role="group" aria-label="Export this view">
             <button type="button" class="btn-link" onClick=${() => this.exportData('daily', 'csv')}>Daily CSV</button>
             <button type="button" class="btn-link" onClick=${() => this.exportData('raw', 'csv')}>Raw CSV</button>
@@ -1819,8 +2134,10 @@ class Dashboard extends Component {
           ? html`
               <div class="empty-site">
                 <h3>No events for ${this.state.siteId} in this period</h3>
-                <p>If this site is new, add the tracking snippet. Otherwise try a longer date range.</p>
-                <${Snippet} site=${this.state.siteId} />
+                ${this.props.share
+                  ? html`<p>Try a longer date range.</p>`
+                  : html`<p>If this site is new, add the tracking snippet. Otherwise try a longer date range.</p>
+                <${Snippet} site=${this.state.siteId} />`}
               </div>`
           : html`
               <${Async} state=${res.timeseries} onRetry=${() => this.retry('timeseries')} skeleton=${html`<${SkelChart} />`}
@@ -1932,7 +2249,8 @@ class Dashboard extends Component {
   }
 
   render() {
-    const { siteId, sites, res, filters, tabs, panel, notice, theme, siteDraft, updatedAt } = this.state;
+    const { siteId, sites, res, filters, tabs, panel, notice, theme, siteDraft, updatedAt, segments } = this.state;
+    const share = this.props.share;
     const query = this.query();
     const offline = Object.values(res).some((r) => r && r.kind === 'network');
     const noSites = sites && sites.length === 0 && !siteId;
@@ -1942,7 +2260,9 @@ class Dashboard extends Component {
         <header class="app-header">
           <h1 class="brand"><img src="/favicon.svg" alt="" width="28" height="28" /> Mallard Metrics</h1>
           <div class="header-actions">
-            <button type="button" class="btn-secondary" aria-expanded=${panel === 'install'} aria-controls="install" onClick=${(e) => this.togglePanel('install', e)}>Install snippet</button>
+            ${!share && html`<button type="button" class="btn-secondary" aria-expanded=${panel === 'install'} aria-controls="install" onClick=${(e) => this.togglePanel('install', e)}>Install snippet</button>`}
+            ${this.props.onLogout && html`<button type="button" class="btn-secondary" aria-expanded=${panel === 'segments'} aria-controls="segments" onClick=${(e) => this.togglePanel('segments', e)}>Segments</button>`}
+            ${this.props.onLogout && html`<button type="button" class="btn-secondary" aria-expanded=${panel === 'share'} aria-controls="share" onClick=${(e) => this.togglePanel('share', e)}>Share links</button>`}
             ${this.props.onLogout && html`<button type="button" class="btn-secondary" aria-expanded=${panel === 'keys'} aria-controls="keys" onClick=${(e) => this.togglePanel('keys', e)}>API keys</button>`}
             <label class="theme-field"><span class="sr-only">Theme</span>
               <select value=${theme} onChange=${(e) => this.setState({ theme: e.target.value }, () => { this.applyTheme(); this.persist(); })}>
@@ -1956,6 +2276,14 @@ class Dashboard extends Component {
         </header>
 
         <main id="main" tabindex="-1">
+        ${share && html`
+          <div class="banner banner-shared" role="note" aria-label="Shared view">
+            <strong>Shared view</strong>
+            <span>
+              Read-only. ${share.segment ? html`Segment: <strong class="inline-strong">${share.segment}</strong>. ` : 'All traffic. '}
+              ${share.expires_at ? `This link expires ${fmtDate(share.expires_at)}.` : ''}
+            </span>
+          </div>`}
         ${siteId || !noSites ? this.renderToolbar() : null}
         <div class="sr-only" role="status" aria-live="polite">${notice && notice.tone !== 'error' ? notice.text : ''}</div>
 
@@ -1977,12 +2305,15 @@ class Dashboard extends Component {
             </div>`}
 
           ${panel === 'keys' && this.props.onLogout && html`<${KeysPanel} onClose=${() => this.closePanel()} onAuthExpired=${this.props.onAuthExpired} />`}
-          ${panel === 'install' && html`<${InstallPanel} site=${siteId || siteDraft} onClose=${() => this.closePanel()} />`}
+          ${panel === 'segments' && this.props.onLogout && html`<${SegmentsPanel} site=${siteId} segments=${segments} filters=${filters}
+            onApply=${(segment) => this.applySegment(segment)} onChanged=${() => this.loadSegments()} onClose=${() => this.closePanel()} onAuthExpired=${this.props.onAuthExpired} />`}
+          ${panel === 'share' && this.props.onLogout && html`<${SharePanel} site=${siteId} segments=${segments} onClose=${() => this.closePanel()} onAuthExpired=${this.props.onAuthExpired} />`}
+          ${panel === 'install' && !share && html`<${InstallPanel} site=${siteId || siteDraft} onClose=${() => this.closePanel()} />`}
 
-          ${noSites && html`<${Welcome} siteDraft=${siteDraft} onDraft=${(v) => this.setState({ siteDraft: v })} onUse=${() => siteDraft && this.change({ siteId: siteDraft })} />`}
+          ${noSites && !share && html`<${Welcome} siteDraft=${siteDraft} onDraft=${(v) => this.setState({ siteDraft: v })} onUse=${() => siteDraft && this.change({ siteId: siteDraft })} />`}
 
           ${siteId && html`
-            <${FilterBar} filters=${filters} onRemove=${(i) => this.removeFilter(i)} onToggle=${(i) => this.toggleFilter(i)} onClear=${() => this.clearFilters()} />
+            <${FilterBar} filters=${filters} menu=${this.renderSegmentMenu()} onRemove=${(i) => this.removeFilter(i)} onToggle=${(i) => this.toggleFilter(i)} onClear=${() => this.clearFilters()} />
             ${this.renderOverview()}
 
             <${RealtimePanel} state=${res.realtime} filtered=${filters.length > 0} onRetry=${() => this.load('realtime')} onVisible=${() => this.want('realtime')} />
@@ -2009,7 +2340,7 @@ class Dashboard extends Component {
 class App extends Component {
   constructor() {
     super();
-    this.state = { checked: false, authenticated: false, setupRequired: false, showSetup: false, unreachable: false };
+    this.state = { checked: false, authenticated: false, setupRequired: false, showSetup: false, unreachable: false, share: null, shareEnded: false };
   }
 
   componentDidMount() {
@@ -2017,6 +2348,7 @@ class App extends Component {
   }
 
   async checkAuth() {
+    if (shareRequested) return this.checkShare();
     const res = await api.get('/api/auth/status');
     if (res.kind === 'ok') {
       const { authenticated, setup_required: setupRequired } = res.data;
@@ -2026,6 +2358,18 @@ class App extends Component {
     }
   }
 
+  /** Open a shared view: ask the server what this link is for. No login is involved. */
+  async checkShare() {
+    if (!shareToken) {
+      this.setState({ checked: true, shareEnded: true });
+      return;
+    }
+    const res = await api.get('/api/shared/session');
+    if (res.kind === 'ok') this.setState({ checked: true, share: res.data, shareEnded: false, unreachable: false });
+    else if (res.kind === 'network' || res.status >= 500) this.setState({ checked: true, unreachable: true });
+    else this.setState({ checked: true, shareEnded: true });
+  }
+
   async logout() {
     await api.send('POST', '/api/auth/logout');
     this.setState({ authenticated: false });
@@ -2033,6 +2377,16 @@ class App extends Component {
 
   render(_, { checked, authenticated, setupRequired, showSetup, unreachable }) {
     if (!checked) return html`<div class="loading-screen" role="status">Loading…</div>`;
+    if (this.state.shareEnded) {
+      return html`
+        <main class="auth-overlay">
+          <div class="auth-card share-ended">
+            <h1><img src="/favicon.svg" alt="" width="28" height="28" /> Mallard Metrics</h1>
+            <h2>This link no longer works</h2>
+            <p class="auth-hint" role="alert">The share link is invalid, has expired, or was revoked. Ask whoever sent it for a new one.</p>
+          </div>
+        </main>`;
+    }
     if (unreachable) {
       return html`
         <main class="auth-overlay">
@@ -2045,6 +2399,13 @@ class App extends Component {
     }
     // Before setup the API reports `authenticated: true` because reads are open,
     // a deliberate deployment mode. The setup form is reachable from the banner.
+    if (this.state.share) {
+      return html`
+        <${Boundary} fallback=${html`<main class="auth-overlay"><div class="auth-card"><h1>Something went wrong</h1><p class="auth-error" role="alert">The dashboard hit an unexpected error.</p><button type="button" onClick=${() => location.reload()}>Reload</button></div></main>`}>
+        <${Dashboard} share=${this.state.share} setupRequired=${false}
+          onAuthExpired=${() => this.setState({ shareEnded: true })} />
+        </${Boundary}>`;
+    }
     if (!authenticated || showSetup) {
       return html`
         <${LoginForm} setupRequired=${setupRequired}

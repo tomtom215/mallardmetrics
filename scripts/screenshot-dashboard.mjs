@@ -302,5 +302,180 @@ if (flag('auth') && flag('password')) {
   });
 }
 
+// Saved segments and share links, as an admin sees them and as a viewer sees
+// them. The viewer states open a real link made by the admin states' session.
+if (flag('auth') && flag('password')) {
+  const authUrl = flag('auth');
+  const signIn = async (page) => {
+    await page.fill('input[type=password]', flag('password'));
+    await page.click('button[type=submit]');
+    await page.waitForSelector('#main');
+    await settle(page);
+  };
+  /** Create a link from inside a signed-in page. */
+  const mint = (page, body) => page.evaluate(async (b) => {
+    const r = await fetch('/api/share-links', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) });
+    return r.json();
+  }, body);
+  const site = await (async () => {
+    const { ctx, page } = await open(authUrl);
+    await page.waitForSelector('input[type=password]');
+    await signIn(page);
+    const chosen = await page.locator('.toolbar select').first().inputValue().catch(() => '');
+    await ctx.close();
+    return chosen;
+  })();
+
+  await eachView('segments-empty', authUrl, async (page, shot) => {
+    await signIn(page);
+    await page.getByRole('button', { name: 'Segments' }).click();
+    await shot();
+  }, { setup: (p) => p.route('**/api/segments?**', jsonReply(200, [])) });
+
+  await eachView('segments-saved', authUrl, async (page, shot) => {
+    await signIn(page);
+    await loadAll(page);
+    await page.locator('.bar-link').first().click();
+    await settle(page);
+    await page.getByRole('button', { name: 'Segments' }).click();
+    await page.getByLabel('Name', { exact: true }).fill('Chrome on desktop');
+    await page.getByRole('button', { name: 'Save current filters' }).click();
+    await settle(page);
+    await shot('-panel');
+    await page.locator('#segments tbody').scrollIntoViewIfNeeded();
+    await shot('-panel-table');
+    await page.getByLabel('Name', { exact: true }).fill('chrome on DESKTOP');
+    await page.getByRole('button', { name: 'Save current filters' }).click();
+    await page.waitForSelector('#segments [role=alert]');
+    await shot('-duplicate-name');
+    await page.getByRole('button', { name: 'Close' }).first().click();
+    await shot('-menu');
+    // Leave nothing behind for the next view.
+    await page.getByRole('button', { name: 'Segments' }).click();
+    page.once('dialog', (d) => d.accept());
+    await page.getByRole('button', { name: /^Delete/ }).first().click();
+    await settle(page);
+  });
+
+  await eachView('share-empty', authUrl, async (page, shot) => {
+    await signIn(page);
+    await page.getByRole('button', { name: 'Share links' }).click();
+    await shot();
+  }, { setup: (p) => p.route('**/api/share-links', (r) => (r.request().method() === 'GET' ? jsonReply(200, [])(r) : r.continue())) });
+
+  const days = (n) => new Date(Date.now() + n * 86400000).toISOString().replace(/\.\d+Z$/, 'Z');
+  const row = (id, label, segment, status, extra = {}) => ({ id, label, site_id: site || 'demo.example.com', segment, filters: segment ? 'browsers==Chrome' : '', created_at: days(-12), expires_at: days(18), last_used_at: days(-1), status, ...extra });
+  await eachView('share-list', authUrl, async (page, shot) => {
+    await signIn(page);
+    await page.getByRole('button', { name: 'Share links' }).click();
+    await settle(page);
+    await shot();
+  }, {
+    setup: (p) => p.route('**/api/share-links', (r) => (r.request().method() === 'GET'
+      ? jsonReply(200, [
+          row('a1', 'Q4 board pack', 'Chrome users', 'active'),
+          row('b2', 'Agency read-only access with a rather long label that must truncate', null, 'active', { expires_at: null, last_used_at: null }),
+          row('c3', 'Old partner link', null, 'expired', { expires_at: days(-3), created_at: days(-40) }),
+          row('d4', 'Revoked after the audit', 'Chrome users', 'revoked', { created_at: days(-60), expires_at: days(5) }),
+        ])(r)
+      : r.continue())),
+  });
+
+  await eachView('share-created', authUrl, async (page, shot) => {
+    await signIn(page);
+    await page.getByRole('button', { name: 'Share links' }).click();
+    await page.getByLabel('Label (private)').fill('Q4 board pack');
+    await page.getByRole('button', { name: 'Create link' }).click();
+    await page.waitForSelector('.banner-key .key-value');
+    await shot();
+    await page.getByRole('button', { name: 'Done' }).click();
+    // The link is real; revoke it so the instance is left as it was found.
+    page.once('dialog', (d) => d.accept());
+    await page.getByRole('button', { name: /^Revoke/ }).first().click();
+    await settle(page);
+    await shot('-revoked');
+  });
+
+  await eachView('share-error', authUrl, async (page, shot) => {
+    await signIn(page);
+    await page.getByRole('button', { name: 'Share links' }).click();
+    await page.getByLabel('Label (private)').fill('One too many');
+    await page.getByRole('button', { name: 'Create link' }).click();
+    await page.waitForSelector('#share [role=alert]');
+    await shot();
+  }, { setup: (p) => p.route('**/api/share-links', (r) => (r.request().method() === 'POST'
+    ? jsonReply(409, { code: 'conflict', error: 'This instance already has 100 active share links; revoke one first' })(r)
+    : r.continue())) });
+
+  // The viewer. One link per view, made by a throwaway signed-in context.
+  const viewerLink = async (segment) => {
+    const { ctx, page } = await open(authUrl);
+    await page.waitForSelector('input[type=password]');
+    await signIn(page);
+    let segmentId;
+    if (segment) {
+      segmentId = await page.evaluate(async ([siteId, name]) => {
+        const r = await fetch('/api/segments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ site_id: siteId, name, filters: 'browsers==Chrome' }) });
+        return (await r.json()).id;
+      }, [site, segment]);
+    }
+    const made = await mint(page, { label: 'screenshots', site_id: site, ...(segmentId ? { segment_id: segmentId } : {}), expires_in_days: 30 });
+    await ctx.close();
+    return { url: `${authUrl}/#share=${made.token}`, id: made.id, segmentId };
+  };
+  const dispose = async (made) => {
+    const { ctx, page } = await open(authUrl);
+    await page.waitForSelector('input[type=password]');
+    await signIn(page);
+    await page.evaluate(async ([id, segmentId]) => {
+      await fetch(`/api/share-links/${id}`, { method: 'DELETE' });
+      if (segmentId) await fetch(`/api/segments/${segmentId}`, { method: 'DELETE' });
+    }, [made.id, made.segmentId]);
+    await ctx.close();
+  };
+
+  const plain = await viewerLink(null);
+  await eachView('shared-populated', plain.url, async (page, shot) => {
+    await settle(page);
+    await loadAll(page);
+    await shot();
+  }, { full: true });
+  await eachView('shared-filter', plain.url, async (page, shot) => {
+    await settle(page);
+    await loadAll(page);
+    if (await page.locator('.bar-link').count()) {
+      await page.locator('.bar-link').first().click();
+      await settle(page);
+      await shot();
+    }
+  });
+
+  const limited = await viewerLink('Chrome only');
+  await eachView('shared-segment', limited.url, async (page, shot) => {
+    await settle(page);
+    await loadAll(page);
+    await shot();
+  }, { full: true });
+  await dispose(limited);
+
+  // The same links after they stop working, and a mangled one.
+  await eachView('shared-ended', limited.url, async (page, shot) => {
+    await page.waitForSelector('.share-ended');
+    await settle(page);
+    await shot();
+  });
+  await eachView('shared-broken', `${authUrl}/#share=ms_truncated`, async (page, shot) => {
+    await page.waitForSelector('.share-ended');
+    await shot();
+  });
+  await eachView('shared-busy', plain.url, async (page, shot) => {
+    // The client retries a 429 with backoff, so the network never goes idle; wait for it to give up.
+    await page.waitForFunction(() => /busy right now/i.test(document.body.innerText), null, { timeout: 60000 }).catch(() => {});
+    await page.waitForTimeout(500);
+    await shot();
+  }, { setup: (p) => p.route('**/api/shared/stats/**', jsonReply(429, { code: 'too_many_requests', error: 'This share link is being used too heavily. Try again in a moment.' }, { 'retry-after': '0' })) });
+  await dispose(plain);
+}
+
 await browser.close();
 console.log(`screenshots written to ${OUT}`);
