@@ -1,125 +1,108 @@
 # Roadmap
 
-This document describes the current state of Mallard Metrics and future directions. For a detailed history of what has shipped, see [CHANGELOG.md](CHANGELOG.md).
+Where Mallard Metrics stands, what it cannot do, and what is missing for wider
+use. For what has shipped, see [CHANGELOG.md](CHANGELOG.md). Nothing below is
+scheduled; items are ordered by evidence of need, not by commitment.
 
 ---
 
-## Current Status
+## Status
 
-Core functionality is complete and production-ready:
+Implemented and covered by the test suite (counts in
+[DEVELOPMENT.md](DEVELOPMENT.md#current-metrics)):
 
-**Ingestion**
-- `POST /api/event` plus a `GET` pixel endpoint for JavaScript-free contexts
-- Per-site HMAC-SHA256 visitor IDs with configurable salt rotation
-- User-Agent and Client Hints parsing, bot filtering, GeoIP resolution
-- Per-site and per-IP rate limiting, bounded buffering, atomic Parquet writes
-
-**Storage**
-- Two-tier DuckDB hot table plus Parquet cold tier, unioned by `events_all`
-- Date-partitioned layout with automatic compaction and retention cleanup
-- A read-connection pool so queries do not block ingestion
-
-**Analytics**
-- Visitors, pageviews, events, visits, bounce rate, visit duration
-- Twenty breakdown dimensions, covering every column the ingest path populates
-- Gap-filled time series, realtime activity, goals, custom properties, revenue
-- Segment filters on every report, over any of the twenty dimensions
-- Behavioral analytics: cumulative funnels with ordering modes, per-visitor
-  retention cohorts, session metrics, sequence matching, forward/backward flow
-- Daily and raw event exports as CSV or JSON
-
-**Operations**
-- Embedded dashboard SPA (Preact + HTM, no build step) with dark mode
-- Period comparison against the previous period or the same period last year
-- Argon2id authentication with a persisted credential, scoped API keys managed
-  from the dashboard, per-IP brute-force protection
-- GDPR mode, configurable privacy flags, Art. 17 erasure endpoint
-- Prometheus metrics — internal counters plus HTTP request counts and a latency
-  histogram — structured logging, readiness probes, graceful shutdown
-- Configurable DuckDB memory limit, thread count and extension directory
-- OWASP security headers, CSRF protection, non-root container image
+- **Ingestion**: `POST /api/event`, a pixel `GET`, per-site and per-client-IP rate limits, bounded buffering, bot filtering, GeoIP, User-Agent and Client Hints parsing.
+- **Storage**: DuckDB hot table plus date-partitioned Parquet, unioned by `events_all`; crash-safe flush and compaction; retention; consistent reads.
+- **Analytics**: core and session metrics, twenty breakdown dimensions, segment filters on every report, period comparison on `/api/stats/main`, goals, custom properties, per-currency revenue, realtime, and (with the `behavioral` extension) funnels, retention, sequences and flow; CSV/JSON export.
+- **Operations**: embedded dashboard, Argon2id auth with persisted credential, API keys (`ReadOnly`/`Admin`), GDPR mode and erasure endpoint, Prometheus `/metrics`, health probes, alert rules and a Grafana dashboard (`deploy/monitoring/`), a backup script, a systemd unit, a hardened production compose stack, glibc release binaries and image.
 
 ---
 
 ## Known limitations
 
-Stated plainly, because each is a property of the design rather than a bug:
+Each is a property of the design today, not a bug.
 
-- **Cross-period visitor analysis depends on salt rotation.** With the default
-  daily rotation, "unique visitors" over a longer range counts visitor-days, and
-  weekly retention cohorts cannot work. `visitor_salt_rotation_days` trades
-  privacy for that capability, and the retention endpoint reports which side of
-  the trade the current configuration sits on.
-- **Behavioral analytics need a community extension** downloaded at startup.
-  Without network access on first run, those endpoints return 503.
-- **Single-node.** There is no clustering, replication or read-replica story.
-  DuckDB handles a great deal on one box, but the ceiling is one box.
-- **Revenue is not converted between currencies.** There is no exchange-rate
-  source, so totals are reported per currency and never summed.
-- **Erasure is site plus date range.** Visitor IDs are pseudonymous hashes, so a
-  named individual's rows cannot be singled out.
-- **Exports are built in memory, not streamed.** `limit` therefore bounds memory
-  as well as row count. Slice by date range rather than raising the ceiling on a
-  small host.
+- **Behavioral analytics need a runtime download.** Funnels, retention, sessions, sequences, flow and entry/exit pages come from a DuckDB community extension (written by this project's author) fetched on first start. Offline, those endpoints answer `503`; `mallard-metrics --install-extension` seeds it ahead of time. Startup refuses a cached build older than 0.10.0.
+- **Cross-day visitor analysis depends on salt rotation.** With the default daily rotation, "unique visitors" over a range counts visitor-days and weekly retention cannot work. Raising `visitor_salt_rotation_days` trades privacy for that capability; `/api/stats/retention` says which side the configuration is on.
+- **Single node.** No clustering, replication or read replicas.
+- **No published capacity figures.** [PERF.md](PERF.md) has micro-benchmarks only. The Parquet read path re-expands a glob across all sites and days on every query; a scoped read exists but is not yet used by the query layer (see below).
+- **One admin credential.** No users, roles, per-site access or SSO; API keys have two scopes and see every site.
+- **Revenue is never converted between currencies**; totals are per currency.
+- **Erasure is site plus date range**; a named individual's rows cannot be singled out because visitor IDs are hashes.
+- **Raw exports are built in memory**, capped at 1,000,000 rows (default 100,000). A chunked writer (`stream_raw_export` in `src/query/export.rs`) exists but the endpoint does not use it yet.
+- **Bot filtering is a User-Agent substring list.** No ASN/data-centre or referrer-spam filtering.
+- **Session analyses are unavailable under hour-rounded timestamps** (`gdpr_mode`).
+- **`site_ids` comes from configuration**, not a UI; there is no site-management screen.
 
 ---
 
-## Future Considerations
+## Gaps for production use
 
-Potential directions, not committed work. Each depends on demonstrated need.
+Ranked from an ecosystem comparison done on 2026-10-20 that read competitors'
+repositories and documentation pages. Its competitor figures were partly
+unverified, so none are repeated here; "who ships it" cites only what the report
+read on a named page. Effort: S under a week, M one to three weeks, L longer
+(estimates for the current architecture).
 
-### Performance and scale
+| # | Gap | Evidence others ship it | Effort |
+|---|---|---|---|
+| 1 | Multiple users, roles and per-site access | Umami (Teams), Rybbit (organisations), HitKeep (members) | L |
+| 2 | OIDC single sign-on | Plausible has it outside Community Edition; HitKeep lists it on a paid plan | M, after 1 |
+| 3 | Data import (Plausible/Umami CSV first, GA4 later); the main migration blocker | Plausible (GA4 + CSV), Rybbit (Umami, Simple Analytics) | M to L |
+| 4 | Scheduled email or webhook reports; spike alerts | Plausible, Swetrix, HitKeep, OpenPanel | M |
+| 5 | Read-only share links per site | Plausible, Umami, HitKeep | M |
+| 6 | Saved segments; comparison for breakdowns and the time series | Rybbit (saved segments), Umami | S to M |
+| 7 | Stronger bot and spam defence (ASN data, referrer-spam list, flood detection) | Rybbit, Plausible Cloud | M |
+| 8 | Site-management UI (add/remove sites, copy snippet) | Rybbit, Umami | M |
+| 9 | Documented first-party proxy recipe for ad-blocker resilience (`/js/script.js` and `data-api` already exist; the recipe is missing) | Plausible, Umami | S |
+| 10 | Search Console integration | Plausible, OpenPanel, HitKeep | M to L |
+| 11 | Scroll-depth, form, 404 and engagement-time events | Plausible | S each |
+| 12 | Backup/restore tooling beyond `deploy/backup.sh`; streamed and Parquet exports | HitKeep (S3 backups), GoatCounter (async CSV) | M |
+| 13 | A published scale envelope (events per second, query latency at 10M and 100M rows, memory) and pre-aggregated rollups | Matomo publishes sizing tiers | M to L |
+| 14 | Server-side and mobile SDKs, a client library | Rybbit, OpenPanel, Pirsch | S to M |
+| 15 | MCP/AI-assistant endpoint over the existing API | Umami, Rybbit, OpenPanel, HitKeep | S to M |
 
-- **Time-partitioned Parquet statistics** — record per-file min/max timestamps so
-  a narrow date range can skip files without opening their footers.
-- **Incremental pre-aggregation** — materialise daily rollups for ranges where
-  exact per-event detail is not needed.
-- **Multi-node deployment** — only if a single process demonstrably cannot cope.
+Already done since the report's matrix was drawn, and therefore **not** gaps:
+segment filters on every report, period comparison on the headline figures,
+Prometheus metrics with alert rules, a supported backup script, glibc images
+with the extension verified at build, per-IP login lockout, a persisted admin
+credential.
 
-### Features
+### Engineering work that follows from this repository
 
-- **Alerting** — thresholds and anomaly detection on traffic or conversions.
-- **Scheduled reports** — periodic summaries by email or webhook.
-- **Saved segments** — naming and storing a filter set, so it can be recalled
-  rather than rebuilt. The filters themselves now exist; what is missing is
-  persistence and a name.
-- **Comparison beyond the headline figures** — `compare` currently applies to
-  `/api/stats/main`. Extending it to breakdowns and the time series means
-  deciding how to align two rankings that do not share their rows, which is a
-  design question rather than a mechanical one.
-- **UTM-aware attribution models** — first-touch and last-touch, rather than the
-  per-event attribution available today.
-- **Alternative auth backends** — OIDC or SAML for organisations that need it.
+- Adopt `files_for_range` / `scoped_events_sql` in the query layer. The commit that added them measured 3.0 ms against about 0.6 s for the same site-and-week question over 9,000 files (informal, see [PERF.md](PERF.md)).
+- Wire the chunked raw export into `GET /api/stats/export`.
+- Replace hand-rolled pieces with maintained data or crates only after benchmarking: a bot-UA list (data, not a crate), the Matomo referrer lists, the `url` crate for URL parsing, `moka` for the query cache. The ecosystem report flags each as a candidate, not a recommendation.
+- Evaluate DuckLake for the hot/cold tiering as a branch prototype; its maintenance functions and extension-download story were not verified.
 
-### Ecosystem
+### Positioning
 
-- **Additional GeoIP providers** — IP2Location and other MMDB-compatible databases.
-- **Additional export formats** — Parquet and Arrow IPC for warehouse ingestion.
-- **Streaming exports** — a chunked response body, removing the memory bound
-  that `limit` currently doubles as.
-- **A client library** — a thin wrapper over the ingest endpoint for server-side
-  events in common languages.
+Funnels, journeys and retention are absent from Plausible Community Edition
+according to Plausible's documentation; Umami, Rybbit, OpenPanel and HitKeep list
+funnels, so they are not a differentiator against those. What Mallard offers that
+the same search did not find elsewhere is the combination of a single Rust
+binary, embedded DuckDB, an open Parquet cold tier and documented salt-rotation
+trade-offs. HitKeep (Go, embedded DuckDB, MIT) overlaps this architecture and
+ships more product features today; Mallard is currently a capable engine with a
+thin product around it.
 
 ---
 
-## Verification Protocol
+## Verification protocol
 
-Every release must pass the full validation suite before tagging:
+Every release must pass the validation suite before tagging; the release
+workflow (`.github/workflows/release.yml`) enforces it on every version tag.
 
 ```bash
-cargo test --all-targets   # all 602 tests pass
-cargo clippy --all-targets --all-features -- -D warnings   # zero warnings
-cargo fmt -- --check       # zero format violations
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps   # docs build cleanly
+cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt -- --check
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
-# Behavioral-extension tests skip when the extension cannot be downloaded.
-# CI sets this so a skip becomes a failure.
+# Behavioral tests skip when the extension cannot be downloaded; CI turns a skip
+# into a failure with this variable.
 MALLARD_REQUIRE_BEHAVIORAL=1 cargo test --all-targets
 
-# End-to-end against the real binary: every route, on a socket, with real
-# storage. The in-process tests cannot see a route that only breaks once the
-# server is assembled.
+# End-to-end against the real binary: every route, on a socket, with real storage.
 cargo build && scripts/smoke-test.sh
 ```
-
-The release workflow (`.github/workflows/release.yml`) enforces these gates automatically on every tag push.
