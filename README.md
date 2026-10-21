@@ -1,16 +1,51 @@
 # Mallard Metrics
 
-> **Self-hosted, privacy-focused web analytics powered by DuckDB and the `behavioral` extension.**
-> Single binary. Single process. Zero external dependencies.
+> **Self-hosted, cookieless web analytics in one Rust process, with an embedded DuckDB database and dashboard.**
 
-[![Tests](https://img.shields.io/badge/tests-602_passing-brightgreen?style=flat-square)](#development)
+[![Tests](https://img.shields.io/badge/tests-759_passing-brightgreen?style=flat-square)](DEVELOPMENT.md#current-metrics)
 [![Rust](https://img.shields.io/badge/rust-1.98%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE)
-[![Clippy](https://img.shields.io/badge/clippy-0_warnings-brightgreen?style=flat-square)](#development)
+[![Clippy](https://img.shields.io/badge/clippy-0_warnings-brightgreen?style=flat-square)](DEVELOPMENT.md#current-metrics)
 [![Privacy](https://img.shields.io/badge/privacy-no_cookies-teal?style=flat-square)](#privacy-by-design)
 [![Docs](https://img.shields.io/badge/docs-GitHub_Pages-navy?style=flat-square)](https://tomtom215.github.io/mallardmetrics)
 
-A lightweight, privacy-respecting alternative to Plausible Analytics. Runs entirely on your infrastructure — no third-party services, no cookies, no persistent IP storage. See [PRIVACY.md](PRIVACY.md) for the complete data-processing architecture and operator compliance guidance.
+Mallard Metrics is a web-analytics server in the same family as Plausible and
+Umami: you add a small script to your pages, events are stored on your own
+machine, and a dashboard shows traffic, sources, goals, revenue and (with the
+`behavioral` DuckDB extension) funnels, retention, sessions, sequences and flow.
+It sets no cookies and never writes a visitor IP address to storage. See
+[PRIVACY.md](PRIVACY.md) for exactly what is processed and what the operator
+still owes under data-protection law.
+
+## What it is, and what it is not
+
+**Is:** one process that ingests, stores, queries, authenticates and serves the
+dashboard. Storage is a DuckDB hot table plus date-partitioned Parquet files in
+one data directory. The Docker image is a glibc build on distroless
+(`gcr.io/distroless/cc-debian12`) running as UID 65532.
+
+**Is not (today):**
+
+- **Not dependency-free.** DuckDB is compiled in, but funnels, retention,
+  sessions, sequences, flow and entry/exit pages come from the `behavioral`
+  community extension, which is **downloaded from the DuckDB community
+  repository on first start**. Without a route to it those endpoints answer
+  `503`; everything else works. See [air-gapped hosts](#behavioral-extension-on-an-air-gapped-host).
+- **Not multi-user.** There is one admin credential plus API keys with two
+  scopes (`ReadOnly`, `Admin`). No teams, roles, per-site access or SSO.
+- **Not multi-node.** One process, one data directory. No clustering or
+  replication.
+- **No published capacity figures.** [PERF.md](PERF.md) records micro-benchmarks
+  only; it does not say how many events per second or how large a data set one
+  host handles. Do not size a deployment from this project's marketing.
+- **Not a full product suite.** There is no data import, scheduled report or
+  alert, shareable public link, site-management UI or Search Console
+  integration. [ROADMAP.md](ROADMAP.md) lists what is missing and why.
+
+Funnels, journeys and retention are not part of Plausible Community Edition
+according to its documentation, which is the main reason to pick Mallard over
+it. Other open-source tools (Umami, Rybbit, OpenPanel, HitKeep) list funnels
+too; compare them on their own terms.
 
 ---
 
@@ -20,6 +55,7 @@ A lightweight, privacy-respecting alternative to Plausible Analytics. Runs entir
 - [Quick Start](#quick-start)
 - [Tracking Script](#tracking-script)
 - [Configuration](#configuration)
+- [How metrics are defined](#how-metrics-are-defined)
 - [API Reference](#api-reference)
 - [Architecture](#architecture)
 - [Dashboard](#dashboard)
@@ -35,127 +71,144 @@ A lightweight, privacy-respecting alternative to Plausible Analytics. Runs entir
 
 ### Privacy by Design
 
-- **No cookies** — Visitor identification is an HMAC-SHA256 of site + IP + User-Agent under a rotating salt; no cookies are set and no browser storage is written
-- **No persistent IP storage** — IP addresses are used in RAM for the GeoIP lookup and the visitor-ID derivation, then discarded; no IP is ever written to the event store. The one exception is deliberate and not on the analytics path: authentication events log a *truncated* address (IPv4 `/24`, IPv6 `/48`) so an operator can investigate an attack on the dashboard
-- **Rotating salt** — Visitor IDs change when the salt rotates (every 24 hours by default), so the same IP and User-Agent hash differently on different days
-- **Per-site scoping** — The site ID is part of the hash input, so one person visiting two sites on the same instance is not correlatable across them
-- **Pseudonymous, not anonymous** — Stored visitor IDs are hashes, and pseudonymous data is still personal data under GDPR Recital 26. Geographic data derived from IP is stored. See [PRIVACY.md](PRIVACY.md) for the full analysis and operator obligations.
+- **No cookies.** The visitor ID is an HMAC-SHA256 of site + IP + User-Agent
+  under a rotating salt. The tracking script sets no cookies and writes nothing
+  to browser storage; it reads one `localStorage` key, `mallard_ignore`, which a
+  site owner can set to opt their own browser out.
+- **No IP address is stored.** The IP is held in memory for the GeoIP lookup and
+  the visitor-ID hash, then dropped. One deliberate exception, off the analytics
+  path: authentication events log a *truncated* address (IPv4 `a.b.c.x`, IPv6
+  first three groups) so an operator can investigate an attack on the dashboard.
+- **Rotating salt.** IDs change when the salt rotates (every UTC day by default).
+- **Per-site scoping.** The site ID is part of the hash input, so one person on
+  two sites of the same instance is not correlatable.
+- **Pseudonymous, not anonymous.** Stored IDs are hashes, which GDPR still
+  treats as personal data (Recital 26). Country, region and city derived from
+  the IP are stored unless you reduce `geoip_precision`.
 
-> **Salt rotation has an analytical cost.** With the default daily rotation, a
+> **Salt rotation has an analytical cost.** With the default daily rotation a
 > visitor seen on two days carries two unrelated IDs. "Unique visitors" over a
-> multi-day range therefore counts visitor-days rather than people, and weekly
-> retention cohorts cannot work at all. Raise `visitor_salt_rotation_days` if you
-> need cross-day analysis, and read the trade-off in [PRIVACY.md](PRIVACY.md).
+> multi-day range therefore counts visitor-days, and weekly retention cohorts
+> cannot work at all. Raise `visitor_salt_rotation_days` for cross-day analysis,
+> and read the trade-off in [PRIVACY.md](PRIVACY.md#the-salt-rotation-trade-off).
 
-### Single Binary Deployment
+### Analytics
 
-- **One process** handles ingestion, storage, querying, authentication, and the dashboard
-- **Zero external dependencies** — DuckDB is embedded; no separate database to install or manage
-- **`FROM scratch` Docker image** — Static musl binary with no runtime dependencies
-- **WAL durability** — DuckDB disk-based storage survives crashes without data loss
+- **Core metrics**: unique visitors, pageviews, events, sessions, bounce rate,
+  visit duration, views per visit. Session figures need the `behavioral`
+  extension; without it they are `null`, not `0`.
+- **Realtime**: current visitors, top pages and sources, per-minute series.
+- **Twenty breakdown dimensions**: pages, entry and exit pages, referrers,
+  sources, five UTM parameters, countries, regions, cities, browsers and
+  versions, OS and versions, device types, screen widths, event names.
+- **Segment filters**: `filters=countries==DE;devices!=mobile` narrows every
+  figure in a report, not only one breakdown.
+- **Period comparison**: `compare=previous_period` or `year_over_year` on
+  `/api/stats/main`.
+- **Goals, custom properties and revenue**: conversion per custom event;
+  revenue reported per currency and never summed across currencies.
+- **Time series**: hourly or daily buckets, gap-filled.
+- **Behavioral** (extension required): cumulative funnels with ordering modes,
+  weekly retention cohorts, ordered sequence matching, forward/backward flow.
+- **Export**: daily summaries or raw events, CSV or JSON.
 
-### Analytical Power
+### GDPR mode
 
-- **Core metrics** — Unique visitors, pageviews, events, visits, bounce rate, visit duration
-- **Realtime** — Current visitors, top pages and sources, with a per-minute series
-- **Twenty breakdown dimensions** — Pages, entry and exit pages, referrers and sources, all five UTM parameters, countries, regions, cities, browsers and versions, operating systems and versions, device types, screen widths, and event names
-- **Segment filters** — `filters=countries==DE;devices!=mobile` narrows every figure a request returns, not just the breakdown you were looking at. Dimension names are the breakdown slugs, so clicking a row in the dashboard filters everything to it
-- **Period comparison** — `compare=previous_period` or `compare=year_over_year` returns the same headline figures for an equally long earlier window, so the dashboard can show whether a number went up or down and by how much
-- **Goals and custom properties** — Conversion rates for every custom event, and drill-down into the properties attached to them
-- **Revenue** — Totals, order counts and average order value, reported per currency and never summed across them
-- **Time-series** — Hourly and daily aggregation, gap-filled so a quiet day reads as zero rather than vanishing
-- **Funnel analysis** — Cumulative multi-step funnels with drop-off, via `window_funnel()`, including its six ordering modes
-- **Retention cohorts** — Weekly cohorts with retained counts and rates, via `retention()`
-- **Session analytics** — Visits, duration and bounce rate, via `sessionize()`
-- **Sequence matching** — Ordered pattern detection via `sequence_match()` and `sequence_count()`
-- **Flow analysis** — Where visitors go next *and* where they came from, via `sequence_next_node()`
-- **Export** — Daily summaries or raw events, as CSV or JSON
+`MALLARD_GDPR_MODE=true` switches on a bundle of data-minimising flags, each of
+which can also be set on its own:
 
-### GDPR-Friendly Deployment
-
-Mallard Metrics ships a first-class GDPR mode that reduces data collection to the minimum needed for aggregate analytics:
-
-| Setting | Standard | GDPR Mode |
+| Setting | Standard | GDPR mode |
 |---|---|---|
-| Visitor ID | HMAC-SHA256 pseudonymous hash | HMAC-SHA256 (suppress with `suppress_visitor_id`) |
-| Referrer | Full URL with query string | Path only — query and fragment stripped |
-| Timestamps | Microsecond precision | Rounded down to the hour |
-| Browser info | Name + version | Name only |
-| OS info | Name + version | Name only |
-| Screen / device | Stored | Omitted |
-| GeoIP | City-level | Country-level at most |
+| Visitor ID | HMAC-SHA256 hash | unchanged; `suppress_visitor_id` (not part of the bundle) replaces it with a random UUID per request |
+| Referrer | Full URL | Query string and fragment removed |
+| Timestamps | Full precision | Rounded down to the hour |
+| Browser / OS | Name + version | Name only |
+| Viewport width and device type | Stored | Omitted |
+| GeoIP | `city` | `country` at most |
 
-Enable with a single environment variable (`MALLARD_GDPR_MODE=true`) or configure each flag independently. A `DELETE /api/gdpr/erase` endpoint supports GDPR Art. 17 right-to-erasure requests. See [PRIVACY.md](PRIVACY.md) for the full compliance analysis and operator obligations.
+Because timestamps are rounded, anything that orders events inside an hour is
+meaningless; with `round_timestamps` on (which GDPR mode sets) the sessions,
+funnel, sequences, flow and entry/exit-page endpoints answer `503`, and the
+session fields of `/api/stats/main` are `null`. `DELETE /api/gdpr/erase`
+removes a site's data for a date range. Details and the legal framing are in
+[PRIVACY.md](PRIVACY.md).
 
-### Production Ready
+### Operations
 
-- **Argon2id authentication** — Password-protected dashboard with cryptographic session tokens
-- **API key management** — Programmatic access with SHA-256 hashed keys (`mm_` prefix, disk-persisted)
-- **Rate limiting** — Per-site and per-client-IP token-bucket limiters, both bounded
-- **Query caching** — TTL cache with LRU eviction, applied to every read endpoint
-- **Bot filtering** — Automatic filtering of known bot User-Agents
-- **GeoIP resolution** — MaxMind GeoLite2 integration with graceful fallback
-- **Data retention** — Configurable automatic cleanup of old Parquet partitions
-- **Graceful shutdown** — Buffered events are flushed before process exit
-- **Prometheus metrics** — `GET /metrics` with counters for ingestion, cache, auth and rate limiting, plus request counts by status class and a latency histogram
-- **Persisted admin credential** — a password set through the setup endpoint is stored as an Argon2id hash (mode 0600) and survives a restart, so an instance cannot be claimed by whoever reaches it first after a reboot
-- **Consistent reads** — analytics queries never observe a flush, compaction or erasure part-way through, so a report cannot double-count events that are momentarily in both storage tiers
-- **Bounded DuckDB** — configurable `memory_limit` and thread count, so one expensive query cannot take the process down with it
-- **Security headers** — OWASP-recommended headers including HSTS, CSP, and Permissions-Policy
-- **CSRF protection** — Origin/Referer validation on all state-mutating endpoints
-- **Brute-force protection** — Per-IP lockout on both login and first-time setup
-- **Bounded memory** — The event buffer, session store, rate-limiter buckets and login-attempt records all have configurable caps
-- **Atomic writes** — Parquet files, the API-key store and the visitor-ID secret are written to a temporary file and renamed into place; the secret files are mode 0600
-- **Parquet compaction** — Small per-flush files are merged so scan cost does not grow with uptime
-- **Read connection pool** — Analytics queries run on their own DuckDB connections, so a slow dashboard query cannot block ingestion
+- **Auth**: Argon2id password (12 characters minimum, enforced at startup and at
+  setup), HttpOnly `SameSite=Strict` session cookie, API keys stored as SHA-256
+  hashes (`mm_` prefix). A password set through the dashboard is persisted to
+  `data_dir/admin.json`, so a restart does not reopen first-run setup.
+- **Abuse limits**: per-site and per-client-IP ingest rate limits, login lockout
+  per client address, and bounded buffers, sessions and tracking maps.
+- **Durability**: Parquet files are written to a temporary name and renamed;
+  flushes are staged and recovered on startup; the final flush runs after the
+  server has drained on shutdown. Reads never observe a flush, compaction or
+  erasure part-way through.
+- **Observability**: `GET /metrics` (Prometheus text), `/health`,
+  `/health/ready`, `/health/detailed`. Alert rules and a Grafana dashboard live
+  in [`deploy/monitoring/`](deploy/monitoring).
+- **Resource bounds**: configurable DuckDB `memory_limit` and thread count;
+  analytics queries wait at most 10 s for a slot and are interrupted after 20 s.
 
 ---
 
 ## Quick Start
 
-### Docker (recommended)
+### Docker
 
 ```bash
 docker run -d \
   -p 127.0.0.1:8000:8000 \
   -v mallard-data:/data \
-  -e MALLARD_SECRET=your-random-32-char-secret \
-  -e MALLARD_ADMIN_PASSWORD=your-dashboard-password \
+  -e MALLARD_SECRET="$(openssl rand -hex 32)" \
+  -e MALLARD_ADMIN_PASSWORD='choose-a-password-of-12-or-more-characters' \
   ghcr.io/tomtom215/mallardmetrics
 ```
 
-### Docker Compose
+`MALLARD_SECRET` must be at least 16 characters or the server refuses to start.
+Keep the value: changing it changes every visitor ID. (Release images are
+published by the release workflow on a version tag; this README was not able to
+confirm which tag the registry currently holds.)
+
+### Docker Compose (build from source)
 
 ```bash
-docker compose up -d
+echo "MALLARD_SECRET=$(openssl rand -base64 48)" > .env
+docker compose up -d --build
 ```
 
-The default `docker-compose.yml` includes persistent storage, restart policy, and environment variable configuration. Set `MALLARD_SECRET` and `MALLARD_ADMIN_PASSWORD` in your environment for production.
+The first build compiles DuckDB and takes several minutes. The compose file
+requires `MALLARD_SECRET` and binds the port to `127.0.0.1`. For an
+internet-facing host use [`deploy/docker-compose.production.yml`](deploy/docker-compose.production.yml).
 
-### From Source
+### From source
 
 ```bash
-# Requires Rust 1.98.0 (installed automatically via rust-toolchain.toml)
+# Rust 1.98.0 is installed automatically via rust-toolchain.toml
 cargo build --release
 ./target/release/mallard-metrics
 ```
 
-Visit `http://localhost:8000` to access the dashboard. Until an admin password is set, analytics are readable by anyone who can reach the port — a deliberate mode for a public dashboard, and one the dashboard warns about on every load, with a button to set a password. Set `MALLARD_ADMIN_PASSWORD`, or use that button, before exposing an instance to a network.
+Open `http://localhost:8000`. Until an admin password exists, analytics are
+readable by anyone who can reach the port (a deliberate mode for a public
+dashboard; the dashboard warns about it and offers a button to set a password).
+Set `MALLARD_ADMIN_PASSWORD`, or use that button, before exposing an instance.
+
+`mallard-metrics --help` lists the command-line options: an optional config-file
+path, `--healthcheck`, `--install-extension`, `--version`.
 
 ---
 
 ## Tracking Script
-
-Add the following snippet to every page you want to track:
 
 ```html
 <script defer data-domain="yourdomain.com"
   src="https://your-mallard-instance.com/mallard.js"></script>
 ```
 
-### Custom Events and Revenue Tracking
-
-The tracking script exposes `window.mallard()` for custom event tracking:
+`/js/script.js` is an alias of `/mallard.js` for people migrating from
+Plausible. The script also exposes `window.mallard()` for custom events:
 
 ```javascript
 // Track a custom event
@@ -172,188 +225,162 @@ window.mallard('purchase', {
 });
 ```
 
-| Parameter  | Type     | Description                        |
-|------------|----------|------------------------------------|
-| `props`    | Object   | Custom properties (max 4096 chars) |
-| `revenue`  | Number   | Revenue amount                     |
-| `currency` | String   | ISO 4217 currency code             |
-| `callback` | Function | Called after the event is sent     |
+| Option | Type | Description |
+|---|---|---|
+| `props` | Object | Custom properties; the JSON must fit in 4096 bytes |
+| `revenue` | Number | Revenue amount |
+| `currency` | String | Three-letter ISO 4217 code |
+| `callback` | Function | Called after the event is sent (uses XHR instead of `sendBeacon`) |
 
-The tracking script is about 3.8 KB gzipped, has zero external dependencies, sets no cookies, and writes nothing to browser storage. It is served unminified so you can read exactly what runs on your visitors' browsers.
+Script attributes (`data-api`, `data-exclude`, `data-hash`, `data-outbound`,
+`data-downloads`, `data-link-query`, `data-honor-dnt`, `data-include-local`) are
+documented in the header comment of [`tracking/script.js`](tracking/script.js)
+and in [docs/src/tracking-script.md](docs/src/tracking-script.md).
+
+The script is about 4.0 KB gzipped (4,013 bytes at `gzip -9`; CI enforces a
+4,096-byte budget), has no dependencies, sets no cookies, and is served
+unminified so you can read what runs in your visitors' browsers.
 
 ---
 
 ## Configuration
 
-Mallard Metrics is configured via a TOML file, environment variables, or both. Environment variables override TOML values.
-
-```bash
-./mallard-metrics /path/to/mallard-metrics.toml
-```
-
-See [`mallard-metrics.toml.example`](mallard-metrics.toml.example) for a fully documented configuration template.
-
-### Key Environment Variables
+Mallard reads an optional TOML file (first command-line argument) and
+`MALLARD_*` environment variables; **environment variables win**. Unknown TOML
+keys are a startup error. [`mallard-metrics.toml.example`](mallard-metrics.toml.example)
+lists every setting with its default and its environment variable, and
+[docs/src/configuration.md](docs/src/configuration.md) explains them. The ones
+most deployments touch:
 
 | Variable | Default | Description |
 |---|---|---|
-| `MALLARD_HOST` | `0.0.0.0` | Server bind address |
-| `MALLARD_PORT` | `8000` | Server listen port |
-| `MALLARD_DATA_DIR` | `data` | Directory for Parquet data and DuckDB file |
-| `MALLARD_SECRET` | (auto-generated) | HMAC key for visitor ID hashing. Auto-generated and persisted to `data_dir/.secret` on first run. **Set explicitly for production** |
-| `MALLARD_ADMIN_PASSWORD` | (none) | Admin password for dashboard authentication |
-| `MALLARD_SECURE_COOKIES` | `false` | Enable `Secure` flag on session cookies (required when behind TLS) |
-| `MALLARD_METRICS_TOKEN` | (none) | Bearer token protecting the `/metrics` endpoint |
-| `MALLARD_FLUSH_COUNT` | `1000` | Events buffered before flushing to disk |
-| `MALLARD_FLUSH_INTERVAL` | `60` | Seconds between periodic buffer flushes |
-| `MALLARD_GEOIP_DB` | (none) | Path to MaxMind GeoLite2-City.mmdb |
-| `MALLARD_DASHBOARD_ORIGIN` | (none) | Restrict dashboard CORS to this origin (enables CSRF protection) |
-| `MALLARD_FILTER_BOTS` | `true` | Filter known bot User-Agents |
-| `MALLARD_RETENTION_DAYS` | `0` | Auto-delete data older than N days (0 = unlimited) |
-| `MALLARD_RATE_LIMIT` | `0` | Max events/sec per site (0 = unlimited) |
-| `MALLARD_CACHE_TTL` | `60` | Query cache TTL in seconds |
-| `MALLARD_CACHE_MAX_ENTRIES` | `10000` | Maximum cached query results (0 = unlimited) |
-| `MALLARD_MAX_CONCURRENT_QUERIES` | `10` | Maximum concurrent analytics queries (0 = unlimited); excess returns 429 |
-| `MALLARD_SESSION_TTL` | `86400` | Dashboard session TTL in seconds (24 hours) |
-| `MALLARD_SHUTDOWN_TIMEOUT` | `30` | Graceful shutdown timeout in seconds |
-| `MALLARD_MAX_LOGIN_ATTEMPTS` | `5` | Failed login attempts per IP before lockout (0 = disabled) |
-| `MALLARD_LOGIN_LOCKOUT` | `300` | Lockout duration in seconds after exceeding max login attempts |
-| `MALLARD_LOG_FORMAT` | `text` | Log format: `text` or `json` |
-| `MALLARD_GDPR_MODE` | `false` | Enable GDPR-friendly preset (see [PRIVACY.md](PRIVACY.md)) |
-| `MALLARD_STRIP_REFERRER_QUERY` | `false` | Strip `?query` and `#fragment` from stored referrers |
-| `MALLARD_ROUND_TIMESTAMPS` | `false` | Round event timestamps to the nearest hour |
-| `MALLARD_SUPPRESS_VISITOR_ID` | `false` | Replace HMAC visitor hash with per-request UUID (breaks unique-visitor counting) |
-| `MALLARD_SUPPRESS_BROWSER_VERSION` | `false` | Store browser name only, not version |
-| `MALLARD_SUPPRESS_OS_VERSION` | `false` | Store OS name only, not version |
-| `MALLARD_SUPPRESS_SCREEN_SIZE` | `false` | Omit screen width and device type |
-| `MALLARD_GEOIP_PRECISION` | `city` | GeoIP precision: `city`, `region`, `country`, or `none` |
-| `MALLARD_SITE_IDS` | (none) | Comma-separated allowlist, enforced against the Origin header *and* the event payload |
-| `MALLARD_TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `X-Real-IP`. Only enable behind a proxy that overwrites them |
-| `MALLARD_VISITOR_SALT_ROTATION_DAYS` | `1` | Days a visitor-ID salt stays valid. See the note under Privacy by Design |
-| `MALLARD_SESSION_WINDOW_MINUTES` | `30` | Inactivity gap that ends a session |
-| `MALLARD_REALTIME_WINDOW_MINUTES` | `5` | Window the realtime endpoint treats as "now" |
-| `MALLARD_COMPACT_AFTER_FILES` | `24` | Merge a partition's Parquet files past this count (0 disables) |
-| `MALLARD_READ_CONNECTIONS` | `4` | Read-only DuckDB connections for analytics queries |
-| `MALLARD_MAX_BUFFERED_EVENTS` | `100000` | Hard cap on buffered events (0 = unbounded) |
-| `MALLARD_MAX_TRACKED_KEYS` | `10000` | Cap on rate-limit buckets and login-attempt records |
-| `MALLARD_MAX_SESSIONS` | `10000` | Cap on concurrent dashboard sessions |
-| `MALLARD_RATE_LIMIT_PER_IP` | `0` | Ingest events per second per client IP (0 = unlimited) |
-| `MALLARD_EXTENSION_DIR` | `data_dir/extensions` | Where DuckDB installs community extensions. Kept on the data volume because the `FROM scratch` image has no `HOME` and a read-only root filesystem |
-| `MALLARD_DUCKDB_MEMORY_LIMIT` | (DuckDB default: ~80% of RAM) | Cap on query memory, e.g. `1GB` |
-| `MALLARD_DUCKDB_THREADS` | (one per core) | DuckDB worker threads |
+| `MALLARD_SECRET` | generated and saved to `data_dir/.secret` | HMAC key for visitor IDs; at least 16 characters. Set it explicitly in production |
+| `MALLARD_ADMIN_PASSWORD` | none | Dashboard password; at least 12 characters, a short list of obvious values is refused. A password that fails the policy stops startup |
+| `MALLARD_DATA_DIR` | `data` | DuckDB file, Parquet files, extension cache, secrets. Must not contain `*`, `?`, `[` or `]` |
+| `MALLARD_HOST`, `MALLARD_PORT` | `0.0.0.0`, `8000` | Bind address |
+| `MALLARD_SITE_IDS` | none | Comma-separated allowlist, checked against both `Origin` and the payload |
+| `MALLARD_SECURE_COOKIES` | `false` | `Secure` flag on the session cookie; set it behind TLS |
+| `MALLARD_DASHBOARD_ORIGIN` | none | Restricts dashboard CORS to this origin and turns on the Origin/Referer check for session-authenticated writes |
+| `MALLARD_TRUST_PROXY_HEADERS` | `false` | Take the client address from `X-Forwarded-For` / `X-Real-IP` |
+| `MALLARD_TRUSTED_PROXY_HOPS` | `1` | With the above: the client is entry N counted **from the right** of `X-Forwarded-For` (1 to 8). One proxy is 1; a CDN in front of nginx is 2 |
+| `MALLARD_VISITOR_SALT_ROTATION_DAYS` | `1` | Salt lifetime; see the note under Privacy by Design |
+| `MALLARD_RETENTION_DAYS` | `0` | Delete Parquet partitions older than N days (0 keeps everything) |
+| `MALLARD_GDPR_MODE` | `false` | Data-minimising bundle; see [PRIVACY.md](PRIVACY.md) |
+| `MALLARD_METRICS_TOKEN` | none | Bearer token required by `/metrics` |
+| `MALLARD_RATE_LIMIT`, `MALLARD_RATE_LIMIT_PER_IP` | `0`, `0` | Ingest events per second per site / per client IP (0 = unlimited) |
+| `MALLARD_DUCKDB_MEMORY_LIMIT`, `MALLARD_DUCKDB_THREADS` | DuckDB defaults | Cap query memory (e.g. `1GB`) and worker threads |
+| `MALLARD_EXTENSION_DIR` | `data_dir/extensions` | Where the `behavioral` extension is installed; on the data volume so it persists under a read-only root filesystem |
+| `MALLARD_SHUTDOWN_TIMEOUT` | `30` | Seconds to let in-flight requests drain before the final flush |
 
-Every setting is also available in the TOML file; see
-[`mallard-metrics.toml.example`](mallard-metrics.toml.example) for the full list
-with commentary. Unknown keys in that file are a startup error, so a typo is
-reported rather than silently ignored.
+Startup refuses to run when: `MALLARD_SECRET` is shorter than 16 characters;
+`MALLARD_ADMIN_PASSWORD` fails the password policy; `data_dir/.secret` exists
+but cannot be read; `login_lockout_secs` is 0; or a setting is out of range.
+It logs a warning (it does not stop) for risky combinations such as an empty
+`site_ids` with no per-IP rate limit, or `max_login_attempts = 0`.
+
+---
+
+## How metrics are defined
+
+These definitions are implemented in `src/query/sessions.rs` and
+`src/api/stats.rs`; a figure here means the following, which may differ from
+other tools.
+
+- **Session**: a run of one visitor's events (of any kind) with no gap larger
+  than `session_window_minutes` (30 by default). Custom events keep a session
+  alive. Only sessions containing at least one pageview are *counted*.
+- **Bounce**: a counted session with exactly one event, which is a pageview. A
+  custom event ends the bounce.
+- **Visit duration**: last event minus first event in the session.
+- **Views per visit**: mean pageviews per counted session.
+- **Entry / exit page**: pathname of the session's first / last pageview.
+- **Filters select sessions; they do not cut them.** A session is kept when it
+  contains an event matching every filter and is then measured whole. Plain
+  counts (visitors, pageviews, events) count only the matching events.
+- **Flow** looks at pageviews only, with consecutive repeats collapsed.
+- **Periods**: `7d`, `30d`, `90d` are that many calendar days **including
+  today** (so `7d` is seven daily buckets); `12mo` is twelve months ending
+  today; `day` and `today` are today. A lone `start_date` or `end_date` is a
+  `400`; both are inclusive and may span at most 366 days.
+- **Retention** looks back `visitor_salt_rotation_days` before the report start
+  to decide whether a visitor is new.
+- **Unique visitors** are distinct visitor IDs, so they obey the salt-rotation
+  note above.
 
 ---
 
 ## API Reference
 
-All `/api/stats/*`, `/api/keys/*`, and `/api/stats/export` endpoints require authentication (session cookie or API key). The ingestion endpoint and health checks are unauthenticated.
+Everything under `/api/stats/*`, `/api/sites`, `/api/keys` and `/api/gdpr/*`
+requires a session cookie or an API key (`Authorization: Bearer mm_...` or
+`X-API-Key: mm_...`) once an admin password exists. Key management and erasure
+additionally need an `Admin` key or session, and are refused before setup.
+Ingestion, auth, health, `/metrics` (unless a token is set), `robots.txt` and
+`security.txt` need no credentials. Full parameter and response documentation:
+[docs/src/api-reference/](docs/src/api-reference).
 
-### Common Query Parameters
+### Common query parameters
 
 | Parameter | Default | Description |
 |---|---|---|
-| `site_id` | (required) | Analytics property identifier |
-| `period` | `30d` | Time period: `day`, `today`, `7d`, `30d`, `90d`, `12mo` |
-| `start_date` | (none) | Explicit start date, `YYYY-MM-DD`, inclusive |
-| `end_date` | (none) | Explicit end date, `YYYY-MM-DD`, **inclusive** |
-| `limit` | `10` | Row limit where the endpoint returns a list (max 1000) |
-| `filters` | (none) | Segment, e.g. `browsers==Chrome;countries!=US` |
+| `site_id` | required | Analytics property identifier |
+| `period` | `30d` | `day`, `today`, `7d`, `30d`, `90d`, `12mo` |
+| `start_date`, `end_date` | none | `YYYY-MM-DD`, both inclusive, given together, at most 366 days |
+| `limit` | `10` | Rows for list endpoints; above the endpoint's maximum is a `400` |
+| `filters` | none | Segment, e.g. `browsers==Chrome;countries!=US` |
 
-An explicit range may span at most 366 days. A `limit` above the endpoint's
-maximum is an error rather than a silent clamp.
+### Errors
+
+Errors produced by Mallard's handlers are JSON with a stable `code` and a
+human-readable `error`, for example
+`{"code":"bad_request","error":"start_date and end_date must be given together"}`.
+Codes: `bad_request`, `unauthorized`, `not_found`, `internal_error`,
+`too_many_requests`, `behavioral_unavailable`, `query_timeout`. A query that
+exceeds its deadline is `504`; a request over the concurrent-query limit is `429`
+with `Retry-After: 1`. A malformed query string rejected by the web framework
+(for example a missing `site_id`) currently returns a plain-text `400` without a
+`code`.
 
 ### Endpoints
 
-#### Health and Monitoring
-
-| Method | Endpoint | Description |
+| Method | Endpoint | Notes |
 |---|---|---|
-| GET | `/health` | Liveness check (returns `ok`) |
-| GET | `/health/ready` | Readiness probe — queries DuckDB; returns 503 if not ready |
-| GET | `/health/detailed` | JSON system status (version, buffer, auth, GeoIP, behavioral extension, cache) |
-| GET | `/metrics` | Prometheus metrics (`text/plain; version=0.0.4`) |
-| GET | `/robots.txt` | Crawler policy |
-| GET | `/.well-known/security.txt` | RFC 9116 security contact |
-
-#### Authentication
-
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | `/api/auth/setup` | First-run admin password setup |
-| POST | `/api/auth/login` | Login with credentials |
-| POST | `/api/auth/logout` | Logout and clear session |
-| GET | `/api/auth/status` | Check authentication status |
-
-#### Ingestion
-
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | `/api/event` | Ingest a tracking event (permissive CORS, 64 KB body limit) |
-| GET | `/api/event` | Pixel tracking — same parameters via query string; returns 1×1 GIF |
-
-#### Core Analytics (authenticated)
-
-Every stats endpoint accepts `site_id`, a date range (`period`, or
-`start_date`/`end_date`), and `filters` — a segment such as
-`browsers==Chrome;countries!=US` that narrows the whole report.
-
-| Method | Endpoint | Description |
-|---|---|---|
+| GET | `/health` | Liveness; body `ok` |
+| GET | `/health/ready` | Readiness; queries DuckDB, `503` if not ready |
+| GET | `/health/detailed` | JSON status; `503` with `"status":"degraded"` when Parquet files exist that the `events_all` view does not read |
+| GET | `/metrics` | Prometheus text, `text/plain; version=0.0.4` |
+| GET | `/robots.txt`, `/.well-known/security.txt` | |
+| POST | `/api/auth/setup`, `/api/auth/login`, `/api/auth/logout` | First-run password, login, logout |
+| GET | `/api/auth/status` | Authentication state |
+| POST | `/api/event` | Ingest (permissive CORS, preflight cached 24 h, 64 KB body limit) |
+| GET | `/api/event` | Pixel: same fields in the query string, always answers a 1x1 GIF |
+| HEAD | `/api/event` | Answers like the GIF and records nothing |
 | GET | `/api/sites` | Site IDs that have data |
-| GET | `/api/stats/main` | Visitors, pageviews, events, and (with the extension) visits, bounce rate and visit duration. Accepts `compare=previous_period` or `compare=year_over_year`, adding a `comparison` object with the same figures for an equally long earlier window |
-| GET | `/api/stats/timeseries` | Gap-filled visitor and pageview counts per bucket |
-| GET | `/api/stats/realtime` | Current visitors, top pages and sources, per-minute series. Takes `filters` but not a date range: its window is `realtime_window_minutes` |
-| GET | `/api/stats/revenue` | Revenue by currency, event and page |
-| GET | `/api/stats/goals` | Conversion rate for every custom event |
-| GET | `/api/stats/properties` | Custom property keys seen in range |
-| GET | `/api/stats/property-values` | One property (`key`), broken down by value; optional `event` filter |
-| GET | `/api/stats/breakdown/{dim}` | Breakdown by any dimension (below) |
+| GET | `/api/stats/main` | Headline figures; `compare=previous_period` or `year_over_year` adds a `comparison` object |
+| GET | `/api/stats/timeseries` | Gap-filled visitors and pageviews per bucket |
+| GET | `/api/stats/realtime` | Takes `filters`, not a date range; window is `realtime_window_minutes` |
+| GET | `/api/stats/revenue`, `/goals`, `/properties`, `/property-values` | Revenue per currency; goal conversion; custom properties |
+| GET | `/api/stats/breakdown/{dim}` | `pages`, `entry-pages`*, `exit-pages`*, `referrers`, `sources`, `countries`, `regions`, `cities`, `browsers`, `browser-versions`, `os`, `os-versions`, `devices`, `screen-sizes`, `utm-sources`, `utm-mediums`, `utm-campaigns`, `utm-contents`, `utm-terms`, `events` |
+| GET | `/api/stats/sessions`* | Sessions, average duration, pages per session, bounce rate |
+| GET | `/api/stats/funnel`* | `steps` (2 to 32, `page:/path` or `event:name`), `window`, `modes` |
+| GET | `/api/stats/retention`* | `weeks` (2 to 32) |
+| GET | `/api/stats/sequences`* | `steps` (2 to 32) |
+| GET | `/api/stats/flow`* | `page`, `direction`, `limit` (max 100) |
+| GET | `/api/stats/export` | `format=csv\|json`, `kind=daily\|raw` |
+| POST, GET, DELETE | `/api/keys`, `/api/keys/{hash}` | Create, list, revoke API keys (Admin) |
+| DELETE | `/api/gdpr/erase` | `site_id`, `start_date`, `end_date` (Admin) |
 
-Breakdown dimensions: `pages`, `entry-pages`\*, `exit-pages`\*, `referrers`,
-`sources`, `countries`, `regions`, `cities`, `browsers`, `browser-versions`,
-`os`, `os-versions`, `devices`, `screen-sizes`, `utm-sources`, `utm-mediums`,
-`utm-campaigns`, `utm-contents`, `utm-terms`, `events`.
-\* needs the `behavioral` extension.
+\* needs the `behavioral` extension and exact timestamps: answers `503` when the
+extension is not loaded or `round_timestamps` is on.
 
-Session-derived fields in `/api/stats/main` are `null` — not `0` — when the
-extension is unavailable, so "no sessions" is distinguishable from "could not
-be computed".
-
-#### Advanced Analytics (authenticated, requires `behavioral` extension)
-
-| Method | Endpoint | Parameters | Description |
-|---|---|---|---|
-| GET | `/api/stats/sessions` | — | Visits, average duration, pages per visit, bounce rate |
-| GET | `/api/stats/funnel` | `steps`, `window`, `modes` | Cumulative funnel: visitors reaching at least each step, with drop-off |
-| GET | `/api/stats/retention` | `weeks` (2–32) | Weekly cohorts with retained counts and rates |
-| GET | `/api/stats/sequences` | `steps` (2–32) | Ordered pattern matching, with a repeat-completion count |
-| GET | `/api/stats/flow` | `page`, `direction`, `limit` | Where visitors went next, or came from |
-
-These return **503** with an explanation when the `behavioral` extension is not
-loaded, rather than an empty `200` that reads as "no data".
-
-`funnel` accepts any combination of the extension's ordering modes:
-`strict`, `strict_deduplication`, `strict_order`, `strict_increase`,
-`strict_once`, `allow_reentry`, `timestamp_dedup`.
-
-`retention` also returns `identity_supports_cohorts` and, when false, a `caveat`
-explaining that the configured `visitor_salt_rotation_days` is shorter than the
-cohorts being measured — so every week past the first is structurally zero.
-
-#### Data Management (authenticated)
-
-| Method | Endpoint | Description |
-|---|---|---|
-| GET | `/api/stats/export` | Export analytics data (`format=csv` or `format=json`) |
-| DELETE | `/api/gdpr/erase` | Erase all events for a site within a date range (Art. 17 erasure) |
-| POST | `/api/keys` | Create an API key |
-| GET | `/api/keys` | List all API keys |
-| DELETE | `/api/keys/{hash}` | Revoke an API key |
+Funnels default to `strict_once` (one event fills one step) unless the caller
+passes `strict_once` or `strict_increase`. Other modes may be combined:
+`strict`, `strict_deduplication`, `strict_order`, `allow_reentry` (only together
+with `strict_order`, else `400`), `timestamp_dedup`. `retention` returns
+`identity_supports_cohorts` and, when false, a `caveat`. Erasure that cannot
+remove every partition answers `500` with `"status":"partial"` and
+`failed_dates`. Raw exports are capped at 1,000,000 rows (default 100,000) and
+are built in memory.
 
 ---
 
@@ -361,7 +388,7 @@ cohorts being measured — so every week past the first is structurally zero.
 
 ```mermaid
 flowchart TD
-    TS["Tracking Script\nmallard.js ~3.8KB gzipped"]
+    TS["Tracking Script\nmallard.js ~4 KB gzipped"]
     DASH["Dashboard SPA\nPreact + HTM"]
 
     TS -->|"POST /api/event"| AXUM
@@ -396,62 +423,24 @@ flowchart TD
     end
 ```
 
-### Module Map
-
-| Module | Purpose |
-|---|---|
-| `config.rs` | TOML and environment configuration, validation, and startup advisories |
-| `server.rs` | Axum router, middleware stack, health and Prometheus endpoints |
-| `ingest/handler.rs` | Shared event validation and enrichment for the POST and pixel paths |
-| `ingest/buffer.rs` | Bounded in-memory event buffer with atomic drain-and-flush |
-| `ingest/visitor_id.rs` | Per-site HMAC-SHA256 visitor IDs with configurable salt rotation |
-| `ingest/useragent.rs` | User-Agent and Client Hints parsing, bot detection |
-| `ingest/geoip.rs` | MaxMind GeoLite2 reader with graceful fallback |
-| `ingest/ratelimit.rs` | Bounded token-bucket limiter, used per site and per client IP |
-| `storage/mod.rs` | Read-connection pool for analytics queries |
-| `storage/schema.rs` | Table definitions, the `events_all` view, behavioral extension loading |
-| `storage/parquet.rs` | Atomic Parquet writes, date partitioning, compaction, retention |
-| `storage/migrations.rs` | Schema versioning |
-| `query/mod.rs` | `QueryScope` — the parameters every analytics query shares |
-| `query/metrics.rs` | Core metrics and session aggregates, in two passes rather than four |
-| `query/breakdowns.rs` | Twenty breakdown dimensions, including session-derived entry/exit pages |
-| `query/timeseries.rs` | Gap-filled time bucketing |
-| `query/realtime.rs` | Current visitors, top pages and sources, per-minute series |
-| `query/revenue.rs` | Revenue by currency, event and page |
-| `query/events.rs` | Goal conversions and custom-property breakdowns |
-| `query/export.rs` | Daily and raw event exports, CSV and JSON rendering |
-| `query/funnel.rs` | `window_funnel()` — cumulative funnels with ordering modes |
-| `query/retention.rs` | `retention()` — per-visitor cohort counts |
-| `query/sequences.rs` | `sequence_match()` and `sequence_count()` |
-| `query/flow.rs` | `sequence_next_node()`, forward and backward |
-| `query/cache.rs` | TTL cache with LRU eviction and per-site invalidation |
-| `api/stats.rs` | Analytics handlers, parameter validation, GDPR erasure |
-| `api/errors.rs` | Error types and their HTTP mapping |
-| `api/auth.rs` | Argon2id auth, sessions, API keys, brute-force protection |
-| `dashboard/` | Embedded SPA (Preact + HTM, no build step) and the tracking script route |
-| `test_support.rs` | `AppState` builder shared by unit and integration tests |
+The module map is kept in one place:
+[docs/src/architecture.md](docs/src/architecture.md#module-map).
 
 ---
 
 ## Dashboard
 
-The dashboard is a single-page application built with Preact + HTM, embedded directly in the binary via `rust-embed`. No build step or Node.js required.
+A Preact + HTM single-page app embedded in the binary with `rust-embed`; there
+is no build step and no Node.js requirement at runtime. The selected site,
+range, comparison and filters live in the URL, so a view can be bookmarked.
 
 ![Mallard Metrics Dashboard](docs/src/dashboard-screenshot.png)
 
-**Views include:**
-
-- Visitor and pageview counts with period selector
-- Time-series line chart (visitors and pageviews)
-- Six breakdown tables (pages, sources, browsers, OS, devices, countries)
-- Session analytics cards (total sessions, avg duration, pages/session)
-- Funnel analysis visualization (horizontal bar chart)
-- Retention cohort grid (weekly cohort boolean matrix)
-- Sequence matching conversion metrics
-- Flow analysis (next-page navigation table)
-- CSV and JSON export buttons
-- Period comparison (previous period or same period last year) with per-metric change
-- API key management — create, list and revoke keys, with the plaintext shown once
+It shows headline figures with period comparison, a visitors/pageviews chart,
+grouped breakdown tabs (pages, sources, locations, technology) where clicking a
+row filters everything to it, realtime activity, goals, revenue, and the
+behavioral reports; it also exports CSV/JSON and manages API keys (the key is
+shown once).
 
 ---
 
@@ -460,84 +449,38 @@ The dashboard is a single-page application built with Preact + HTM, embedded dir
 | Component | Technology | Version |
 |---|---|---|
 | Language | Rust | 1.98.0 (edition 2024) |
-| Web Framework | Axum | 0.8 |
-| Database | DuckDB (disk-based, embedded) | 1.5.6 (crate 1.10506.1) |
-| Analytics Engine | `behavioral` extension | 0.10.0 or newer, runtime-loaded |
-| Storage Format | Parquet (ZSTD compressed) | date-partitioned, compacted |
+| Web framework | Axum | 0.8 |
+| Database | DuckDB, embedded, disk-based | 1.5.6 (`duckdb` crate 1.10506.1) |
+| Behavioral analytics | `behavioral` extension, loaded at runtime | 0.10.0 or newer required |
+| Storage format | Parquet, ZSTD, date-partitioned | |
 | Frontend | Preact + HTM | no build step |
-| Password Hashing | Argon2id | `argon2` 0.6 |
-| Constant-time comparison | `subtle` | 2.6 |
-| GeoIP | MaxMind GeoLite2 | `maxminddb` 0.30 |
-| Deployment | Static musl binary | `FROM scratch` Docker |
+| Password hashing | Argon2id | `argon2` 0.6 |
+| GeoIP | MaxMind GeoLite2 / MMDB | `maxminddb` 0.32 |
+| Container | glibc binary on distroless `cc-debian12` | UID 65532; no musl build |
 
 ---
 
 ## Development
 
-### Prerequisites
-
-- Rust 1.98.0 (installed automatically via `rust-toolchain.toml`)
-- Git
-
-### Build and Test
+Prerequisites: Rust 1.98.0 (installed by `rust-toolchain.toml`) and Git. Build
+tooling, the validation suite, test counts and the CI inventory are in
+[DEVELOPMENT.md](DEVELOPMENT.md); the workflow and standards are in
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```bash
-# Build
 cargo build
-
-# Run all tests
-#
-# Behavioral-extension tests skip when the extension cannot be downloaded.
-# Set MALLARD_REQUIRE_BEHAVIORAL=1 to make that a failure instead, as CI does.
-cargo test
-
-# Clippy (zero warnings required)
-cargo clippy --all-targets
-
-# Format check
-cargo fmt -- --check
-
-# Build documentation
-cargo doc --no-deps
-
-# Run the server
-cargo run
-
-# Run benchmarks
-cargo bench
+MALLARD_REQUIRE_BEHAVIORAL=1 cargo test --all-targets
 ```
-
-### Quality Standards
-
-- **Zero clippy warnings** — pedantic, nursery, and cargo lint groups enabled
-- **Zero formatting violations** — enforced via `cargo fmt`
-- **All 602 tests pass** — no ignored tests
-- **Documentation builds without errors**
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow.
 
 ---
 
 ## Deployment
 
-### Docker Compose (recommended for production)
+Production stack (Caddy for TLS, internal-only network, backups, monitoring):
+[`deploy/`](deploy) and [docs/src/deploy-vps.md](docs/src/deploy-vps.md). Fly.io:
+[docs/src/deploy-flyio.md](docs/src/deploy-flyio.md).
 
-Create a `.env` file (do not commit to source control):
-
-```bash
-MALLARD_SECRET=your-random-32-char-secret
-MALLARD_ADMIN_PASSWORD=your-strong-dashboard-password
-MALLARD_SECURE_COOKIES=true
-MALLARD_METRICS_TOKEN=your-prometheus-bearer-token
-```
-
-Then start:
-
-```bash
-docker compose up -d
-```
-
-### Reverse Proxy (nginx)
+### Reverse proxy (nginx)
 
 ```nginx
 server {
@@ -550,38 +493,41 @@ server {
     location / {
         proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host              $host;
-        proxy_set_header X-Forwarded-For  $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Real-IP        $remote_addr;
+        proxy_set_header X-Real-IP         $remote_addr;
     }
 }
 ```
 
-### GeoIP Setup (optional)
+Run Mallard with `MALLARD_TRUST_PROXY_HEADERS=true` and
+`MALLARD_TRUSTED_PROXY_HOPS=1`. Mallard counts `X-Forwarded-For` entries from
+the right, so the entry your own nginx appended is the one it trusts and
+anything a client put further left is ignored. Set the hop count to the number
+of proxies you operate (2 with a CDN in front of nginx); too high a value lets a
+client choose its address.
 
-1. Register for a free MaxMind account at [maxmind.com](https://www.maxmind.com/en/geolite2/signup)
-2. Download the GeoLite2-City database (`.mmdb` format)
-3. Set `MALLARD_GEOIP_DB=/path/to/GeoLite2-City.mmdb`
+### GeoIP (optional)
 
-If the GeoIP database is missing, country/region/city fields are stored as `NULL`. The system degrades gracefully — no errors are raised.
+Download a MaxMind GeoLite2-City `.mmdb` (free account required) and set
+`MALLARD_GEOIP_DB=/path/to/GeoLite2-City.mmdb`. Without it, country, region and
+city are `NULL`. An empty `MALLARD_GEOIP_DB` counts as unset.
 
 ### Behavioral extension on an air-gapped host
 
-The `behavioral` extension is downloaded from the DuckDB community repository on
-first run, so a deployment whose runtime network has no outbound route — the
-bundled production compose file is one, on purpose — cannot install it, and
-funnels, retention, sessions, sequences and flow answer 503. Seed it once from
+The extension is downloaded on first run. A host without an outbound route (the
+production compose file puts Mallard on an internal network on purpose) cannot
+install it, and the behavioral endpoints answer `503`. Seed it once from
 somewhere with a route, against the same data directory:
 
 ```bash
 mallard-metrics --install-extension
-# Installed the behavioral extension (version 0.10.0) into data/extensions
 ```
 
-It writes the extension to the data volume and exits without creating a
-database. Every later start loads it from disk. See
-[the VPS guide](https://tomtom215.github.io/mallardmetrics/deploy-vps.html) for
-the Docker form.
+It writes the extension under the data directory (default
+`data/extensions`) and exits without creating a database; every later start
+loads it from disk. A cached extension older than 0.10.0 makes startup refuse.
+Docker form: [the VPS guide](docs/src/deploy-vps.md).
 
 ---
 
@@ -589,21 +535,21 @@ the Docker form.
 
 | Document | Description |
 |---|---|
-| **[GitHub Pages](https://tomtom215.github.io/mallardmetrics)** | Full documentation site — API reference, architecture, deployment, security |
-| [PRIVACY.md](PRIVACY.md) | Data-processing architecture, GDPR/ePrivacy/CCPA analysis, operator compliance obligations |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | Development setup, workflow, code standards, PR checklist |
-| [SECURITY.md](SECURITY.md) | Security model, privacy guarantees, threat model, vulnerability reporting |
-| [CHANGELOG.md](CHANGELOG.md) | Version history following Keep a Changelog format |
-| [ROADMAP.md](ROADMAP.md) | Implementation phases, completed work, and future plans |
-| [PERF.md](PERF.md) | Benchmark framework, methodology, and measured baselines |
-| [LESSONS.md](LESSONS.md) | 31 development lessons learned, organized by category |
-| [DEVELOPMENT.md](DEVELOPMENT.md) | Module map, build commands, and development guidelines |
-| [mallard-metrics.toml.example](mallard-metrics.toml.example) | Annotated configuration template |
+| [Documentation site](https://tomtom215.github.io/mallardmetrics) | API reference, architecture, deployment, security |
+| [PRIVACY.md](PRIVACY.md) | Data processing, GDPR / ePrivacy / CCPA notes, operator obligations |
+| [SECURITY.md](SECURITY.md) | Security model, threat model, vulnerability reporting |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Setup, workflow, standards, PR checklist |
+| [DEVELOPMENT.md](DEVELOPMENT.md) | Commands, measured test and CI counts |
+| [CHANGELOG.md](CHANGELOG.md) | Version history (Keep a Changelog) |
+| [ROADMAP.md](ROADMAP.md) | Status, known limitations, gaps |
+| [PERF.md](PERF.md) | Benchmark method and the figures actually measured |
+| [LESSONS.md](LESSONS.md) | Numbered engineering lessons |
+| [mallard-metrics.toml.example](mallard-metrics.toml.example) | Every setting with defaults |
 
 ---
 
 ## License
 
-AGPL-3.0 — see [LICENSE](LICENSE) for the full text.
-
-Mallard Metrics is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, version 3.
+AGPL-3.0, see [LICENSE](LICENSE). Mallard Metrics is free software: you can
+redistribute it and/or modify it under the terms of the GNU Affero General
+Public License as published by the Free Software Foundation, version 3.
