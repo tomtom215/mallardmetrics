@@ -116,9 +116,11 @@ function BehavioralHelp({ detail, compactView }) {
     <div class="placeholder placeholder-unavailable behavioral-help">
       <strong>Behavioral analytics is unavailable on this server</strong>
       <p>
-        Visits, bounce rate, funnels, retention, sequences, flow and entry and exit pages depend on
-        DuckDB's${' '}<code>behavioral</code> community extension, and it is not loaded. Page views,
-        events, breakdowns, goals and revenue are unaffected.
+        ${compactView
+          ? html`This report needs DuckDB's${' '}<code>behavioral</code> extension, which is not loaded. See Overview.`
+          : html`Visits, bounce rate, funnels, retention, sequences, flow and entry and exit pages depend on
+              DuckDB's${' '}<code>behavioral</code> community extension, and it is not loaded. Page views,
+              events, breakdowns, goals and revenue are unaffected.`}
       </p>
       ${!compactView &&
       html`
@@ -1088,6 +1090,42 @@ class ToolPanel extends Component {
  * API key management. The plaintext key is returned once and never again, so it
  * stays on screen until dismissed rather than vanishing on the next render.
  */
+/** Snapshot the data on the server. Admin only: a 403 or 409 is shown in the server's own words. */
+class BackupSection extends Component {
+  constructor() {
+    super();
+    this.state = { busy: false, result: null };
+  }
+
+  async run() {
+    this.setState({ busy: true, result: null });
+    const res = await api.send('POST', '/api/admin/backup');
+    if (res.kind === 'unauthorized') return this.props.onAuthExpired();
+    this.setState({
+      busy: false,
+      result: res.kind === 'ok'
+        ? { ok: true, ...res.data }
+        : { ok: false, message: res.status === 403 ? 'This needs an admin key or an admin session.' : res.message },
+    });
+  }
+
+  render(_, { busy, result }) {
+    return html`
+      <section aria-labelledby="backup-title">
+        <h3 class="subhead" id="backup-title">Backup</h3>
+        <p class="muted">Snapshot the database and event files into the server's <code>backups</code> folder while it keeps running. Restoring is done on the server.</p>
+        <div class="inline-controls">
+          <button type="button" class="btn-secondary" disabled=${busy} onClick=${() => this.run()}>${busy ? 'Creating backup…' : 'Create backup'}</button>
+        </div>
+        <div role="status">
+          ${result && result.ok && html`<p>Backup <strong>${result.name}</strong> created: <code>${result.path}</code> (${num(result.hot_rows)} recent events, ${num(result.parquet_files)} archive files).</p>`}
+          ${result && !result.ok && html`<div class="placeholder placeholder-error">${result.message}</div>`}
+        </div>
+      </section>
+    `;
+  }
+}
+
 class KeysPanel extends Component {
   constructor() {
     super();
@@ -1180,6 +1218,7 @@ class KeysPanel extends Component {
                   </table>
                 </div>
               `}
+        <${BackupSection} onAuthExpired=${this.props.onAuthExpired} />
       </${ToolPanel}>
     `;
   }
@@ -1802,7 +1841,7 @@ class Dashboard extends Component {
     return html`
       ${prev && html`<p class="comparison-note">Compared with ${fmtDate(prev.start_date)} – ${fmtDate(prev.end_date)}${baselineEmpty ? ' — no data in that period, so there is nothing to compare against' : ''}</p>`}
       ${unavailable && html`<${Unavailable} reason=${this.state.reason} />`}
-      <dl class="metrics-grid">
+      <dl class="metrics-grid metrics-grid-overview">
         <${MetricCard} label="Unique visitors" help=${HELP.visitors} value=${compact(m.unique_visitors)} full=${num(m.unique_visitors)} delta=${delta('unique_visitors')} />
         <${MetricCard} label="Pageviews" help=${HELP.pageviews} value=${compact(m.total_pageviews)} full=${num(m.total_pageviews)} delta=${delta('total_pageviews')} />
         <${MetricCard} label="Total events" help=${HELP.events} value=${compact(m.total_events)} full=${num(m.total_events)} delta=${delta('total_events')} />
