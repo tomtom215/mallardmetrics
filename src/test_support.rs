@@ -57,6 +57,7 @@ pub struct AppStateBuilder {
     datacenter: crate::ingest::asn::DatacenterFilter,
     visitor_salt_rotation_days: u32,
     api_keys: ApiKeyStore,
+    share: crate::api::share::ShareState,
 }
 
 impl Default for AppStateBuilder {
@@ -88,6 +89,7 @@ impl Default for AppStateBuilder {
             datacenter: crate::ingest::asn::DatacenterFilter::disabled(),
             visitor_salt_rotation_days: 1,
             api_keys: ApiKeyStore::default(),
+            share: crate::api::share::ShareState::in_memory(),
         }
     }
 }
@@ -128,6 +130,7 @@ impl AppStateBuilder {
     setter!(suppress_screen_size, bool);
     setter!(visitor_salt_rotation_days, u32);
     setter!(api_keys, ApiKeyStore);
+    setter!(share, crate::api::share::ShareState);
 
     #[allow(clippy::missing_const_for_fn)]
     #[must_use]
@@ -224,6 +227,7 @@ impl AppStateBuilder {
             filter_bots: self.filter_bots,
             sessions: SessionStore::new(3600),
             api_keys: self.api_keys,
+            share: self.share,
             admin_password: crate::api::auth::AdminPasswordStore::in_memory(
                 self.admin_password_hash,
             ),

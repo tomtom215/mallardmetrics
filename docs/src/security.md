@@ -99,6 +99,18 @@ Password policy (setup endpoint and `MALLARD_ADMIN_PASSWORD` alike): at least 12
 | Scopes | `ReadOnly` (read routes) or `Admin` (also key management and erasure) |
 | Persistence | Disk-persisted; survive server restarts |
 
+### Share Links
+
+A share link is a revocable, read-only, no-login view of one site. The token is
+256 bits from the OS CSPRNG, shown once, and stored only as a SHA-256 hash in
+`data_dir/share_links.json` (mode 0600, atomic writes). It travels in the URL
+fragment and an `X-Share-Token` header, so it is in no URL the server sees, no
+log and no `Referer`. It is **not** an API key: it opens only the read-only
+`/api/shared/` routes, with `site_id` forced to the link's site, the link's
+segment added to every query, and no exports. Expiry and revocation apply on the
+next request. The full design, threat model and the list of what is *not*
+protected is in [Share Links and Segments](share-links.md).
+
 ---
 
 ## Input Validation and SQL Injection Prevention
@@ -157,11 +169,11 @@ All HTTP responses include these OWASP-recommended security headers:
 |---|---|---|
 | `X-Content-Type-Options` | `nosniff` | Prevents MIME-type sniffing |
 | `X-Frame-Options` | `DENY` | Prevents clickjacking via iframe embedding |
-| `Referrer-Policy` | `strict-origin-when-cross-origin` | Limits referrer leakage |
+| `Referrer-Policy` | `strict-origin-when-cross-origin`; `no-referrer` on every [share link](share-links.md) response | Limits referrer leakage |
 | `Content-Security-Policy` | `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'` (HTML responses only) | Restricts scripts and resources to same origin |
 | `Permissions-Policy` | `geolocation=(), microphone=(), camera=(), interest-cohort=()` | Disables browser feature APIs |
 | `Strict-Transport-Security` | `max-age=31536000; includeSubDomains; preload` | Instructs browsers to enforce HTTPS for 1 year; eligible for preload lists |
-| `Cache-Control` | `no-store, no-cache, private` | JSON and CSV responses; prevents shared caches holding analytics data |
+| `Cache-Control` | `no-store, no-cache, private` (`no-store` on every share link response) | JSON and CSV responses; prevents shared caches holding analytics data |
 | `Retry-After` | `1` | Added to any `429` that lacks one |
 | `X-Request-ID` | UUID per request | Injected by the server, propagated through tracing spans for log correlation |
 
@@ -241,4 +253,7 @@ Every analytics endpoint runs under one semaphore of `MALLARD_MAX_CONCURRENT_QUE
 | SSRF through the webhook | URL from configuration only; https required; internal, link-local and metadata addresses refused at connect time; no redirects; DNS rebinding defeated by connecting to the validated address |
 | PII leakage | IPs hashed then discarded; per-period ID rotation; no cookies; no IP in the bundled Caddy log |
 | CSV injection | Formula character escaping in export output |
+| Leaked or guessed share link | 256-bit CSPRNG token, hash-only storage, revocation and expiry on the next request, per-link, global and per-client rate limits; a leaked link stays valid until revoked ([what is not protected](share-links.md#what-is-not-protected)) |
+| Share link used beyond its site, segment or read-only scope | Own router outside the key and session layers; `site_id` forced (another site is `403`); segment AND-ed into every query; no export or admin route is mounted |
+| Share token in logs, history or `Referer` | Carried in the URL fragment and a header, never in a URL the server sees; request-log redaction as a backstop; `no-referrer` and `no-store` on share responses |
 | Dependency vulnerabilities | `cargo-deny` in CI; `Cargo.lock` committed and enforced |

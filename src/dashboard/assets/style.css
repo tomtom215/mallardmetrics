@@ -705,3 +705,36 @@ th.numeric { text-align: right; }
 .subhead { font-size: 1rem; margin: 1.5rem 0 0.25rem; }
 .subhead { color: var(--text); }
 .placeholder-unavailable p:last-child { margin-bottom: 0; }
+
+/* ── Share links and saved segments ──────────────────────────────────── */
+
+/* The mark of a shared view: unmistakably not the admin's dashboard, and not an alarm. */
+.banner-shared { background: color-mix(in srgb, var(--accent) 10%, var(--surface)); border-color: color-mix(in srgb, var(--accent) 40%, var(--surface)); }
+.banner-shared strong:first-child { letter-spacing: 0.01em; }
+.inline-strong { font-weight: 600; }
+.banner-note { flex-basis: 100%; color: var(--text-muted); font-size: 0.8125rem; }
+/* A fixed value in a toolbar slot where the admin has a menu. */
+.field-static { font-weight: 600; padding: 0.4rem 0; overflow-wrap: anywhere; }
+.row-actions { display: flex; flex-wrap: wrap; gap: 0.375rem; }
+.cell-wrap { min-width: 12rem; overflow-wrap: anywhere; }
+.inline-edit { margin: 0; flex-wrap: nowrap; }
+.inline-edit label { min-width: 0; }
+.share-table th, .share-table td { white-space: nowrap; }
+.status { display: inline-block; padding: 0.0625rem 0.5rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600; border: 1px solid var(--border); background: var(--surface-alt); color: var(--text-muted); }
+.status-active { color: var(--success-fg); border-color: color-mix(in srgb, var(--success) 50%, var(--surface)); background: color-mix(in srgb, var(--success) 12%, var(--surface)); }
+.status-expired, .status-revoked { color: var(--text-muted); }
+.share-ended h2 { color: var(--text); }
+
+@media (max-width: 640px) {
+  .inline-edit { flex-wrap: wrap; }
+  /* One line per row; the table scrolls sideways instead of growing tall. */
+  .row-actions { flex-wrap: nowrap; }
+  .row-actions button { flex: 0 0 auto; white-space: nowrap; }
+  .cell-wrap { min-width: 8rem; }
+}
+.segment-menu { display: inline-flex; align-items: center; gap: 0.5rem; margin-right: 0.75rem; }
+.segment-menu select { max-width: 18rem; }
+@media (max-width: 640px) {
+  .segment-menu { flex: 1 1 100%; margin-right: 0; }
+  .segment-menu select { flex: 1 1 auto; max-width: none; }
+}

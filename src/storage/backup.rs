@@ -31,7 +31,13 @@ use std::path::{Path, PathBuf};
 /// restored instance is unconfigured and claimable, without `api_keys.json`
 /// every API key stops working. The `extensions/` directory is left out: it is
 /// downloaded again on start.
-const STATE_FILES: &[&str] = &[".secret", "admin.json", "api_keys.json"];
+const STATE_FILES: &[&str] = &[
+    ".secret",
+    "admin.json",
+    "api_keys.json",
+    "share_links.json",
+    "segments.json",
+];
 
 /// File name of the copied database inside a backup directory.
 pub const BACKUP_DB_FILE: &str = "mallard.duckdb";

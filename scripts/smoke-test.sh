@@ -234,6 +234,57 @@ check backup_contents 'MANIFEST.json' "$(ls "$WORK/data/backups/smoke")"
 check backup_has_database 'mallard.duckdb' "$(ls "$WORK/data/backups/smoke")"
 check backup_is_not_overwritten '409' "$(code -b "$COOKIE_JAR" -X POST "$BASE/api/admin/backup?name=smoke")"
 check backup_rejects_a_path '400' "$(code -b "$COOKIE_JAR" -X POST "$BASE/api/admin/backup?name=..")"
+# ── Share links and saved segments ────────────────────────────────────────
+# A share link is a public credential, so it is checked end to end against the
+# assembled binary: confinement, headers, what reaches the disk and the log.
+check share_admin_unauth     '401' "$(code "$BASE/api/share-links")"
+check segments_list_unauth   '401' "$(code "$BASE/api/segments?site_id=$SITE")"
+SEGMENT="$(curl -sS -b "$COOKIE_JAR" -X POST "$BASE/api/segments" \
+  -H 'Content-Type: application/json' \
+  -d "{\"site_id\":\"$SITE\",\"name\":\"Chrome\",\"filters\":\"browsers==Chrome\"}")"
+check segment_created        '"filters":"browsers==Chrome"' "$SEGMENT"
+SEGMENT_ID="$(printf '%s' "$SEGMENT" | sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p')"
+check segment_listed         'Chrome' "$(curl -sS -b "$COOKIE_JAR" "$BASE/api/segments?site_id=$SITE")"
+check segment_rejects_junk   '400' \
+  "$(code -b "$COOKIE_JAR" -X POST "$BASE/api/segments" -H 'Content-Type: application/json' \
+      -d "{\"site_id\":\"$SITE\",\"name\":\"bad\",\"filters\":\"entry-pages==/\"}")"
+
+LINK="$(curl -sS -b "$COOKIE_JAR" -X POST "$BASE/api/share-links" -H 'Content-Type: application/json' \
+  -d "{\"label\":\"smoke\",\"site_id\":\"$SITE\",\"segment_id\":\"$SEGMENT_ID\",\"expires_in_days\":7}")"
+check share_created          '"token":"ms_[0-9a-f]{64}"' "$LINK"
+TOKEN="$(printf '%s' "$LINK" | sed -n 's/.*"token":"\(ms_[0-9a-f]*\)".*/\1/p')"
+LINK_ID="$(printf '%s' "$LINK" | sed -n 's/.*"id":"\([0-9a-f]*\)".*/\1/p')"
+TOKEN_BODY="${TOKEN#ms_}"
+
+viewer() { curl -sS -H "X-Share-Token: $TOKEN" "$@"; }
+check share_session          '"segment":"Chrome"' "$(viewer "$BASE/api/shared/session")"
+check share_view             '"unique_visitors":1' "$(viewer "$BASE/api/shared/stats/main?$Q")"
+check share_view_site_filled '"unique_visitors":1' "$(viewer "$BASE/api/shared/stats/main?period=7d")"
+check share_other_site       '403' "$(code -H "X-Share-Token: $TOKEN" "$BASE/api/shared/stats/main?site_id=other.test&period=7d")"
+check share_segment_holds    '"total_pageviews":0' \
+  "$(viewer "$BASE/api/shared/stats/main?$Q&filters=browsers%21%3DChrome")"
+check share_no_export        '404' "$(code -H "X-Share-Token: $TOKEN" "$BASE/api/shared/stats/export?$Q&kind=raw")"
+check share_no_sites         '404' "$(code -H "X-Share-Token: $TOKEN" "$BASE/api/shared/sites")"
+check share_is_not_a_key     '401' "$(code -H "X-Share-Token: $TOKEN" "$BASE/api/stats/main?$Q")"
+check share_is_not_a_bearer  '401' "$(code -H "Authorization: Bearer $TOKEN" "$BASE/api/stats/main?$Q")"
+check share_is_not_admin     '401' "$(code -H "X-Share-Token: $TOKEN" "$BASE/api/share-links")"
+check share_post_refused     '405' "$(code -X POST -H "X-Share-Token: $TOKEN" "$BASE/api/shared/stats/main?$Q")"
+check share_no_token         '401' "$(code "$BASE/api/shared/stats/main?$Q")"
+check share_bad_token        '401' "$(code -H 'X-Share-Token: ms_0000' "$BASE/api/shared/stats/main?$Q")"
+SHARE_HEADERS="$(curl -sS -D - -o /dev/null -H "X-Share-Token: $TOKEN" "$BASE/api/shared/stats/main?$Q")"
+check share_no_referrer      'referrer-policy: no-referrer' "$(printf '%s' "$SHARE_HEADERS" | tr 'A-Z' 'a-z')"
+check share_no_store         'cache-control: .*no-store' "$(printf '%s' "$SHARE_HEADERS" | tr 'A-Z' 'a-z')"
+SHARE_LISTING="$(curl -sS -b "$COOKIE_JAR" "$BASE/api/share-links")"
+check share_listed           '"label":"smoke"' "$SHARE_LISTING"
+absent share_listing_has_no_token "$TOKEN_BODY" "$SHARE_LISTING"
+absent share_listing_has_no_hash  'token_hash|"token"' "$SHARE_LISTING"
+check share_file_mode        '^600$' "$(stat -c '%a' "$WORK/data/share_links.json")"
+absent share_file_has_no_token "$TOKEN_BODY" "$(cat "$WORK/data/share_links.json")"
+check share_dashboard_is_static '<div id="app">' "$(curl -sS "$BASE/")"
+# A token pasted into a URL by mistake must not reach the log.
+code "$BASE/s/$TOKEN" >/dev/null
+code "$BASE/api/shared/stats/main?$Q&t=$TOKEN" >/dev/null
+
 check keys_unauthed_after_setup '401' "$(code "$BASE/api/keys")"
 check login_wrong_password '401' \
   "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE/api/auth/login" \
@@ -274,6 +325,8 @@ if grep -qiE '\bERROR\b|panicked' "$WORK/server.log"; then
   grep -iE '\bERROR\b|panicked' "$WORK/server.log" | head -10
   fail=$((fail + 1))
 fi
+
+absent share_token_not_in_log "$TOKEN_BODY" "$(cat "$WORK/server.log")"
 
 # ── The admin password must survive a restart ─────────────────────────────
 # It used to live only in memory, so a restart put the instance back into
@@ -319,6 +372,13 @@ else
   check reads_protected_after_restart '401' "$(code "$BASE/api/stats/main?$Q")"
   check data_survived_restart '"unique_visitors":1' \
     "$(curl -sS -b "$JAR2" "$BASE/api/stats/main?$Q")"
+  # A share link, its segment and its revocation are state too.
+  check share_survives_restart '"unique_visitors":1' \
+    "$(curl -sS -H "X-Share-Token: $TOKEN" "$BASE/api/shared/stats/main?$Q")"
+  check share_revoke '200' "$(code -b "$JAR2" -X DELETE "$BASE/api/share-links/$LINK_ID")"
+  check share_revoked_at_once '401' \
+    "$(code -H "X-Share-Token: $TOKEN" "$BASE/api/shared/stats/main?$Q")"
+  absent share_token_not_in_log_after_restart "$TOKEN_BODY" "$(cat "$WORK/server2.log")"
 fi
 
 echo

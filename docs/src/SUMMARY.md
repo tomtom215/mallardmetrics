@@ -25,6 +25,7 @@
 
 - [Architecture](architecture.md)
 - [Security](security.md)
+- [Share Links and Segments](share-links.md)
 - [Privacy and GDPR](privacy-gdpr.md)
 - [Behavioral Analytics](behavioral-analytics.md)
 

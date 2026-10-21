@@ -70,10 +70,10 @@ if (!failed) console.log(`${FILE}: every this.<method>() call resolves`);
 // the browser refuses to run app.js at all, and nothing but a browser notices.
 const dir = dirname(resolve(FILE));
 const modules = {};
-for (const name of ['format', 'api']) {
+for (const name of ['format', 'api', 'share']) {
   modules[name] = await import(pathToFileURL(resolve(dir, `${name}.js`)).href);
 }
-for (const m of source.matchAll(/import\s*\{([^}]*)\}\s*from\s*'\/(format|api)\.js'/g)) {
+for (const m of source.matchAll(/import\s*\{([^}]*)\}\s*from\s*'\/(format|api|share)\.js'/g)) {
   for (const raw of m[1].split(',')) {
     const imported = raw.trim().split(/\s+as\s+/)[0];
     if (imported && !(imported in modules[m[2]])) {
@@ -89,6 +89,7 @@ for (const m of source.matchAll(/import\s*\{([^}]*)\}\s*from\s*'\/(format|api)\.
 // decide what a user is told are asserted here instead of eyeballed.
 const F = modules.format;
 const A = modules.api;
+const SH = modules.share;
 const checks = [];
 const check = (name, fn) => checks.push([name, fn]);
 
@@ -301,6 +302,89 @@ check('the client retries 429, caps concurrency and classifies results', async (
   assert.equal((await second).kind, 'aborted');
   assert.equal((await first).kind, 'ok');
   assert.equal((await third).kind, 'ok', 'a cancelled request must not stall the queue');
+});
+
+// ── Share links ────────────────────────────────────────────────────────────
+//
+// The token is a credential held in the browser; these rules keep it out of
+// every place it must not go, and keep a shared view from asking for anything a
+// viewer may not have. (The server enforces both again; this is the first line.)
+const TOKEN = `ms_${'ab12'.repeat(16)}`;
+
+check('a share token is read only from a well-formed fragment', () => {
+  assert.equal(SH.readShareToken(`#share=${TOKEN}`), TOKEN);
+  assert.equal(SH.readShareToken(`share=${TOKEN}`), TOKEN);
+  assert.equal(SH.readShareToken(`#x=1&share=${TOKEN}`), TOKEN);
+  for (const bad of ['', '#', '#share=', '#share=ms_', `#share=${TOKEN}0`, `#share=${TOKEN.slice(0, -1)}`,
+    `#share=${TOKEN.toUpperCase()}`, `#share=mm_${'ab12'.repeat(16)}`, `#share=${TOKEN}%0a`, '#share=<script>', undefined, null]) {
+    assert.equal(SH.readShareToken(bad), null, String(bad));
+  }
+  // A malformed token still means "this is a share link", so the page says the
+  // link is broken instead of showing the admin login.
+  assert.equal(SH.wantsSharedView('#share=nonsense'), true);
+  assert.equal(SH.wantsSharedView(''), false);
+  assert.equal(SH.wantsSharedView('#other=share='), false);
+  assert.equal(SH.shareLink('https://a.example', TOKEN), `https://a.example/#share=${TOKEN}`);
+});
+
+check('a shared view may fetch only read-only reports, never exports or admin routes', () => {
+  assert.equal(SH.sharedUrl('/api/stats/main?site_id=a&period=7d'), '/api/shared/stats/main?site_id=a&period=7d');
+  assert.equal(SH.sharedUrl('/api/stats/breakdown/pages?site_id=a'), '/api/shared/stats/breakdown/pages?site_id=a');
+  assert.equal(SH.sharedUrl('/api/shared/session'), '/api/shared/session');
+  for (const refused of ['/api/stats/export?kind=raw', '/api/stats/export', '/api/sites', '/api/keys', '/api/segments?site_id=a',
+    '/api/share-links', '/api/admin/backup', '/api/gdpr/erase', '/api/auth/logout', '/', '/app.js', 'https://evil.example/api/stats/main']) {
+    assert.equal(SH.sharedUrl(refused), null, refused);
+  }
+});
+
+check('the share fetch sends the token as a header only, with no cookies and no referrer', async () => {
+  const seen = [];
+  const f = SH.makeShareFetch(TOKEN, async (url, options) => { seen.push([url, options]); return { ok: true }; });
+  await f('/api/stats/main?site_id=a');
+  const [url, options] = seen[0];
+  assert.equal(url, '/api/shared/stats/main?site_id=a');
+  assert.equal(options.headers['X-Share-Token'], TOKEN);
+  assert.equal(options.credentials, 'omit');
+  assert.equal(options.referrerPolicy, 'no-referrer');
+  assert.doesNotMatch(url, /ms_/, 'the token is never in the URL');
+  for (const [target, opts] of [['/api/stats/export?kind=raw'], ['/api/keys'], ['/api/sites'], ['/api/stats/main', { method: 'POST' }], ['/api/stats/main', { method: 'DELETE' }]]) {
+    await assert.rejects(() => f(target, opts), /cannot make this request/, `${target} ${opts?.method ?? ''}`);
+  }
+  assert.equal(seen.length, 1, 'refused requests never reach fetch');
+  // Existing headers survive.
+  await f('/api/stats/main', { headers: { Accept: 'application/json' } });
+  assert.equal(seen[1][1].headers.Accept, 'application/json');
+});
+
+check('a shared view that the server refuses is reported as an ended link, not a fault', async () => {
+  const res = (status, body) => ({ status, ok: status < 400, headers: { get: () => null }, json: async () => body });
+  const api = new A.Api({ fetchImpl: SH.makeShareFetch(TOKEN, async () => res(401, { code: 'share_link_invalid', error: 'This share link is invalid, has expired, or was revoked.' })) });
+  assert.equal((await api.get('/api/shared/session')).kind, 'unauthorized');
+  const forbidden = new A.Api({ fetchImpl: SH.makeShareFetch(TOKEN, async () => res(403, { code: 'share_site_forbidden', error: 'This share link only shows its own site.' })) });
+  const refused = await forbidden.get('/api/stats/main?site_id=other');
+  assert.equal(refused.kind, 'error');
+  assert.equal(refused.code, 'share_site_forbidden');
+  assert.equal(A.errorCode({ code: 'share_link_invalid' }), 'share_link_invalid');
+});
+
+check('an unauthorized response body is drained, so the request finishes', async () => {
+  // An unread body keeps the request open in the browser, so the page never
+  // reaches network idle. Found when a revoked share link's page would not settle.
+  let drained = false;
+  const res = { status: 401, ok: false, headers: { get: () => null }, text: async () => { drained = true; return ''; }, json: async () => ({}) };
+  assert.equal((await new A.Api({ fetchImpl: async () => res }).get('/x')).kind, 'unauthorized');
+  assert.equal(drained, true);
+});
+
+check('link expiry choices map to the API', () => {
+  assert.equal(SH.expiryDays('7'), 7);
+  assert.equal(SH.expiryDays('365'), 365);
+  assert.equal(SH.expiryDays('never'), null);
+  assert.equal(SH.expiryDays('bogus'), null);
+  assert.ok(SH.EXPIRY_CHOICES.every((c) => c.days === null || (c.days >= 1 && c.days <= 730)));
+  assert.equal(SH.linkStatusLabel('active'), 'Active');
+  assert.equal(SH.linkStatusLabel('revoked'), 'Revoked');
+  assert.equal(SH.linkStatusLabel('whatever'), 'Unknown');
 });
 
 for (const [name, fn] of checks) {

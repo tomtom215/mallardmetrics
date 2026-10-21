@@ -36,6 +36,14 @@ http://your-instance.com
 | `GET` | `/api/stats/retention` | read | [Behavioral](../behavioral-analytics.md#retention-cohorts) |
 | `GET` | `/api/stats/sequences` | read | [Behavioral](../behavioral-analytics.md#sequence-matching) |
 | `GET` | `/api/stats/flow` | read | [Behavioral](../behavioral-analytics.md#flow) |
+| `GET` | `/api/segments` | read | [Share Links](../share-links.md#segments) |
+| `POST` | `/api/segments` | admin | [Share Links](../share-links.md#segments) |
+| `POST` | `/api/segments/{id}` | admin | [Share Links](../share-links.md#segments) |
+| `DELETE` | `/api/segments/{id}` | admin | [Share Links](../share-links.md#segments) |
+| `POST` | `/api/share-links` | admin | [Share Links](../share-links.md#post-apishare-links) |
+| `GET` | `/api/share-links` | admin | [Share Links](../share-links.md#get-apishare-links) |
+| `DELETE` | `/api/share-links/{id}` | admin | [Share Links](../share-links.md#delete-apishare-linksid) |
+| `GET` | `/api/shared/session`, `/api/shared/stats/*` | share token | [Share Links](../share-links.md#how-a-request-is-confined) |
 | `POST` | `/api/keys` | admin | [Authentication](auth.md#post-apikeys) |
 | `GET` | `/api/keys` | admin | [Authentication](auth.md#get-apikeys) |
 | `DELETE` | `/api/keys/{key_hash}` | admin | [Authentication](auth.md#delete-apikeyskey_hash) |
@@ -54,6 +62,9 @@ http://your-instance.com
   `X-API-Key: mm_...`. A `ReadOnly` or `Admin` key works. **Before an admin
   password exists, read routes are open** (a deliberate "public dashboard"
   mode); the dashboard shows a warning banner in that state.
+- **share token** — an `X-Share-Token: ms_...` header, accepted **only** by the
+  `/api/shared/` routes (read-only reports for one site). It is not an API key:
+  presented anywhere else it is a `401`. See [Share Links](../share-links.md).
 - **admin** — a session, or an `Admin`-scoped key. A `ReadOnly` key gets `403`.
   Before an admin password exists these routes answer `401` to everyone.
   Session-authenticated admin requests are also checked against
@@ -88,7 +99,9 @@ The `/api/stats/*`, `/api/sites` and `/api/gdpr/erase` handlers return
 | `too_many_requests` | 429 | No query slot became free within 10 s. Carries `Retry-After: 1`. |
 | `behavioral_unavailable` | 503 | The `behavioral` extension is not loaded. Fix: the install (see [Troubleshooting](../troubleshooting.md#behavioral-endpoints-answer-503)). |
 | `session_data_unavailable` | 503 | `gdpr_mode`/`round_timestamps` stores timestamps rounded to the hour, so sessions, funnels, sequences, flow and entry/exit pages cannot be computed. Not an install problem: the fix is the privacy setting. |
-| `conflict` | 409 | The request conflicts with existing state, for example a backup of that name exists. |
+| `conflict` | 409 | The request conflicts with existing state, for example a backup of that name exists, a segment name is taken or a cap (active share links, segments) is reached. |
+| `share_link_invalid` | 401 | `/api/shared/` routes only: no token, or an unknown, malformed, revoked or expired one. All look alike on purpose. |
+| `share_site_forbidden` | 403 | `/api/shared/` routes only: `site_id` names a site other than the link's. |
 | `query_timeout` | 504 | The statement overran its 20 s deadline and was interrupted. Use a shorter range or fewer filters. |
 
 Not every error body is JSON. These are produced before or outside the handlers
@@ -114,11 +127,11 @@ Branch on the status first and use `code` when it is present.
 | 201 | API key created. |
 | 202 | Event accepted (or silently dropped as bot traffic). |
 | 400 | Invalid input. |
-| 401 | Not authenticated; any admin route before setup. |
-| 403 | Origin not allowed (ingest), read-only key on an admin route, CSRF mismatch. |
+| 401 | Not authenticated; any admin route before setup; an invalid share token. |
+| 403 | Origin not allowed (ingest), read-only key on an admin route, CSRF mismatch, a share link asked for another site. |
 | 404 | Unknown key hash. |
 | 408 | 30-second request timeout. |
-| 409 | `POST /api/auth/setup` when a password already exists. |
+| 409 | `POST /api/auth/setup` when a password already exists; a taken segment name; a cap on share links or segments. |
 | 413 | Ingest body over 64 KB. |
 | 415 | JSON body without a JSON content type. |
 | 422 | JSON parsed but a field is missing or the wrong type. |

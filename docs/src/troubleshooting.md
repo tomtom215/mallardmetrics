@@ -232,3 +232,18 @@ password, change the environment variable and restart. Removing both the variabl
 and `admin.json` puts the instance back in first-run mode, where **the first
 visitor to reach `/api/auth/setup` can claim it**: do that only while it is not
 reachable.
+
+## A share link says "This link no longer works"
+
+The server answers `401 share_link_invalid` for every kind of failure, on
+purpose: the link was revoked, it expired, it was mistyped or cut off (a token is
+`ms_` and 64 hex digits, and the part after `#share=` is the whole secret), or the
+instance lost it. Check **Share links** in the admin dashboard for its status. A
+link also stops working when `share_links.json` could not be read at start: the
+file is moved to `share_links.json.corrupt-<time>` and the store starts empty (see
+[Share Links](share-links.md#lifetime-and-storage)); create the links again, or
+inspect the moved file. A link restored from an old backup is valid again even if
+you revoked it afterwards.
+
+`429` on a share link means its own rate limit (30 requests per second) or the
+instance-wide one (120 per second) was reached; the dashboard retries on its own.

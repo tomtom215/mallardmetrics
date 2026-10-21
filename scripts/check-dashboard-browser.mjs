@@ -37,6 +37,12 @@
 //   python3 scripts/seed-demo-data.py /tmp/mm-ui/mallard.duckdb   # then restart
 //   node scripts/check-dashboard-browser.mjs http://127.0.0.1:18333
 //
+// With --auth it also drives saved segments and share links end to end: create a
+// segment, apply it from the toolbar menu, make a link, open it in a fresh browser
+// context with no cookies, and assert the viewer's page is read-only (no admin
+// controls, no export, no site menu, no request outside /api/shared/, the token in
+// no request URL and in no storage), then revoke it and watch the page say so.
+//
 // Optional extra instances:
 //   --empty=URL     an instance with no events (checks the empty states)
 //   --nobeh=URL     an instance whose behavioral extension failed to load
@@ -732,6 +738,178 @@ if (AUTH && PASSWORD) {
   page.once('dialog', (d) => d.accept());
   await page.getByRole('button', { name: /^Revoke/ }).first().click();
   await ctx.close();
+}
+
+/* ── 5. Saved segments and share links ─────────────────────────────────── */
+
+if (AUTH && PASSWORD) {
+  const where = 'share';
+  const admin = await newPage();
+  // The 409 is the duplicate segment name the check provokes on purpose.
+  watch(admin.page, `${where}/admin`, { allow: (t) => /401/.test(t) || /409.*\/api\/segments|status of 409/.test(t) });
+  const page = admin.page;
+  await page.goto(AUTH, { waitUntil: 'load' });
+  await page.waitForSelector('input[type=password]');
+  await page.fill('input[type=password]', PASSWORD);
+  await page.click('button[type=submit]');
+  await page.waitForSelector('#main', { timeout: 15000 });
+  await loadEverything(page);
+
+  // Segments: save the filters on screen, then apply the segment from the menu.
+  if ((await page.locator('.bar-link').count()) === 0) {
+    fail(where, 'the instance has no breakdown rows to filter on: seed some events');
+  } else {
+    await page.locator('.bar-link').first().click();
+    await page.waitForSelector('.filter-chip');
+    await page.getByRole('button', { name: 'Segments' }).click();
+    await page.waitForSelector('#segments');
+    if (!(await page.getByRole('button', { name: 'Save current filters' }).isDisabled())) fail(where, 'Save current filters is enabled without a name');
+    await page.getByLabel('Name', { exact: true }).fill('Browser check');
+    await page.getByRole('button', { name: 'Save current filters' }).click();
+    await page.waitForSelector('#segments tbody tr', { timeout: 10000 }).catch(() => fail(where, 'a saved segment is not listed'));
+    // A duplicate name is explained, not swallowed.
+    await page.getByLabel('Name', { exact: true }).fill('browser CHECK');
+    await page.getByRole('button', { name: 'Save current filters' }).click();
+    await page.waitForSelector('#segments [role=alert]', { timeout: 10000 }).catch(() => fail(where, 'a duplicate segment name was not explained'));
+    await loadEverything(page);
+    await runAxe(page, `${where}/segments-panel`);
+    await page.getByRole('button', { name: 'Close' }).first().click();
+
+    // The menu lists it, shows it as selected, and clearing returns to all traffic.
+    await page.waitForSelector('.segment-menu select option:text("Browser check")', { state: 'attached', timeout: 10000 }).catch(() => fail(where, 'the Segment menu does not list the new segment'));
+    const menu = page.locator('.segment-menu select');
+    if ((await menu.locator('option:checked').innerText()) !== 'Browser check') fail(where, 'the menu does not show the active segment as selected');
+    await page.getByRole('button', { name: 'Clear all' }).click();
+    await page.waitForFunction(() => !document.querySelector('.filter-chip'));
+    await menu.selectOption({ label: 'Browser check' });
+    await page.waitForSelector('.filter-chip', { timeout: 10000 }).catch(() => fail(where, 'choosing a segment did not apply its filters'));
+    if (!(await page.evaluate(() => location.search)).includes('filters=')) fail(where, 'the applied segment is not in the URL');
+    await menu.selectOption({ index: 0 });
+    await page.waitForFunction(() => !document.querySelector('.filter-chip'));
+  }
+
+  // Share panel: create a link limited to the segment.
+  await page.getByRole('button', { name: 'Share links' }).click();
+  await page.waitForSelector('#share');
+  await page.getByLabel('Label (private)').fill('browser check link');
+  await page.locator('#share').getByLabel('Segment').selectOption({ label: 'Browser check' }).catch(() => notes.push('[share] no segment to attach'));
+  await page.getByRole('button', { name: 'Create link' }).click();
+  await page.waitForSelector('.banner-key .key-value', { timeout: 10000 }).catch(() => fail(where, 'creating a link showed no link'));
+  const link = (await page.locator('.banner-key .key-value').innerText()).trim();
+  if (!/\/#share=ms_[0-9a-f]{64}$/.test(link)) fail(where, `the link has the wrong shape: ${link.slice(0, 60)}`);
+  const token = link.split('#share=')[1] ?? '';
+  if (!/only once|not shown again/i.test(await page.locator('.banner-key').innerText())) fail(where, 'the one-time warning is missing');
+  await runAxe(page, `${where}/share-panel`);
+  await page.getByRole('button', { name: 'Done' }).click();
+  const row = await page.locator('#share tbody tr', { hasText: 'browser check link' }).first().innerText();
+  if (!/Active/.test(row)) fail(where, `the new link is not listed as active: ${row}`);
+  if (row.includes(token.slice(3, 20))) fail(where, 'the token is shown in the link list');
+  if ((await page.locator('body').innerHTML()).includes(token)) fail(where, 'the token is still in the page after Done');
+
+  // The viewer: no cookies, a fresh context.
+  const seenUrls = [];
+  const viewer = await newPage({ viewport: VIEWPORTS.desktop });
+  const vwhere = `${where}/viewer`;
+  watch(viewer.page, vwhere, { allow: () => false });
+  viewer.page.on('request', (r) => seenUrls.push(r.url()));
+  await viewer.page.goto(link, { waitUntil: 'load' });
+  await loadEverything(viewer.page);
+  const vtext = await viewer.page.locator('body').innerText();
+  if (!/Shared view/.test(vtext) || !/Segment:\s*Browser check/.test(vtext)) fail(vwhere, 'the Shared view banner does not name the segment');
+  for (const name of ['Install snippet', 'API keys', 'Share links', 'Segments', 'Sign out', 'Daily CSV', 'Raw CSV', 'Raw JSON', 'Create backup']) {
+    if ((await viewer.page.getByRole('button', { name }).count()) > 0) fail(vwhere, `an admin control is visible: ${name}`);
+  }
+  if ((await viewer.page.locator('.toolbar select').count()) > 0 && (await viewer.page.locator('.toolbar label:has-text("Site") select').count()) > 0) fail(vwhere, 'the site menu is visible');
+  if ((await viewer.page.locator('.segment-menu').count()) > 0) fail(vwhere, 'the segment menu is visible to a viewer');
+  if (/mallard\.js|data-domain/.test(vtext)) fail(vwhere, 'the install snippet is visible');
+  if (!(await viewer.page.locator('.metric-value').first().innerText()).match(/\d/)) fail(vwhere, 'the shared view shows no headline figures');
+  const apiUrls = seenUrls.filter((u) => new URL(u).pathname.startsWith('/api/'));
+  for (const u of apiUrls) {
+    const path = new URL(u).pathname;
+    if (!path.startsWith('/api/shared/')) fail(vwhere, `the viewer asked for ${path}`);
+    if (u.includes(token) || u.includes(token.slice(3))) fail(vwhere, 'the token is in a request URL');
+  }
+  if (apiUrls.length < 5) fail(vwhere, `only ${apiUrls.length} API requests were made`);
+  if (seenUrls.some((u) => u.includes('export'))) fail(vwhere, 'the viewer requested an export');
+  if (!(await viewer.page.evaluate(() => location.hash)).includes(token)) fail(vwhere, 'the address bar lost the link, so a reload would fail');
+  const stored = await viewer.page.evaluate(() => JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage), document.cookie]));
+  if (stored.includes(token.slice(3, 30))) fail(vwhere, 'the token was written to storage or a cookie');
+  const referrer = await viewer.page.evaluate(() => document.querySelector('meta[name=referrer]')?.content);
+  if (referrer !== 'no-referrer') fail(vwhere, 'the page does not ask for no-referrer');
+  // The viewer's own filters narrow the view and keep the link in the address bar.
+  if ((await viewer.page.locator('.bar-link').count()) > 0) {
+    await viewer.page.locator('.bar-link').first().click();
+    await viewer.page.waitForSelector('.filter-chip');
+    const afterFilter = await viewer.page.evaluate(() => ({ hash: location.hash, search: location.search }));
+    if (!afterFilter.hash.includes(token)) fail(vwhere, 'adding a filter dropped the link from the address bar');
+    if (!afterFilter.search.includes('filters=')) fail(vwhere, 'the viewer\'s filter is not in the URL');
+    await viewer.page.locator('.filter-clear').click();
+    await viewer.page.waitForFunction(() => !document.querySelector('.filter-chip'));
+  }
+  // The same browser cannot use the token to reach anything else.
+  // Through the context's request client, so the expected refusals are not logged as page errors.
+  const probes = {};
+  for (const [name, url] of [
+    ['export', '/api/stats/export?site_id=x&kind=raw'],
+    ['sites', '/api/sites'],
+    ['keys', '/api/keys'],
+    ['shared-export', '/api/shared/stats/export?kind=raw'],
+  ]) probes[name] = (await viewer.ctx.request.get(`${AUTH}${url}`, { headers: { 'X-Share-Token': token } })).status();
+  for (const [name, status] of Object.entries(probes)) if (![401, 404].includes(status)) fail(vwhere, `${name} answered ${status} to a share token`);
+  // Settle first: axe on a panel that is dimmed mid-refresh measures the dimming.
+  await loadEverything(viewer.page);
+  await assertCleanContent(viewer.page, vwhere);
+  await assertNoOverflow(viewer.page, vwhere);
+  await runAxe(viewer.page, vwhere);
+
+  // The three widths and both themes, for the screenshots and the layout.
+  for (const theme of ['light', 'dark']) {
+    for (const [name, viewport] of Object.entries(VIEWPORTS)) {
+      const v = await newPage({ viewport, theme });
+      const w = `${where}/viewer/${name}/${theme}`;
+      watch(v.page, w);
+      await v.page.goto(link, { waitUntil: 'load' });
+      await loadEverything(v.page);
+      await assertCleanContent(v.page, w);
+      await assertNoOverflow(v.page, w);
+      await runAxe(v.page, w);
+      await checkKeyboard(v.page, w);
+      await v.ctx.close();
+    }
+  }
+
+  // Revoking is immediate: the open page learns on its next request.
+  page.once('dialog', (d) => d.accept());
+  await page.getByRole('button', { name: 'Revoke browser check link' }).first().click();
+  await page.waitForFunction(() => /Revoked/.test(document.getElementById('share')?.innerText ?? ''), null, { timeout: 10000 }).catch(() => fail(where, 'the revoked link is not shown as revoked'));
+  await runAxe(page, `${where}/share-panel-revoked`);
+  viewer.page.removeAllListeners('response');
+  viewer.page.removeAllListeners('console');
+  await viewer.page.getByRole('button', { name: 'Refresh' }).click();
+  await viewer.page.waitForSelector('.share-ended', { timeout: 20000 }).catch(() => fail(vwhere, 'the open page did not notice the revocation'));
+  const ended = await viewer.page.locator('body').innerText();
+  if (!/no longer works/i.test(ended)) fail(vwhere, 'a revoked link is not explained');
+  if (await viewer.page.locator('input[type=password]').count()) fail(vwhere, 'a revoked link shows the admin sign-in form');
+  await runAxe(viewer.page, `${vwhere}/ended`);
+  await viewer.ctx.close();
+
+  // A mangled link says so rather than offering a login.
+  const broken = await newPage();
+  watch(broken.page, `${where}/broken`, { allow: (t) => /401/.test(t) });
+  await broken.page.goto(`${AUTH}/#share=ms_not-a-real-token`, { waitUntil: 'load' });
+  await broken.page.waitForSelector('.share-ended', { timeout: 10000 }).catch(() => fail(`${where}/broken`, 'a malformed link is not explained'));
+  if (await broken.page.locator('input[type=password]').count()) fail(`${where}/broken`, 'a malformed link shows the sign-in form');
+  await runAxe(broken.page, `${where}/broken`);
+  await broken.ctx.close();
+
+  // Clean up the segment.
+  await page.getByRole('button', { name: 'Close' }).first().click();
+  await page.getByRole('button', { name: 'Segments' }).click();
+  await page.waitForSelector('#segments tbody tr');
+  page.once('dialog', (d) => d.accept());
+  await page.getByRole('button', { name: 'Delete Browser check' }).click();
+  await page.waitForFunction(() => !/Browser check/.test(document.getElementById('segments')?.innerText ?? ''), null, { timeout: 10000 }).catch(() => fail(where, 'the deleted segment is still listed'));
+  await admin.ctx.close();
 }
 
 await browser.close();

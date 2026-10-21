@@ -320,4 +320,7 @@ image is glibc and there is no musl build. See
 | `api/stats.rs` | All analytics and erasure handlers, query execution (slots, deadline) |
 | `api/errors.rs` | `ApiError`, status and `code` mapping |
 | `api/auth.rs` | Sessions, API keys, admin password, CSRF, lockout, middleware |
+| `api/share.rs` | Share links: token store, the gate that confines a share request, `/api/shared/` routes, admin endpoints, log redaction |
+| `api/segments.rs` | Saved segments: store, validation by the filter parser, admin endpoints |
+| `api/persist.rs` | `JsonList`, the atomic, owner-only JSON store behind share links and segments; OS-CSPRNG `random_hex` |
 | `dashboard/` | Embedded SPA assets (`app.js`, `api.js`, `format.js`, `theme.js`, `style.css`) and the tracker route |

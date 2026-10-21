@@ -25,7 +25,9 @@ data/
 ├── extensions/               the behavioral extension (v1.5.6/linux_amd64/...)
 ├── .secret                   visitor-ID secret, mode 0600 (only if MALLARD_SECRET is unset)
 ├── admin.json                Argon2id hash set through /api/auth/setup, mode 0600
-└── api_keys.json             SHA-256 hashes of API keys
+├── api_keys.json             SHA-256 hashes of API keys
+├── share_links.json          share link hashes, labels, segments, expiry, mode 0600
+└── segments.json             saved segments, mode 0600
 ```
 
 `.mN` in a file name is the compaction level. Files are plain Parquet and can be

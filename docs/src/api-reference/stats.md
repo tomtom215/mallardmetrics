@@ -16,6 +16,12 @@ statement is interrupted after **20 seconds** and answers `504`
 (`code: query_timeout`). Both budgets sit inside the 30-second request timeout
 (`408`). Cache hits do not use a slot.
 
+Most reports are also served read-only under `/api/shared/stats/` to a holder of
+a [share link](../share-links.md), authenticated by an `X-Share-Token` header
+instead of a key. `site_id` is then forced to the link's site and the link's
+segment is added to `filters`; exports, `/api/sites` and everything else on this
+page are not available that way.
+
 Examples on this page were run against a seeded 0.2.0 binary. Authenticate with
 `-H "X-API-Key: mm_..."` or a session cookie.
 
@@ -53,7 +59,8 @@ filters=utm-campaigns==spring,sale-2024
 ```
 
 Each condition is `dimension==value` or `dimension!=value`, and conditions are
-joined by `;`. All conditions must hold, so the set is an AND.
+joined by `;`. All conditions must hold, so the set is an AND. A named set of
+conditions can be kept on the server as a [saved segment](../share-links.md#saved-segments).
 
 `;` separates conditions and `,` does not: values legitimately contain commas,
 as `utm-campaigns==spring,sale-2024` above shows.

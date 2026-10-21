@@ -622,6 +622,7 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
         filter_bots: config.filter_bots,
         sessions: SessionStore::with_capacity(config.session_ttl_secs, config.max_sessions),
         api_keys: ApiKeyStore::load_from_disk(config.data_dir.join("api_keys.json")),
+        share: mallard_metrics::api::share::ShareState::load(&config.data_dir),
         admin_password: AdminPasswordStore::load_from_disk(
             config.data_dir.join("admin.json"),
             load_admin_password(),

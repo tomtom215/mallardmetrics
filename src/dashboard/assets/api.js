@@ -15,7 +15,8 @@
  * Failures are told apart by the `code` the server puts in every error body
  * (`bad_request`, `unauthorized`, `not_found`, `internal_error`,
  * `too_many_requests`, `behavioral_unavailable`, `session_data_unavailable`,
- * `query_timeout`, `conflict`), never by
+ * `query_timeout`, `conflict`, and for a shared view `share_link_invalid` and
+ * `share_site_forbidden`), never by
  * matching the wording of its message, which is written for people and free to
  * change. A response with no code at all (a proxy's HTML page, an older server)
  * is classified by its status alone.
@@ -64,6 +65,8 @@ export const ERROR_CODES = [
   'session_data_unavailable',
   'query_timeout',
   'conflict',
+  'share_link_invalid',
+  'share_site_forbidden',
 ];
 
 export function errorCode(body) {
@@ -171,7 +174,13 @@ export class Api {
     try {
       return await this.slot(async () => {
         const res = await this.fetchWithRetry(url, { headers: { Accept: 'application/json' } }, signal);
-        if (res.status === 401) return { kind: 'unauthorized' };
+        if (res.status === 401) {
+          // Drain the body: an unread one keeps the request "in flight" in the
+          // browser (and the page never reaches network idle) until it is
+          // garbage collected.
+          if (typeof res.text === 'function') await res.text().catch(() => {});
+          return { kind: 'unauthorized' };
+        }
 
         let body = null;
         let parsed = false;

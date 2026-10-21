@@ -152,6 +152,17 @@ Revokes the key with that SHA-256 hex hash.
 
 ---
 
+## Share tokens are not API keys
+
+A [share link](../share-links.md) carries a token (`ms_...`) in the
+`X-Share-Token` header. It opens only the read-only `/api/shared/` routes for
+one site. Offered as a key, a bearer token, a cookie or on any other route, it is
+refused (`401`), and an API key is likewise refused on the share routes. Share
+links are created and revoked with the admin endpoints in
+[Share Links](../share-links.md#api).
+
+---
+
 ## `POST /api/admin/backup`
 
 Admin scope. Snapshots both storage tiers while serving; see

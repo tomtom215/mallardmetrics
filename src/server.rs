@@ -1,6 +1,7 @@
 use crate::api::admin;
 use crate::api::auth;
 use crate::api::stats;
+use crate::api::{segments, share};
 use crate::dashboard;
 use crate::ingest::handler::{AppState, ingest_event};
 use axum::Router;
@@ -116,6 +117,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/keys/{key_hash}", delete(auth::revoke_api_key_handler))
         .route("/gdpr/erase", delete(stats::gdpr_erase))
         .route("/admin/backup", post(admin::create_backup))
+        .route("/share-links", post(share::create_share_link))
+        .route("/share-links", get(share::list_share_links))
+        .route("/share-links/{id}", delete(share::revoke_share_link))
+        .route("/segments", post(segments::create_segment))
+        // POST rather than PUT: the dashboard CORS policy allows GET, POST and
+        // DELETE only.
+        .route("/segments/{id}", post(segments::update_segment))
+        .route("/segments/{id}", delete(segments::delete_segment))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_admin_auth,
@@ -123,6 +132,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     let stats_routes = Router::new()
         .route("/sites", get(stats::list_sites))
+        .route("/segments", get(segments::list_segments))
         .route("/stats/main", get(stats::get_main_stats))
         .route("/stats/timeseries", get(stats::get_timeseries))
         .route("/stats/sessions", get(stats::get_sessions))
@@ -157,9 +167,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(ingestion_cors);
 
+    // Read-only, token-authorised, and deliberately outside `protected_routes`:
+    // a share token is not an API key and opens nothing listed there.
     let api_routes = Router::new()
         .merge(ingestion_routes)
         .merge(auth_routes)
+        .merge(share::view_routes(Arc::clone(&state)))
         .merge(protected_routes);
 
     Router::new()
@@ -187,7 +200,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(share::request_span))
         // Added last, so it is the outermost layer and sees the status the
         // client actually receives: a request the timeout layer converts into a
         // 408, or a body the compression layer rewrites, is counted as served.
@@ -208,10 +221,14 @@ async fn add_security_headers(mut response: Response) -> Response {
         HeaderValue::from_static("nosniff"),
     );
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    headers.insert(
-        "referrer-policy",
-        HeaderValue::from_static("strict-origin-when-cross-origin"),
-    );
+    // A response that set its own policy keeps it: share responses say
+    // `no-referrer`, which this must not weaken.
+    if !headers.contains_key("referrer-policy") {
+        headers.insert(
+            "referrer-policy",
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        );
+    }
     headers.insert(
         "permissions-policy",
         HeaderValue::from_static("geolocation=(), microphone=(), camera=(), interest-cohort=()"),
