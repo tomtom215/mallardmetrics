@@ -812,7 +812,7 @@ where
 
 /// Map a behavioral-extension query failure to a 503 rather than a 500.
 fn behavioral_error(state: &AppState, feature: &str, err: ApiError) -> ApiError {
-    if state.behavioral_extension_loaded {
+    if state.behavioral.is_loaded() {
         err
     } else {
         ApiError::behavioral_required(feature)
@@ -1101,7 +1101,7 @@ pub async fn get_breakdown(
 
     if dim.requires_behavioral() {
         require_exact_timestamps(&state, "Entry and exit page breakdowns")?;
-        if !state.behavioral_extension_loaded {
+        if !state.behavioral.is_loaded() {
             return Err(ApiError::behavioral_required(
                 "Entry and exit page breakdowns",
             ));
@@ -1411,7 +1411,7 @@ pub async fn get_funnel(
     let steps = parse_steps(&params.steps, funnel::MIN_STEPS, funnel::MAX_STEPS)?;
 
     require_exact_timestamps(&state, "Funnel analysis")?;
-    if !state.behavioral_extension_loaded {
+    if !state.behavioral.is_loaded() {
         return Err(ApiError::behavioral_required("Funnel analysis"));
     }
 
@@ -1493,7 +1493,7 @@ pub async fn get_retention(
         )));
     }
 
-    if !state.behavioral_extension_loaded {
+    if !state.behavioral.is_loaded() {
         return Err(ApiError::behavioral_required("Retention cohorts"));
     }
 
@@ -1588,7 +1588,7 @@ pub async fn get_sequences(
     )?;
 
     require_exact_timestamps(&state, "Sequence analysis")?;
-    if !state.behavioral_extension_loaded {
+    if !state.behavioral.is_loaded() {
         return Err(ApiError::behavioral_required("Sequence analysis"));
     }
 
@@ -1659,7 +1659,7 @@ pub async fn get_flow(
     })?;
 
     require_exact_timestamps(&state, "Flow analysis")?;
-    if !state.behavioral_extension_loaded {
+    if !state.behavioral.is_loaded() {
         return Err(ApiError::behavioral_required("Flow analysis"));
     }
 

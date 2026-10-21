@@ -14,7 +14,7 @@ use mallard_metrics::ingest::ratelimit::RateLimiter;
 use mallard_metrics::query::cache::QueryCache;
 use mallard_metrics::storage::parquet::ParquetStorage;
 use mallard_metrics::storage::{ReaderPool, TierLock};
-use mallard_metrics::{server, storage};
+use mallard_metrics::{query, server, storage};
 
 use duckdb::Connection;
 use parking_lot::Mutex;
@@ -368,6 +368,7 @@ fn init_tracing(log_format: &str) {
 struct Database {
     writer: Arc<Mutex<Connection>>,
     readers: ReaderPool,
+    /// Loaded on the writer and on every reader.
     behavioral_loaded: bool,
     behavioral_version: Option<String>,
 }
@@ -384,7 +385,7 @@ fn open_database(config: &Config, storage: &ParquetStorage) -> Result<Database, 
     apply_duckdb_settings(&conn, config)?;
     storage::migrations::run_migrations(&conn).map_err(|e| format!("migrations failed: {e}"))?;
 
-    let behavioral_loaded = match storage::schema::load_behavioral_extension(&conn) {
+    let writer_loaded = match storage::schema::load_behavioral_extension(&conn) {
         Ok(()) => {
             tracing::info!(
                 version = storage::schema::behavioral_version(&conn),
@@ -396,7 +397,9 @@ fn open_database(config: &Config, storage: &ParquetStorage) -> Result<Database, 
             tracing::warn!(
                 error = %e,
                 "Behavioral extension unavailable; funnels, retention, sessions, \
-                 sequences and flow analysis will report 503 until it loads"
+                 sequences and flow analysis will report 503 until it loads \
+                 (it is retried every {} s)",
+                query::extension::RETRY_INTERVAL.as_secs()
             );
             false
         }
@@ -426,11 +429,27 @@ fn open_database(config: &Config, storage: &ParquetStorage) -> Result<Database, 
 
     let writer = Arc::new(Mutex::new(conn));
     let readers = ReaderPool::new(&writer, config.read_connections);
-    if readers.len() > 1 {
-        // Only the extension needs arming per connection; the view the writer
-        // just created is already in the shared catalog.
-        let _ = readers.for_each(storage::schema::load_behavioral_extension);
-    }
+    // The view the writer just created is already in the shared catalog, and
+    // `LOAD` on the writer arms readers cloned from it too (pinned by
+    // `query::extension::tests::loading_on_the_writer_arms_cloned_readers`).
+    // A query is handed whichever reader is next, so "loaded" is still asked of
+    // every connection rather than of the writer alone, and a failure is
+    // reported: it used to be dropped (`let _ =`), and the first one ended the
+    // loop.
+    let behavioral_loaded = if writer_loaded && readers.len() > 1 {
+        let report = query::extension::load_everywhere(&writer, &readers);
+        if !report.complete() {
+            tracing::warn!(
+                failed = report.attempted - report.loaded,
+                of = readers.len(),
+                "Behavioral extension did not load on every read connection; \
+                 reporting it as unavailable and retrying"
+            );
+        }
+        report.complete()
+    } else {
+        writer_loaded
+    };
 
     Ok(Database {
         writer,
@@ -570,8 +589,10 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
         query_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
         query_limits,
         secure_cookies: config.secure_cookies,
-        behavioral_extension_loaded: db.behavioral_loaded,
-        behavioral_version: db.behavioral_version,
+        behavioral: query::extension::ExtensionState::new(
+            db.behavioral_loaded,
+            db.behavioral_version,
+        ),
         trust_proxy_headers: config.trust_proxy_headers,
         trusted_proxy_hops: config.trusted_proxy_hops,
         session_window: config.session_window_interval(),
@@ -691,6 +712,15 @@ fn spawn_background_tasks(config: &Config, state: &Arc<AppState>) {
         spawn_retention_task(config.retention_days, state);
     }
     spawn_housekeeping_task(state);
+    if !state.behavioral.is_loaded() {
+        // Started without the extension on every connection (no network at
+        // boot, a reader that failed to load): keep trying instead of serving
+        // 503 until the next restart.
+        tokio::spawn(query::extension::retry_until_loaded(
+            Arc::clone(state),
+            query::extension::RETRY_INTERVAL,
+        ));
+    }
 }
 
 /// Flush buffered events to Parquet on a timer.

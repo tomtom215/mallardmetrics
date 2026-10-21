@@ -564,7 +564,7 @@ async fn test_breakdowns_across_every_dimension() {
             &format!("/api/stats/breakdown/{slug}?site_id=example.com&period=30d"),
         )
         .await;
-        let expected = if dim.requires_behavioral() && !state.behavioral_extension_loaded {
+        let expected = if dim.requires_behavioral() && !state.behavioral.is_loaded() {
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::OK
@@ -1104,7 +1104,7 @@ async fn test_sessions_endpoint_reports_a_missing_extension() {
     // Without the extension the route must say so rather than returning zeros,
     // which are indistinguishable from a site where everyone bounced.
     let (state, _dir) = plain_state();
-    if state.behavioral_extension_loaded {
+    if state.behavioral.is_loaded() {
         return;
     }
     let response = get(&state, "/api/stats/sessions?site_id=example.com&period=30d").await;
@@ -1297,7 +1297,7 @@ async fn test_flow_rejects_bad_direction_and_page() {
 #[tokio::test]
 async fn test_behavioral_endpoints_report_unavailability_clearly() {
     let (state, _dir) = plain_state();
-    if state.behavioral_extension_loaded {
+    if state.behavioral.is_loaded() {
         return;
     }
     // A 200 with an empty body was indistinguishable from a site with no data.

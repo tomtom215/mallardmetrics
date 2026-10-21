@@ -429,8 +429,8 @@ async fn detailed_health_check(State(state): State<Arc<AppState>>) -> Response {
         "buffer_empty": state.buffer.is_empty(),
         "dropped_events": state.buffer.dropped_events.load(Ordering::Relaxed),
         "geoip_loaded": state.geoip.is_loaded(),
-        "behavioral_extension_loaded": state.behavioral_extension_loaded,
-        "behavioral_version": state.behavioral_version,
+        "behavioral_extension_loaded": state.behavioral.is_loaded(),
+        "behavioral_version": state.behavioral.version(),
         "read_connections": state.readers.len(),
         "filter_bots": state.filter_bots,
         "session_window": state.session_window,
@@ -548,7 +548,7 @@ fn write_gauges(out: &mut String, state: &AppState) {
         "mallard_behavioral_extension",
         "Whether the DuckDB behavioral extension is loaded",
         "gauge",
-        u64::from(state.behavioral_extension_loaded),
+        u64::from(state.behavioral.is_loaded()),
     );
     metric(
         out,
@@ -678,6 +678,7 @@ fn escape_label(value: &str) -> String {
 /// decides what funnel results mean, so it belongs next to the binary's own.
 fn write_build_info(out: &mut String, state: &AppState) {
     use std::fmt::Write;
+    let behavioral_version = state.behavioral.version();
     let _ = writeln!(
         out,
         "# HELP mallard_build_info Version of this binary and of the loaded behavioral extension"
@@ -687,7 +688,7 @@ fn write_build_info(out: &mut String, state: &AppState) {
         out,
         "mallard_build_info{{version=\"{}\",behavioral_version=\"{}\"}} 1",
         escape_label(env!("CARGO_PKG_VERSION")),
-        escape_label(state.behavioral_version.as_deref().unwrap_or("none"))
+        escape_label(behavioral_version.as_deref().unwrap_or("none"))
     );
 }
 
@@ -1039,7 +1040,7 @@ mod tests {
                 )))
                 .await
                 .unwrap();
-            let expected = if dim.requires_behavioral() && !state.behavioral_extension_loaded {
+            let expected = if dim.requires_behavioral() && !state.behavioral.is_loaded() {
                 StatusCode::SERVICE_UNAVAILABLE
             } else {
                 StatusCode::OK
@@ -1106,7 +1107,7 @@ mod tests {
         // Reporting 200 with an empty body made a missing extension look like a
         // site with no data.
         let (state, _dir) = state_builder().build();
-        if state.behavioral_extension_loaded {
+        if state.behavioral.is_loaded() {
             return;
         }
         for uri in [

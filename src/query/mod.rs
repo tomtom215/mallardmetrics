@@ -2,6 +2,7 @@ pub mod breakdowns;
 pub mod cache;
 pub mod events;
 pub mod export;
+pub mod extension;
 pub mod flow;
 pub mod funnel;
 pub mod metrics;

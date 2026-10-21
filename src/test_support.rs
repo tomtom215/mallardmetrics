@@ -12,6 +12,7 @@ use crate::ingest::geoip::GeoIpReader;
 use crate::ingest::handler::AppState;
 use crate::ingest::ratelimit::RateLimiter;
 use crate::query::cache::QueryCache;
+use crate::query::extension::ExtensionState;
 use crate::storage::ReaderPool;
 use crate::storage::parquet::ParquetStorage;
 use duckdb::Connection;
@@ -165,11 +166,45 @@ impl AppStateBuilder {
         // An in-memory database is private to its connection, so readers share
         // the writer rather than cloning into an empty catalog.
         let readers = ReaderPool::shared(&conn);
-        let storage = ParquetStorage::new(dir.path(), 0);
+        // Tests that assert on behavioral endpoints opt in explicitly;
+        // otherwise the real extension state is used so an environment with
+        // the extension available exercises the real code path.
+        let behavioral = ExtensionState::new(
+            self.behavioral_extension_loaded || behavioral_loaded,
+            behavioral_version,
+        );
+        let state = self.assemble(conn, readers, dir.path(), behavioral);
+        (state, dir)
+    }
+
+    /// Build the state over a database and reader pool the test made itself,
+    /// for tests that need real, independent reader connections (L28) or
+    /// control over which connections have the behavioral extension.
+    ///
+    /// Loads nothing: the extension flag starts false unless
+    /// [`AppStateBuilder::behavioral_extension_loaded`] was set.
+    pub fn build_over(
+        self,
+        writer: Arc<Mutex<Connection>>,
+        readers: ReaderPool,
+        events_dir: &std::path::Path,
+    ) -> Arc<AppState> {
+        let behavioral = ExtensionState::new(self.behavioral_extension_loaded, None);
+        self.assemble(writer, readers, events_dir, behavioral)
+    }
+
+    fn assemble(
+        self,
+        conn: Arc<Mutex<Connection>>,
+        readers: ReaderPool,
+        events_dir: &std::path::Path,
+        behavioral: ExtensionState,
+    ) -> Arc<AppState> {
+        let storage = ParquetStorage::new(events_dir, 0);
         let tier_lock = crate::storage::TierLock::new();
         let buffer = EventBuffer::new(1000, 0, Arc::clone(&conn), storage, tier_lock.clone());
 
-        let state = Arc::new(AppState {
+        Arc::new(AppState {
             buffer,
             readers,
             tier_lock,
@@ -201,11 +236,7 @@ impl AppStateBuilder {
             query_semaphore: Arc::new(tokio::sync::Semaphore::new(self.query_permits)),
             query_limits: self.query_limits,
             secure_cookies: self.secure_cookies,
-            // Tests that assert on behavioral endpoints opt in explicitly;
-            // otherwise the real extension state is used so an environment with
-            // the extension available exercises the real code path.
-            behavioral_extension_loaded: self.behavioral_extension_loaded || behavioral_loaded,
-            behavioral_version,
+            behavioral,
             trust_proxy_headers: self.trust_proxy_headers,
             trusted_proxy_hops: self.trusted_proxy_hops,
             session_window: "30 minutes".to_string(),
@@ -218,10 +249,8 @@ impl AppStateBuilder {
             suppress_os_version: self.suppress_os_version,
             suppress_screen_size: self.suppress_screen_size,
             geoip_precision: self.geoip_precision,
-            events_dir: dir.path().to_path_buf(),
-        });
-
-        (state, dir)
+            events_dir: events_dir.to_path_buf(),
+        })
     }
 
     /// Build only the state, leaking the temporary directory.
@@ -241,7 +270,7 @@ impl AppStateBuilder {
 /// locally when the extension cannot be downloaded, fail in CI where
 /// `MALLARD_REQUIRE_BEHAVIORAL=1` is set.
 pub fn require_behavioral(state: &AppState, what: &str) -> bool {
-    if state.behavioral_extension_loaded {
+    if state.behavioral.is_loaded() {
         return true;
     }
     assert!(
