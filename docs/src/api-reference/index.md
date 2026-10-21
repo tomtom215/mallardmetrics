@@ -41,6 +41,7 @@ http://your-instance.com
 | `DELETE` | `/api/keys/{key_hash}` | admin | [Authentication](auth.md#delete-apikeyskey_hash) |
 | `DELETE` | `/api/gdpr/erase` | admin | [Stats](stats.md#delete-apigdprerase) |
 | `POST` | `/api/admin/backup` | admin | [Auth](auth.md#post-apiadminbackup) |
+| `GET` | `/api/admin/export/parquet` | admin | [Stats](stats.md#get-apiadminexportparquet) |
 | `GET` | `/health`, `/health/ready`, `/health/detailed` | none | [Health](health.md) |
 | `GET` | `/metrics` | none, or bearer token | [Health & Metrics](health.md#get-metrics) |
 | `GET` | `/mallard.js`, `/js/script.js` | none | [Tracking Script](../tracking-script.md) |

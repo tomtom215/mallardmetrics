@@ -23,6 +23,7 @@ data/
 │   │   └── date=2026-10-21/
 │   └── site_id=other.org/
 ├── extensions/               the behavioral extension (v1.5.6/linux_amd64/...)
+├── exports/                  transient Parquet exports (empty unless one is in flight)
 ├── .secret                   visitor-ID secret, mode 0600 (only if MALLARD_SECRET is unset)
 ├── admin.json                Argon2id hash set through /api/auth/setup, mode 0600
 └── api_keys.json             SHA-256 hashes of API keys
@@ -130,6 +131,17 @@ the **partition date**, so it cannot be used for per-visitor deletion.
 both tiers. Semantics, partial failure and the limits of site-and-date
 granularity are on [Privacy and GDPR](privacy-gdpr.md#erasure) and in the
 [API reference](api-reference/stats.md#delete-apigdprerase).
+
+## Importing and exporting
+
+- [Importing Data](importing-data.md): `mallard-metrics import` loads a Google
+  Analytics 4 BigQuery export (the one event-level export whose schema is
+  documented) with the server stopped, and says why the other products' exports
+  cannot be imported.
+- [Exporting to Parquet](exporting-parquet.md): one site and date range as a
+  single Parquet file for a warehouse, without `visitor_id`.
+
+Imported rows are ordinary rows whose `visitor_id` starts with `imp:`.
 
 ## Backup and restore
 

@@ -179,6 +179,16 @@ definition changes on your own data:
 Keep a note of the upgrade date next to any long-running chart of these four
 figures.
 
+## New, with nothing to do
+
+- `mallard-metrics import` ([Importing Data](importing-data.md)) is a new
+  subcommand; it is never run by the server and changes nothing unless you run it.
+- `GET /api/admin/export/parquet` ([Exporting to Parquet](exporting-parquet.md))
+  is a new admin route. It creates `<data_dir>/exports` the first time it is used
+  and is not part of a [backup](backup-restore.md). No setting was added.
+- Rows imported by the new command have a `visitor_id` starting `imp:`; nothing
+  in an upgrade creates them.
+
 ## After the upgrade
 
 - `curl /health/detailed`: `status` ok, `cold_tier` `healthy` (or `empty` on a

@@ -94,6 +94,25 @@ few startup conditions that used to be accepted are now refused; read
 
 ### Added
 
+- **`mallard-metrics import ga4-bigquery`** loads a Google Analytics 4 BigQuery
+  export (newline-delimited JSON) into a stopped instance: offline, streamed,
+  validated with line-numbered errors, `--dry-run`, `--skip-invalid`, site id
+  supplied by you, idempotent (key: site, visitor id, timestamp, event name,
+  path, as a multiset), written through the server's own flush and recovery.
+  Imported rows carry a `visitor_id` starting `imp:` (a keyed hash of GA4's
+  session, never the user id) and follow the instance's privacy settings. They
+  count in pageviews, events and every breakdown; unique visitors are GA4
+  *sessions*, and imported dates never form retention cohorts. Plausible,
+  Fathom, Umami and Matomo are **not** importable: Plausible and Fathom export
+  aggregates only, and Umami's and Matomo's event-level formats have no
+  published schema to build against. See [Importing Data](docs/src/importing-data.md).
+- **`GET /api/admin/export/parquet`** (admin scope): one site and date range as a
+  single Parquet file with a documented schema, no `visitor_id`, an `is_imported`
+  flag, `Content-Length`, a 1,000,000-row cap that refuses rather than truncates,
+  and the same tier-lock and scoped-read rules as the reports. The file is
+  written under `<data_dir>/exports` and deleted after the download. See
+  [Exporting to Parquet](docs/src/exporting-parquet.md).
+
 - `MALLARD_QUERY_QUEUE_WAIT_SECS` (default 5) and `MALLARD_QUERY_DEADLINE_SECS`
   (default 20), TOML `query_queue_wait_secs` and `query_deadline_secs`: how long
   a request waits for a query slot (then `429`) and how long a statement may run

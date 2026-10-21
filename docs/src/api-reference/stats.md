@@ -372,7 +372,8 @@ date,visitors,pageviews,top_page,top_source
 2024-01-16,38,121,"/blog","Direct"
 ```
 
-A raw export carries one row per stored event. **`visitor_id` is deliberately
+A raw export carries one row per stored event, including rows from an
+[import](../importing-data.md). **`visitor_id` is deliberately
 excluded**: a file of per-event pseudonyms is precisely the artefact this project
 exists to avoid producing.
 
@@ -402,6 +403,29 @@ Streaming has consequences worth knowing:
 A day with no events has `top_page` `"(none)"` and `top_source` `"(direct)"`;
 a day with events whose referrer is unknown has `"(unknown)"` as its source.
 `limit` over 1,000,000 is a `400`. `filters` apply to exports too.
+
+---
+
+## `GET /api/admin/export/parquet`
+
+**Requires admin authentication** (`401` without, `403` for a `ReadOnly` key).
+One site and date range as a single Parquet file, for loading into a data
+warehouse. `visitor_id` is not in the file. The schema, the consistency
+guarantees, the limits and the measurements are on
+[Exporting to Parquet](../exporting-parquet.md).
+
+| Parameter | Default | Description |
+|---|---|---|
+| `site_id` | required | The site |
+| `start_date`, `end_date` | `period` | Inclusive `YYYY-MM-DD` dates; both or neither. A range is capped at 366 days |
+| `period` | `30d` | Used when no dates are given |
+
+The response is `200` with `Content-Type: application/vnd.apache.parquet`,
+`Content-Disposition: attachment; filename="mallard-events-<site>-<start>.parquet"`,
+a `Content-Length` (a download that ends short is therefore detectable) and
+`X-Mallard-Rows`. A range with more than 1,000,000 events is a `400`, not a
+truncated file; a second export while one runs is a `429`; a range that takes
+longer than the query deadline is a `504`.
 
 ---
 

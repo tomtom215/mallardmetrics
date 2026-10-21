@@ -34,5 +34,7 @@
   - [Fly.io Deployment](deploy-flyio.md)
 - [Monitoring](monitoring.md)
 - [Data Management](data-management.md)
+  - [Importing Data](importing-data.md)
+  - [Exporting to Parquet](exporting-parquet.md)
 - [Backup and Restore](backup-restore.md)
 - [Troubleshooting](troubleshooting.md)

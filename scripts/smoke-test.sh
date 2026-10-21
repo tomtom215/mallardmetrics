@@ -232,6 +232,20 @@ check backup_contents 'MANIFEST.json' "$(ls "$WORK/data/backups/smoke")"
 check backup_has_database 'mallard.duckdb' "$(ls "$WORK/data/backups/smoke")"
 check backup_is_not_overwritten '409' "$(code -b "$COOKIE_JAR" -X POST "$BASE/api/admin/backup?name=smoke")"
 check backup_rejects_a_path '400' "$(code -b "$COOKIE_JAR" -X POST "$BASE/api/admin/backup?name=..")"
+# ── Parquet export (admin) ────────────────────────────────────────────────
+PQ="$BASE/api/admin/export/parquet?site_id=$SITE&period=7d"
+check parquet_unauth '401' "$(code "$PQ")"
+check parquet_bad_site '400' "$(code -b "$COOKIE_JAR" "$BASE/api/admin/export/parquet?site_id=..%2Fx&period=7d")"
+check parquet_ok '200' \
+  "$(curl -sS -o "$WORK/export.parquet" -D "$WORK/export.headers" -w '%{http_code}' -b "$COOKIE_JAR" "$PQ")"
+check parquet_content_type 'application/vnd\.apache\.parquet' "$(cat "$WORK/export.headers")"
+check parquet_disposition 'mallard-events-smoke\.test-.*\.parquet' "$(cat "$WORK/export.headers")"
+check parquet_row_count '[Xx]-[Mm]allard-[Rr]ows: [1-9]' "$(cat "$WORK/export.headers")"
+check parquet_magic_head 'PAR1' "$(head -c 4 "$WORK/export.parquet")"
+check parquet_magic_tail 'PAR1' "$(tail -c 4 "$WORK/export.parquet")"
+absent parquet_has_no_visitor_id 'visitor_id' "$(strings "$WORK/export.parquet" 2>/dev/null)"
+sleep 1
+check parquet_leaves_no_file '^0$' "$(find "$WORK/data/exports" -type f 2>/dev/null | wc -l | tr -d ' ')"
 check keys_unauthed_after_setup '401' "$(code "$BASE/api/keys")"
 check login_wrong_password '401' \
   "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE/api/auth/login" \
@@ -317,6 +331,53 @@ else
   check reads_protected_after_restart '401' "$(code "$BASE/api/stats/main?$Q")"
   check data_survived_restart '"unique_visitors":1' \
     "$(curl -sS -b "$JAR2" "$BASE/api/stats/main?$Q")"
+fi
+
+# ── Importing another product's export ────────────────────────────────────
+# The server must be stopped: DuckDB locks the file. The importer is the
+# binary itself, so this is also the check that the subcommand is wired up.
+FIXTURE="${MALLARD_IMPORT_FIXTURE:-tests/fixtures/ga4-bigquery-sample.ndjson}"
+if [ -f "$FIXTURE" ]; then
+  IMPORT_SITE="imported.test"
+  imp() { MALLARD_DATA_DIR="$WORK/data" "$BIN" import ga4-bigquery --site-id "$IMPORT_SITE" "$@"; }
+  # A dry run opens no database, so it works against the running server.
+  check import_dry_run '(^|\n)valid_events: 6' "$(imp --file "$FIXTURE" --dry-run 2>&1)"
+  # The real import must refuse while the server holds the lock.
+  imp --file "$FIXTURE" > "$WORK/import-locked.log" 2>&1
+  check import_refused_while_running '1' "$?"
+  check import_says_why 'Stop it first' "$(cat "$WORK/import-locked.log")"
+  # An invalid line aborts with its number and writes nothing.
+  { head -n 2 "$FIXTURE"; echo 'not json'; } > "$WORK/bad.ndjson"
+  imp --file "$WORK/bad.ndjson" --dry-run > "$WORK/import-bad.log" 2>&1
+  check import_bad_line_exit '1' "$?"
+  check import_bad_line_number 'line 3: not valid JSON' "$(cat "$WORK/import-bad.log")"
+
+  kill "$SRV" 2>/dev/null
+  wait "$SRV" 2>/dev/null
+  check import_runs '(^|\n)inserted: 6' "$(imp --file "$FIXTURE" 2>&1)"
+  check import_is_idempotent '(^|\n)inserted: 0' "$(imp --file "$FIXTURE" 2>&1)"
+  check import_writes_partitions 'date=2026-03-14' \
+    "$(ls "$WORK/data/events/site_id=$IMPORT_SITE")"
+
+  MALLARD_HOST=127.0.0.1 MALLARD_PORT="$PORT" MALLARD_DATA_DIR="$WORK/data" \
+    MALLARD_FLUSH_COUNT=1 MALLARD_FLUSH_INTERVAL=1 \
+    "$BIN" > "$WORK/server-import.log" 2>&1 &
+  SRV=$!
+  for _ in $(seq 1 60); do curl -fsS "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
+  JAR_IMP="$WORK/cookies-import"
+  curl -sS -o /dev/null -c "$JAR_IMP" -X POST "$BASE/api/auth/login" \
+    -H 'Content-Type: application/json' -d '{"password":"a-sufficiently-long-password"}'
+  IQ="site_id=$IMPORT_SITE&start_date=2026-03-14&end_date=2026-03-14"
+  IMPORTED_MAIN="$(curl -sS -b "$JAR_IMP" "$BASE/api/stats/main?$IQ")"
+  check imported_pageviews '"total_pageviews":4' "$IMPORTED_MAIN"
+  check imported_visitors '"unique_visitors":3' "$IMPORTED_MAIN"
+  check imported_in_pages '/blog/duck-care' "$(curl -sS -b "$JAR_IMP" "$BASE/api/stats/breakdown/pages?$IQ")"
+  absent imported_raw_has_no_ids 'imp:' \
+    "$(curl -sS -b "$JAR_IMP" "$BASE/api/stats/export?$IQ&kind=raw&format=csv")"
+  kill "$SRV" 2>/dev/null
+  wait "$SRV" 2>/dev/null
+else
+  echo "note: $FIXTURE not found; skipping the import checks"
 fi
 
 echo
