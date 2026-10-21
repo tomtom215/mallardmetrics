@@ -100,6 +100,7 @@ const browser = await chromium.launch();
 process.on('uncaughtException', (e) => {
   for (const p of [...new Set(problems)]) console.error(p);
   console.error(`check aborted: ${String(e.message).split('\n')[0]}`);
+  if (process.env.CHECK_STACK) console.error(e.stack);
   process.exit(1);
 });
 
@@ -723,6 +724,11 @@ if (AUTH && PASSWORD) {
   await page.getByRole('button', { name: 'Create key' }).click();
   await page.waitForSelector('.key-value', { timeout: 10000 }).catch(() => fail(where, 'creating an API key showed no key'));
   await runAxe(page, `${where}/keys`);
+  await page.getByRole('button', { name: 'Create backup' }).click();
+  await page.waitForFunction(() => /created:/.test(document.getElementById('keys')?.innerText ?? ''), null, { timeout: 30000 }).catch(() => fail(where, 'Create backup showed no result'));
+  const backupText = await page.locator('#keys').innerText();
+  if (!/Backup mallard-\d{8}T\d{6}Z created/.test(backupText) || !/backups/.test(backupText)) fail(where, `the backup result does not name the backup and its path: ${backupText.slice(-200)}`);
+  await runAxe(page, `${where}/backup`);
   page.once('dialog', (d) => d.accept());
   await page.getByRole('button', { name: /^Revoke/ }).first().click();
   await ctx.close();
