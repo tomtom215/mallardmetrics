@@ -23,6 +23,11 @@
 // removable filter chips, custom-range validation, comparison state,
 // keyboard-operable tabs, the chart's table alternative, retry after a 429,
 // and a readable message (not raw JSON) after a 500 or a lost connection.
+// It also drives the states the server's error `code` selects (a query
+// timeout, a busy server, session data that gdpr_mode rounds away), retention
+// with unfinished weeks, "Show more" on a breakdown, entry-page columns, the
+// figure definitions, a single offline banner, and that a repeat visit makes
+// no request for the dashboard's own files.
 //
 // Not part of CI, because it needs a browser. Run it before shipping a
 // dashboard change:
@@ -35,6 +40,7 @@
 // Optional extra instances:
 //   --empty=URL     an instance with no events (checks the empty states)
 //   --nobeh=URL     an instance whose behavioral extension failed to load
+//   --gdpr=URL      an instance running with gdpr_mode (rounded timestamps)
 //   --auth=URL --password=PW   an instance with an admin password
 //
 // Requires Playwright and axe-core, resolved from the normal module path or
@@ -49,6 +55,7 @@ const flag = (name) => args.find((a) => a.startsWith(`--${name}=`))?.slice(name.
 const BASE = (args.find((a) => !a.startsWith('--')) ?? 'http://127.0.0.1:8000').replace(/\/$/, '');
 const EMPTY = flag('empty');
 const NOBEH = flag('nobeh');
+const GDPR = flag('gdpr');
 const AUTH = flag('auth');
 const PASSWORD = flag('password');
 
@@ -384,9 +391,201 @@ for (const theme of ['light', 'dark']) {
   const text = await page.locator('body').innerText();
   if (!/cannot reach the server/i.test(text)) fail(where, 'offline state is not explained');
   for (const bad of ['undefined', 'NaN', 'Failed to fetch', 'TypeError']) if (text.includes(bad)) fail(where, `offline page shows "${bad}"`);
+  // One banner, not one error per panel.
+  const sentences = (text.match(/cannot reach the server/gi) ?? []).length;
+  if (sentences !== 1) fail(where, `"Cannot reach the server" appears ${sentences} times; expected one banner`);
+  if ((await page.locator('.placeholder-error').count()) > 0) fail(where, 'panels still show their own error while the server is offline');
+  if ((await page.getByRole('button', { name: /^(Retry|Try again)$/ }).count()) > 0) fail(where, 'panels offer their own Retry while the server is offline');
+  if ((await page.locator('.placeholder-offline').count()) < 3) fail(where, 'offline panels are not collapsed to a line');
   await page.unroute('**/api/**');
   await page.getByRole('button', { name: 'Retry now' }).click();
   await page.waitForFunction(() => !document.querySelector('.banner-error'), null, { timeout: 15000 }).catch(() => fail(where, 'dashboard did not recover once the server returned'));
+  await ctx.close();
+}
+
+/* ── 3b. States chosen by the server's error code ───────────────────────── */
+
+const json = (status, body, headers = {}) => ({ status, contentType: 'application/json', headers, body: JSON.stringify(body) });
+
+{
+  const { ctx, page } = await newPage();
+  const where = 'failure/timeout-and-busy';
+  page.on('pageerror', (e) => fail(where, `page error: ${e.message}`));
+  await page.route('**/api/stats/goals**', (r) => r.fulfill(json(504, { error: 'The query did not finish within 30 seconds. Try a shorter date range or fewer filters.', code: 'query_timeout' })));
+  await page.route('**/api/stats/revenue**', (r) => r.fulfill(json(429, { error: 'too many concurrent queries', code: 'too_many_requests' }, { 'retry-after': '0' })));
+  await page.goto(BASE, { waitUntil: 'load' });
+  await loadEverything(page);
+  const goals = await page.locator('#goals').innerText();
+  if (!/took too long/i.test(goals) || !/shorter date range/i.test(goals)) fail(where, 'a query timeout is not explained with a remedy');
+  if (/HTTP 504|30 seconds/.test(goals)) fail(where, 'a query timeout shows the status or the server wording');
+  if ((await page.locator('#goals').getByRole('button', { name: 'Try again' }).count()) !== 1) fail(where, 'a query timeout offers no retry');
+  if ((await page.locator('#goals .placeholder-error').count()) > 0) fail(where, 'a timeout is styled as a fault');
+  const revenue = await page.locator('#revenue').innerText();
+  if (!/busy/i.test(revenue) || /HTTP 429/.test(revenue)) fail(where, 'a persistently busy server is not explained');
+  // Retry really retries.
+  await page.unroute('**/api/stats/goals**');
+  await page.locator('#goals').getByRole('button', { name: 'Try again' }).click();
+  await page.waitForFunction(() => !/took too long/.test(document.getElementById('goals')?.innerText ?? ''), null, { timeout: 15000 }).catch(() => fail(where, 'Try again did not reload the panel'));
+  await ctx.close();
+}
+
+{
+  // Session data rounded away by gdpr_mode is information, not an error.
+  const { ctx, page } = await newPage();
+  const where = 'gdpr-mocked';
+  const asked = [];
+  page.on('request', (r) => asked.push(new URL(r.url()).pathname));
+  page.on('pageerror', (e) => fail(where, `page error: ${e.message}`));
+  await page.route('**/api/stats/main**', async (route) => {
+    const res = await route.fetch();
+    const body = await res.json();
+    Object.assign(body, { behavioral_available: false, total_sessions: null, bounce_rate: null, avg_visit_duration_secs: null, views_per_visit: null });
+    await route.fulfill({ response: res, json: body });
+  });
+  await page.goto(BASE, { waitUntil: 'load' });
+  await loadEverything(page);
+  const text = await page.locator('body').innerText();
+  if (!/gdpr_mode/.test(text) || !/rounds? away|rounded to the hour/i.test(text)) fail(where, 'rounded timestamps are not explained');
+  if ((await page.locator('.placeholder-error').count()) > 0) fail(where, 'gdpr_mode is presented as an error');
+  if ((await page.locator('.placeholder-unavailable').count()) > 0) fail(where, 'gdpr_mode is presented with the missing-extension warning');
+  if (/MALLARD_EXTENSION_DIR/.test(await page.locator('body').innerHTML())) fail(where, 'gdpr_mode tells people to fix the extension');
+  for (const gone of ['/api/stats/funnel', '/api/stats/sequences', '/api/stats/flow']) if (asked.includes(gone)) fail(where, `${gone} was requested although sessions are unavailable`);
+  if ((await page.locator('#retention .retention-table').count()) !== 1) fail(where, 'weekly retention, which gdpr_mode does not affect, is not shown');
+  await assertCleanContent(page, where);
+  await runAxe(page, where);
+  await ctx.close();
+}
+
+{
+  const retention = (identity, cohorts) => ({ identity_supports_cohorts: identity, caveat: identity ? null : 'wording the dashboard must not parse', cohorts });
+  const cohorts = [
+    { cohort_date: '2026-09-28', cohort_size: 120, retained: [120, 54, 31, 22], retention_rates: [1, 0.45, 0.2583, 0.1833], complete_weeks: 4, partial_first_week: true },
+    { cohort_date: '2026-10-05', cohort_size: 98, retained: [98, 41, 27, 0], retention_rates: [1, 0.4184, 0.2755, 0], complete_weeks: 3, partial_first_week: false },
+    { cohort_date: '2026-10-19', cohort_size: 37, retained: [37, 0, 0, 0], retention_rates: [1, 0, 0, 0], complete_weeks: 0, partial_first_week: false },
+  ];
+  for (const [name, viewport] of [['desktop', VIEWPORTS.desktop], ['mobile', VIEWPORTS.mobile]]) {
+    const { ctx, page } = await newPage({ viewport });
+    const where = `retention/${name}`;
+    watch(page, where);
+    await page.route('**/api/stats/retention**', (r) => r.fulfill(json(200, retention(true, cohorts))));
+    await page.goto(BASE, { waitUntil: 'load' });
+    await loadEverything(page);
+    const cells = await page.locator('.retention-table tbody td').allInnerTexts();
+    // Unfinished weeks are dashes: 3 in the third cohort's rows plus 1 in the second.
+    if (cells.filter((c) => c.trim().startsWith('–')).length !== 4) fail(where, `expected 4 unfinished-week dashes, got ${cells.filter((c) => c.trim().startsWith('–')).length}`);
+    if (cells.filter((c) => c.trim() === '0%').length > 0) fail(where, 'an unfinished week is printed as 0%');
+    if ((await page.locator('.retention-table .tag').count()) !== 1) fail(where, 'the partial first week is not labelled');
+    if (!/has not finished yet/.test(await page.locator('#retention').innerText())) fail(where, 'the dashes are not explained');
+    if (name === 'mobile') {
+      const scroll = await page.locator('.retention-scroll').evaluate((el) => ({ sw: el.scrollWidth, cw: el.clientWidth, tab: el.tabIndex }));
+      if (!(scroll.sw > scroll.cw)) fail(where, 'the retention table does not scroll sideways on a phone');
+      if (scroll.tab !== 0) fail(where, 'the scrolling retention table cannot be focused from the keyboard');
+      await assertNoOverflow(page, where);
+    }
+    await runAxe(page, where);
+    await ctx.close();
+  }
+
+  const { ctx, page } = await newPage();
+  const where = 'retention/identity-caveat';
+  watch(page, where);
+  await page.route('**/api/stats/retention**', (r) => r.fulfill(json(200, retention(false, cohorts))));
+  await page.goto(BASE, { waitUntil: 'load' });
+  await loadEverything(page);
+  const note = await page.locator('#retention .notice').innerText();
+  if (!/visitor_salt_rotation_days/.test(note) || !/at least 21/.test(note)) fail(where, 'the caveat does not name the setting and the value to use');
+  if (/wording the dashboard must not parse/.test(note)) fail(where, "the server's caveat wording is displayed verbatim");
+  if ((await page.locator('#retention .placeholder-error, #retention .notice[role="alert"]').count()) > 0) fail(where, 'the caveat is styled as an error');
+  const dashes = (await page.locator('.retention-table tbody td').allInnerTexts()).filter((c) => c.trim().startsWith('–')).length;
+  if (dashes !== 9) fail(where, `weeks that cannot be measured should be dashes, got ${dashes}`);
+  await runAxe(page, where);
+  await ctx.close();
+}
+
+{
+  const { ctx, page } = await newPage();
+  const where = 'breakdowns';
+  watch(page, where);
+  const asked = [];
+  page.on('request', (r) => asked.push(r.url()));
+  await page.goto(BASE, { waitUntil: 'load' });
+  await loadEverything(page);
+  if (!asked.some((u) => /breakdown\/pages\?.*limit=10(&|$)/.test(u))) fail(where, 'the first request for a breakdown does not ask for 10 rows');
+  const more = page.locator('#bd-pages').getByRole('button', { name: /Show more/ });
+  if ((await more.count()) === 0) {
+    notes.push('[breakdowns] the demo site has fewer than 10 pages: Show more was not exercised');
+  } else {
+    await more.click();
+    await page.waitForFunction(() => document.querySelectorAll('#bd-pages tbody tr').length > 10, null, { timeout: 15000 }).catch(() => fail(where, 'Show more did not add rows'));
+    if (!asked.some((u) => /breakdown\/pages\?.*limit=50(&|$)/.test(u))) fail(where, 'Show more did not ask the server for more rows');
+    if ((await page.locator('#bd-pages .breakdown-scroll').count()) !== 1) fail(where, 'a long list does not scroll inside its panel');
+    await assertNoOverflow(page, where);
+    await runAxe(page, `${where}/long-list`);
+    await page.locator('#bd-pages').getByRole('button', { name: /Show top 10/ }).click();
+    await page.waitForFunction(() => document.querySelectorAll('#bd-pages tbody tr').length <= 10, null, { timeout: 15000 }).catch(() => fail(where, 'Show top 10 did not collapse the list'));
+  }
+  // Entry pages count visits that began there, in their own column.
+  await page.getByRole('tab', { name: 'Entry pages' }).click();
+  await page.waitForFunction(() => /Entrances/.test(document.getElementById('bd-pages')?.innerText ?? ''), null, { timeout: 15000 }).catch(() => fail(where, 'entry pages do not show an Entrances column'));
+  await page.getByRole('tab', { name: 'Exit pages' }).click();
+  await page.waitForFunction(() => /\bExits\b/.test(document.getElementById('bd-pages')?.innerText ?? ''), null, { timeout: 15000 }).catch(() => fail(where, 'exit pages do not show an Exits column'));
+  if ((await page.locator('#bd-pages .bar-link').count()) > 0) fail(where, 'exit pages offer a filter the server rejects');
+  await ctx.close();
+}
+
+{
+  const { ctx, page } = await newPage();
+  const where = 'definitions-and-periods';
+  watch(page, where);
+  await page.goto(BASE, { waitUntil: 'load' });
+  await loadEverything(page);
+  await page.locator('.definitions summary').click();
+  const defs = await page.locator('.definitions').innerText();
+  for (const term of ['Bounce rate', 'Visit duration', 'Views per visit', 'Entry and exit pages', 'Filters']) if (!defs.includes(term)) fail(where, `the definitions omit "${term}"`);
+  if (!/exactly one event/.test(defs) || !/at least one pageview/.test(defs)) fail(where, 'the bounce and visit definitions do not match the server');
+  await page.getByRole('button', { name: '7D' }).click();
+  await page.waitForFunction(() => /Last 7 days, including today/.test(document.querySelector('.range-summary')?.innerText ?? ''));
+  const summary = await page.locator('.range-summary').innerText();
+  const m = /(\w{3} \d+, \d{4}) – (\w{3} \d+, \d{4})/.exec(summary);
+  if (!m) fail(where, `7D shows no dates: "${summary}"`);
+  else if (Math.round((Date.parse(`${m[2]} UTC`) - Date.parse(`${m[1]} UTC`)) / 86400000) !== 6) fail(where, `7D should span seven days including today, got "${summary}"`);
+  const chartDays = await page.locator('.chart-readout').count();
+  void chartDays;
+  await page.getByRole('button', { name: 'View as table' }).click();
+  const rows = await page.locator('.chart-table tbody tr').count();
+  if (rows !== 7) fail(where, `7D chart has ${rows} points; expected 7`);
+  await ctx.close();
+}
+
+{
+  // The panel for live activity says so when nobody is there, and never "No data for this period".
+  const { ctx, page } = await newPage();
+  const where = 'realtime';
+  watch(page, where);
+  await page.goto(BASE, { waitUntil: 'load' });
+  await loadEverything(page);
+  const live = await page.locator('#realtime').innerText();
+  if (!/current visitors|No one is on/.test(live)) fail(where, `the realtime panel says "${live.slice(0, 80)}"`);
+  if (/No data for this period/.test(live)) fail(where, 'the realtime panel uses the date-range wording');
+  await ctx.close();
+}
+
+{
+  // A repeat visit takes the dashboard's own files from the browser cache.
+  const { ctx, page } = await newPage();
+  const where = 'caching';
+  await page.goto(BASE, { waitUntil: 'load' });
+  await loadEverything(page);
+  await page.reload({ waitUntil: 'load' });
+  await loadEverything(page);
+  const assets = await page.evaluate(() =>
+    performance.getEntriesByType('resource').filter((e) => /\.(js|css|svg)(\?|$)/.test(e.name) && !e.name.includes('/api/')).map((e) => ({ name: new URL(e.name).pathname + new URL(e.name).search, transferSize: e.transferSize })));
+  if (assets.length < 6) fail(where, `only ${assets.length} asset requests were recorded`);
+  for (const a of assets) {
+    if (a.transferSize !== 0) fail(where, `${a.name} went to the network on a repeat visit (${a.transferSize} bytes)`);
+    if (!/\?v=[0-9a-f]{12}$/.test(a.name)) fail(where, `${a.name} is requested without a version`);
+  }
+  notes.push(`[caching] repeat visit: ${assets.length} dashboard files, ${assets.filter((a) => a.transferSize === 0).length} served from the browser cache`);
   await ctx.close();
 }
 
@@ -416,6 +615,29 @@ if (NOBEH) {
   const text = await page.locator('body').innerText();
   if (!/Behavioral analytics is unavailable/.test(text)) fail(where, 'missing the behavioral-unavailable explanation');
   if (!/MALLARD_EXTENSION_DIR/.test(await page.locator('body').innerHTML())) fail(where, 'explanation does not say how to fix it');
+  await assertCleanContent(page, where);
+  await runAxe(page, where);
+  await ctx.close();
+}
+
+if (GDPR) {
+  const { ctx, page } = await newPage();
+  const where = 'gdpr-instance';
+  watch(page, where);
+  await page.goto(GDPR, { waitUntil: 'load' });
+  await loadEverything(page);
+  const text = await page.locator('body').innerText();
+  if (!/This report needs session data that gdpr_mode rounds away/.test(text)) fail(where, 'missing the gdpr_mode explanation');
+  if ((await page.locator('.placeholder-error').count()) > 0) fail(where, 'gdpr_mode is presented as an error');
+  if ((await page.locator('.placeholder-unavailable').count()) > 0) fail(where, 'gdpr_mode is presented with the missing-extension warning');
+  if (/Behavioral analytics is unavailable/.test(text)) fail(where, 'gdpr_mode is reported as a missing extension');
+  if (!(await page.locator('.metric-value').first().innerText()).match(/\d/)) fail(where, 'the headline figures are missing');
+  if ((await page.locator('#retention .retention-table, #retention .placeholder:not(.placeholder-info)').count()) < 1) fail(where, 'weekly retention is not shown');
+  // Entry pages are session-derived, so the tab explains instead of failing.
+  await page.getByRole('tab', { name: 'Entry pages' }).click();
+  await page.waitForTimeout(800);
+  await page.waitForLoadState('networkidle');
+  if (!/rounded to the hour/.test(await page.locator('#bd-pages').innerText())) fail(where, 'the entry-pages tab does not explain gdpr_mode');
   await assertCleanContent(page, where);
   await runAxe(page, where);
   await ctx.close();

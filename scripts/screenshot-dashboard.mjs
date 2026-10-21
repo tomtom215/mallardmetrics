@@ -9,13 +9,15 @@
 //
 //   node scripts/screenshot-dashboard.mjs http://127.0.0.1:8000 /tmp/shots
 //   node scripts/screenshot-dashboard.mjs BASE OUTDIR --site=demo.example.com \
-//        --empty=URL --nobeh=URL --auth=URL --password=PW
+//        --empty=URL --nobeh=URL --gdpr=URL --auth=URL --password=PW
 //
 // Per theme (light, dark) and width (1440, 820, 390) it saves a full-page
 // capture; then the states that are easy to break: a filter chip, comparison
 // on, a rejected custom range, the chart table, the install snippet, loading
-// skeletons, per-panel errors, a lost connection, and (when the extra
-// instances are given) the empty, behavioral-unavailable and sign-in views.
+// skeletons, per-panel errors, a query timeout, a lost connection, retention
+// with unfinished weeks and with the identity caveat, a long breakdown, the
+// figure definitions, and (when the extra instances are given) the empty,
+// behavioral-unavailable, gdpr_mode and sign-in views.
 //
 // Requires Playwright (see check-dashboard-browser.mjs for resolution rules).
 
@@ -27,7 +29,7 @@ const args = process.argv.slice(2);
 const flag = (name) => args.find((a) => a.startsWith(`--${name}=`))?.slice(name.length + 3);
 const [BASE, OUT] = args.filter((a) => !a.startsWith('--'));
 if (!BASE || !OUT) {
-  console.error('usage: screenshot-dashboard.mjs BASE_URL OUT_DIR [--site=ID] [--empty=URL] [--nobeh=URL] [--auth=URL --password=PW]');
+  console.error('usage: screenshot-dashboard.mjs BASE_URL OUT_DIR [--site=ID] [--empty=URL] [--nobeh=URL] [--gdpr=URL] [--auth=URL --password=PW]');
   process.exit(2);
 }
 const SITE = flag('site');
@@ -143,18 +145,88 @@ for (const theme of ['light', 'dark']) {
 }
 
 {
+  // Server gone: one banner, and the panels collapse to a line each.
   const { ctx, page } = await open(first);
   await settle(page);
+  await loadAll(page);
   await page.route('**/api/**', (r) => r.abort('connectionrefused'));
   await page.getByRole('button', { name: 'Refresh' }).click();
   await page.waitForTimeout(2500);
   await snap(page, 'state-offline');
+  await snap(page, 'state-offline-full', true);
+  await ctx.close();
+}
+
+{
+  // A query that overran its deadline, and a server that stays busy.
+  const { ctx, page } = await open(first, {
+    setup: async (p) => {
+      await p.route('**/api/stats/goals**', (r) => r.fulfill({ status: 504, contentType: 'application/json', body: '{"error":"The query did not finish within 30 seconds. Try a shorter date range or fewer filters.","code":"query_timeout"}' }));
+      await p.route('**/api/stats/revenue**', (r) => r.fulfill({ status: 429, headers: { 'retry-after': '0' }, contentType: 'application/json', body: '{"error":"too many concurrent queries","code":"too_many_requests"}' }));
+    },
+  });
+  await settle(page);
+  await page.evaluate(() => document.getElementById('goals')?.scrollIntoView());
+  await page.waitForTimeout(9000);
+  await snap(page, 'state-timeout-and-busy');
+  await ctx.close();
+}
+
+{
+  // Retention as the server reports it: unfinished weeks, a partial first week.
+  const mock = (identity) => (r) =>
+    r.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        identity_supports_cohorts: identity,
+        caveat: identity ? null : 'server wording that the dashboard does not parse',
+        cohorts: [
+          { cohort_date: '2026-09-28', cohort_size: 120, retained: [120, 54, 31, 22], retention_rates: [1, 0.45, 0.2583, 0.1833], complete_weeks: 4, partial_first_week: true },
+          { cohort_date: '2026-10-05', cohort_size: 98, retained: [98, 41, 27, 0], retention_rates: [1, 0.4184, 0.2755, 0], complete_weeks: 3, partial_first_week: false },
+          { cohort_date: '2026-10-12', cohort_size: 143, retained: [143, 60, 0, 0], retention_rates: [1, 0.4196, 0, 0], complete_weeks: 2, partial_first_week: false },
+          { cohort_date: '2026-10-19', cohort_size: 37, retained: [37, 0, 0, 0], retention_rates: [1, 0, 0, 0], complete_weeks: 0, partial_first_week: false },
+        ],
+      }),
+    });
+  for (const [label, identity] of [['retention-weeks', true], ['retention-caveat', false]]) {
+    for (const [name, size] of [['desktop', SIZES.desktop], ['mobile', SIZES.mobile]]) {
+      const { ctx, page } = await open(first, { size, setup: (p) => p.route('**/api/stats/retention**', mock(identity)) });
+      await settle(page);
+      await page.evaluate(() => document.getElementById('retention')?.scrollIntoView());
+      await page.waitForTimeout(1200);
+      await snap(page, `state-${label}-${name}`);
+      await ctx.close();
+    }
+  }
+}
+
+{
+  // A long breakdown (Show more), entry pages with their own columns, and the definitions.
+  const { ctx, page } = await open(first);
+  await settle(page);
+  await page.evaluate(() => document.getElementById('bd-pages')?.scrollIntoView());
+  await page.waitForTimeout(800);
+  const more = page.getByRole('button', { name: /Show more/ }).first();
+  if (await more.count()) {
+    await more.click();
+    await settle(page);
+    await snap(page, 'state-breakdown-more');
+  }
+  await page.getByRole('tab', { name: 'Entry pages' }).click();
+  await settle(page);
+  await snap(page, 'state-entry-pages');
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.locator('.definitions summary').click();
+  await page.locator('.definitions').scrollIntoViewIfNeeded();
+  await snap(page, 'state-definitions');
   await ctx.close();
 }
 
 const extra = [
   ['empty', flag('empty')],
   ['no-behavioral', flag('nobeh')],
+  ['gdpr', flag('gdpr')],
 ];
 for (const [label, url] of extra) {
   if (!url) continue;
