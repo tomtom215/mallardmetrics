@@ -173,7 +173,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // `/js/script.js` is an alias for people migrating from Plausible.
         .route("/mallard.js", get(dashboard::serve_tracking_script))
         .route("/js/script.js", get(dashboard::serve_tracking_script))
-        .route("/mallard-extras.js", get(crate::ingest::extras::serve_extras_script))
+        .route(
+            "/mallard-extras.js",
+            get(crate::ingest::extras::serve_extras_script),
+        )
         .nest("/api", api_routes)
         .route("/", get(dashboard::serve_index))
         .route("/{*path}", get(dashboard::serve_asset))
@@ -555,6 +558,13 @@ fn write_gauges(out: &mut String, state: &AppState) {
     );
     metric(
         out,
+        "mallard_datacenter_filter",
+        "Whether the datacenter traffic filter is enabled",
+        "gauge",
+        u64::from(state.datacenter.is_enabled()),
+    );
+    metric(
+        out,
         "mallard_filter_bots",
         "Whether bot filtering is enabled",
         "gauge",
@@ -626,6 +636,13 @@ fn write_counters(out: &mut String, state: &AppState) {
         "Ingest requests rejected by a rate limiter",
         "counter",
         state.rate_limit_rejections_total.load(Ordering::Relaxed),
+    );
+    metric(
+        out,
+        "mallard_datacenter_filtered_total",
+        "Events dropped because the client address is in a listed hosting/datacenter ASN",
+        "counter",
+        state.datacenter.filtered(),
     );
     metric(
         out,

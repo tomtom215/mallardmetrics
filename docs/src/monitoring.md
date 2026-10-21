@@ -54,6 +54,7 @@ text are exact.
 | `mallard_geoip_loaded` | gauge | Whether a GeoIP database is loaded |
 | `mallard_behavioral_extension` | gauge | Whether the DuckDB behavioral extension is loaded |
 | `mallard_filter_bots` | gauge | Whether bot filtering is enabled |
+| `mallard_datacenter_filter` | gauge | Whether the datacenter traffic filter is enabled |
 | `mallard_events_ingested_total` | counter | Events buffered since startup |
 | `mallard_events_dropped_total` | counter | Events discarded because the buffer was at capacity |
 | `mallard_flush_failures_total` | counter | Parquet flush failures since startup (periodic flush task) |
@@ -62,6 +63,7 @@ text are exact.
 | `mallard_process_start_time_seconds` | gauge | Unix time at which the process started |
 | `mallard_last_flush_success_timestamp_seconds` | gauge | Unix time of the last flush that completed without error (0 before the first) |
 | `mallard_rate_limit_rejections_total` | counter | Ingest requests rejected by a rate limiter (per-site and per-IP, POST and pixel) |
+| `mallard_datacenter_filtered_total` | counter | Events dropped because the client address is in a listed hosting ASN (always 0 unless `asn_db_path` is set) |
 | `mallard_login_failures_total` | counter | Failed login attempts since startup |
 | `mallard_cache_hits_total` | counter | Query cache hits since startup |
 | `mallard_cache_misses_total` | counter | Query cache misses since startup |

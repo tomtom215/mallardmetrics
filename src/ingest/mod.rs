@@ -1,3 +1,4 @@
+pub mod asn;
 pub mod buffer;
 pub mod extras;
 pub mod geoip;

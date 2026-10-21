@@ -66,6 +66,7 @@ Checked in this order; the body is empty unless stated.
 | `site_ids` set and `d` not in it | 403 |
 | Per-site (`rate_limit_per_site`) or per-IP (`rate_limit_per_ip`) limit exceeded | 429 with `Retry-After: 1` |
 | Bot User-Agent while `filter_bots = true` | **202**, event discarded, not counted |
+| Client address in a listed hosting ASN while `asn_db_path` is set | **202**, event discarded, counted in `mallard_datacenter_filtered_total` ([configuration](../configuration.md#datacenter-traffic-filter)) |
 | Buffer at `max_buffered_events` (flushes are failing) or server shutting down | 503 |
 
 Note the order: bot filtering runs **after** rate limiting, so bot traffic

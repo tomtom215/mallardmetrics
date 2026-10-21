@@ -24,14 +24,17 @@ Per event, in the `events` table and the Parquet files
 | `country_code`, `region`, `city` | Only with a GeoIP database, limited by `geoip_precision`. |
 | `props`, `revenue_*` | Whatever your code sends. Custom properties are free text: you decide what goes in. |
 
-**Never stored:** the IP address (it is hashed, used for GeoIP and the in-memory
+**Never stored:** the IP address (it is hashed, used for GeoIP, the optional
+[datacenter filter](configuration.md#datacenter-traffic-filter) and the in-memory
 rate limiters, then dropped; it is not in the database, the Parquet files or the
 application log), cookies, the raw User-Agent, any browser storage value.
 
 The tracking script sets no cookies and writes nothing to browser storage. It
 **reads** exactly one `localStorage` key, `mallard_ignore`: setting it to `true`
 opts that browser out (for example your own). It sends nothing else about the
-browser than the fields above.
+browser than the fields above. The optional [extras script](extras.md) keeps
+those guarantees: it stores nothing, and its form event carries a form id or
+name, never field names or values.
 
 ## What a visitor ID is
 

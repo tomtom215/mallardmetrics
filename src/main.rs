@@ -562,6 +562,7 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
         secret: load_or_create_secret(config),
         allowed_sites: config.site_ids.clone(),
         geoip: GeoIpReader::open(config.geoip_db_path.as_deref()),
+        datacenter: open_datacenter_filter(config)?,
         filter_bots: config.filter_bots,
         sessions: SessionStore::with_capacity(config.session_ttl_secs, config.max_sessions),
         api_keys: ApiKeyStore::load_from_disk(config.data_dir.join("api_keys.json")),
@@ -609,6 +610,24 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
         data_dir: config.data_dir.clone(),
         backup_dir: config.data_dir.join("backups"),
     }))
+}
+
+/// The datacenter filter: off unless `asn_db_path` is set, and a database that
+/// cannot be used stops startup (a silent downgrade would look like filtering).
+fn open_datacenter_filter(
+    config: &Config,
+) -> Result<mallard_metrics::ingest::asn::DatacenterFilter, String> {
+    use mallard_metrics::ingest::asn::DatacenterFilter;
+    let Some(path) = config.asn_db_path.as_deref() else {
+        return Ok(DatacenterFilter::disabled());
+    };
+    let filter = DatacenterFilter::open(path, &config.datacenter_asns)?;
+    tracing::info!(
+        path = %path.display(),
+        asns = filter.asn_count(),
+        "Datacenter traffic filter enabled"
+    );
+    Ok(filter)
 }
 
 /// Hash the admin password supplied through the environment, if any.
