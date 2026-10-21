@@ -401,11 +401,28 @@ async fn readiness_check(State(state): State<Arc<AppState>>) -> Response {
 /// operator: whether an admin password is set (that is a claimable instance),
 /// how many sessions are live, and whether proxy headers are trusted. The same
 /// facts are on `/metrics`, which can be put behind a token.
-async fn detailed_health_check(
-    State(state): State<Arc<AppState>>,
-) -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({
-        "status": "ok",
+async fn detailed_health_check(State(state): State<Arc<AppState>>) -> Response {
+    // A cold tier that the view does not read means reports silently omit
+    // everything that has been flushed. That is an outage that looks healthy,
+    // so it fails the check.
+    let cold_tier = {
+        let writer = state.buffer.conn().clone();
+        let events_dir = state.events_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::storage::schema::cold_tier_status(&writer.lock(), &events_dir)
+        })
+        .await
+        .unwrap_or(crate::storage::schema::ColdTierStatus::Degraded)
+    };
+    let degraded = cold_tier == crate::storage::schema::ColdTierStatus::Degraded;
+    let status = if degraded {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    let body = axum::Json(serde_json::json!({
+        "status": if degraded { "degraded" } else { "ok" },
+        "cold_tier": format!("{cold_tier:?}").to_lowercase(),
         "version": env!("CARGO_PKG_VERSION"),
         "buffered_events": state.buffer.len(),
         "buffer_empty": state.buffer.is_empty(),
@@ -419,7 +436,8 @@ async fn detailed_health_check(
         "visitor_salt_rotation_days": state.visitor_salt_rotation_days,
         "cache_entries": state.query_cache.len(),
         "cache_empty": state.query_cache.is_empty(),
-    }))
+    }));
+    axum::response::IntoResponse::into_response((status, body))
 }
 
 /// Emit one metric family: name, help text, type, and value.
@@ -562,6 +580,13 @@ fn write_counters(out: &mut String, state: &AppState) {
         "Parquet flush failures since startup",
         "counter",
         state.flush_failures_total.load(Ordering::Relaxed),
+    );
+    metric(
+        out,
+        "mallard_buffer_flush_failures_total",
+        "Flushes of the in-memory buffer that failed after retries inside push",
+        "counter",
+        state.buffer.flush_failures.load(Ordering::Relaxed),
     );
     metric(
         out,
@@ -757,6 +782,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_health_fails_when_flushed_files_are_not_being_read() {
+        // Parquet files exist on disk but the `events_all` view is hot-only, so
+        // every report silently omits what was flushed. That must not look healthy.
+        let (state, _dir) = state_builder().build();
+        let healthy = build_router(Arc::clone(&state))
+            .oneshot(get("/health/detailed"))
+            .await
+            .unwrap();
+        assert_eq!(healthy.status(), StatusCode::OK);
+
+        let partition = state.events_dir.join("site_id=example.com/date=2024-01-01");
+        std::fs::create_dir_all(&partition).unwrap();
+        std::fs::write(partition.join("0001.parquet"), b"not parquet").unwrap();
+
+        let response = build_router(state)
+            .oneshot(get("/health/detailed"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(json["status"], "degraded");
+        assert_eq!(json["cold_tier"], "degraded");
+    }
+
+    #[tokio::test]
     async fn test_head_on_the_pixel_answers_without_recording_an_event() {
         let (state, _dir) = state_builder().build();
         let request = Request::builder()
@@ -819,6 +869,7 @@ mod tests {
         assert!(text.contains("mallard_last_flush_success_timestamp_seconds 1700000000"));
         assert!(text.contains("mallard_process_start_time_seconds"));
         assert!(text.contains("mallard_rate_limiter_evictions_total 0"));
+        assert!(text.contains("mallard_buffer_flush_failures_total 0"));
     }
 
     #[test]

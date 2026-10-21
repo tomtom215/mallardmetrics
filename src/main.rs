@@ -413,6 +413,13 @@ fn open_database(config: &Config, storage: &ParquetStorage) -> Result<Database, 
         Err(e) => tracing::warn!(error = %e, "Could not clean up interrupted Parquet writes"),
     }
 
+    // A flush interrupted after its rows were committed to Parquet staging but
+    // before the file was published is finished here, before the view exists.
+    match storage.recover_pending_flushes(&conn) {
+        Ok(report) => tracing::info!(?report, "Checked for interrupted flushes"),
+        Err(e) => tracing::warn!(error = %e, "Could not recover interrupted flushes"),
+    }
+
     if let Err(e) = storage::schema::setup_query_view(&conn, &events_dir) {
         tracing::warn!(error = %e, "Could not create the events_all view; queries will be limited");
     }
@@ -732,13 +739,16 @@ fn unix_now() -> u64 {
 /// Delete Parquet partitions past the retention horizon, daily.
 fn spawn_retention_task(retention_days: u32, state: &Arc<AppState>) {
     let storage = state.buffer.storage().clone();
+    let writer = state.buffer.conn().clone();
     let tier_lock = state.tier_lock.clone();
+    let cache_state = Arc::clone(state);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(RETENTION_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
             let storage = storage.clone();
+            let writer = writer.clone();
             let tier_lock = tier_lock.clone();
             let result = tokio::task::spawn_blocking(move || {
                 // The read glob is expanded when a query starts and the files
@@ -746,12 +756,16 @@ fn spawn_retention_task(retention_days: u32, state: &Arc<AppState>) {
                 // makes the query fail on a file that no longer exists. Taking
                 // the tier lock keeps deletions out of that window.
                 let _tier = tier_lock.write();
-                storage.cleanup_old_partitions(retention_days)
+                // Refreshes the view too: removing the last partition would
+                // otherwise leave `events_all` reading a glob that matches nothing.
+                storage.cleanup_old_partitions_and_refresh(&writer.lock(), retention_days)
             })
             .await;
             match result {
                 Ok(Ok(0)) => {}
                 Ok(Ok(removed)) => {
+                    // Reports cached before the cleanup still include what was removed.
+                    cache_state.query_cache.clear();
                     tracing::info!(removed, retention_days, "Data retention cleanup completed");
                 }
                 Ok(Err(e)) => tracing::error!(error = %e, "Data retention cleanup failed"),
@@ -826,9 +840,10 @@ async fn flush_on_shutdown(state: &Arc<AppState>, timeout: std::time::Duration) 
         "Shutting down gracefully, flushing buffered events"
     );
 
+    // `shutdown_flush` also closes the buffer, so nothing can be pushed behind it.
     let flush = tokio::task::spawn_blocking({
         let state = Arc::clone(state);
-        move || state.buffer.flush()
+        move || state.buffer.shutdown_flush()
     });
 
     match tokio::time::timeout(timeout, flush).await {

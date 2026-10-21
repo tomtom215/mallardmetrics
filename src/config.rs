@@ -855,6 +855,7 @@ impl Config {
 
     /// Settings that decide who is let in and who is believed about their address.
     fn validate_access_controls(&self) -> Result<(), String> {
+        crate::storage::parquet::validate_data_dir(&self.data_dir)?;
         if self.login_lockout_secs == 0 {
             return Err(
                 "login_lockout_secs must be > 0; 0 would end every lockout immediately, \

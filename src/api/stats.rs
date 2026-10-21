@@ -5,8 +5,9 @@ use crate::query::{
     Filter, UNKNOWN_VALUE, breakdowns, events, export, flow, funnel, metrics, realtime, retention,
     revenue, sequences, timeseries,
 };
+use crate::storage::parquet::ErasureReport;
 use axum::extract::{Path, Query, State};
-use axum::http::header;
+use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::{Json, http::HeaderValue};
 use chrono::NaiveDate;
@@ -1631,6 +1632,65 @@ pub struct GdprEraseParams {
     pub end_date: String,
 }
 
+/// Remove one site's data for a date range from both tiers.
+///
+/// Blocking: takes the tier write lock and the writer connection. Returns the
+/// number of hot-table rows deleted and what happened to the Parquet partitions.
+fn erase_site_range(
+    state: &AppState,
+    site_id: &str,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+) -> Result<(i64, ErasureReport), ApiError> {
+    let start_str = start_date.format("%Y-%m-%d").to_string();
+    let end_str = end_date.format("%Y-%m-%d").to_string();
+    let writer = state.buffer.conn();
+
+    // Between the hot-table delete and the partition removal the two tiers
+    // disagree; no query may observe that.
+    let _tier = state.tier_lock.write();
+
+    // Delete from the hot table first, holding the writer lock only for the two
+    // statements.
+    let db_count: i64 = {
+        let guard = writer.lock();
+        let count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE site_id = ? \
+                 AND STRFTIME(CAST(timestamp AS DATE), '%Y-%m-%d') BETWEEN ? AND ?",
+                duckdb::params![site_id, start_str, end_str],
+                |row| row.get(0),
+            )
+            .map_err(ApiError::DatabaseError)?;
+        guard
+            .execute(
+                "DELETE FROM events WHERE site_id = ? \
+                 AND STRFTIME(CAST(timestamp AS DATE), '%Y-%m-%d') BETWEEN ? AND ?",
+                duckdb::params![site_id, start_str, end_str],
+            )
+            .map_err(ApiError::DatabaseError)?;
+        count
+    };
+
+    // A directory that could not be removed is personal data still on disk, so
+    // it is reported rather than counted as zero.
+    let report = state
+        .buffer
+        .storage()
+        .erase_partitions_report(site_id, start_date, end_date)
+        .map_err(|e| ApiError::Internal(format!("Could not erase Parquet partitions: {e}")))?;
+
+    // Rebuild the union view so the deleted partitions leave the read glob.
+    // Connections opened against one database share its catalog, so refreshing
+    // on the writer covers the whole reader pool — see
+    // `storage::tests::test_readers_see_the_view_refreshed_after_a_flush`, which
+    // is what the post-flush refresh in `parquet.rs` relies on too.
+    crate::storage::schema::setup_query_view(&writer.lock(), &state.events_dir)
+        .map_err(ApiError::DatabaseError)?;
+
+    Ok((db_count, report))
+}
+
 /// DELETE /api/gdpr/erase — permanently delete data for a site and date range.
 ///
 /// Removes rows from the hot table and the matching Parquet partitions, then
@@ -1683,58 +1743,44 @@ pub async fn gdpr_erase(
         }
     }
 
-    let site_id = params.site_id.clone();
-    let start_str = params.start_date.clone();
-    let end_str = params.end_date.clone();
-    let events_dir = state.events_dir.clone();
-    let storage = state.buffer.storage().clone();
-    let writer = state.buffer.conn().clone();
-    let tier_lock = state.tier_lock.clone();
-
-    let (db_records_deleted, parquet_partitions_deleted) =
-        tokio::task::spawn_blocking(move || -> Result<(i64, u64), duckdb::Error> {
-            // Between the hot-table delete and the partition removal the two
-            // tiers disagree; no query may observe that.
-            let _tier = tier_lock.write();
-            // Delete from the hot table first, holding the writer lock only for
-            // the two statements.
-            let db_count: i64 = {
-                let guard = writer.lock();
-                let count: i64 = guard
-                    .query_row(
-                        "SELECT COUNT(*) FROM events WHERE site_id = ? \
-                         AND STRFTIME(CAST(timestamp AS DATE), '%Y-%m-%d') BETWEEN ? AND ?",
-                        duckdb::params![site_id, start_str, end_str],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-                guard.execute(
-                    "DELETE FROM events WHERE site_id = ? \
-                     AND STRFTIME(CAST(timestamp AS DATE), '%Y-%m-%d') BETWEEN ? AND ?",
-                    duckdb::params![site_id, start_str, end_str],
-                )?;
-                count
-            };
-
-            let parquet_removed = storage
-                .erase_partitions(&site_id, start_date, end_date)
-                .unwrap_or(0);
-
-            // Rebuild the union view so the deleted partitions leave the read
-            // glob. Connections opened against one database share its catalog,
-            // so refreshing on the writer covers the whole reader pool — see
-            // `storage::tests::test_readers_see_the_view_refreshed_after_a_flush`,
-            // which is what the post-flush refresh in `parquet.rs` relies on too.
-            crate::storage::schema::setup_query_view(&writer.lock(), &events_dir)?;
-
-            Ok((db_count, parquet_removed))
+    let (db_records_deleted, report) = {
+        let state = Arc::clone(&state);
+        let site_id = params.site_id.clone();
+        tokio::task::spawn_blocking(move || {
+            erase_site_range(&state, &site_id, start_date, end_date)
         })
         .await
-        .map_err(|e| ApiError::Internal(format!("Erasure task panicked: {e}")))?
-        .map_err(ApiError::DatabaseError)?;
+        .map_err(|e| ApiError::Internal(format!("Erasure task panicked: {e}")))??
+    };
 
     // Without this the dashboard would keep serving erased data from cache.
     state.query_cache.invalidate_site(&params.site_id);
+
+    let parquet_partitions_deleted = report.removed;
+    if !report.failed.is_empty() {
+        let failed: Vec<&str> = report
+            .failed
+            .iter()
+            .map(|(date, _)| date.as_str())
+            .collect();
+        for (date, error) in &report.failed {
+            tracing::error!(site_id = %params.site_id, date = %date, error = %error, "GDPR erasure could not remove a partition");
+        }
+        // 500, not 200: the request asked for the data to be gone and some of it
+        // is not. The caller must retry; the body says which dates remain.
+        return Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "partial",
+                "site_id": params.site_id,
+                "start_date": params.start_date,
+                "end_date": params.end_date,
+                "db_records_deleted": db_records_deleted,
+                "parquet_partitions_deleted": parquet_partitions_deleted,
+                "failed_dates": failed,
+            })),
+        ));
+    }
 
     tracing::warn!(
         site_id = %params.site_id,
@@ -1745,14 +1791,17 @@ pub async fn gdpr_erase(
         "GDPR erasure completed"
     );
 
-    Ok(Json(serde_json::json!({
-        "status": "erased",
-        "site_id": params.site_id,
-        "start_date": params.start_date,
-        "end_date": params.end_date,
-        "db_records_deleted": db_records_deleted,
-        "parquet_partitions_deleted": parquet_partitions_deleted,
-    })))
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "erased",
+            "site_id": params.site_id,
+            "start_date": params.start_date,
+            "end_date": params.end_date,
+            "db_records_deleted": db_records_deleted,
+            "parquet_partitions_deleted": parquet_partitions_deleted,
+        })),
+    ))
 }
 
 #[cfg(test)]
