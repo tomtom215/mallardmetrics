@@ -469,8 +469,10 @@ fn bench_report_scale(c: &mut Criterion) {
         "30 minutes",
     );
 
+    // The layout the writer produces today: `site_id` is a column in the file
+    // as well as a directory name, which the scoped read depends on.
     let root = tempfile::tempdir().unwrap();
-    write_scale_dataset(root.path(), false);
+    write_scale_dataset(root.path(), true);
     let conn = Connection::open_in_memory().unwrap();
     schema::init_schema(&conn).unwrap();
     schema::setup_query_view(&conn, root.path()).unwrap();
@@ -520,6 +522,32 @@ fn bench_report_scale(c: &mut Criterion) {
     group.finish();
 }
 
+/// Cost of inserting into a full query cache (audit S-10).
+///
+/// At capacity every insert evicts the least recently used entry by scanning
+/// them all under the cache mutex. This measures that at the default size, to
+/// decide whether replacing the cache is worth anything. Setup is outside
+/// `b.iter()` (L21); each iteration inserts a key the cache has not seen, so it
+/// always has to evict.
+fn bench_cache_insert_full(c: &mut Criterion) {
+    use mallard_metrics::query::cache::{QueryCache, cache_key};
+    let mut group = c.benchmark_group("cache_insert_full");
+    for capacity in [1_000usize, 10_000, 100_000] {
+        let cache = QueryCache::new(60, capacity);
+        for i in 0..capacity {
+            cache.insert(cache_key("main", "site", &[&i.to_string()]), "{}");
+        }
+        let mut next = capacity;
+        group.bench_function(BenchmarkId::from_parameter(capacity), |b| {
+            b.iter(|| {
+                next += 1;
+                cache.insert(cache_key("main", "site", &[&next.to_string()]), "{}");
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_buffer_push,
@@ -527,6 +555,7 @@ criterion_group!(
     bench_queries,
     bench_query_scale,
     bench_report_scale,
+    bench_cache_insert_full,
     bench_user_agent,
     bench_visitor_id
 );
