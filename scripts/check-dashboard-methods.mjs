@@ -245,6 +245,16 @@ check('the client retries 429, caps concurrency and classifies results', async (
   const behavioral = await coded(503, { error: 'any wording at all', code: 'behavioral_unavailable' });
   assert.equal(behavioral.kind, 'unavailable');
   assert.equal(behavioral.code, 'behavioral_unavailable');
+  // Rounded timestamps (gdpr_mode) have their own code, distinct from a missing extension.
+  const rounded = await coded(503, { error: 'Funnel analysis is not available while timestamps are rounded', code: 'session_data_unavailable' });
+  assert.equal(rounded.kind, 'unavailable');
+  assert.equal(rounded.code, 'session_data_unavailable');
+  assert.equal((await coded(409, { error: 'A backup named x already exists', code: 'conflict' })).kind, 'error');
+  assert.equal(A.errorCode({ code: 'conflict' }), 'conflict');
+  const sent = await new A.Api({ fetchImpl: async () => res(409, { error: 'A backup named x already exists', code: 'conflict' }) }).send('POST', '/x');
+  assert.equal(sent.kind, 'error');
+  assert.equal(sent.status, 409);
+  assert.match(sent.message, /already exists/);
   assert.equal((await coded(503, { error: 'Funnel analysis requires the DuckDB `behavioral` community extension' })).kind, 'error', 'the word "behavioral" in a message is not a code');
   assert.equal((await coded(503, { error: 'shutting down', code: 'internal_error' })).kind, 'error');
   const timeout = await coded(504, { error: 'The query did not finish within 30 seconds.', code: 'query_timeout' });

@@ -439,7 +439,7 @@ const json = (status, body, headers = {}) => ({ status, contentType: 'applicatio
   await page.route('**/api/stats/main**', async (route) => {
     const res = await route.fetch();
     const body = await res.json();
-    Object.assign(body, { behavioral_available: false, total_sessions: null, bounce_rate: null, avg_visit_duration_secs: null, views_per_visit: null });
+    Object.assign(body, { behavioral_available: false, sessions_unavailable_reason: 'timestamps_rounded', total_sessions: null, bounce_rate: null, avg_visit_duration_secs: null, views_per_visit: null });
     await route.fulfill({ response: res, json: body });
   });
   await page.goto(BASE, { waitUntil: 'load' });
@@ -450,6 +450,11 @@ const json = (status, body, headers = {}) => ({ status, contentType: 'applicatio
   if ((await page.locator('.placeholder-unavailable').count()) > 0) fail(where, 'gdpr_mode is presented with the missing-extension warning');
   if (/MALLARD_EXTENSION_DIR/.test(await page.locator('body').innerHTML())) fail(where, 'gdpr_mode tells people to fix the extension');
   for (const gone of ['/api/stats/funnel', '/api/stats/sequences', '/api/stats/flow']) if (asked.includes(gone)) fail(where, `${gone} was requested although sessions are unavailable`);
+  if (asked.includes('/health/detailed')) fail(where, 'the cause was inferred from /health/detailed instead of read from the response');
+  // The panels beside the overview must not repeat its long explanation.
+  const long = (text.match(/Timestamps are rounded to the hour, so visits cannot be reconstructed/g) ?? []).length;
+  if (long < 3) fail(where, `the funnel, sequence and flow panels should each show the compact text (found ${long})`);
+  if ((text.match(/With gdpr_mode every timestamp is rounded/g) ?? []).length !== 1) fail(where, 'the long gdpr_mode explanation is not shown exactly once');
   if ((await page.locator('#retention .retention-table').count()) !== 1) fail(where, 'weekly retention, which gdpr_mode does not affect, is not shown');
   await assertCleanContent(page, where);
   await runAxe(page, where);
@@ -457,7 +462,38 @@ const json = (status, body, headers = {}) => ({ status, contentType: 'applicatio
 }
 
 {
-  const retention = (identity, cohorts) => ({ identity_supports_cohorts: identity, caveat: identity ? null : 'wording the dashboard must not parse', cohorts });
+  // The cause comes from the response alone: a 503's `code` on a panel, and
+  // `sessions_unavailable_reason` on /main. An older server that sends
+  // neither gets the generic explanation, not a guess.
+  const cases = [
+    ['code-rounded', { behavioral_available: true }, { error: 'rounded', code: 'session_data_unavailable' }, /rounded to the hour/, /MALLARD_EXTENSION_DIR/],
+    ['code-extension', { behavioral_available: true }, { error: 'no extension', code: 'behavioral_unavailable' }, /Behavioral analytics is unavailable/, /rounded to the hour/],
+    ['reason-extension', { behavioral_available: false, sessions_unavailable_reason: 'extension_missing', total_sessions: null }, null, /MALLARD_EXTENSION_DIR/, /rounded to the hour/],
+    ['reason-absent', { behavioral_available: false, total_sessions: null }, null, /MALLARD_EXTENSION_DIR/, /rounded to the hour/],
+  ];
+  for (const [label, mainPatch, panel503, expected, forbidden] of cases) {
+    const { ctx, page } = await newPage();
+    const where = `unavailable-cause/${label}`;
+    const asked = [];
+    page.on('request', (r) => asked.push(new URL(r.url()).pathname));
+    page.on('pageerror', (e) => fail(where, `page error: ${e.message}`));
+    await page.route('**/api/stats/main**', async (route) => {
+      const res = await route.fetch();
+      await route.fulfill({ response: res, json: { ...(await res.json()), ...mainPatch } });
+    });
+    if (panel503) await page.route('**/api/stats/funnel**', (r) => r.fulfill(json(503, panel503)));
+    await page.goto(BASE, { waitUntil: 'load' });
+    await loadEverything(page);
+    const scope = panel503 ? await page.locator('#funnel').innerHTML() : await page.locator('body').innerHTML();
+    if (!expected.test(scope)) fail(where, `the explanation does not match the cause (${expected})`);
+    if (forbidden.test(scope)) fail(where, `the explanation names the wrong cause (${forbidden})`);
+    if (asked.includes('/health/detailed')) fail(where, 'the cause was inferred from /health/detailed');
+    await ctx.close();
+  }
+}
+
+{
+  const retention = (identity, cohorts) => ({ identity_supports_cohorts: identity, visitor_salt_rotation_days: identity ? 30 : 7, caveat: identity ? null : 'wording the dashboard must not parse', cohorts });
   const cohorts = [
     { cohort_date: '2026-09-28', cohort_size: 120, retained: [120, 54, 31, 22], retention_rates: [1, 0.45, 0.2583, 0.1833], complete_weeks: 4, partial_first_week: true },
     { cohort_date: '2026-10-05', cohort_size: 98, retained: [98, 41, 27, 0], retention_rates: [1, 0.4184, 0.2755, 0], complete_weeks: 3, partial_first_week: false },
@@ -494,12 +530,34 @@ const json = (status, body, headers = {}) => ({ status, contentType: 'applicatio
   await loadEverything(page);
   const note = await page.locator('#retention .notice').innerText();
   if (!/visitor_salt_rotation_days/.test(note) || !/at least 21/.test(note)) fail(where, 'the caveat does not name the setting and the value to use');
+  if (!/every 7 days/.test(note)) fail(where, 'the caveat does not state the rotation period the server reported');
   if (/wording the dashboard must not parse/.test(note)) fail(where, "the server's caveat wording is displayed verbatim");
   if ((await page.locator('#retention .placeholder-error, #retention .notice[role="alert"]').count()) > 0) fail(where, 'the caveat is styled as an error');
   const dashes = (await page.locator('.retention-table tbody td').allInnerTexts()).filter((c) => c.trim().startsWith('–')).length;
   if (dashes !== 9) fail(where, `weeks that cannot be measured should be dashes, got ${dashes}`);
   await runAxe(page, where);
   await ctx.close();
+}
+
+{
+  // The site selector: busiest site first and selected, with its 30-day count; a URL that names a site wins.
+  const { ctx, page } = await newPage();
+  const where = 'site-selector';
+  watch(page, where);
+  await page.route('**/api/sites', (r) => r.fulfill(json(200, { sites: ['busy.example', 'quiet.example', 'idle.example'], details: [{ site_id: 'busy.example', events_30d: 18423 }, { site_id: 'quiet.example', events_30d: 12 }, { site_id: 'idle.example', events_30d: 0 }] })));
+  await page.goto(BASE, { waitUntil: 'load' });
+  await page.waitForSelector('select');
+  const options = await page.locator('.toolbar select option').allInnerTexts();
+  if (options.length !== 3 || !/^busy\.example\b.*18,423 events \(30d\)/.test(options[0]) || !/idle\.example.*0 events/.test(options[2])) fail(where, `options do not show the 30-day counts: ${JSON.stringify(options)}`);
+  if ((await page.locator('.toolbar select').inputValue()) !== 'busy.example') fail(where, 'the busiest site is not selected by default');
+  await ctx.close();
+  const named = await newPage();
+  watch(named.page, `${where}/url`);
+  await named.page.route('**/api/sites', (r) => r.fulfill(json(200, { sites: ['busy.example', 'quiet.example'], details: [{ site_id: 'busy.example', events_30d: 5 }, { site_id: 'quiet.example', events_30d: 1 }] })));
+  await named.page.goto(`${BASE}/?site=quiet.example`, { waitUntil: 'load' });
+  await named.page.waitForSelector('select');
+  if ((await named.page.locator('.toolbar select').inputValue()) !== 'quiet.example') fail(where, 'a site named in the URL does not win over the busiest');
+  await named.ctx.close();
 }
 
 {
@@ -614,6 +672,7 @@ if (NOBEH) {
   await loadEverything(page);
   const text = await page.locator('body').innerText();
   if (!/Behavioral analytics is unavailable/.test(text)) fail(where, 'missing the behavioral-unavailable explanation');
+  if (/gdpr_mode/.test(text)) fail(where, 'a missing extension is reported as gdpr_mode');
   if (!/MALLARD_EXTENSION_DIR/.test(await page.locator('body').innerHTML())) fail(where, 'explanation does not say how to fix it');
   await assertCleanContent(page, where);
   await runAxe(page, where);

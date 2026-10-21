@@ -790,7 +790,7 @@ const RETENTION_MIN_ROTATION_DAYS = (RETENTION_WEEKS - 1) * 7;
  * missing the visitors first seen earlier that week, so it is labelled.
  */
 function RetentionGrid({ data }) {
-  const { cohorts, identity_supports_cohorts: supported } = data;
+  const { cohorts, identity_supports_cohorts: supported, visitor_salt_rotation_days: rotation } = data;
   // An informational note, not an error: nothing is broken, the server is set up
   // to forget visitors faster than this report needs it to remember them.
   const notice =
@@ -799,7 +799,7 @@ function RetentionGrid({ data }) {
       <div class="notice notice-info" role="note">
         <strong>Weeks after the first cannot be measured with the current setting.</strong>
         Retention follows the same visitor from one week to the next, but this server replaces visitor
-        IDs sooner than that, so a returning visitor looks like a new one. To measure ${RETENTION_WEEKS}-week
+        IDs${Number.isFinite(rotation) ? html` every ${rotation} day${rotation === 1 ? '' : 's'}` : ' sooner than that'}, so a returning visitor looks like a new one. To measure ${RETENTION_WEEKS}-week
         cohorts, set <code>visitor_salt_rotation_days</code> (environment variable${' '}
         <code>MALLARD_VISITOR_SALT_ROTATION_DAYS</code>) to at least ${RETENTION_MIN_ROTATION_DAYS} and
         restart. It applies to events collected from then on, and a longer setting lets a visitor be
@@ -1262,6 +1262,14 @@ const FILTER_LABELS = {
 // an event, so the server has no per-event predicate for them and answers 400.
 const FILTERABLE_SLUGS = new Set(ALL_BREAKDOWN_SLUGS.filter((slug) => slug !== 'entry-pages' && slug !== 'exit-pages'));
 
+/**
+ * Why session data is missing, from what the server says: 'rounded'
+ * (gdpr_mode / round_timestamps), 'extension' (the behavioral extension is not
+ * loaded) or 'unknown' (an older server that names no cause).
+ */
+const reasonFromMain = (value) => (value === 'timestamps_rounded' ? 'rounded' : value === 'extension_missing' ? 'extension' : 'unknown');
+const reasonFromCode = (code) => (code === 'session_data_unavailable' ? 'rounded' : code === 'behavioral_unavailable' ? 'extension' : 'unknown');
+
 // Reports computed from sessions or ordered events. `retention` is separate: it
 // needs the extension but not exact timestamps, so gdpr_mode leaves it working.
 const BEHAVIORAL_KEYS = new Set(['funnel', 'retention', 'sequences', 'flow']);
@@ -1291,7 +1299,10 @@ class Dashboard extends Component {
     const period = url.period || prefs.period || '30d';
     this.state = {
       sites: null,
-      siteId: url.siteId || prefs.siteId || '',
+      siteEvents: {},
+      // The address bar names a site; otherwise the busiest one is chosen once
+      // the list arrives (a remembered site would hide that default).
+      siteId: url.siteId || '',
       siteDraft: '',
       period: period === 'today' ? 'day' : period,
       startDate: url.startDate || prefs.startDate || '',
@@ -1323,6 +1334,7 @@ class Dashboard extends Component {
     this.wanted = new Set();
     this.fetched = new Set();
     this.behavioral = null;
+    this.reason = null;
     this.mainWaiters = [];
     this.onPop = () => this.restoreFromUrl();
     this.onVisibility = () => {
@@ -1403,32 +1415,6 @@ class Dashboard extends Component {
     return this.mainSettled ? Promise.resolve() : new Promise((resolve) => this.mainWaiters.push(resolve));
   }
 
-  /**
-   * Why session data is missing: 'extension' (the behavioral extension is not
-   * loaded), 'rounded' (it is, but gdpr_mode rounds timestamps to the hour, so
-   * sessions cannot be built) or 'unknown'. `/stats/main` reports only that it
-   * could not compute sessions, so the public health endpoint names the cause.
-   */
-  whyUnavailable(gen) {
-    if (!this.reasonPromise || this.reasonGen !== gen) {
-      this.reasonGen = gen;
-      this.reasonPromise = (async () => {
-        let reason = 'unknown';
-        try {
-          const res = await fetch('/health/detailed', { headers: { Accept: 'application/json' } });
-          const body = await res.json();
-          if (body.behavioral_extension_loaded === true) reason = 'rounded';
-          else if (body.behavioral_extension_loaded === false) reason = 'extension';
-        } catch (e) {
-          /* the health endpoint is a hint; without it the generic explanation is used */
-        }
-        if (gen === this.gen) this.setState({ reason });
-        return reason;
-      })();
-    }
-    return this.reasonPromise;
-  }
-
   /** Fetch one report. Stale results from an earlier view are dropped. */
   async load(key, { quiet = false } = {}) {
     const gen = this.gen;
@@ -1444,8 +1430,7 @@ class Dashboard extends Component {
       await this.whenMain();
       if (gen !== this.gen) return;
       if (this.behavioral === false) {
-        const reason = await this.whyUnavailable(gen);
-        if (gen !== this.gen) return;
+        const reason = this.reason;
         // Weekly retention does not depend on the order of events inside an
         // hour, so a rounded-timestamp server can still answer it.
         if (!(key === 'retention' && reason === 'rounded')) {
@@ -1464,13 +1449,15 @@ class Dashboard extends Component {
     }
     if (key === 'main') {
       this.behavioral = result.kind === 'ok' ? result.data.behavioral_available !== false : null;
+      // The server names the cause itself (`sessions_unavailable_reason`); an
+      // older one that does not leaves it 'unknown' and the generic help shows.
+      this.reason = this.behavioral === false ? reasonFromMain(result.data.sessions_unavailable_reason) : null;
+      this.setState({ reason: this.reason });
       this.mainSettled = true;
       this.mainWaiters.splice(0).forEach((resolve) => resolve());
     }
     if (result.kind === 'unavailable') {
-      // Name the cause; the code alone cannot tell a missing extension from rounded timestamps.
-      result.reason = await this.whyUnavailable(gen);
-      if (gen !== this.gen) return;
+      result.reason = reasonFromCode(result.code);
     }
     if (quiet && result.kind !== 'ok' && prev && prev.kind === 'ok') {
       this.setRes(key, { ...prev, loading: false, offline: true });
@@ -1501,6 +1488,7 @@ class Dashboard extends Component {
     this.fetched.clear();
     this.mainSettled = false;
     this.behavioral = null;
+    this.reason = null;
     this.persist();
     this.syncUrl(push);
     document.title = `${this.state.siteId} · Mallard Metrics`;
@@ -1574,10 +1562,16 @@ class Dashboard extends Component {
       return;
     }
     const sites = result.data.sites || [];
+    // `details` carries each site's events in the last 30 days, busiest first.
+    // An older server sends only the IDs; then no counts are shown.
+    const details = Array.isArray(result.data.details) ? result.data.details : [];
+    const siteEvents = Object.fromEntries(details.map((d) => [d.site_id, d.events_30d]));
+    const busiest = details.find((d) => sites.includes(d.site_id))?.site_id ?? sites[0];
     this.setState((prev) => ({
       sites,
-      // A saved or linked site that no longer exists falls back to a real one.
-      siteId: sites.length > 0 && !sites.includes(prev.siteId) ? sites[0] : prev.siteId,
+      siteEvents,
+      // A linked site that does not exist falls back to the busiest real one.
+      siteId: sites.length > 0 && !sites.includes(prev.siteId) ? busiest : prev.siteId,
     }));
   }
 
@@ -1701,7 +1695,7 @@ class Dashboard extends Component {
   /* Rendering ------------------------------------------------------------ */
 
   renderToolbar() {
-    const { sites, siteId, siteDraft, period, startDate, endDate, compare, rangeOpen, draftStart, draftEnd, rangeError, updatedAt } = this.state;
+    const { sites, siteEvents, siteId, siteDraft, period, startDate, endDate, compare, rangeOpen, draftStart, draftEnd, rangeError, updatedAt } = this.state;
     const refreshing = Object.values(this.state.res).some((r) => r && r.loading);
     const today = todayUTC();
     return html`
@@ -1710,7 +1704,7 @@ class Dashboard extends Component {
           ? html`
               <label class="field"><span class="field-label">Site</span>
                 <select value=${siteId} onChange=${(e) => this.change({ siteId: e.target.value })}>
-                  ${sites.map((site) => html`<option value=${site} title=${site}>${site}</option>`)}
+                  ${sites.map((site) => html`<option value=${site} title=${site}>${Object.hasOwn(siteEvents, site) ? `${site} · ${num(siteEvents[site])} events (30d)` : site}</option>`)}
                 </select>
               </label>`
           : html`
