@@ -4,8 +4,8 @@ use crate::query::QueryScope;
 use crate::query::cache::{CacheKey, cache_key};
 use crate::query::scoped::ColdReads;
 use crate::query::{
-    Filter, UNKNOWN_VALUE, breakdowns, events, export, flow, funnel, metrics, realtime, retention,
-    revenue, sequences, timeseries,
+    Filter, UNKNOWN_VALUE, breakdowns, events, export, flow, funnel, metrics, parquet_export,
+    realtime, retention, revenue, sequences, timeseries,
 };
 use crate::storage::parquet::ErasureReport;
 use axum::body::{Body, Bytes};
@@ -2086,6 +2086,175 @@ async fn stream_raw_export(
             "The export ended before producing any output".to_string(),
         )),
     }
+}
+
+// ── Parquet export ───────────────────────────────────────────────────────
+
+/// Parameters for the Parquet export endpoint.
+#[derive(Debug, Deserialize)]
+pub struct ParquetExportParams {
+    pub site_id: String,
+    #[serde(default = "default_period")]
+    pub period: String,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+}
+
+/// The response body of a Parquet export: the file, read in chunks.
+struct FileBody {
+    rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+}
+
+impl futures_core::Stream for FileBody {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+/// Stream `file` to the client, then delete it and free the export slot.
+///
+/// The reader is a task, so a client that stalls holds only the task and the
+/// slot, and [`EXPORT_MAX_DURATION`] ends it. `guard` and `busy` are released
+/// *before* the body can end (`tx` is dropped last), so a client that has read
+/// to the end can immediately ask for another export.
+fn stream_export_file(
+    mut file: tokio::fs::File,
+    guard: parquet_export::TempFile,
+    busy: parquet_export::ExportSlot,
+) -> FileBody {
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(EXPORT_CHANNEL_DEPTH);
+    tokio::spawn(async move {
+        let copy = async {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match file.read(&mut buf).await {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        if tx
+                            .send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                }
+            }
+        };
+        let finished = tokio::time::timeout(EXPORT_MAX_DURATION, copy).await;
+        // The file is deleted and the slot freed *before* the body can end:
+        // `tx` is dropped last, so a client that has read to the end can
+        // immediately ask for another export.
+        drop(guard);
+        drop(busy);
+        if finished.is_err() {
+            tracing::warn!("A Parquet export download exceeded its time cap; aborting");
+            let _ = tx
+                .send(Err(std::io::Error::other("the export download timed out")))
+                .await;
+        }
+    });
+    FileBody { rx }
+}
+
+/// GET /api/admin/export/parquet — one site and date range as a Parquet file.
+///
+/// Admin scope. `visitor_id` is not in the file (see
+/// [`parquet_export`]); the schema is documented in
+/// `docs/src/exporting-parquet.md`. The file is written to
+/// `<data_dir>/exports` under the shared tier read lock, which is released
+/// before the download starts, then streamed and deleted. A range with more
+/// than [`parquet_export::MAX_ROWS`] rows is a `400`, not a truncated file.
+pub async fn export_parquet(
+    State(state): State<Arc<AppState>>,
+    ApiQuery(params): ApiQuery<ParquetExportParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    let range = StatsParams {
+        site_id: params.site_id.clone(),
+        period: params.period.clone(),
+        start_date: params.start_date.clone(),
+        end_date: params.end_date.clone(),
+        limit: None,
+        filters: None,
+        compare: None,
+    }
+    .validated()?;
+
+    let busy = parquet_export::ExportSlot::try_claim(&state.data_dir).ok_or_else(|| {
+        ApiError::TooManyRequests(
+            "Another Parquet export is running. Please retry when it has finished.".to_string(),
+        )
+    })?;
+
+    let data_dir = state.data_dir.clone();
+    let path = tokio::task::spawn_blocking(move || parquet_export::new_export_path(&data_dir))
+        .await
+        .map_err(|e| ApiError::Internal(format!("Export task panicked: {e}")))?
+        .map_err(|e| ApiError::Internal(format!("Could not prepare the exports directory: {e}")))?;
+    // From here the file is removed however this request ends.
+    let guard = parquet_export::TempFile(path.clone());
+
+    let scope = state.scope(&params.site_id, &range.start, &range.end);
+    let dest = path.clone();
+    let outcome = run_scoped(&state, move |conn, cold| {
+        parquet_export::write_parquet(conn, &cold.scope(scope, 0), &dest, parquet_export::MAX_ROWS)
+    })
+    .await?;
+    let rows = match outcome {
+        parquet_export::Outcome::Written { rows } => rows,
+        parquet_export::Outcome::TooManyRows => {
+            return Err(ApiError::BadRequest(format!(
+                "More than {} events match; choose a shorter date range.",
+                parquet_export::MAX_ROWS
+            )));
+        }
+    };
+
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Could not open the export file: {e}")))?;
+    let length = file
+        .metadata()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Could not size the export file: {e}")))?
+        .len();
+
+    let body = stream_export_file(file, guard, busy);
+
+    let filename = format!(
+        "mallard-events-{}-{}.parquet",
+        params.site_id,
+        range.start.split(' ').next().unwrap_or(&range.start)
+    );
+    let disposition = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(parquet_export::CONTENT_TYPE),
+            ),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::CONTENT_LENGTH, HeaderValue::from(length)),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            (
+                axum::http::HeaderName::from_static("x-mallard-rows"),
+                HeaderValue::from(rows),
+            ),
+        ],
+        Body::from_stream(body),
+    ))
 }
 
 // ── GDPR erasure ─────────────────────────────────────────────────────────

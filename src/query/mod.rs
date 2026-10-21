@@ -6,6 +6,7 @@ pub mod extension;
 pub mod flow;
 pub mod funnel;
 pub mod metrics;
+pub mod parquet_export;
 pub mod realtime;
 pub mod retention;
 pub mod revenue;
