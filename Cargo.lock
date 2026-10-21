@@ -1337,6 +1337,8 @@ dependencies = [
  "hex",
  "hmac",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "mallard-metrics",
  "maxminddb",
  "mime_guess",

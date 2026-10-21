@@ -18,7 +18,6 @@ use mallard_metrics::{query, server, storage};
 
 use duckdb::Connection;
 use parking_lot::Mutex;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -296,9 +295,6 @@ async fn run(config_path: Option<&std::path::Path>) {
 
     tracing::info!(addr = %addr, "Listening");
 
-    // ConnectInfo makes the peer address available to handlers, which is what
-    // the client-IP fallback uses when no proxy headers are trusted.
-    let service = app.into_make_service_with_connect_info::<SocketAddr>();
     let shutdown_timeout = std::time::Duration::from_secs(config.shutdown_timeout_secs.max(1));
 
     // The final flush has to come after the server has drained, not before.
@@ -307,13 +303,17 @@ async fn run(config_path: Option<&std::path::Path>) {
     // they accept lands in a buffer that a flush started at the signal has
     // already emptied. So the future below only waits for the signal; the flush
     // runs once `serve` returns.
+    //
+    // `server::serve` is `axum::serve` plus a header-read timeout (SI-14): the
+    // peer address still reaches handlers as ConnectInfo, which the client-IP
+    // fallback uses when no proxy headers are trusted, and shutdown still stops
+    // accepting and then drains.
     let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
-    let serving = axum::serve(listener, service).with_graceful_shutdown(async move {
+    let serving = server::serve(listener, app, server::HEADER_READ_TIMEOUT, async move {
         wait_for_shutdown_signal().await;
         // The receiver only goes away if `serve` has already returned.
         let _ = signalled_tx.send(());
     });
-    let serving = std::future::IntoFuture::into_future(serving);
     tokio::pin!(serving);
 
     // A connection that never finishes must not keep the process alive past the
