@@ -37,5 +37,7 @@
 - [Monitoring](monitoring.md)
 - [Webhook Alerts and Reports](alerts-and-reports.md)
 - [Data Management](data-management.md)
+  - [Importing Data](importing-data.md)
+  - [Exporting to Parquet](exporting-parquet.md)
 - [Backup and Restore](backup-restore.md)
 - [Troubleshooting](troubleshooting.md)

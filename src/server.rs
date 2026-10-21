@@ -125,6 +125,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // DELETE only.
         .route("/segments/{id}", post(segments::update_segment))
         .route("/segments/{id}", delete(segments::delete_segment))
+        .route("/admin/export/parquet", get(stats::export_parquet))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_admin_auth,

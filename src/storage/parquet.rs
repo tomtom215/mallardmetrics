@@ -305,6 +305,20 @@ impl ParquetStorage {
         Ok(dir.join(format!("{:04}.parquet", Self::max_file_number(&dir) + 1)))
     }
 
+    /// Make the next flushes stop as a power cut would: `after_delete` false
+    /// stops once the staged file is durable, true once the hot rows are also
+    /// deleted. `None` clears it. For the importer's crash tests.
+    #[cfg(test)]
+    pub(crate) fn inject_flush_crash(&self, after_delete: Option<bool>) {
+        self.faults.lock().crash_after = after_delete.map(|d| {
+            if d {
+                CrashPoint::FlushAfterDelete
+            } else {
+                CrashPoint::FlushAfterStage
+            }
+        });
+    }
+
     #[cfg(test)]
     fn crash_at(&self, point: CrashPoint) -> bool {
         self.faults.lock().crash_after == Some(point)

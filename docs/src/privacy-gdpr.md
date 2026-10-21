@@ -122,6 +122,17 @@ authentication, see the [API reference](api-reference/stats.md#delete-apigdprera
   data. Expire them on your own schedule and record that in your procedure; if a
   restore is ever needed, repeat the erasure afterwards.
 
+## Imported data and exports
+
+- [Imported rows](importing-data.md) are stored under the same settings as live
+  ones (`gdpr_mode` and its parts), carry no IP address, user id or advertising
+  id, and get a visitor id that starts `imp:` and is a keyed hash of the
+  source's *session*, so one person's sessions stay unlinked. Erase them like any
+  other rows, by site and date range.
+- The [Parquet export](exporting-parquet.md) leaves `visitor_id` out for the
+  same reason the raw export does. It is written to `<data_dir>/exports` for the
+  length of the download and then deleted.
+
 ## What the bundled Caddy logs
 
 `deploy/Caddyfile` removes everything that identifies a visitor from every

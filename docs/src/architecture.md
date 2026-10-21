@@ -292,7 +292,7 @@ image is glibc and there is no musl build. See
 
 | Module | Purpose |
 |---|---|
-| `main.rs` | Startup order, background tasks, `--healthcheck`, `--install-extension`, signals, shutdown |
+| `main.rs` | Startup order, background tasks, `--healthcheck`, `--install-extension`, `import`, signals, shutdown |
 | `lib.rs` | Library root; the binary is a thin wrapper |
 | `config.rs` | TOML and environment configuration, validation, advisories |
 | `server.rs` | Router, middleware, CORS, security headers, `/metrics`, health probes |
@@ -316,6 +316,8 @@ image is glibc and there is no musl build. See
 | `query/funnel.rs`, `retention.rs`, `sequences.rs`, `flow.rs` | Behavioral reports |
 | `query/events.rs`, `revenue.rs` | Goals, properties, revenue |
 | `query/export.rs` | Daily and raw export (a chunked exporter exists but is not yet used by the handler) |
+| `query/parquet_export.rs` | One site and range as a single Parquet file: schema, `COPY`, export directory |
+| `import/` | `mallard-metrics import`: the GA4 BigQuery parser (`ga4.rs`), staging, idempotent merge and flush (`mod.rs`), command line (`cli.rs`) |
 | `query/cache.rs` | TTL and LRU result cache with an erasure epoch |
 | `api/stats.rs` | All analytics and erasure handlers, query execution (slots, deadline) |
 | `api/errors.rs` | `ApiError`, status and `code` mapping |

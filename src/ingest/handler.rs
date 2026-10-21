@@ -827,7 +827,7 @@ fn classify_device(width: u32) -> String {
 }
 
 /// Extract a normalised pathname from a URL.
-fn sanitize_pathname(url: &str) -> String {
+pub fn sanitize_pathname(url: &str) -> String {
     // The query and fragment go first. Looking for the path's slash before
     // removing them found one *inside* the query for `https://host?next=/a/b`
     // and reported `/a/b` as the page.
@@ -912,7 +912,7 @@ const fn is_invisible_format(c: char) -> bool {
 
 /// Truncate to `max_len` characters and drop control and invisible format
 /// characters.
-fn sanitize_string(input: &str, max_len: usize) -> String {
+pub fn sanitize_string(input: &str, max_len: usize) -> String {
     input
         .chars()
         .filter(|c| !c.is_control() && !is_invisible_format(*c))
@@ -942,7 +942,7 @@ fn sanitize_props(props: &str) -> Option<String> {
 }
 
 /// Normalise a currency to an uppercase ISO 4217 alphabetic code.
-fn normalize_currency(code: &str) -> Option<String> {
+pub fn normalize_currency(code: &str) -> Option<String> {
     let trimmed = code.trim();
     if trimmed.len() != 3 || !trimmed.chars().all(|c| c.is_ascii_alphabetic()) {
         return None;

@@ -41,6 +41,7 @@ async fn main() {
         Some("--healthcheck") => std::process::exit(run_healthcheck().await),
         Some("--install-extension") => std::process::exit(run_install_extension()),
         Some("--test-webhook") => std::process::exit(run_test_webhook().await),
+        Some("import") => std::process::exit(mallard_metrics::import::cli::run(&args[1..])),
         Some("--version" | "-V") => {
             println!("mallard-metrics {}", env!("CARGO_PKG_VERSION"));
             return;
@@ -64,7 +65,8 @@ fn print_help() {
              mallard-metrics [CONFIG_FILE]\n    \
              mallard-metrics --healthcheck\n    \
              mallard-metrics --install-extension\n    \
-             mallard-metrics --test-webhook\n\n\
+             mallard-metrics --test-webhook\n    \
+             mallard-metrics import <FORMAT> --site-id <ID> --file <PATH>\n\n\
          OPTIONS:\n    \
              CONFIG_FILE           Path to a TOML configuration file (optional)\n    \
              --healthcheck         Probe a running instance and exit 0 when healthy\n    \
@@ -74,6 +76,8 @@ fn print_help() {
                                    run this once with one, then start normally.\n    \
              --test-webhook        Send one test notification to the configured alert\n                          \
                                    webhook (MALLARD_ALERTS_*) and exit 0 if it was accepted\n    \
+             import                Load another product's export while the server is\n                          \
+                                   stopped; see `mallard-metrics import --help`\n    \
              --version, -V         Print the version and exit\n    \
              --help, -h            Print this message\n\n\
          Configuration may also be supplied through MALLARD_* environment\n\
