@@ -18,6 +18,12 @@ pub enum ApiError {
     /// not available. Previously these requests returned `200` with an empty
     /// body, so the dashboard showed "no data" for a site full of data.
     BehavioralUnavailable(String),
+    /// 504 — the query passed its deadline and was interrupted.
+    ///
+    /// The caller's request was valid and the server is healthy; the work was
+    /// too large for the time allowed, so a narrower range or fewer filters will
+    /// succeed. A 400 would blame the caller, a 500 would page someone.
+    QueryTimeout(String),
 }
 
 impl std::fmt::Display for ApiError {
@@ -32,6 +38,7 @@ impl std::fmt::Display for ApiError {
             Self::BehavioralUnavailable(msg) => {
                 write!(f, "Behavioral extension unavailable: {msg}")
             }
+            Self::QueryTimeout(msg) => write!(f, "Query timed out: {msg}"),
         }
     }
 }
@@ -55,6 +62,23 @@ impl ApiError {
             Self::Internal(_) | Self::DatabaseError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::BehavioralUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::QueryTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
+        }
+    }
+
+    /// A stable, machine-readable identifier for the failure.
+    ///
+    /// Clients branch on this rather than on the message text, which is written
+    /// for people and free to change.
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::BadRequest(_) => "bad_request",
+            Self::Unauthorized(_) => "unauthorized",
+            Self::NotFound(_) => "not_found",
+            Self::Internal(_) | Self::DatabaseError(_) => "internal_error",
+            Self::TooManyRequests(_) => "too_many_requests",
+            Self::BehavioralUnavailable(_) => "behavioral_unavailable",
+            Self::QueryTimeout(_) => "query_timeout",
         }
     }
 
@@ -86,10 +110,16 @@ impl IntoResponse for ApiError {
             | Self::Unauthorized(msg)
             | Self::NotFound(msg)
             | Self::TooManyRequests(msg)
-            | Self::BehavioralUnavailable(msg) => msg.clone(),
+            | Self::BehavioralUnavailable(msg)
+            | Self::QueryTimeout(msg) => msg.clone(),
         };
 
-        (status, Json(serde_json::json!({ "error": message }))).into_response()
+        let body = Json(serde_json::json!({ "error": message, "code": self.code() }));
+        if matches!(self, Self::TooManyRequests(_)) {
+            // Capacity frees as in-flight queries finish, which is seconds.
+            return (status, [(axum::http::header::RETRY_AFTER, "1")], body).into_response();
+        }
+        (status, body).into_response()
     }
 }
 
@@ -134,6 +164,53 @@ mod tests {
         assert_eq!(
             ApiError::behavioral_required("funnels").status(),
             StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            ApiError::QueryTimeout(String::new()).status(),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn test_every_error_carries_a_stable_code() {
+        let cases = [
+            (ApiError::BadRequest("x".into()), "bad_request"),
+            (ApiError::Unauthorized("x".into()), "unauthorized"),
+            (ApiError::NotFound("x".into()), "not_found"),
+            (ApiError::Internal("x".into()), "internal_error"),
+            (
+                ApiError::from(duckdb::Error::QueryReturnedNoRows),
+                "internal_error",
+            ),
+            (ApiError::TooManyRequests("x".into()), "too_many_requests"),
+            (
+                ApiError::behavioral_required("Funnel analysis"),
+                "behavioral_unavailable",
+            ),
+            (ApiError::QueryTimeout("x".into()), "query_timeout"),
+        ];
+        for (error, code) in cases {
+            let response = error.into_response();
+            assert_eq!(body_json(response).await["code"], code);
+        }
+    }
+
+    #[test]
+    fn test_only_a_busy_server_asks_the_client_to_retry() {
+        let busy = ApiError::TooManyRequests("busy".into()).into_response();
+        assert_eq!(
+            busy.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("1")
+        );
+        // A missing extension needs an operator, so retrying would only repeat the failure.
+        let missing = ApiError::behavioral_required("Funnel analysis").into_response();
+        assert!(
+            missing
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_none()
         );
     }
 

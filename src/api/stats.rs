@@ -644,10 +644,9 @@ where
 /// The error for a statement that overran its deadline.
 ///
 /// A `400` because the request as posed is too expensive and the remedy is the
-/// caller's (a shorter range, fewer filters). `ApiError` has no timeout variant
-/// yet; a `504` would be the more precise status once it does.
+/// caller's (a shorter range, fewer filters), and the status says so: 504.
 fn deadline_error(deadline: Duration) -> ApiError {
-    ApiError::BadRequest(format!(
+    ApiError::QueryTimeout(format!(
         "The query did not finish within {} seconds. Try a shorter date range or fewer filters.",
         deadline.as_secs()
     ))
@@ -2349,7 +2348,8 @@ mod tests {
             "the interrupt did not stop the statement: {:?}",
             started.elapsed()
         );
-        assert!(matches!(err, ApiError::BadRequest(_)), "{err}");
+        assert!(matches!(err, ApiError::QueryTimeout(_)), "{err}");
+        assert_eq!(err.status(), StatusCode::GATEWAY_TIMEOUT);
         assert!(err.to_string().contains("did not finish"), "{err}");
 
         // The interrupt must not leak into the connection's next user.
