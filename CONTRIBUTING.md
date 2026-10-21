@@ -22,9 +22,9 @@ Thank you for your interest in contributing to Mallard Metrics. This document co
 
 ### Prerequisites
 
-- **Rust 1.94.0+** -- The `rust-toolchain.toml` file will install the correct version automatically via `rustup`
+- **Rust 1.98.0** -- `rust-toolchain.toml` pins it and `rustup` installs it automatically
 - **Git**
-- **Disk space** -- DuckDB's bundled compilation produces large build artifacts (~27GB in debug mode). Run `cargo clean` between major rebuilds if space is constrained.
+- **Disk space** -- DuckDB is compiled from source. Each distinct feature/profile combination (`cargo build`, `test`, `clippy`, `doc`) gets its own `libduckdb-sys` build directory, about 1.1 GB each with the repository's `debug = false` setting for that crate (LESSONS L4); a shared `target/` serving several worktrees measured 11 GB on 2026-10-21. Check `df -h` before concluding a build is hung: a full disk makes the C++ compile crawl rather than fail.
 
 ### Clone and Verify
 
@@ -33,6 +33,7 @@ git clone https://github.com/tomtom215/mallardmetrics.git
 cd mallardmetrics
 
 # Verify your setup compiles and all tests pass
+# (behavioral tests need network access on first run to fetch the extension)
 cargo test --all-targets
 
 # Verify zero lint warnings and formatting violations
@@ -46,62 +47,21 @@ If all three commands succeed, your development environment is ready.
 
 ## Project Structure
 
+The per-module map (`src/api`, `src/ingest`, `src/query`, `src/storage`) is
+kept in one place: [`docs/src/architecture.md`](docs/src/architecture.md#module-map).
+At the top level:
+
 ```
-mallardmetrics/
-├── src/
-│   ├── main.rs                  -- Entry point, background tasks, signal handling
-│   ├── lib.rs                   -- Module declarations
-│   ├── config.rs                -- TOML + env var configuration, validation, advisories
-│   ├── server.rs                -- Axum router, middleware, routes, /metrics, health
-│   ├── test_support.rs          -- Shared AppState builder for tests
-│   ├── api/
-│   │   ├── auth.rs              -- Authentication, sessions, API keys
-│   │   ├── errors.rs            -- Error types and HTTP responses
-│   │   └── stats.rs             -- All analytics endpoint handlers
-│   ├── ingest/
-│   │   ├── handler.rs           -- POST /api/event and the GET pixel
-│   │   ├── buffer.rs            -- Bounded in-memory event buffer with flush
-│   │   ├── visitor_id.rs        -- HMAC-SHA256 visitor ID and salt rotation
-│   │   ├── useragent.rs         -- User-Agent and Client Hints parsing
-│   │   ├── geoip.rs             -- MaxMind GeoIP reader
-│   │   └── ratelimit.rs         -- Per-site and per-IP token-bucket limiters
-│   ├── query/
-│   │   ├── mod.rs               -- QueryScope: site, range and session window
-│   │   ├── metrics.rs           -- Core metrics, including session metrics
-│   │   ├── breakdowns.rs        -- Dimension breakdown queries
-│   │   ├── timeseries.rs        -- Gap-filled time-bucketed aggregations
-│   │   ├── realtime.rs          -- Last-N-minutes activity snapshot
-│   │   ├── funnel.rs            -- Cumulative funnels (behavioral ext)
-│   │   ├── retention.rs         -- Per-visitor retention cohorts (behavioral ext)
-│   │   ├── sequences.rs         -- Sequence matching (behavioral ext)
-│   │   ├── flow.rs              -- Flow analysis (behavioral ext)
-│   │   ├── events.rs            -- Goals and custom property keys/values
-│   │   ├── revenue.rs           -- Per-currency revenue totals
-│   │   ├── export.rs            -- Daily and raw export as CSV or JSON
-│   │   ├── cache.rs             -- TTL + LRU query cache
-│   │   └── test_support.rs      -- TestDb for query tests
-│   ├── storage/
-│   │   ├── mod.rs               -- ReaderPool: round-robin read connections
-│   │   ├── schema.rs            -- DuckDB schema, events_all view, behavioral ext
-│   │   ├── parquet.rs           -- Atomic writes, compaction, retention, erasure
-│   │   └── migrations.rs        -- Schema versioning
-│   └── dashboard/
-│       └── mod.rs               -- Embedded Preact+HTM SPA
-├── tests/
-│   └── ingest_test.rs           -- Integration tests (66 tests)
-├── benches/
-│   └── ingest_bench.rs          -- Criterion.rs benchmarks
-├── src/dashboard/assets/        -- Frontend SPA files (embedded via rust-embed)
-├── tracking/script.js           -- Tracking script (~3.8 KB gzipped)
-├── mallard-metrics.toml.example -- Configuration template
-├── Dockerfile                   -- Alpine musl builder, FROM scratch runtime
-├── docker-compose.yml           -- Production-ready compose file
-├── scripts/
-│   ├── smoke-test.sh            -- End-to-end checks against the real binary
-│   ├── check-dashboard-methods.mjs -- Static check for dead method references
-│   ├── check-dashboard-browser.mjs -- Drives the dashboard in a real browser
-│   └── seed-demo-data.py        -- 30 days of synthetic events, for demos
-└── .github/workflows/ci.yml     -- CI pipeline (8 jobs; the first is a 4-way matrix)
+src/                  Rust crate (library + the mallard-metrics binary)
+src/dashboard/assets/ Preact + HTM dashboard, embedded via rust-embed
+tests/ingest_test.rs  Integration tests (full HTTP path, in-process)
+benches/              Criterion benchmarks
+tracking/script.js    The tracking script, served at /mallard.js
+scripts/              smoke-test.sh, dashboard checks, seed data, Docker and ABI checks
+deploy/               Production compose, Caddyfile, backup, systemd, monitoring
+docs/                 mdBook documentation site
+.github/workflows/    ci.yml, pages.yml, release.yml, security.yml
+Dockerfile, docker-compose.yml, mallard-metrics.toml.example, Makefile
 ```
 
 ---
@@ -144,7 +104,7 @@ All four commands must pass before submitting a PR:
 
 | Command | Requirement |
 |---|---|
-| `cargo test --all-targets` | All 602 tests pass (535 unit + 67 integration) |
+| `cargo test --all-targets` | All tests pass (current count: [DEVELOPMENT.md](DEVELOPMENT.md#current-metrics)) |
 | `cargo clippy --all-targets --all-features -- -D warnings` | Zero warnings (pedantic + nursery + cargo lints) |
 | `cargo fmt -- --check` | Zero formatting violations |
 | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps` | Documentation builds without errors |
@@ -207,13 +167,13 @@ Run `cargo fmt` before every commit. The CI pipeline will reject improperly form
 ### Error Handling
 
 - Return meaningful error types (see `api/errors.rs`)
-- Query functions that depend on the `behavioral` extension must degrade gracefully when it is unavailable -- return defaults or empty results, not errors
+- Report a missing `behavioral` extension honestly: endpoints that need it return `503` with code `behavioral_unavailable`, and the session fields of `/api/stats/main` are `null`. Never return an empty `200` or a `0` that reads as "no data"
 - Log errors with structured fields using `tracing`
 
 ### Privacy
 
 - **Never** store IP addresses in DuckDB or Parquet files
-- IP addresses may only be used for HMAC hashing (visitor ID) and GeoIP lookup, then must be discarded
+- IP addresses may only be used for HMAC hashing (visitor ID) and GeoIP lookup, then must be discarded. The one exception is the truncated address (`anonymize_ip`) in authentication log lines
 - See `SECURITY.md` for the full privacy model
 
 ---
@@ -242,6 +202,10 @@ cargo test -- --nocapture
 cargo bench --no-run
 ```
 
+If several worktrees share one `CARGO_TARGET_DIR`, `touch` your sources before
+building and run a copied binary: the package hash ignores the worktree path, so
+cargo can otherwise run another worktree's test binary (LESSONS L36).
+
 ### Writing Tests
 
 - Every public function needs tests covering:
@@ -255,14 +219,12 @@ cargo bench --no-run
 
 ### Test Counts
 
-When adding tests, update the test count in `DEVELOPMENT.md` by running:
+When you add tests, update the table in [DEVELOPMENT.md](DEVELOPMENT.md#current-metrics)
+and grep every document for the old total (LESSONS L16). The counts come from
+the `test result:` lines of:
 
 ```bash
-# Count unit tests
-cargo test --lib 2>&1 | grep "test result"
-
-# Count integration tests
-cargo test --test ingest_test 2>&1 | grep "test result"
+MALLARD_REQUIRE_BEHAVIORAL=1 cargo test --all-targets 2>&1 | grep "test result"
 ```
 
 ---
@@ -273,7 +235,7 @@ Benchmarks use Criterion.rs 0.8 and live in `benches/ingest_bench.rs`.
 
 ### Rules
 
-- **100 samples** per benchmark minimum
+- **100 samples** per benchmark minimum (the `query_scale` benchmark uses 10 because one iteration takes about a second; its figures are informal for that reason)
 - **Run 3+ times** before comparing results
 - **Report mean with 95% confidence intervals** -- never a single number
 - **Improvements accepted** only when confidence intervals do not overlap
@@ -317,6 +279,7 @@ Before submitting your PR, verify every item:
 - [ ] `cargo test --all-targets` -- all tests pass
 - [ ] `MALLARD_REQUIRE_BEHAVIORAL=1 cargo test --all-targets` -- behavioral tests really ran
 - [ ] `scripts/smoke-test.sh` -- the real binary still serves every route
+- [ ] `scripts/docker-smoke.sh <image>` -- if the Dockerfile or `deploy/` changed
 - [ ] `node scripts/check-dashboard-browser.mjs` -- if the dashboard changed
 - [ ] `cargo clippy --all-targets --all-features -- -D warnings` -- zero warnings
 - [ ] `cargo fmt -- --check` -- zero formatting violations
@@ -324,8 +287,8 @@ Before submitting your PR, verify every item:
 - [ ] New or changed functionality has corresponding tests
 - [ ] No SQL injection vectors introduced (parameterized queries used)
 - [ ] No PII stored (IP addresses only for hashing/GeoIP, then discarded)
-- [ ] CHANGELOG.md updated with your changes
-- [ ] Documentation updated if applicable (README.md, DEVELOPMENT.md)
+- [ ] CHANGELOG.md `[Unreleased]` updated with your changes
+- [ ] Documentation updated where behaviour changed (README.md, `docs/src/`, DEVELOPMENT.md test counts)
 
 ---
 
