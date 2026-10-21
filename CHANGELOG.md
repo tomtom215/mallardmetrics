@@ -17,6 +17,192 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Changes since 0.2.0 (`6944e68`). Several reported figures change meaning, and a
+few startup conditions that used to be accepted are now refused; read
+**Breaking** before upgrading.
+
+### Breaking
+
+- **`MALLARD_SECRET` shorter than 16 characters stops startup.** Use a random
+  value such as `openssl rand -hex 32`. A secret that is only whitespace is
+  treated as unset. Changing the secret still changes every visitor ID.
+- **Other startup refusals.** A `MALLARD_ADMIN_PASSWORD` that fails the setup
+  policy (12 characters minimum, obvious values refused); an unreadable
+  `data_dir/.secret` (it used to be silently replaced, which changed every
+  visitor ID); `login_lockout_secs = 0`; a `data_dir` containing `*`, `?`, `[`
+  or `]`; and, when `trust_proxy_headers` is on, a `trusted_proxy_hops` outside
+  1 to 8. An empty `MALLARD_GEOIP_DB` now means "not set".
+- **Client address behind a proxy is counted from the right.** With
+  `MALLARD_TRUST_PROXY_HEADERS=true` Mallard used the leftmost
+  `X-Forwarded-For` entry, which the client controls behind an appending proxy.
+  It now uses entry `MALLARD_TRUSTED_PROXY_HOPS` (new, default 1) from the
+  right. One proxy needs no change; a CDN in front of your proxy needs `2`.
+  Visitor IDs, GeoIP and rate-limit buckets of deployments that relied on the
+  leftmost entry will change.
+- **`/health/detailed` fields.** `auth_configured`, `active_sessions` and
+  `trust_proxy_headers` are gone. `cold_tier` is added, and the endpoint answers
+  `503` with `"status": "degraded"` when Parquet files exist that the
+  `events_all` view does not read. Monitors that parse the old fields or expect
+  `200` need updating.
+- **`Nd` periods are N days.** `7d` now spans seven daily buckets including
+  today (it spanned eight; `30d` spanned 31). `12mo` is the twelve months ending
+  today. Figures for the same label are therefore lower than before, and
+  period comparison shifts by the new length. A `start_date` without an
+  `end_date` (or the reverse) is a `400` instead of being ignored.
+- **Session, bounce and filter definitions changed**, so the numbers change.
+  A session is a run of one visitor's events of any kind; only sessions with a
+  pageview count; a bounce is a counted session of exactly one event, a
+  pageview (a custom event ends the bounce); filters select whole sessions
+  instead of cutting them; entry/exit pages use the same sessions as
+  `/api/stats/sessions`. Entry/exit rows now report the pageviews and events of
+  their sessions, with a new `sessions` field for entrances (they previously
+  reported the entrance count as `pageviews` and `events`). See
+  [README](README.md#how-metrics-are-defined).
+- **Flow counts pageviews only** and collapses consecutive repeats. A custom
+  event no longer appears as a destination, and a reload is not a transition.
+- **Funnels default to `strict_once`** (one event fills one step) unless the
+  caller passes `strict_once` or `strict_increase`. `allow_reentry` without
+  `strict_order` is a `400`. Cause: DuckDB 1.5.6 / `behavioral` 0.10.0 follows
+  ClickHouse, where one event can satisfy several steps.
+- **DuckDB 1.5.6 and `behavioral` >= 0.10.0.** Startup refuses an older cached
+  extension build on the data volume, because `INSTALL` is a no-op when a file
+  is already present. Remove the extension directory (`data_dir/extensions` by
+  default) and restart, or run `mallard-metrics --install-extension` after
+  removing it, so a current build is installed.
+- **`gdpr_mode` / `round_timestamps` disable session analyses.** Sessions,
+  funnel, sequences, flow and entry/exit pages answer `503` and the session
+  fields of `/api/stats/main` are `null`, because order within an hour is lost.
+- **The musl build is gone.** The `behavioral` extension is not published for
+  musl (`linux_*_musl` requests return 404), so that image answered `503` on
+  funnels, retention, sessions, sequences and flow. The image is now a glibc
+  binary on distroless `cc-debian12:nonroot` (UID 65532); release archives are
+  `*-unknown-linux-gnu` for x86_64 and aarch64. It is no longer `FROM scratch`
+  or statically linked. Any process that copied the old binary out of the image
+  must use the new one.
+- **Errors carry a stable `code`.** Handler errors are
+  `{"code": ..., "error": ...}` with `bad_request`, `unauthorized`,
+  `not_found`, `internal_error`, `too_many_requests`,
+  `behavioral_unavailable` or `query_timeout`. A query that passes its deadline
+  is `504` (it was `400`). Clients that matched on message text should switch to
+  `code`. (Query-string rejections by the web framework, such as a missing
+  `site_id`, are still plain text.)
+- **GDPR erasure that cannot remove a partition answers `500`** with
+  `"status": "partial"` and `failed_dates`, instead of `200 "erased"`.
+- **Backups.** `deploy/backup.sh` (graceful stop, hard-linked snapshot, verify,
+  always restart, prune) replaces the cron job that copied the live data
+  directory, which could produce a copy DuckDB could not open.
+
+### Added
+
+- `MALLARD_TRUSTED_PROXY_HOPS` (TOML `trusted_proxy_hops`).
+- `/metrics`: `mallard_build_info{version,behavioral_version}`,
+  `mallard_last_flush_success_timestamp_seconds`,
+  `mallard_process_start_time_seconds`, `mallard_rate_limiter_evictions_total`,
+  `mallard_buffer_flush_failures_total`.
+- Startup advisories for `max_login_attempts = 0` and for an instance with
+  neither `site_ids` nor a per-IP rate limit.
+- `HEAD /api/event` answers like the pixel and records nothing; the ingest CORS
+  preflight is cacheable for 24 hours.
+- Retention reports `complete_weeks` and `partial_first_week` per cohort, so
+  weeks that have not happened yet are not shown as zero retention. The
+  retention scan starts `visitor_salt_rotation_days` before the report instead
+  of at the beginning of history.
+- Analytics queries wait up to 10 s for a slot instead of failing at once, and
+  are interrupted after 20 s. `429` (genuine overload) carries `Retry-After: 1`.
+- Tracking script: `data-link-query="true"` keeps query and fragment on
+  outbound and download URLs (now stripped by default); `data-hash` reports
+  `#/pricing` as the path `/pricing`; the referrer is sent only until the first
+  in-page navigation; back/forward-cache restores and prerendered pages are
+  handled. The script is 4,013 bytes gzipped (budget 4,096).
+- Dashboard rebuilt: state in the URL, lazy panels, a request queue with `429`
+  back-off, accessible tabs, a chart table view, a copy-snippet button.
+- Operations: `deploy/monitoring/` (eleven Prometheus alert rules with tests, a
+  Grafana dashboard, a scrape example), `deploy/systemd/` unit, `Makefile`,
+  pre-commit hooks, devcontainer, `scripts/docker-smoke.sh`,
+  `scripts/check-binary-abi.sh`, `scripts/shutdown-race-test.py`,
+  `scripts/check-seed-schema.py`, and `.github/workflows/security.yml`
+  (RustSec advisories weekly and on dependency changes).
+- Recognised iOS browser wrappers (Chrome, Edge, Opera on iOS) and more bots
+  (`Storebot-Google`, `GoogleOther`, `BingPreview`, `meta-external*`,
+  `PostmanRuntime`, `Bytespider`, `ChatGPT-User`).
+- `maxminddb` 0.32, with tests that decode a real MMDB.
+- Benchmark `query_scale` (see [PERF.md](PERF.md)); `files_for_range` and
+  `scoped_events_sql`, a site-and-date-scoped Parquet read, and `stream_raw_export`,
+  a chunked raw export. Neither is used by a request yet.
+
+### Changed
+
+- The `events_all` view reads hive keys as explicit types and enables the
+  Parquet metadata cache; a site-and-week query over 9,000 files measured 1.36 s
+  to 0.6 s in that change's informal benchmark.
+- The cumulative funnel is summed in Rust instead of cross-joining steps with
+  visitors.
+- Flush stages `NNNN.parquet.pending`, fsyncs it, deletes the hot rows, then
+  renames; startup recovers interrupted flushes by comparing rows. Compaction
+  merges within levels without holding the tier lock for the whole merge. A
+  flush writes at most a bounded number of partitions, largest first.
+- `push` returns success when the event is safely buffered even if the flush it
+  triggered failed (the failure is counted); a retrying client no longer
+  duplicates the event.
+- Rate-limit keys for IPv6 clients are the /64. At the key cap the limiters
+  evict in batches instead of refusing new keys.
+- Login attempts are counted when admitted, before password verification, and at
+  most 4 Argon2 operations run at once (`503` beyond that).
+- The production compose file sets `MALLARD_TRUST_PROXY_HEADERS=true` and
+  `MALLARD_TRUSTED_PROXY_HOPS=1`; Caddy logs no IP, headers or query string;
+  `setup.sh` makes the data directory owned by UID 65532.
+- macOS `os_version` is no longer stored (every browser reports a frozen
+  10.15.7). Client-hint brand, version and platform are restricted to known values.
+- Toolchain and CI: Rust 1.98.0; the musl target removed; the smoke job and
+  release binaries require the extension; dependency updates for `duckdb` are
+  grouped apart with a cooldown.
+
+### Fixed
+
+- **Shutdown lost late events.** The final flush ran before the server drained,
+  so a request accepted during shutdown was lost. The server now drains first
+  (bounded by `shutdown_timeout_secs`), then flushes and closes the buffer.
+- **Compaction could lose rows** when a later source file could not be removed;
+  **a crash between publishing a flush and deleting the hot rows counted every
+  row twice**; a power loss could leave a short Parquet file in the read glob.
+- **A corrupt Parquet file silently hid the whole cold tier**; the view now
+  falls back to the hot table only when there are no files, and `cold_tier`
+  reports the degraded state.
+- **Retention left the view reading an empty glob** after removing the last
+  partition, and did not clear the query cache. Erasure and retention reported
+  success when removal failed, and left empty site directories.
+- **Reports hid decode errors.** Rows that failed to decode were dropped, so an
+  endpoint answered `200` with a shorter report; errors now propagate. A
+  transient session-query failure is no longer cached as "no session data".
+- A cold dashboard load (about 30 requests) was answered `429` past the tenth;
+  readers could deadlock against a flush when the pool shared the writer
+  connection; a pre-erasure result could be cached after an erasure.
+- Custom property keys containing `.` can be queried; one malformed `props`
+  value no longer fails a report for the whole range.
+- The pixel endpoint always answers a GIF, even for a missing site or a bad width.
+- API-key and secret-file writes are durable, serialised and honest about
+  failure (a failed write was reported as success, and a revoked key could be
+  live again after a restart).
+- The login and setup responses no longer repeat the session token; login,
+  setup and logout apply the dashboard-origin check, case-insensitively and
+  ignoring a default port.
+- Huge `login_lockout_secs` / `session_ttl_secs` no longer panic.
+
+### Security
+
+- Client-IP trust (see Breaking), IPv6 /64 keying, batch eviction instead of
+  refusal in the limiters, and attempt counting before verification.
+- Query-string and fragment removed from outbound/download event URLs by
+  default; path parsing no longer reads a `/` from the query string; invisible
+  format characters are dropped from stored strings; the User-Agent is bounded
+  before hashing.
+- Advisories in `rustls`, `rustls-webpki` and `webpki-roots` cleared
+  (RUSTSEC-2026-0285 and five others).
+- `/health/detailed` no longer discloses whether an admin password is set, the
+  live session count or the proxy setting. (`/metrics` still exposes
+  `mallard_auth_configured` and `mallard_active_sessions`; set
+  `MALLARD_METRICS_TOKEN` or keep it off the public network.)
+
 ## [0.2.0] - 2026-08-31
 
 A broad modernisation pass. The toolchain, edition and every dependency are

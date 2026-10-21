@@ -51,6 +51,7 @@ HTML reports are generated in `target/criterion/` after each run.
 | `query` | `breakdown_utm_source_10k` | Breakdown over a sparse, mostly-NULL column |
 | `query` | `goals_10k` | Conversion rates per custom event |
 | `query` | `revenue_10k` | Revenue totals per currency |
+| `query_scale` | view variants, `scoped_file_list` | One site-and-week count over a synthetic 100 sites x 90 days dataset (9,000 Parquet files); `MALLARD_BENCH_SITES` / `MALLARD_BENCH_DAYS` shrink it. 10 samples, not 100, because one iteration takes about a second |
 | (top level) | `parse_user_agent` | User-Agent parsing |
 | (top level) | `generate_visitor_id` | HMAC-SHA256 visitor ID derivation |
 
@@ -110,7 +111,7 @@ grep -E "benchmark_group|bench_function|bench_with_input" benches/ingest_bench.r
 
 ---
 
-#### `query_metrics` — Analytics queries over 10K pre-loaded events
+#### `query` — Analytics queries over 10K pre-loaded events
 
 DuckDB schema and 10K events are initialized once **outside** the benchmark loop. Timing measures query execution only.
 
@@ -120,7 +121,7 @@ DuckDB schema and 10K events are initialized once **outside** the benchmark loop
 | `timeseries_10k` | 3.0022 ms | 2.9751 ms | 3.0019 ms | **3.0019 ms \[2.9860 ms, 3.0181 ms\]** |
 | `breakdown_pages_10k` | 3.5319 ms | 3.5110 ms | 3.5630 ms | **3.5319 ms \[3.5102 ms, 3.5541 ms\]** |
 
-All three query types complete in under 5 ms over 10K events with CIs under 1.5% width.
+All three query types complete in under 5 ms over 10K events with CIs under 1.5% width. These figures were taken on the older toolchain above and predate the session, filter and scoped-read changes; treat them as superseded until re-measured. They say nothing about events per second or about data sets larger than 10K rows.
 
 ---
 
@@ -131,9 +132,29 @@ cargo bench
 # View results in target/criterion/report/index.html
 
 # Run a specific group only:
-./target/release/deps/ingest_bench-<hash> --bench "query_metrics"
+./target/release/deps/ingest_bench-<hash> --bench "query"
 ./target/release/deps/ingest_bench-<hash> --bench "ingest_throughput"
 ```
+
+---
+
+#### `query_scale` — what a request costs as the Parquet tier grows (informal)
+
+Reported in the message of commit `0d33184`, not re-measured for this document and
+**not** meeting this project's own protocol (10 samples, not 100; no confidence
+intervals recorded; two runs on one idle 4-core 2.1 GHz Xeon, release build,
+median of samples). Treat as an indication of where time goes, not as a baseline.
+
+| Variant (one site, one week, 9,000 files) | Run 1 | Run 2 |
+|---|---|---|
+| `events_all` as shipped before the commit | 1.36 s | 1.43 s |
+| + footer cache | 0.98 s | 0.98 s |
+| hive keys as explicit types + footer cache (kept) | 0.61 s | 0.59 s |
+| site-scoped file list (`scoped_events_sql`) | 3.0 ms | 3.0 ms |
+
+The scoped file list exists in `src/storage/` (`files_for_range`,
+`scoped_events_sql`) but the query layer does not use it yet, so no request
+benefits from the last row today.
 
 ---
 
@@ -149,8 +170,8 @@ cargo bench
 | Daily salt generation | O(1) | HMAC-SHA256 of fixed-size date input |
 | Unique visitors query | O(n) | `COUNT(DISTINCT)` scan over partition |
 | Bounce rate query | O(n log n) | `sessionize()` window function (sort + scan) |
-| Query cache lookup | O(1) | Hash map with TTL expiration |
-| Rate limit check | O(1) | Token-bucket per site_id |
+| Query cache lookup | O(1) | Hash map with TTL expiration and LRU eviction at the entry cap |
+| Rate limit check | O(1) amortised | Token bucket per site ID and per client network; evicts in batches at the key cap |
 
 ---
 
