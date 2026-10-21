@@ -29,7 +29,7 @@ commands behind them:
 # Build
 cargo build
 
-# Run all tests (759 tests at the time of writing; see Current Metrics)
+# Run all tests (see Current Metrics for the counts at the time of writing)
 cargo test --all-targets
 
 # Behavioral-extension tests skip when the extension cannot be downloaded.
@@ -76,15 +76,17 @@ Measured on 2026-10-21 at the commit that introduced this table, with
 
 | Metric | Value | Verified by |
 |---|---|---|
-| Unit tests (lib) | 683 passed, 1 ignored | `cargo test --lib` (the ignored one is a timing harness in `src/storage/parquet.rs`) |
-| Integration tests | 76 | `cargo test --test ingest_test` |
-| Total passing | 759 | `MALLARD_REQUIRE_BEHAVIORAL=1 cargo test --all-targets` |
+| Unit tests (lib) | 925 passed, 1 ignored | `cargo test --lib` (the ignored one is a timing harness in `src/storage/parquet.rs`) |
+| Integration tests | 91 passed, 2 ignored | `cargo test --test ingest_test` (the ignored two are memory measurements run by hand) |
+| Other integration suites | share 34, import 5, parquet export 5, datacenter 4, extras 1 | `cargo test --test share_test` (and the like) |
+| Total passing | 1,065 | `MALLARD_REQUIRE_BEHAVIORAL=1 MALLARD_REQUIRE_NODE=1 cargo test --all-targets` |
 | Doc tests | 0 | `cargo test --doc` |
 | Property-test suites | 3 | `src/query/cache.rs`, `src/ingest/ratelimit.rs`, `src/ingest/visitor_id.rs` |
 | Clippy warnings | 0 | `cargo clippy --all-targets --all-features -- -D warnings` |
 | Format violations | 0 | `cargo fmt -- --check` |
 | CI job definitions | 18 | `ci.yml` 9, `pages.yml` 2, `release.yml` 6, `security.yml` 1 |
 | Tracking script, gzipped | 4,013 bytes | `gzip -9 -c tracking/script.js \| wc -c` (budget 4,096) |
+| Extras script, gzipped | 1,830 bytes | `gzip -9 -c tracking/extras.js \| wc -c` (budget 2,048) |
 
 CI runs 18 job definitions across four workflows. A push to `main`
 expands the `ci.yml` `ci` matrix (Test, Clippy, Format, Documentation) into four

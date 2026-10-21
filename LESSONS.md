@@ -250,6 +250,81 @@ Three defects with one shape, all invisible to tests that drove a single synthet
 2. The rate limiter refused every new key once its map was full of active keys, so 10,000 cheap requests with distinct keys turned genuine visitors away for as long as the attacker kept it up. Make room instead, in batches (an eighth of the cap: idle entries first, then least recently used), so the scan is paid once per batch rather than once per request while holding the lock every ingest request needs. Export a counter for evictions; one that nothing exports (the previous `capacity_rejections`) is invisible.
 3. A map keyed by a client-supplied label needs an allow-list or a cap, because the label is attacker-chosen.
 
+### L39: A new kind of credential gets its own router
+
+Share links are bearer tokens that must reach a short list of read-only routes and
+nothing else. Teaching the existing auth middleware about them would have made
+"what can a token reach" a question about branches in shared code; a separate
+`/api/shared/*` router with a whitelist makes it a list a reviewer can read, and an
+attacker's tricks (method override, path normalisation, a repeated parameter, a
+token used as an API key) all land on a 404 or 401. An adversarial review tried
+dozens of them and the whitelist held.
+
+### L40: A secret should travel where no server layer can log it, and a log-absence test needs a canary
+
+The share token travels in the URL fragment and an `X-Share-Token` header: a
+fragment is never sent to the server, so no proxy, access log or `Referer` can
+hold it. The test that the token is absent from the logs also asserts that the
+redaction marker *is* present, because "nothing matched" passes just as well when
+nothing was captured. Redaction is a backstop and must still be tested against
+case and percent-encoding: the first version matched only lowercase `ms_`.
+
+### L41: Budgets for refused and accepted credentials must be separate
+
+If guessing tokens and using a valid one spend the same rate budget, an attacker's
+guesses lock out legitimate viewers (a variant of L31). Refused credentials spend a
+per-client budget; valid ones spend a per-link budget.
+
+### L42: A kill switch must not wait for the disk
+
+Revoking a share link takes effect in memory first and the file is written after;
+if the write fails the API says so and the link stays dead. An API key store makes
+the opposite choice because losing a key is not a security event the same way.
+
+### L43: A filter that selects sessions is a leak when the segment is a boundary
+
+"Filters select whole visits" is the right reading for the person exploring their
+own data and the wrong one for a segment handed to someone else: the visits that
+touch the segment also contain pages outside it, and views per visit, exit pages
+and session figures report them. For a share link the segment cuts events before
+visits form. The way this was found is the lesson: an independent reviewer
+reproduced it against a running server, which a reading of the code had not.
+
+### L44: Check outbound traffic at the connect, not at the URL
+
+A webhook URL check on the hostname is defeated by a second DNS answer. Resolve once,
+validate every address, connect to that exact address and re-check the peer at the
+dialer; the test needs a resolver that changes its answer. Include the forms that
+carry an IPv4 address inside an IPv6 one (mapped, NAT64, 6to4, SIIT, Teredo): the
+review still found two unblocked ranges.
+
+### L45: Text a stranger can write must be made inert before it goes into someone else's chat
+
+Page paths and referrers are written by whoever sends events. Interpolated into a
+Slack or Discord message they ping channels and plant links. Keep the real values
+in the structured payload and reduce the human text to a safe alphabet.
+
+### L46: An aggregate export is not an event export
+
+Check each source's documented schema for per-event rows before writing an importer;
+otherwise report the limit. Only the GA4 BigQuery export qualified. Likewise, an
+`ORDER BY` on a `COPY` of a million rows quadrupled peak memory for nothing a
+warehouse needs: measure before sorting.
+
+### L47: An opt-in feature that can silently degrade must fail startup
+
+A City database opens as an ASN database and decodes to nothing; a filter that
+quietly protects nothing looks like working protection. Check the database type at
+open and refuse to start.
+
+### L48: A test that depends on a timer must run where the timer runs
+
+The truncated-export test failed every time under CPU load (8 of 8) on tokio's
+single-thread test runtime, because the producer's stall timeout is only driven when
+the test thread wakes, and that thread drained the channel in the same moment.
+"Flaky, passes alone" was a diagnosis waiting to be made: reproduce under load, find
+the race, fix the test's runtime, and show the same load run now passes.
+
 ---
 
 ## General Engineering Principles

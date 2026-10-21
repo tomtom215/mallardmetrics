@@ -573,7 +573,7 @@ The following activities are **not performed** by Mallard Metrics, regardless of
 - Does not use fingerprinting techniques that access device APIs (WebGL, Canvas, AudioContext); the script reports the viewport width, the page URL and the referrer
 - Does not store raw IP addresses anywhere on disk
 - Does not store raw User-Agent strings anywhere on disk
-- Does not transmit collected data to any third party. The only outbound request the server makes is the one-time download of the `behavioral` extension from the DuckDB community repository
+- Does not transmit collected data to any third party on its own. By default the only outbound request the server makes is the download of the `behavioral` extension from the DuckDB community repository. If **you** set `MALLARD_ALERTS_WEBHOOK_URL`, the server sends notifications to that one URL: alerts carry counts and statuses, and reports carry visitor and pageview totals plus the top five page paths and referrer sources of a site (no visitor IDs, no IP addresses). If that URL is a chat service, those summaries go to that service, which is then a recipient you chose and should list in your own records of processing
 - Does not perform cross-site tracking
 - Does not serve advertising
 - Does not sell data

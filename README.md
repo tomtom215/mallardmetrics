@@ -110,7 +110,33 @@ too; compare them on their own terms.
 - **Time series**: hourly or daily buckets, gap-filled.
 - **Behavioral** (extension required): cumulative funnels with ordering modes,
   weekly retention cohorts, ordered sequence matching, forward/backward flow.
-- **Export**: daily summaries or raw events, CSV or JSON.
+- **Export**: daily summaries or raw events (CSV or JSON, streamed), and a
+  Parquet export of one site and date range for a warehouse. Visitor IDs are
+  never exported.
+- **Saved segments**: named filter sets per site, applied from the dashboard.
+
+### Sharing, data in and out, and notifications
+
+- **Share links**: a revocable, read-only public link to one site's dashboard,
+  optionally limited to a saved segment and an expiry. The token travels in the
+  URL fragment, only its hash is stored, and the link cannot reach exports,
+  other sites or any admin route. A segment cuts events, so a viewer sees
+  nothing outside it. Read the [threat model](docs/src/share-links.md) first:
+  a viewer can still drill down to a single visitor within the segment.
+- **Import**: `mallard-metrics import ga4-bigquery` loads a Google Analytics 4
+  BigQuery event export while the server is stopped. Other products' exports are
+  aggregates or lack a published schema; see [Importing data](docs/src/importing-data.md).
+- **Online backup**: `POST /api/admin/backup` snapshots both storage tiers while
+  serving. See [Backup and Restore](docs/src/backup-restore.md).
+- **Webhook alerts and reports**: signed notifications for operational problems
+  and for traffic that drops or spikes against the same hour of earlier weeks,
+  plus daily or weekly summaries. One URL, https by default, internal addresses
+  refused. See [Alerts and reports](docs/src/alerts-and-reports.md).
+- **Optional tracker extras**: scroll depth, engagement time, 404 pages and form
+  submits in a second script with its own size budget; the main tracker stays
+  small. See [Tracker extras](docs/src/extras.md).
+- **Datacenter filter** (opt-in, needs an ASN database): drops traffic from
+  hosting providers like other bot traffic.
 
 ### GDPR mode
 
