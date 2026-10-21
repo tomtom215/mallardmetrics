@@ -26,9 +26,12 @@ services:
       - MALLARD_SECURE_COOKIES=${MALLARD_SECURE_COOKIES:-false}
       - MALLARD_METRICS_TOKEN=${MALLARD_METRICS_TOKEN:-}
       - MALLARD_DASHBOARD_ORIGIN=${MALLARD_DASHBOARD_ORIGIN:-}
-      # Only enable behind a proxy that OVERWRITES X-Forwarded-For with the
-      # real client address. Otherwise clients choose their own IP.
+      # Enable only when every request arrives through your own reverse proxy;
+      # otherwise clients choose their own IP. Set the hop count to the number of
+      # proxies in front (the client is that many entries from the RIGHT of
+      # X-Forwarded-For).
       - MALLARD_TRUST_PROXY_HEADERS=${MALLARD_TRUST_PROXY_HEADERS:-false}
+      - MALLARD_TRUSTED_PROXY_HOPS=${MALLARD_TRUSTED_PROXY_HOPS:-1}
       # Cap DuckDB below the container limit so a heavy query fails with an
       # error instead of getting the whole process OOM-killed.
       - MALLARD_DUCKDB_MEMORY_LIMIT=${MALLARD_DUCKDB_MEMORY_LIMIT:-640MB}
