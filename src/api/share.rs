@@ -670,7 +670,10 @@ pub async fn share_gate(
             }
         }
         Err(ScopeError::OtherSite) => {
-            tracing::warn!(link_id = %link.id, "Share link used to ask for a different site; refused");
+            // Debug, not warn: the holder of a link controls how often this fires
+            // (up to the per-link limit, every second), and a warn per request
+            // would let them fill the log. The refusal itself is the 403.
+            tracing::debug!(link_id = %link.id, "Share link used to ask for a different site; refused");
             return refusal(
                 StatusCode::FORBIDDEN,
                 "share_site_forbidden",
@@ -692,7 +695,12 @@ pub async fn share_gate(
     }
 
     parts.extensions.insert(link);
-    next.run(Request::from_parts(parts, body)).await
+    // A share link's segment is a confidentiality boundary: run the request so
+    // that every report cuts events to the segment instead of measuring whole
+    // visits that merely touch it (see `query::SEGMENT_CUTS_EVENTS`).
+    crate::query::SEGMENT_CUTS_EVENTS
+        .scope(true, next.run(Request::from_parts(parts, body)))
+        .await
 }
 
 /// Headers every share response carries, errors included.
@@ -891,15 +899,28 @@ pub async fn revoke_share_link(
 /// anyway: the request span records the URI of every request, and a token in
 /// it would be written to the log with every line logged under that span.
 pub fn redact_tokens(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.contains(TOKEN_PREFIX) {
+    let prefix = TOKEN_PREFIX.as_bytes();
+    let has_prefix = |s: &str| {
+        s.as_bytes()
+            .windows(prefix.len())
+            .any(|w| w.eq_ignore_ascii_case(prefix))
+    };
+    // Percent-escapes are decoded and the prefix is matched without regard to
+    // case, so `?x=MS_...` and `/%6d%73_...` are caught as well as `ms_...`.
+    // A URI that holds a token is therefore logged in decoded form; one that
+    // holds none is returned untouched.
+    let decoded = percent_decode(text);
+    if !has_prefix(&decoded) {
         return std::borrow::Cow::Borrowed(text);
     }
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
+    let bytes = decoded.as_bytes();
+    let mut out = String::with_capacity(decoded.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i..].starts_with(TOKEN_PREFIX.as_bytes()) {
-            let start = i + TOKEN_PREFIX.len();
+        if bytes.len() - i >= prefix.len()
+            && bytes[i..i + prefix.len()].eq_ignore_ascii_case(prefix)
+        {
+            let start = i + prefix.len();
             let run = bytes[start..]
                 .iter()
                 .take_while(|b| b.is_ascii_hexdigit())
@@ -914,11 +935,36 @@ pub fn redact_tokens(text: &str) -> std::borrow::Cow<'_, str> {
             }
         }
         // Copy one whole character; `i` is always on a boundary.
-        let ch = text[i..].chars().next().unwrap_or('\u{fffd}');
+        let ch = decoded[i..].chars().next().unwrap_or('\u{fffd}');
         out.push(ch);
         i += ch.len_utf8();
     }
     std::borrow::Cow::Owned(out)
+}
+
+/// `text` with `%XX` escapes decoded (invalid UTF-8 replaced), or `text` itself
+/// when it has none. Only used to look for tokens, never to interpret a URI.
+fn percent_decode(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('%') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            out.push(u8::try_from(h * 16 + l).unwrap_or(b'?'));
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    std::borrow::Cow::Owned(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// The request span, as `tower_http`'s default makes it but with the URI redacted.
@@ -1473,5 +1519,27 @@ mod tests {
         );
         assert_eq!(redact_tokens("café/ms_"), "café/ms_");
         assert_eq!(redact_tokens("plain"), "plain");
+    }
+
+    #[test]
+    fn test_redaction_catches_case_and_percent_encoding() {
+        // Found by an adversarial review: only the exact lowercase `ms_` was
+        // redacted, so a token pasted with another case or escaped slipped
+        // through into the debug log.
+        let hex = "ab12".repeat(16);
+        for text in [
+            format!("/api/shared/stats/main?x=MS_{hex}"),
+            format!("/api/shared/stats/main?x=Ms_{hex}"),
+            format!("/p/%6d%73_{hex}"),
+            format!("/p/%6D%73%5F{hex}"),
+            format!("/p/%4d%53_{hex}"),
+        ] {
+            let out = redact_tokens(&text);
+            assert!(!out.contains("ab12ab12"), "{text} -> {out}");
+            assert!(out.contains("ms_[redacted]"), "{text} -> {out}");
+        }
+        // Ordinary escapes and a stray percent sign are left alone.
+        assert_eq!(redact_tokens("/a%20b?q=100%"), "/a%20b?q=100%");
+        assert_eq!(redact_tokens("/%zz/%4"), "/%zz/%4");
     }
 }

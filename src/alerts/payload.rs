@@ -160,7 +160,12 @@ impl Notification {
         let text: String = self.text.chars().take(MAX_TEXT_CHARS).collect();
         let value = match format {
             PayloadFormat::Slack => json!({ "text": text }),
-            PayloadFormat::Discord => json!({ "content": text }),
+            // `allowed_mentions.parse = []` tells Discord to ping nobody whatever
+            // the text contains, a second line of defence behind the sanitising
+            // of visitor-supplied values in the report text.
+            PayloadFormat::Discord => {
+                json!({ "content": text, "allowed_mentions": { "parse": [] } })
+            }
             PayloadFormat::Generic => {
                 let mut obj = json!({
                     "schema": SCHEMA,
@@ -213,15 +218,28 @@ mod tests {
     }
 
     #[test]
-    fn chat_formats_send_exactly_one_field() {
+    fn chat_formats_send_only_the_fields_their_service_defines() {
         let now = Utc::now();
         let n = Notification::for_alert(&sample(), AlertStatus::Resolved, now, 2, now);
         let slack: Value = serde_json::from_slice(&n.body(PayloadFormat::Slack)).unwrap();
         assert_eq!(slack.as_object().unwrap().len(), 1);
         assert!(slack["text"].as_str().unwrap().starts_with("[RESOLVED]"));
         let discord: Value = serde_json::from_slice(&n.body(PayloadFormat::Discord)).unwrap();
-        assert_eq!(discord.as_object().unwrap().len(), 1);
+        // `content` plus the documented `allowed_mentions` guard, nothing else.
+        let mut keys: Vec<&str> = discord
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["allowed_mentions", "content"]);
         assert!(discord["content"].is_string());
+        assert_eq!(
+            discord["allowed_mentions"]["parse"],
+            serde_json::json!([]),
+            "Discord must be told to parse no mentions"
+        );
     }
 
     #[test]

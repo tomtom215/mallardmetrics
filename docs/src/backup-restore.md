@@ -65,7 +65,8 @@ large; ingestion keeps buffering throughout.
 
 Rules and limits:
 
-- `name` is only a name (letters, digits, `-`, `_`, `.`; not starting with a dot).
+- `name` is only a name (letters, digits, `-`, `_`, `.`; not starting with a dot
+  or ending in `.partial`, the suffix an unfinished backup is written under).
   The endpoint cannot write anywhere but `<data_dir>/backups`. An existing name is
   a `409`; backups are never overwritten. A backup is written to `<name>.partial`
   and renamed last, so a directory without that suffix is complete.
@@ -73,6 +74,13 @@ Rules and limits:
   protects against mistakes and corruption, not against losing the disk. Copy the
   directory to another machine afterwards (`rsync -a`, which un-links on a
   different filesystem), and delete old backups yourself: nothing prunes them.
+- **A backup keeps what you later erase.** `DELETE /api/gdpr/erase` removes data
+  from the live tiers only. Backups hold their own copy (the Parquet files are
+  hard links to the same bytes, which survive the live name being removed), so an
+  erased visitor's events remain in every backup taken before the erase, and a
+  restore brings them back. If you must honour an erasure completely, delete the
+  affected backups too, or restore and erase again. See
+  [Privacy and GDPR](privacy-gdpr.md).
 - Events still in the memory buffer are not in any backup (they are not durable
   yet); `hot_rows` reports what the hot table held.
 - It needs an admin session or admin API key; `deploy/backup.sh` below needs a

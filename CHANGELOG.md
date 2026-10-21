@@ -314,6 +314,26 @@ few startup conditions that used to be accepted are now refused; read
 
 ### Security
 
+Fixes from an independent adversarial review of the share-link, webhook, backup
+and datacenter-filter code (no critical or high findings; each below was
+reproduced against the running server before it was fixed):
+
+- **A share link's segment now cuts events instead of selecting visits.** With
+  the segment `pages==/p1`, a viewer could read views per visit, entry and exit
+  pages and session figures computed from the *whole* visit, which exposed pages
+  the segment excludes. For a link, events outside the segment are removed before
+  visits are formed. The same filter in the admin dashboard is unchanged.
+- **Webhook report text is inert.** Page paths and referrer sources are
+  visitor-controlled; `<!channel>`, `@everyone` and markdown links reached Slack and
+  Discord messages unchanged. They are now reduced to a safe alphabet and
+  length-capped in the chat text (the structured fields keep the real values),
+  and Discord bodies carry `allowed_mentions: {parse: []}`.
+- Webhook targets in `fec0::/10` and the SIIT range `::ffff:0:0/96` are refused.
+- Backup names may not end in `.partial` (a finished backup with that name was
+  deleted by the next request for the name without it).
+- Share-token redaction in debug logs now matches any case and percent-escapes.
+- A link holder asking for another site no longer writes a warning per request.
+
 - Client-IP trust (see Breaking), IPv6 /64 keying, batch eviction instead of
   refusal in the limiters, and attempt counting before verification.
 - Query-string and fragment removed from outbound/download event URLs by

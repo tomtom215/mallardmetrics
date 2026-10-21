@@ -69,6 +69,17 @@ fn blocked_v6(ip: Ipv6Addr) -> Option<&'static str> {
     if seg[..6].iter().all(|&x| x == 0) {
         return Some("IPv4-compatible address");
     }
+    // ::ffff:0:a.b.c.d (RFC 2765 SIIT "IPv4-translated"): judged by the IPv4
+    // address it carries, since a translator forwards it to exactly that.
+    if seg[..4] == [0, 0, 0, 0] && seg[4] == 0xffff && seg[5] == 0 {
+        return blocked_v4(Ipv4Addr::new(
+            seg[6].to_be_bytes()[0],
+            seg[6].to_be_bytes()[1],
+            seg[7].to_be_bytes()[0],
+            seg[7].to_be_bytes()[1],
+        ))
+        .or(Some("IPv4-translated address"));
+    }
     let embedded = |hi: u16, lo: u16| {
         let (h, l) = (hi.to_be_bytes(), lo.to_be_bytes());
         Ipv4Addr::new(h[0], h[1], l[0], l[1])
@@ -92,6 +103,8 @@ fn blocked_v6(ip: Ipv6Addr) -> Option<&'static str> {
     }
     match seg[0] {
         x if x & 0xffc0 == 0xfe80 => Some("link-local address"),
+        // fec0::/10, deprecated by RFC 3879 but still routed on some old networks.
+        x if x & 0xffc0 == 0xfec0 => Some("site-local address"),
         x if x & 0xfe00 == 0xfc00 => {
             Some("unique-local address (includes the IPv6 metadata endpoints)")
         }
@@ -283,6 +296,11 @@ mod tests {
             "198.19.255.255",
             "::",
             "::1",
+            "fec0::1",
+            "feff::1",
+            "::ffff:0:a9fe:a9fe",
+            "::ffff:0:7f00:1",
+            "::ffff:0:a00:1",
             "fe80::1",
             "febf::1",
             "fc00::1",

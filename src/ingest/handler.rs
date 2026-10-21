@@ -228,6 +228,7 @@ impl AppState {
     /// A [`QueryScope`](crate::query::QueryScope) for this deployment's session window.
     pub fn scope(&self, site_id: &str, start: &str, end: &str) -> crate::query::QueryScope {
         crate::query::QueryScope::new(site_id, start, end, self.session_window.clone())
+            .with_cut_events(crate::query::segment_cuts_events())
     }
 }
 

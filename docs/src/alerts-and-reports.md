@@ -193,7 +193,7 @@ Every request carries:
 |---|---|
 | `X-Mallard-Timestamp` | Unix seconds, decimal. **Refreshed on every retry** |
 | `X-Mallard-Signature` | `v1=` + lowercase hex of `HMAC-SHA256(secret, timestamp + "." + raw body)` |
-| `X-Mallard-Delivery` | the `delivery_id`, constant across retries |
+| `X-Mallard-Delivery` | the `delivery_id`, constant across retries (also in the generic body; Slack and Discord bodies carry only their chat field) |
 | `X-Mallard-Event` | `kind` |
 | `User-Agent` | `mallard-metrics/<version>` |
 
@@ -204,20 +204,29 @@ unsigned.
 
 **To verify**, on the *raw* body bytes, before parsing the JSON:
 
-1. read the two headers; reject if the timestamp is more than 5 minutes from
-   your clock (replay window);
+1. read the two headers; reject if the timestamp is not an integer or is more
+   than 5 minutes from your clock (replay window);
 2. compute `HMAC-SHA256(secret, timestamp + "." + body)`;
 3. compare with `hmac.compare_digest` (constant time).
+
+Only the timestamp and the body are signed: `X-Mallard-Event` and
+`X-Mallard-Delivery` are not, so take the event kind and delivery id from the
+verified body. The five-minute window limits replay but does not prevent it: to
+reject a repeat inside the window, remember delivery ids for that long (the id
+is in the generic body).
 
 ```python
 import hashlib, hmac, time
 
 def verify(secret: bytes, headers, body: bytes, tolerance: int = 300) -> bool:
-    ts = headers["X-Mallard-Timestamp"]
-    sig = headers["X-Mallard-Signature"]
-    if abs(time.time() - int(ts)) > tolerance:
+    try:
+        ts = headers["X-Mallard-Timestamp"]
+        sig = headers["X-Mallard-Signature"].encode("ascii")
+        if abs(time.time() - int(ts)) > tolerance:
+            return False
+    except (KeyError, ValueError, UnicodeError):
         return False
-    expected = "v1=" + hmac.new(secret, ts.encode() + b"." + body, hashlib.sha256).hexdigest()
+    expected = ("v1=" + hmac.new(secret, ts.encode() + b"." + body, hashlib.sha256).hexdigest()).encode()
     return hmac.compare_digest(expected, sig)
 ```
 

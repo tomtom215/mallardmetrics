@@ -546,6 +546,40 @@ mod tests {
     }
 
     #[test]
+    fn test_a_segment_that_cuts_events_measures_only_what_is_inside_it() {
+        // A share link's segment is a confidentiality boundary. Selecting
+        // sessions would report the whole three-page visit that merely touched
+        // /p1; cutting events must report only the /p1 part of it.
+        let db = TestDb::new();
+        if !db.require_behavioral("segment cutting") {
+            return;
+        }
+        insert_pageview(&db.conn, "a", "2024-01-15 10:00:00", "/p1");
+        insert_pageview(&db.conn, "a", "2024-01-15 10:01:00", "/p2");
+        insert_pageview(&db.conn, "a", "2024-01-15 10:02:00", "/p3");
+        let segment =
+            crate::query::test_support::filtered_scope("2024-01-01", "2024-02-01", "pages==/p1");
+
+        let selected = query_session_metrics(&db.conn, &segment).unwrap();
+        assert!(
+            (selected.avg_pages_per_session - 3.0).abs() < f64::EPSILON,
+            "selecting sessions measures the whole visit: {selected:?}"
+        );
+
+        let cut = query_session_metrics(&db.conn, &segment.with_cut_events(true)).unwrap();
+        assert_eq!(cut.total_sessions, 1);
+        assert!(
+            (cut.avg_pages_per_session - 1.0).abs() < f64::EPSILON,
+            "cutting events sees one page: {cut:?}"
+        );
+        assert!(
+            (cut.avg_session_duration_secs - 0.0).abs() < f64::EPSILON,
+            "{cut:?}"
+        );
+        assert!((cut.bounce_rate - 1.0).abs() < f64::EPSILON, "{cut:?}");
+    }
+
+    #[test]
     fn test_passive_event_names_match_the_extras_script() {
         let script = include_str!("../../tracking/extras.js");
         for name in sessions::PASSIVE_EVENTS {

@@ -87,15 +87,25 @@ fn passive_sql_list() -> String {
 /// `duration_secs`, `entry_page`, `exit_page`. The caller supplies the
 /// statement that follows, e.g. `SELECT COUNT(*) FROM per_session`.
 ///
-/// Bind with [`per_session_params`]: the filter values come first because the
-/// segment expression sits in the `SELECT` list, ahead of the `WHERE`.
+/// Bind with [`per_session_params`]. The order differs by mode: when filters
+/// select sessions the segment expression sits in the `SELECT` list, so its
+/// values come first; when they cut events it sits in the `WHERE`, after the
+/// range.
 pub fn per_session_cte(scope: &QueryScope) -> String {
     let events = scope.events();
+    // Selecting sessions evaluates the segment per event and keeps any session
+    // with a match; cutting events applies it in the WHERE, so sessions form
+    // only from events inside it. Either way `in_segment` exists for the HAVING.
+    let (in_segment, cut) = if scope.cuts_events() {
+        ("TRUE".to_string(), format!(" AND {}", scope.filter_expr()))
+    } else {
+        (scope.filter_expr(), String::new())
+    };
     format!(
         "WITH scoped AS (
              SELECT visitor_id, timestamp, event_name, pathname,
                     {segment} AS in_segment
-             FROM {events} WHERE {range}
+             FROM {events} WHERE {range}{cut}
          ),
          sessionized AS (
              SELECT *, sessionize(timestamp, INTERVAL '{window}') OVER (
@@ -118,7 +128,7 @@ pub fn per_session_cte(scope: &QueryScope) -> String {
              HAVING COUNT(*) FILTER (WHERE event_name = 'pageview') >= 1
                 AND bool_or(in_segment)
          )",
-        segment = scope.filter_expr(),
+        segment = in_segment,
         range = QueryScope::range_clause(),
         window = window(scope),
         passive = passive_sql_list(),
@@ -128,6 +138,12 @@ pub fn per_session_cte(scope: &QueryScope) -> String {
 /// The parameters of [`per_session_cte`], in order: filter values, then site,
 /// start and end.
 pub fn per_session_params(scope: &QueryScope) -> Vec<&str> {
+    if scope.cuts_events() {
+        // The filter now follows the range in the text, so it follows it here.
+        let mut out: Vec<&str> = scope.range_params().into_iter().collect();
+        out.extend(scope.filter_params());
+        return out;
+    }
     let mut out: Vec<&str> = scope.filter_params().collect();
     out.extend(scope.range_params());
     out
@@ -154,6 +170,21 @@ mod tests {
         let segment_at = sql.find("browser = ?").expect("segment predicate");
         let range_at = sql.find("site_id = ?").expect("range predicate");
         assert!(segment_at < range_at, "bind order follows text order");
+    }
+
+    #[test]
+    fn test_cutting_events_binds_the_filter_after_the_range() {
+        let s = filtered_scope("2024-01-01", "2024-02-01", "pages==/p1").with_cut_events(true);
+        let sql = per_session_cte(&s);
+        assert_eq!(sql.matches('?').count(), per_session_params(&s).len());
+        assert_eq!(
+            per_session_params(&s),
+            ["test.com", "2024-01-01", "2024-02-01", "/p1"]
+        );
+        let range_at = sql.find("site_id = ?").expect("range predicate");
+        let segment_at = sql.find("pathname = ?").expect("segment predicate");
+        assert!(range_at < segment_at, "bind order follows text order");
+        assert!(sql.contains("TRUE AS in_segment"));
     }
 
     #[test]

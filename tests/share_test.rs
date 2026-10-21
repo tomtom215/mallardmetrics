@@ -1569,3 +1569,73 @@ async fn test_a_saved_segment_narrows_an_ordinary_dashboard_view() {
     .await;
     assert_eq!(main["total_pageviews"], 1);
 }
+
+// A segment on a share link is a confidentiality boundary, so it must cut events
+// before sessions form. Selecting whole sessions that merely touch the segment
+// (what the same filter does for the person who built it) showed a viewer pages
+// the segment excludes.
+#[tokio::test]
+async fn test_a_segment_does_not_leak_the_rest_of_a_visit() {
+    let env = env();
+    if !require_behavioral(&env.state, "segment confidentiality") {
+        return;
+    }
+    let ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36";
+    for path in ["/p1", "/p2", "/p3"] {
+        event(&env, ua, SITE, "pageview", path, None).await;
+    }
+    env.state.buffer.flush().expect("flush");
+    let segment = admin(
+        &env,
+        "POST",
+        "/api/segments",
+        Some(serde_json::json!({"site_id": SITE, "name": "p1", "filters": "pages==/p1"})),
+    )
+    .await;
+    assert_eq!(segment.status(), StatusCode::CREATED);
+    let segment_id = json(segment).await["id"].as_str().unwrap().to_string();
+    let (_, token) = make_link(
+        &env,
+        serde_json::json!({"label": "p1 only", "site_id": SITE, "segment_id": segment_id}),
+    )
+    .await;
+
+    let get = |route: &str| {
+        let uri = format!("/api/shared/stats/{route}?site_id={SITE}&period=30d");
+        let (env, token) = (&env, token.clone());
+        async move { json(viewer(env, &token, &uri).await).await }
+    };
+
+    let main = get("main").await;
+    assert_eq!(main["total_pageviews"], 1, "{main}");
+    assert_eq!(
+        main["views_per_visit"], 1.0,
+        "the visit's other pages are outside the segment: {main}"
+    );
+    let exits = get("breakdown/exit-pages").await;
+    assert_eq!(
+        paths(&exits),
+        vec!["/p1"],
+        "no page outside the segment: {exits}"
+    );
+    let entries = get("breakdown/entry-pages").await;
+    assert_eq!(paths(&entries), vec!["/p1"], "{entries}");
+    assert_eq!(entries[0]["pageviews"], 1, "{entries}");
+    let sessions = get("sessions").await;
+    assert_eq!(sessions["avg_pages_per_session"], 1.0, "{sessions}");
+
+    // The owner's reading of the very same filter is unchanged, and the two must
+    // not share a cache entry: the share request above has already populated it.
+    let owner = admin(
+        &env,
+        "GET",
+        &format!("/api/stats/main?site_id={SITE}&period=30d&filters=pages%3D%3D%2Fp1"),
+        None,
+    )
+    .await;
+    let owner = json(owner).await;
+    assert_eq!(
+        owner["views_per_visit"], 3.0,
+        "for the person who built the segment, a filter still selects whole visits: {owner}"
+    );
+}

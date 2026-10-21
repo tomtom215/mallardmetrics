@@ -103,7 +103,11 @@ impl From<std::io::Error> for BackupError {
 
 /// A single path component with no way to leave the backup root.
 fn is_safe_name(name: &str) -> bool {
-    !name.is_empty()
+    // `<name>.partial` is where an unfinished backup is written, and an old one
+    // is removed before a new attempt; a finished backup that ended in that
+    // suffix would be deleted by the next request for the name without it.
+    !name.ends_with(".partial")
+        && !name.is_empty()
         && name.len() <= 128
         && !name.starts_with('.')
         && name
@@ -450,7 +454,17 @@ mod tests {
         let (dir, conn, events) = fixture();
         let roots = dir.path().join("backups");
         fs::create_dir_all(&roots).unwrap();
-        for bad in ["", "..", "../x", "a/b", ".hidden", "a b", "a\\b", "x..y"] {
+        for bad in [
+            "",
+            "..",
+            "../x",
+            "a/b",
+            ".hidden",
+            "a b",
+            "a\\b",
+            "x..y",
+            "ok.partial",
+        ] {
             let err = create_backup(&conn, &TierLock::new(), dir.path(), &events, &roots, bad)
                 .unwrap_err();
             assert!(matches!(err, BackupError::BadName(_)), "{bad:?}: {err}");

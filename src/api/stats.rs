@@ -105,7 +105,14 @@ pub fn filters_cache_key(filters: &[Filter]) -> String {
         .collect();
     parts.sort_unstable();
     parts.dedup();
-    parts.join(";")
+    let key = parts.join(";");
+    // The same filters give different numbers when they cut events instead of
+    // choosing sessions, so the two must never share a cache entry.
+    if crate::query::segment_cuts_events() {
+        format!("cut|{key}")
+    } else {
+        key
+    }
 }
 
 /// Maximum filters accepted on one request.

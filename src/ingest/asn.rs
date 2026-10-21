@@ -6,7 +6,7 @@
 //! `mallard_datacenter_filtered_total`.
 //!
 //! PRIVACY: the address is used transiently, as for GeoIP. It is parsed, looked
-//! up in the memory-mapped database, and discarded. Nothing here stores it,
+//! up in the in-memory database, and discarded. Nothing here stores it,
 //! logs it or puts it in an error. The only state kept is one counter.
 
 use std::collections::HashSet;

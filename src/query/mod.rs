@@ -58,6 +58,26 @@ pub fn behavioral_loaded(conn: &duckdb::Connection) -> bool {
     .map_or(true, |n| n > 0)
 }
 
+tokio::task_local! {
+    /// Set to `true` around a request that must not see outside its segment.
+    ///
+    /// A filter normally *selects sessions*: a visit with one matching event is
+    /// measured whole, so a segment `pages==/pricing` still reports where those
+    /// visits went next. That is the right reading for the person who built the
+    /// segment, and the wrong one for a share link, whose segment is a
+    /// confidentiality boundary. The share middleware runs the request inside
+    /// this scope and [`AppState::scope`](crate::ingest::handler::AppState::scope)
+    /// reads it, so every report built for that request cuts events instead,
+    /// without any handler having to know.
+    pub static SEGMENT_CUTS_EVENTS: bool;
+}
+
+/// Whether the current request's segment cuts events (see [`SEGMENT_CUTS_EVENTS`]).
+#[must_use]
+pub fn segment_cuts_events() -> bool {
+    SEGMENT_CUTS_EVENTS.try_with(|v| *v).unwrap_or(false)
+}
+
 /// One condition narrowing a report to a subset of events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Filter {
@@ -127,6 +147,9 @@ pub struct QueryScope {
     /// parenthesised subquery over just the files this scope can touch.
     /// See [`scoped::ColdReads`].
     source: String,
+    /// Whether the filters remove events before sessions are formed, rather than
+    /// choosing which whole sessions to keep. See [`SEGMENT_CUTS_EVENTS`].
+    cut_events: bool,
 }
 
 impl QueryScope {
@@ -143,6 +166,7 @@ impl QueryScope {
             session_window: session_window.into(),
             filters: Vec::new(),
             source: EVENTS_ALL.to_string(),
+            cut_events: false,
         }
     }
 
@@ -182,6 +206,19 @@ impl QueryScope {
         let end = parse_bound(&self.end)?.date();
         let from = start.checked_sub_days(Days::new(u64::from(lookback_days)))?;
         Some((from, end))
+    }
+
+    /// The same scope with filters that cut events before sessionising.
+    #[must_use]
+    pub const fn with_cut_events(mut self, cut: bool) -> Self {
+        self.cut_events = cut;
+        self
+    }
+
+    /// Whether the filters cut events before sessionising.
+    #[must_use]
+    pub const fn cuts_events(&self) -> bool {
+        self.cut_events
     }
 
     /// The same scope narrowed by `filters`.

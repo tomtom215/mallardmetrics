@@ -126,6 +126,13 @@ impl Report {
     }
 
     /// The short human summary used for the `text` / `content` fields.
+    ///
+    /// Page paths and referrer sources are written by whoever sends events,
+    /// which for a public site is anyone, and chat services give some characters
+    /// meaning: `<!channel>`, `@everyone`, `<https://x|label>` and `[label](url)`
+    /// would put a ping or a spoofed link into the operator's channel. So they
+    /// are reduced to a conservative alphabet here ([`chat_safe`]); the structured
+    /// `top_pages` / `top_sources` fields keep the real values for machines.
     pub fn text(&self) -> String {
         let period = if self.start == self.end {
             self.start.to_string()
@@ -137,7 +144,7 @@ impl Report {
                 "none".to_string()
             } else {
                 rows.iter()
-                    .map(|(v, pv, _)| format!("{v} ({pv})"))
+                    .map(|(v, pv, _)| format!("{} ({pv})", chat_safe(v)))
                     .collect::<Vec<_>>()
                     .join(", ")
             }
@@ -155,6 +162,33 @@ impl Report {
             ranked(&self.top_sources),
         )
     }
+}
+
+/// Longest piece of visitor-supplied text shown in a chat message.
+const CHAT_ITEM_MAX_CHARS: usize = 60;
+
+/// `value` made inert for a chat service: only ASCII letters, digits and
+/// `/ . _ ~ : - %` pass; anything else becomes `?`, and long values are cut.
+///
+/// Dropping `<`, `>`, `@`, `[`, `]`, `(`, `)`, `*`, backtick, `|` and control
+/// characters is what stops mentions, links and formatting; replacing rather
+/// than deleting keeps a path recognisably a path.
+fn chat_safe(value: &str) -> String {
+    let mut out: String = value
+        .chars()
+        .take(CHAT_ITEM_MAX_CHARS)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '~' | ':' | '-' | '%') {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    if value.chars().count() > CHAT_ITEM_MAX_CHARS {
+        out.push_str("...");
+    }
+    out
 }
 
 /// Gather a report. Four statements, each through the query runner, so each
@@ -284,6 +318,52 @@ mod tests {
             top_pages: vec![("/".into(), 200, 90), ("/pricing".into(), 50, 30)],
             top_sources: vec![("Google".into(), 60, 40)],
         }
+    }
+
+    #[test]
+    fn visitor_supplied_text_cannot_ping_or_link_through_the_chat_message() {
+        // Anyone who knows a site id can send events whose path or referrer is
+        // whatever they like; the top five of a quiet site is easy to reach.
+        let mut r = sample();
+        r.top_pages = vec![
+            ("/<!channel>".into(), 9, 9),
+            ("/@everyone".into(), 8, 8),
+            ("/<https://evil.example|Reset your password>".into(), 7, 7),
+            ("/[x](https://evil.example)".into(), 6, 6),
+            ("/`code`*bold*\nnew line".into(), 5, 5),
+        ];
+        r.top_sources = vec![("@here <@U123>".into(), 4, 4)];
+        let text = r.text();
+        for dangerous in ['<', '>', '@', '[', ']', '(', ')', '*', '`', '|'] {
+            // The summary's own "(vs previous period)" / "(120)" parentheses are
+            // ours; look only at the lines carrying visitor-supplied values.
+            for line in text.lines().filter(|l| l.starts_with("Top ")) {
+                let values = line.split_once(": ").map_or("", |(_, v)| v);
+                let values = values.replace(" (", "").replace("),", "").replace(')', "");
+                assert!(
+                    !values.contains(dangerous),
+                    "{dangerous:?} reached the chat text: {line}"
+                );
+            }
+        }
+        assert!(!text.contains('\n') || text.lines().count() == 5, "{text}");
+        // The machine-readable copy is untouched.
+        let json = r.to_json();
+        assert_eq!(json["top_pages"][0]["path"], "/<!channel>");
+    }
+
+    #[test]
+    fn long_visitor_text_is_cut() {
+        let mut r = sample();
+        r.top_pages = vec![("/".to_string() + &"a".repeat(500), 1, 1)];
+        let line = r
+            .text()
+            .lines()
+            .find(|l| l.starts_with("Top pages"))
+            .unwrap()
+            .to_string();
+        assert!(line.chars().count() < 120, "{line}");
+        assert!(line.contains("..."), "{line}");
     }
 
     #[test]

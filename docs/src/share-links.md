@@ -40,7 +40,8 @@ Someone who opens the link sees the normal dashboard for that site, marked
 API keys, share links, segments, backup, sign-out and every export. They can
 change the date range, compare periods, click values to add filters and open
 every report panel. Anything they add narrows the view further; nothing they do
-widens it.
+widens it. If the link has a segment, every figure is computed **from the events
+inside the segment only** (see [what a segment cuts](#what-a-segment-cuts)).
 
 ## Threat model
 
@@ -59,8 +60,26 @@ a viewer inside a segment can combine filters until a count reaches one visitor
 and read that visitor's page, browser, operating system, referrer and country.
 That is the same power any dashboard user has; a share link is not an
 aggregates-only view. Restricting a link to a segment narrows what exists to be
-drilled into, which is the control you have. Do not give a link to someone you
+drilled into, which is the control you have, and it is a real boundary: events
+outside the segment take no part in any report the viewer can run. Do not give a link to someone you
 would not give the dashboard to for that segment.
+
+## What a segment cuts
+
+For the person who builds a segment, a filter *selects visits*: a visit with one
+matching event is measured whole, so the segment `pages==/pricing` still reports
+where those visitors went next and how long they stayed. That is the right
+reading for exploring your own data and the wrong one for a link you hand to
+someone else, because it would show them pages the segment excludes.
+
+So a share link's segment works the other way. **Events outside the segment are
+removed before visits are formed**, in every report: views per visit, bounce rate,
+visit duration, entry and exit pages, sessions, flow, funnels and sequences all
+see only the segment. With the segment `pages==/p1`, a visitor who viewed `/p1`,
+`/p2` and `/p3` is one visit of one page, its exit page is `/p1`, and `/p2` and
+`/p3` appear nowhere. The same filter typed into the admin dashboard still gives
+the whole three-page visit. (This was found by an adversarial review; a test
+reproduces it through a real link.)
 
 ## How the token travels
 
