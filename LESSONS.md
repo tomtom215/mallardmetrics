@@ -42,12 +42,16 @@ Four commands in one session accumulated four such directories — `cargo check`
 
 ### L22: The `behavioral` extension was version-gated on DuckDB; 0.10.0 no longer is, but its results changed
 
-Through 0.9.x the extension was built against DuckDB's unstable C API, so each release served one DuckDB version, and `INSTALL behavioral FROM community` returned 404 for any other. From 0.10.0 it uses the stable C API and loads on DuckDB 1.3.2 and later. Two things still bite:
+Through 0.9.x the extension was built against DuckDB's unstable C API, so each release served one DuckDB version, and `INSTALL behavioral FROM community` returned 404 for any other. From 0.10.0 it uses the stable C API and is stated to load on DuckDB 1.3.2 and later (not re-verified here; only DuckDB 1.5.5 serving 0.9.1 and 1.5.6 serving 0.10.0 were checked, on 2026-10-21). Two things still bite:
 
 1. **`INSTALL` is a no-op when a file is already present**, so a data volume keeps whatever build it first cached. The community repo serves 0.9.1 for DuckDB 1.5.5 and 0.10.0 for 1.5.6, so bumping the `duckdb` crate changes funnel behaviour for new installs only. `load_behavioral_extension` therefore checks `behavioral_version()` against `MIN_BEHAVIORAL_VERSION` and refuses an older build.
 2. **0.10.0 changed `window_funnel`** to follow ClickHouse: one event that satisfies several steps fills all of them. Steps built from `page:` and `event:` specifications overlap routinely, so funnels default to `strict_once` (one event, one step). Verified by a test that fails when that default is removed.
 
 Before changing the crate version, install the extension for the target DuckDB version and run the suite with `MALLARD_REQUIRE_BEHAVIORAL=1`.
+
+### L36: Worktrees that share one cargo target directory can run each other's test binaries
+
+Cargo's package hash does not include the workspace path. Two checkouts of the same package sharing `CARGO_TARGET_DIR` therefore compute the same artifact name, and `cargo test` in one can decide the other's binary is up to date and run it, so a green run proves nothing about the code in front of you. Before building, `touch` the sources (`touch $(find src tests benches -name '*.rs')`), and run a *copied* binary rather than `target/debug/mallard-metrics`, which another checkout may overwrite while you are using it. Better still, give each worktree its own target directory when the disk allows (L4 says why it often does not).
 
 ---
 
@@ -87,13 +91,17 @@ Tests that mutate the process environment serialise on a `static Mutex<()>`. Whe
 
 The lock guards ordering, not invariants, so poisoning carries no information: `ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner)`. The failure list then names exactly what broke.
 
+### L38: A report that a file was written is not evidence that it was
+
+An audit agent's output claimed a report had been written; the file was never on disk. Outputs that claim an action (a file written, a command run, a count taken) are claims. Check the artifact with `ls`, `git status`, or by running the command, before building on it or repeating the claim in a document. This is L16 applied to process: the verification is the work.
+
 ---
 
 ## Architecture
 
 ### L9: Behavioral extension availability is runtime-dependent
 
-The `behavioral` extension is installed from the DuckDB community repository at runtime. Unit tests cannot assume it is available. Queries using `sessionize`, `window_funnel`, `retention`, etc. must gracefully handle the extension being absent. Use `unwrap_or(default)` for metrics that depend on behavioral functions.
+The `behavioral` extension is installed from the DuckDB community repository at runtime. Unit tests cannot assume it is available. Queries using `sessionize`, `window_funnel`, `retention`, etc. must handle the extension being absent without lying: a metric that cannot be computed is `null` (session fields of `/api/stats/main`) or the endpoint answers `503` with code `behavioral_unavailable`. A defaulted `0` reads as "no data" and was cached for a whole TTL after a transient failure, so only *absence* of the extension may degrade; any other error propagates.
 
 ### L10: E2E testing is non-negotiable
 
@@ -122,15 +130,35 @@ Reversing the order does not fix it; it swaps double-counting for a window where
 
 The fix is a reader-writer lock spanning the inconsistent window — coarse, held only across file operations, and worth far more than the throughput it costs. The test that proves it has to build a real file-backed database with a real reader pool; a version driven through the in-memory fixtures passed with or without the lock, which would have been worse than no test at all.
 
-### L29: The default extension directory does not exist in a `FROM scratch` image
+### L29: A dependency's default path and published platforms are part of the deployment contract
 
-DuckDB installs community extensions under `$HOME/.duckdb/extensions`. A `scratch` image has no `/etc/passwd` and sets no `HOME`, and the deployment this project recommends adds `read_only: true`. So `INSTALL behavioral FROM community` had nowhere to write, and every funnel, retention, session, sequence and flow request answered 503 — on a container that passed its healthcheck, served the dashboard, and ingested events perfectly.
+Two incidents, one lesson. Both left a container that passed its healthcheck, served the dashboard and ingested events perfectly, while every funnel, retention, session, sequence and flow request answered 503.
 
-Nothing in the test suite could see it: the tests open in-memory databases on a normal filesystem with a normal `HOME`. The general lesson is that a dependency's *default path* is part of the deployment contract. Set it explicitly to somewhere the deployment guarantees is writable — here, the data volume — rather than inheriting a default that happens to work on a developer's laptop.
+**The default path.** DuckDB installs community extensions under `$HOME/.duckdb/extensions`. The `FROM scratch` image the project then shipped had no `/etc/passwd` and no `HOME`, and the recommended deployment adds `read_only: true`, so `INSTALL behavioral FROM community` had nowhere to write. Nothing in the test suite could see it: the tests open in-memory databases on a normal filesystem with a normal `HOME`. Set the path explicitly to somewhere the deployment guarantees is writable (here, the data volume, `MALLARD_EXTENSION_DIR`).
+
+**The platform matrix.** The same image was a static musl binary. DuckDB derives its platform string from the C library it was built against, so a musl build asks the community repository for `linux_amd64_musl`, which answers 404 (checked 2026-10-21: `linux_amd64`, `linux_arm64`, `osx_arm64` return 200; both musl platforms return 404, for DuckDB v1.5.6). The fix was to build on glibc and run on distroless `cc-debian12`, to refuse musl release binaries, and to have `scripts/docker-smoke.sh` and the release workflow fail unless the image reports a `behavioral_version`.
+
+Before choosing a base image, a target triple or a dependency version, read the dependency's published platform and version matrix; it constrains the deployment as much as your own code does.
 
 ### L11: Axum Tower middleware composes cleanly
 
 CORS, tracing, and compression are added as Tower layers with no impedance mismatch. The `tower::ServiceExt` trait enables testing routers with `oneshot()` without starting a real server.
+
+### L34: Filters must select sessions, not cut them
+
+Session metrics applied the segment filter *before* `sessionize`. A two-page visit narrowed to one of its pages then looked like a one-page bounce lasting zero seconds, and the entry page of a `/pricing` report was always `/pricing`. A filter answers "which sessions contain this", so keep a session when one of its events matches every filter and measure it whole; plain event counts still count only the matching events. The same audit found two endpoints carrying separate copies of the session SQL that disagreed about what a session is; there is now one definition (`query::sessions::per_session_cte`), and a counted session needs a pageview. When two endpoints must agree, make them share the query, not the intention.
+
+### L35: Never block on a second lock while holding a resource the other path takes first
+
+Flushes take the exclusive tier lock and then the connection lock (L28). A reader that took a connection and then waited for the tier lock could therefore deadlock against a flush whenever the reader pool shares the writer connection: a pool of size 1, and every in-memory test database. The fix is an ordering rule rather than a timeout: a reader takes the connection, only *tries* the tier lock, and if a writer holds it releases the connection, waits for the writer to finish, and starts again (`execute_on_reader` in `src/api/stats.rs`). The test that pins it runs readers and a flusher concurrently on a shared connection and fails if they do not finish.
+
+The same rewrite fixed a second cost of lock scope: taking the shared tier lock *before* queueing for a connection meant every request parked behind the four reader connections also held up the next flush, tying ingest latency to the slowest dashboard query. Hold a lock only while the work that needs it runs, and compaction likewise merges without the tier lock on its own connection, taking it only for the rename swap.
+
+### L37: A crash-safety claim needs a test per crash point, and recovery must decide from content
+
+Flush and compaction are sequences (write, fsync, delete, rename, unlink). The crash-safe versions came from reproducing each step boundary with a failing test on the old code: an immutable file (`chattr +i`) for removal failures, a reconstructed post-crash directory for ordering failures. Each found real loss: a compaction that deleted the merged file after unlinking some sources, a flush that could leave every row visible twice, a power loss leaving a short Parquet file in the read glob.
+
+Recovery must not infer from a proxy. "The partition still has hot rows, so the staged file is a duplicate" is wrong if the process kept running after a failed publish and new rows arrived for the same partition: the next restart would delete the only copy. Compare content (`EXCEPT ALL` of the staged file against the hot rows): fully covered means duplicate, otherwise publish. Handle the unreadable case separately (drop it if rows are still hot, set it aside as `.corrupt` if not), and never fall back silently: the old view setup fell back to "hot tier only" on *any* error, so one corrupt file hid the whole cold tier with no error. `/health/detailed` now reports `cold_tier` and answers 503 when Parquet files exist that the view does not read.
 
 ---
 
@@ -205,6 +233,22 @@ Two habits catch this class. First, ask of any in-memory credential what a resta
 The login handler resolved the client address without the peer socket, so on any deployment not behind a trusted proxy — the default — every attempt keyed the same bucket: the literal string `"unknown"`. Every unit test passed, because each drove one synthetic address and the behaviour under a single key is indistinguishable.
 
 The tell is a fallback value that is *shared* rather than *absent*. `Option::None` would have forced a decision at every call site; `"unknown"` silently merged every client into one, which flipped a protection into an amplification — five failures from anyone locked out everyone.
+
+---
+
+### L32: A proxy header is trustworthy only at the position your own infrastructure wrote it
+
+`client_ip` took the *leftmost* `X-Forwarded-For` entry. Behind a proxy that appends (the documented nginx `$proxy_add_x_forwarded_for`), the leftmost entry is whatever the client sent, so any visitor could choose its own visitor ID, GeoIP country and rate-limit bucket by adding a header. Each proxy you operate appends the address it received the connection from, so count from the **right**: the client is entry N, where N is the number of proxies that are yours (`MALLARD_TRUSTED_PROXY_HOPS`). A chain shorter than N, or implausibly long, is ignored rather than guessed at.
+
+The setting cannot be checked from inside the process: too large a value silently trusts attacker-supplied entries. Hence the startup advisory that spells out the count, and the documentation of each proxy topology (one proxy is 1; a CDN in front of nginx is 2). Related: IPv6 clients are keyed by their /64 for abuse control, since one subscriber owns a whole /64 and would otherwise get a fresh bucket per request; the full address still feeds the visitor hash and GeoIP.
+
+### L33: Count a guarded attempt when it is admitted; bound every map by making room, never by refusing
+
+Three defects with one shape, all invisible to tests that drove a single synthetic client:
+
+1. Login attempts were counted *after* verification, so a burst of parallel requests all passed the lockout check before any failure was recorded (12 of 12 guesses were checked against a limit of 3), and a client that hung up mid-verification kept its guess for free. Count when the attempt is admitted, atomically with the check, and refund only an attempt the server never judged. Bound the slow check itself too: at most 4 Argon2 operations run at once, and a saturated server answers 503.
+2. The rate limiter refused every new key once its map was full of active keys, so 10,000 cheap requests with distinct keys turned genuine visitors away for as long as the attacker kept it up. Make room instead, in batches (an eighth of the cap: idle entries first, then least recently used), so the scan is paid once per batch rather than once per request while holding the lock every ingest request needs. Export a counter for evictions; one that nothing exports (the previous `capacity_rejections`) is invisible.
+3. A map keyed by a client-supplied label needs an allow-list or a cap, because the label is attacker-chosen.
 
 ---
 
