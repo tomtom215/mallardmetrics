@@ -2,13 +2,15 @@
 
 > Fly.io is a managed application platform that runs Docker containers in hardware-isolated micro-VMs (Firecracker) across a global network. It is **not** a "free tier" service — it requires a credit card. However, its Hobby plan includes enough free allowances to run Mallard Metrics at low-to-medium traffic volumes at little or no monthly cost.
 
+> **Verification status.** This page could not be tested: it needs a Fly.io account and `flyctl`, and the repository ships **no `fly.toml`**; the one below is an example to create, not a file you can copy from the repo. What is verified is how Mallard behaves (startup checks, ports, shutdown, proxy handling, the extension download). What is **not** verified and is marked *(unverified)* where it appears: Fly's prices and allowances, volume ownership and permissions for a non-root container, the `X-Forwarded-For` Fly's proxy sends, `kill_timeout` behaviour, volume snapshot consistency, and every `fly` command. Check Fly's current documentation before relying on any of them.
+
 ---
 
 ## Overview
 
 Fly.io runs your Docker image as a Firecracker micro-VM. Mallard Metrics deploys well because:
 
-- The `FROM scratch` musl-static binary has no OS dependencies
+- The image is a small glibc distroless image (UID 65532, no shell) built from the repository `Dockerfile`; there is no musl build, because the DuckDB `behavioral` extension is not published for musl
 - Fly.io provides persistent volumes for DuckDB and Parquet data
 - Fly.io terminates TLS automatically — no Caddy or certbot needed
 - The Fly.io edge network handles HTTP/2 and HTTPS globally
@@ -45,7 +47,9 @@ Fly.io runs your Docker image as a Firecracker micro-VM. Mallard Metrics deploys
 
 ## Pricing and Allowances
 
-Fly.io's Hobby plan (requires a payment method) includes monthly allowances:
+*(unverified: these figures are from an earlier version of this page and Fly.io has changed its plans more than once. Check [fly.io/pricing](https://fly.io/pricing) before you rely on any "free" claim.)*
+
+The page previously described monthly allowances:
 
 | Resource | Included free |
 |---|---|
@@ -56,7 +60,7 @@ Fly.io's Hobby plan (requires a payment method) includes monthly allowances:
 
 Mallard Metrics needs:
 
-- **1 VM** — `shared-cpu-1x` with 256 MB RAM is sufficient for up to ~10k daily events. Scale to 512 MB or 1x CPU for higher loads.
+- **1 VM** — DuckDB needs real memory: the repository's own compose files use 1 GB with `MALLARD_DUCKDB_MEMORY_LIMIT` at 640 MB. A 256 MB machine with DuckDB's default limit (about 80% of RAM) is likely to be OOM-killed by one heavy report *(untested)*. Start with 512 MB to 1 GB and set the limit explicitly.
 - **1 Volume** — minimum 1 GB (DuckDB grows with data). 3 GB is comfortable for a year of moderate traffic.
 
 At low traffic, your deployment may fit entirely within the free allowances. At higher traffic or with a large data volume, expect $1–5/month.
@@ -121,7 +125,7 @@ app            = "mallard-metrics-YOURNAME"
 primary_region = "ord"    # Chicago. See: fly platform regions
 
 [build]
-  # Use the existing Dockerfile (FROM scratch, musl binary)
+  # The repository Dockerfile: glibc binary on distroless, UID 65532
   dockerfile = "Dockerfile"
 
 [env]
@@ -137,6 +141,14 @@ primary_region = "ord"    # Chicago. See: fly platform regions
   MALLARD_FILTER_BOTS        = "true"
   MALLARD_SECURE_COOKIES     = "true"
   MALLARD_RETENTION_DAYS     = "365"
+  # Fly's proxy sits in front of the app. Trust its X-Forwarded-For, one hop.
+  # (unverified: confirm Fly overwrites or appends the header the way the hop
+  # rule needs; see Configuration. Without these two lines every visitor looks
+  # like Fly's proxy and five wrong passwords lock the admin out.)
+  MALLARD_TRUST_PROXY_HEADERS = "true"
+  MALLARD_TRUSTED_PROXY_HOPS  = "1"
+  MALLARD_DUCKDB_MEMORY_LIMIT = "640MB"     # about 60% of a 1 GB machine
+  MALLARD_SHUTDOWN_TIMEOUT    = "25"
   MALLARD_RATE_LIMIT         = "200"
   MALLARD_CACHE_TTL          = "300"
   MALLARD_MAX_LOGIN_ATTEMPTS = "5"
@@ -159,7 +171,12 @@ primary_region = "ord"    # Chicago. See: fly platform regions
 [[vm]]
   cpu_kind = "shared"
   cpus     = 1
-  memory   = "256mb"     # Increase to "512mb" for >50k daily events
+  memory   = "1gb"       # the repository's compose files use 1 GB
+
+# Give the shutdown flush time. Fly's default kill timeout is short (unverified:
+# check the current default); Mallard may need up to MALLARD_SHUTDOWN_TIMEOUT
+# for the drain and again for the final flush.
+kill_timeout = "60s"
 
 [mounts]
   source      = "mallard_data"    # Volume name (created below)
@@ -188,9 +205,11 @@ fly platform regions
 
 ### Dockerfile note
 
-The existing `Dockerfile` targets `x86_64-unknown-linux-musl`. Fly.io runs on x86-64 by default — **no changes to the Dockerfile are needed**.
+The repository `Dockerfile` builds a glibc binary on the build host's architecture. Fly's remote builder is x86-64 by default, which matches x86-64 machines. Do not switch the Dockerfile to a musl target: the `behavioral` extension cannot load there.
 
-If you want to build for Fly.io's ARM machines (`--vm-cpu-kind performance`), change the target to `aarch64-unknown-linux-musl` and update the `rust-toolchain.toml` accordingly.
+The image listens on port 8000. This example overrides it to 8080 with `MALLARD_PORT`; keep `internal_port`, the health check port and `MALLARD_PORT` identical.
+
+**Volume ownership *(unverified)*.** The container runs as UID 65532 and the image creates `/data` owned by that user, but a Fly volume is mounted over `/data`, and whether it is writable by a non-root user depends on how Fly mounts it. If the machine logs `Permission denied` or `Failed to create the data directory /data/events` at startup, the volume is not writable by UID 65532 and this deployment needs a change (for example running the machine as root, or a one-off ownership fix) that this page cannot specify.
 
 ---
 
@@ -228,7 +247,7 @@ fly secrets set \
   --app "$APP"
 ```
 
-**Save the admin password** before running the above — it is not retrievable after setting:
+`MALLARD_SECRET` needs 16+ characters and the admin password 12+, or the machine refuses to start. **Save the admin password and the metrics token** before running the above: neither is retrievable after setting.
 
 ```bash
 # Generate and save before setting:
@@ -338,16 +357,15 @@ fly logs --app mallard-metrics-YOURNAME -n 200
 # Parse JSON structured logs
 fly logs --app mallard-metrics-YOURNAME | jq 'select(.fields.uri != "/health/ready")'
 
-# Machine console (SSH equivalent — note: FROM scratch has no shell)
-# Use this to inspect the volume contents:
+# Machine console (unverified). The image has no shell, so what you can do in
+# there depends on what Fly's console provides.
 fly ssh console --app mallard-metrics-YOURNAME
-# > ls /data/
 ```
 
 **Prometheus metrics:**
 ```bash
-METRICS_TOKEN=$(fly secrets list --app mallard-metrics-YOURNAME | grep METRICS_TOKEN)
-curl -H "Authorization: Bearer $YOUR_METRICS_TOKEN" \
+# `fly secrets list` shows only digests, so use the token you saved when you set it:
+curl -H "Authorization: Bearer $MALLARD_METRICS_TOKEN" \
   https://mallard-metrics-YOURNAME.fly.dev/metrics
 ```
 
@@ -404,19 +422,13 @@ Fly.io performs a blue/green-style deploy — it starts the new machine, runs he
 
 ---
 
-## Backup and Restore
+## Backups
 
-Fly.io volumes are not automatically backed up. Back up the DuckDB file and Parquet data regularly.
+Read [Backup and Restore](backup-restore.md) first: the data directory holds a live DuckDB file that cannot be copied consistently while the process runs, and `deploy/backup.sh` is written for Docker Compose, not Fly.
 
-**Export via API** (for structured backup):
-```bash
-# CSV export of all data
-curl -H "Authorization: Bearer $API_KEY" \
-  "https://mallard-metrics-YOURNAME.fly.dev/api/stats/export?site_id=example.com&format=json" \
-  > backup-$(date +%Y%m%d).json
-```
+**The export endpoint is not a backup.** `GET /api/stats/export` returns daily rollups or raw events *without visitor IDs*, for one site and date range, up to a row limit. It is useful for analysis, not for restoring an instance (it excludes the admin hash, API keys and secret).
 
-**Volume snapshot** (Fly.io feature):
+**Volume snapshot** (Fly.io feature; *unverified for DuckDB consistency*: a snapshot taken while Mallard runs is a crash-consistent image of the volume at best, and the guidance above says a live copy may not open or may miss recent writes. Mallard recovers interrupted Parquet flushes at startup but the DuckDB file and WAL are what is at risk. To get a clean snapshot, stop the machine first, snapshot, then start it):
 ```bash
 # List volumes
 fly volumes list --app mallard-metrics-YOURNAME
@@ -448,7 +460,7 @@ fly volumes create mallard_data_restore \
 fly logs --app mallard-metrics-YOURNAME | tail -50
 
 # Common causes:
-# 1. MALLARD_SECRET not set — run: fly secrets list
+# 1. MALLARD_SECRET missing or under 16 characters, or the admin password under 12 — run: fly secrets list; the log's first line names it
 # 2. Volume not found — run: fly volumes list
 # 3. Port mismatch — ensure MALLARD_PORT=8080 matches fly.toml internal_port=8080
 ```
@@ -458,11 +470,7 @@ fly logs --app mallard-metrics-YOURNAME | tail -50
 ```bash
 fly checks list --app mallard-metrics-YOURNAME
 
-# Test the endpoint manually
-fly ssh console --app mallard-metrics-YOURNAME
-# Inside the console (if you have a shell):
-wget -qO- http://localhost:8080/health/ready
-# Note: FROM scratch has no shell — use fly proxy instead:
+# Test the endpoint manually. The image has no shell or wget, so use a proxy:
 fly proxy 8080 --app mallard-metrics-YOURNAME
 # Then in another terminal: curl http://localhost:8080/health/ready
 ```
@@ -524,14 +532,7 @@ Yes. Fly.io provides a free `*.fly.dev` subdomain with a valid TLS certificate. 
 
 `fly ssh console --app mallard-metrics-YOURNAME`
 
-Note that the Mallard container is `FROM scratch` and has no shell. The `fly ssh console` command connects to the VM's outer shell (not the container), so you can run `ls /` but not exec into the container.
-
-To inspect the data volume:
-```bash
-fly ssh console --app mallard-metrics-YOURNAME
-ls /data/         # See DuckDB and Parquet files
-du -sh /data/     # Check usage
-```
+*(unverified)* The Mallard image is distroless and has no shell, so it cannot be exec'd into. Whether `fly ssh console` gives you a usable shell on the VM, and where the volume is visible from it, depends on Fly. Prefer `/health/detailed` and the logs.
 
 **Q: Can I run Mallard Metrics alongside other services?**
 
@@ -546,8 +547,8 @@ Fly.io apps are isolated. You can deploy other services as separate Fly apps in 
 
 **Q: Does the behavioral extension work on Fly.io?**
 
-Yes, if the `behavioral` extension binary is included in the build. Check `GET /health/detailed` — `"behavioral_extension_loaded": true` confirms it loaded successfully.
+Yes. Mallard downloads the extension on first start onto the volume (`/data/extensions`), which needs outbound access to `community-extensions.duckdb.org`; a Fly machine normally has it *(unverified)*. Check `GET /health/detailed`: `"behavioral_extension_loaded": true` confirms it. Later starts load it from the volume. The image must be glibc (it is); a musl image could never load it.
 
 **Q: What happens to in-flight events if the machine is auto-stopped?**
 
-Mallard handles `SIGTERM` with a graceful shutdown — it flushes the in-memory event buffer to Parquet before the machine stops. As long as the shutdown completes within `MALLARD_SHUTDOWN_TIMEOUT_SECS` (default 30s), no events are lost. Events buffered after the flush starts may be lost. Set `min_machines_running = 1` to avoid auto-stop entirely for high-reliability deployments.
+Mallard handles `SIGTERM` with a graceful shutdown — it flushes the in-memory event buffer to Parquet before the machine stops. As long as the machine is given enough time to finish (Mallard drains connections for up to `MALLARD_SHUTDOWN_TIMEOUT` seconds, default 30, then flushes for up to that long again; set `kill_timeout` accordingly, *unverified*), no events are lost. If the platform kills the process first, events still in the memory buffer are lost. Set `min_machines_running = 1` to avoid auto-stop entirely for high-reliability deployments.
