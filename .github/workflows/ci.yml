@@ -144,7 +144,7 @@ jobs:
       - name: Lint shell scripts
         run: |
           set -euo pipefail
-          # shellcheck is preinstalled on GitHub's Ubuntu runners.
+          # The runner image ships with shellcheck preinstalled.
           shellcheck scripts/*.sh deploy/*.sh
 
       - name: Check the declared MSRV matches every place it is pinned
