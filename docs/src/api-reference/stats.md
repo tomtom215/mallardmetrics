@@ -4,12 +4,20 @@ All stats endpoints require authentication: a session cookie, an
 `Authorization: Bearer <key>` API key, or an `X-API-Key` header.
 
 Every read endpoint is cached for `cache_ttl_secs` (default 60) except
-`/api/stats/realtime`, where a cached answer would not be realtime. The cache
+`/api/stats/realtime` (a cached answer would not be realtime) and
+`/api/stats/export` (large, read once). The cache
 evicts least-recently-used entries when full, and a GDPR erasure drops that
 site's entries immediately.
 
-All endpoints share one concurrency limit (`max_concurrent_queries`, default 10)
-and return `429` with a `Retry-After` header when it is reached.
+All endpoints share one concurrency limit (`max_concurrent_queries`, default 10).
+A request that finds every slot busy **waits up to 10 seconds** for one; only
+then does it get `429` (`code: too_many_requests`, `Retry-After: 1`). A running
+statement is interrupted after **20 seconds** and answers `504`
+(`code: query_timeout`). Both budgets sit inside the 30-second request timeout
+(`408`). Cache hits do not use a slot.
+
+Examples on this page were run against a seeded 0.2.0 binary. Authenticate with
+`-H "X-API-Key: mm_..."` or a session cookie.
 
 ---
 
@@ -18,15 +26,20 @@ and return `429` with a `Retry-After` header when it is reached.
 | Parameter | Type | Description |
 |---|---|---|
 | `site_id` | string | Required. The site to query. |
-| `period` | string | `day`, `today`, `7d`, `30d`, `90d`, `12mo`. Defaults to `30d`. |
-| `start_date` | string | `YYYY-MM-DD`, **inclusive**. Must be paired with `end_date`; overrides `period`. |
-| `end_date` | string | `YYYY-MM-DD`, **inclusive**. Range may span at most 366 days. |
+| `period` | string | `day`, `today`, `7d`, `30d`, `90d`, `12mo`. Defaults to `30d`. Anything else is a `400`. |
+| `start_date` | string | `YYYY-MM-DD`, **inclusive**. Must be paired with `end_date`; overrides `period`. A lone `start_date` or `end_date` is a `400`. |
+| `end_date` | string | `YYYY-MM-DD`, **inclusive**. `end_date` minus `start_date` may be at most 366 days (so up to 367 days are covered); more is a `400`. |
 | `limit` | integer | Rows to return, where the endpoint returns a list. Exceeding the endpoint's maximum is a `400`, not a silent clamp. |
 | `filters` | string | Narrow the report to a segment. See below. |
 | `compare` | string | `previous_period` or `year_over_year`. Read by `/api/stats/main` only. |
 
 Both explicit dates are inclusive, so `start_date=2024-01-01&end_date=2024-01-31`
 covers all of January.
+
+Periods are UTC calendar days **including today**: `7d` is seven daily buckets
+(today and the six days before), `30d` thirty, `day`/`today` is today so far, and
+`12mo` is the twelve months ending today. Sites have no time zone; a day boundary
+is a UTC boundary. See [Metric definitions](../metric-definitions.md#periods).
 
 ### Segment filters
 
@@ -68,7 +81,10 @@ expresses them; asking for one returns `400` rather than quietly filtering on
 At most 12 conditions per request, each value at most 512 characters. An unknown
 dimension, a missing operator or an empty value is a `400` naming the problem.
 
-Filtered and unfiltered results are cached separately, and the cache key is
+A filter **selects sessions, it does not cut them**: a session is kept when at
+least one of its events matches every condition, and is then measured whole (see
+[Metric definitions](../metric-definitions.md#filters)). Filtered and unfiltered
+results are cached separately, and the cache key is
 built from the parsed conditions, so `a==1;b==2` and `b==2;a==1` share an entry.
 
 `GET /api/stats/realtime` accepts `filters` but not a date range: its window is
@@ -79,14 +95,17 @@ filtered too, so it always agrees with the totals beside it.
 
 Returns `400` unless the value is non-empty, at most 256 characters, and made up
 only of ASCII alphanumerics plus `.`, `-`, `_` and `:`. The same rule governs
-ingestion, so anything accepted at ingest is queryable.
+ingestion, so anything accepted at ingest is queryable. A missing `site_id` is a
+plain-text `400` from the query-string parser, not a JSON error.
 
 ---
 
 ## `GET /api/sites`
 
 Site IDs that have data — from the query view, from the on-disk partitions, and
-from the configured `site_ids` allowlist.
+from the configured `site_ids` allowlist (so a configured site with no data yet
+is listed). Sorted, de-duplicated. Events still in the in-memory buffer are not
+counted until they are flushed.
 
 ```json
 {"sites": ["blog.example.com", "example.com"]}
@@ -112,11 +131,11 @@ from the configured `site_ids` allowlist.
 
 | Field | Notes |
 |---|---|
-| `unique_visitors` | Distinct `visitor_id` values. Over a range longer than one salt rotation this counts visitor-periods, not people — see [Behavioral Analytics](../behavioral-analytics.md#a-prerequisite-that-is-easy-to-miss-visitor-identity). |
+| `unique_visitors` | Distinct `visitor_id` values over **all** events in range, custom events included. Over a range longer than one salt rotation this counts visitor-periods, not people — see [Behavioral Analytics](../behavioral-analytics.md#a-prerequisite-that-is-easy-to-miss-visitor-identity). |
 | `total_pageviews` | Events named `pageview`. |
 | `total_events` | All events, custom ones included. |
 | `views_per_visitor` | `total_pageviews / unique_visitors`. Previously called `pages_per_visit`, which is not what it measured. |
-| `total_sessions`, `bounce_rate`, `avg_visit_duration_secs`, `views_per_visit` | Need the `behavioral` extension. **`null` when unavailable**, which is meaningfully different from `0`. |
+| `total_sessions`, `bounce_rate`, `avg_visit_duration_secs`, `views_per_visit` | Need the `behavioral` extension, and exact timestamps. **`null` when unavailable** (extension not loaded, or `gdpr_mode`/`round_timestamps` on), which is meaningfully different from `0`. Definitions: [Metric definitions](../metric-definitions.md). |
 | `behavioral_available` | Whether those four could be computed. |
 | `comparison` | Present only when `compare` was requested. See below. |
 
@@ -162,7 +181,8 @@ Only `/api/stats/main` reads `compare`. The other endpoints ignore it.
 
 ## `GET /api/stats/timeseries`
 
-Hourly buckets for ranges up to two days, daily beyond that.
+Hourly buckets for ranges of up to two days, daily beyond that. Daily buckets
+are labelled `YYYY-MM-DD`, hourly ones `YYYY-MM-DD HH:00`.
 
 ```json
 [
@@ -188,6 +208,16 @@ happened.
 Ordered by visitors, then by value — so equal counts do not reorder between
 refreshes.
 
+`entry-pages` and `exit-pages` are **session-level**. Each row also carries
+`sessions` (the number of entrances or exits), and its `pageviews` and `events`
+count everything in those sessions, not just the entry page:
+
+```json
+{"value": "/", "visitors": 2, "pageviews": 6, "events": 7, "sessions": 3}
+```
+
+Other dimensions omit `sessions` and count events.
+
 | Dimension | Column |
 |---|---|
 | `pages` | `pathname` |
@@ -202,7 +232,9 @@ refreshes.
 | `utm-sources`, `utm-mediums`, `utm-campaigns`, `utm-contents`, `utm-terms` | The `utm_*` columns |
 | `events` | `event_name` |
 
-\* Needs the `behavioral` extension; returns `503` without it.
+\* Need the `behavioral` extension and exact timestamps; `503`
+(`behavioral_unavailable`) without the extension or under `gdpr_mode`.
+They cannot be used in `filters`.
 
 An unknown dimension returns `400` listing the available ones. `limit` defaults
 to 10, maximum 1000.
@@ -301,8 +333,13 @@ adding 10 USD to 10 EUR would produce a number that means nothing.
 `GET /api/stats/sessions`, `/funnel`, `/retention`, `/sequences` and `/flow` are
 documented in full under [Behavioral Analytics](../behavioral-analytics.md).
 
-They return **`503`** with an explanatory `error` when the `behavioral`
-extension is not loaded, rather than an empty `200` that reads as "no data".
+They return **`503`** (`code: behavioral_unavailable`) with an explanatory
+`error` when the `behavioral` extension is not loaded, rather than an empty `200`
+that reads as "no data". Sessions, funnel, sequences, flow and the entry/exit
+breakdowns also return `503` while `round_timestamps` is on (it is switched on by
+`gdpr_mode`), because events inside one hour can no longer be ordered; retention
+and every non-session report keep working. `/api/stats/main` then reports its
+session fields as `null`.
 
 ---
 
@@ -330,18 +367,31 @@ CSV fields are quoted, internal quotes doubled, and values beginning with `=`,
 `+`, `-`, `@`, tab or carriage return are prefixed with an apostrophe so a
 spreadsheet does not evaluate them as formulas.
 
-The response is built in memory rather than streamed, so `limit` is also a
-memory bound: the 100,000-row default is a few tens of megabytes, and the
+The response is built in memory rather than streamed (the chunked exporter in
+`src/query/export.rs` is not wired into the HTTP handler yet), so `limit` is also
+a memory bound: the 100,000-row default is a few tens of megabytes, and the
 1,000,000-row ceiling a few hundred. Export in date-range slices rather than
-raising the limit on a memory-constrained host.
+raising the limit on a memory-constrained host. The response carries
+`Content-Disposition: attachment; filename="mallard-daily-<start>.csv"`
+(`mallard-events-<start>.json` for raw JSON).
+
+A day with no events has `top_page` `"(none)"` and `top_source` `"(direct)"`;
+a day with events whose referrer is unknown has `"(unknown)"` as its source.
+`limit` over 1,000,000 is a `400`. `filters` apply to exports too.
 
 ---
 
 ## `DELETE /api/gdpr/erase`
 
-**Requires admin authentication.** Permanently deletes a site's events across an
-inclusive date range, from both the hot table and the on-disk Parquet
-partitions, then refreshes the query view and drops that site's cached results.
+**Requires admin authentication** (`401` without, `403` for a `ReadOnly` key).
+Permanently deletes a site's events across an inclusive date range, from both the
+hot table and the on-disk Parquet partitions, then refreshes the query view and
+drops that site's cached results.
+
+All three parameters are required; `end_date` minus `start_date` may be at most
+366 days. Order of work: buffered events are flushed first (so they cannot
+reappear after the erasure), then both tiers are cleared under the exclusive
+tier lock, so no report sees a half-erased state.
 
 ```
 DELETE /api/gdpr/erase?site_id=example.com&start_date=2024-01-01&end_date=2024-01-31
@@ -353,9 +403,24 @@ DELETE /api/gdpr/erase?site_id=example.com&start_date=2024-01-01&end_date=2024-0
   "site_id": "example.com",
   "start_date": "2024-01-01",
   "end_date": "2024-01-31",
-  "db_records_deleted": 1204,
+  "db_records_deleted": 0,
   "parquet_partitions_deleted": 31
 }
+```
+
+`db_records_deleted` counts rows removed from the **hot table** only. Because
+every flush moves events on to Parquet, it is usually `0` or small; the bulk of
+the data is counted by `parquet_partitions_deleted` (one per site-day directory,
+which also removes any `.pending`, `.del` and temporary files inside it).
+
+**Partial failure.** If a partition directory cannot be removed, the response is
+`500` with `"status": "partial"` and a `failed_dates` array; the other dates were
+erased. The data in `failed_dates` is still on disk: fix the cause (usually
+permissions or a read-only mount) and repeat the request, which is safe to repeat.
+
+```json
+{"status":"partial","site_id":"example.com","start_date":"2024-01-01","end_date":"2024-01-31",
+ "db_records_deleted":0,"parquet_partitions_deleted":30,"failed_dates":["2024-01-17"]}
 ```
 
 Visitor IDs are pseudonymous hashes rather than identities, so a specific
