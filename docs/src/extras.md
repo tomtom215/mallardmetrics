@@ -114,14 +114,15 @@ calling `form.submit()` from script fire no `submit` event and are not seen.
 
 ## What they do to your numbers
 
-- **Bounce rate.** A visit with one pageview and any other event is not a bounce
-  (see [Metric Definitions](metric-definitions.md)), and the extras' events are
-  ordinary events. With `data-engagement` on, almost every visit that lasts a
-  second sends one, so **bounce rate will fall sharply** and no longer be
-  comparable with earlier data. `data-scroll` has the same effect on every visit
-  that reaches 25 %. Decide whether you want that before enabling them.
-- **Visit duration** improves for the same reason: the extra event is timestamped
-  when the visitor leaves.
+- **Bounce rate is unaffected.** `Scroll Depth` and `Engagement` are sent in the
+  background as the page is hidden, with no action by the visitor, so they are
+  *passive* events and do not end a bounce (see
+  [Metric Definitions](metric-definitions.md#bounce-rate)). `404` and
+  `Form Submit` are ordinary events: a submitted form is an interaction, so it
+  does end one.
+- **Visit duration** improves: the passive events are timestamped when the
+  visitor leaves, and duration runs from a visit's first event to its last, so a
+  one-page visit now has a duration instead of 0 s.
 - **Goals.** Every event name other than `pageview` appears in the goals list, so
   `Scroll Depth`, `Engagement`, `404` and `Form Submit` will show up there with
   a conversion rate. That is expected.

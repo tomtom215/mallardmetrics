@@ -99,8 +99,9 @@ few startup conditions that used to be accepted are now refused; read
   (`data-scroll`), engagement time (`data-engagement`), 404 detection
   (`data-404-selector` / `data-404-title`) and form submits (`data-forms`).
   It sends through the main tracker, so every opt-out and server limit applies
-  unchanged. See [Tracker extras](docs/src/extras.md), including its effect on
-  bounce rate.
+  unchanged. Its background events (`Scroll Depth`, `Engagement`) do not end a
+  bounce, so enabling it leaves bounce rate meaning what it did; see
+  [Tracker extras](docs/src/extras.md).
 - **Datacenter traffic filter**, off by default. `MALLARD_ASN_DB` / `asn_db_path`
   (GeoLite2-ASN or DB-IP ASN lite) turns it on: events from a hosting ASN are
   dropped like bots (`202`, not stored) and counted in

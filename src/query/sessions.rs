@@ -59,10 +59,31 @@ fn window(scope: &QueryScope) -> &str {
     }
 }
 
+/// Event names the optional extras script sends in the background, with no
+/// action by the visitor: reaching a scroll depth and the time a page was
+/// engaged with are both reported as the page is hidden.
+///
+/// They are real events (they count in `total_events` and can be queried), but
+/// they are not interaction, so they must not end a bounce: turning the extras
+/// on would otherwise make every visit look engaged. `tracking/extras.js` is
+/// the source of these names; a test keeps the two in step.
+pub const PASSIVE_EVENTS: &[&str] = &["Engagement", "Scroll Depth"];
+
+/// `PASSIVE_EVENTS` as the body of a SQL `IN (...)`. The names are constants of
+/// this crate, never request input, so inlining them is safe.
+fn passive_sql_list() -> String {
+    PASSIVE_EVENTS
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// SQL beginning a `WITH` list with a `per_session` CTE, one row per counted
 /// session in the segment.
 ///
-/// `per_session` has: `visitor_id`, `session_id`, `event_count`, `page_count`,
+/// `per_session` has: `visitor_id`, `session_id`, `event_count`,
+/// `interaction_count` (events other than [`PASSIVE_EVENTS`]), `page_count`,
 /// `duration_secs`, `entry_page`, `exit_page`. The caller supplies the
 /// statement that follows, e.g. `SELECT COUNT(*) FROM per_session`.
 ///
@@ -84,6 +105,8 @@ pub fn per_session_cte(scope: &QueryScope) -> String {
          per_session AS (
              SELECT visitor_id, session_id,
                     COUNT(*) AS event_count,
+                    COUNT(*) FILTER (WHERE event_name NOT IN ({passive}))
+                        AS interaction_count,
                     COUNT(*) FILTER (WHERE event_name = 'pageview') AS page_count,
                     EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp))) AS duration_secs,
                     MIN_BY(pathname, timestamp) FILTER (WHERE event_name = 'pageview')
@@ -98,6 +121,7 @@ pub fn per_session_cte(scope: &QueryScope) -> String {
         segment = scope.filter_expr(),
         range = QueryScope::range_clause(),
         window = window(scope),
+        passive = passive_sql_list(),
     )
 }
 

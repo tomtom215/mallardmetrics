@@ -2602,7 +2602,13 @@ async fn test_raw_export_streams_with_back_pressure_and_stops_when_the_client_le
     panic!("the query slot was not returned after the client left");
 }
 
-#[tokio::test]
+// A multi-thread runtime: the producer's stall timeout is a tokio timer, and on
+// the default single-thread test runtime it is only driven when the test thread
+// itself wakes. The test thread then drains the channel in the same moment, so
+// under load the producer lost the race and the export "ended cleanly". With
+// worker threads the timer fires while the test is still stalled, as it does in
+// the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_a_client_that_stops_reading_gets_a_truncated_body_not_a_clean_end() {
     use mallard_metrics::api::stats::QueryLimits;
     use std::time::Duration;
@@ -2624,8 +2630,9 @@ async fn test_a_client_that_stops_reading_gets_a_truncated_body_not_a_clean_end(
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body();
 
-    // Stall well past the deadline, then read what is left.
-    tokio::time::sleep(Duration::from_millis(3500)).await;
+    // Stall well past the deadline (and past scheduling delay under load), then
+    // read what is left.
+    tokio::time::sleep(Duration::from_millis(6000)).await;
     let mut aborted = false;
     let mut bytes = 0usize;
     while let Some(frame) = body.frame().await {

@@ -289,8 +289,9 @@ other tools.
 - **Session**: a run of one visitor's events (of any kind) with no gap larger
   than `session_window_minutes` (30 by default). Custom events keep a session
   alive. Only sessions containing at least one pageview are *counted*.
-- **Bounce**: a counted session with exactly one event, which is a pageview. A
-  custom event ends the bounce.
+- **Bounce**: a counted session whose only interaction is its pageview. A custom
+  event ends the bounce; the extras script's background `Scroll Depth` and
+  `Engagement` events do not.
 - **Visit duration**: last event minus first event in the session.
 - **Views per visit**: mean pageviews per counted session.
 - **Entry / exit page**: pathname of the session's first / last pageview.

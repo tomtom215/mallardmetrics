@@ -65,9 +65,11 @@ In the example, for 2026-10-19..20 (`period` or explicit dates):
 
 ## Bounce rate
 
-A **bounce** is a counted session with **exactly one event, and that event is a
-pageview**. A custom event is an interaction, so one pageview plus one click
-(session C) is not a bounce.
+A **bounce** is a counted session whose **only interaction is its pageview**. A
+custom event is an interaction, so one pageview plus one click (session C) is not
+a bounce. The extras script's background events, `Scroll Depth` and `Engagement`,
+are not interactions (the visitor did nothing) and do not end a bounce; they
+still count in total events and in visit duration.
 
 Bounces: B and E. `bounce_rate = 2 / 6 = 0.3333`. For the single day
 `start_date=end_date=2026-10-19` there are five sessions (F is the 20th), so

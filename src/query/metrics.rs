@@ -224,13 +224,15 @@ fn query_session_aggregates(
 
 /// SQL for the session aggregate pass. Split out so it can be unit-tested.
 ///
-/// A bounce is a counted session with exactly one event, which is a pageview;
-/// the full set of definitions is in [`crate::query::sessions`].
+/// A bounce is a counted session whose only interaction is its pageview: a
+/// custom event ends it, a background event from the extras script
+/// ([`sessions::PASSIVE_EVENTS`]) does not. The full set of definitions is in
+/// [`crate::query::sessions`].
 fn session_aggregate_sql(scope: &QueryScope) -> String {
     format!(
         "{cte}
          SELECT COUNT(*),
-                COALESCE(COUNT(*) FILTER (WHERE event_count = 1 AND page_count = 1)::DOUBLE
+                COALESCE(COUNT(*) FILTER (WHERE interaction_count = 1 AND page_count = 1)::DOUBLE
                          / NULLIF(COUNT(*), 0), 0.0),
                 COALESCE(AVG(duration_secs), 0.0),
                 COALESCE(AVG(page_count), 0.0)
@@ -517,6 +519,41 @@ mod tests {
             (m.avg_session_duration_secs - 30.0).abs() < f64::EPSILON,
             "duration spans every event in the visit: (60 + 0) / 2"
         );
+    }
+
+    #[test]
+    fn test_background_events_from_the_extras_script_do_not_end_a_bounce() {
+        // The extras script reports scroll depth and engaged time as the page is
+        // hidden. The visitor did nothing, so the visit is still a bounce; a real
+        // custom event still ends it.
+        let db = TestDb::new();
+        if !db.require_behavioral("passive events") {
+            return;
+        }
+        insert_pageview(&db.conn, "a", "2024-01-15 10:00:00", "/");
+        db.insert_event("a", "2024-01-15 10:00:20", "Scroll Depth", "/");
+        db.insert_event("a", "2024-01-15 10:00:20", "Engagement", "/");
+        insert_pageview(&db.conn, "b", "2024-01-15 11:00:00", "/");
+        db.insert_event("b", "2024-01-15 11:00:30", "Scroll Depth", "/");
+        db.insert_event("b", "2024-01-15 11:00:40", "signup", "/");
+
+        let m = query_session_metrics(&db.conn, &scope("2024-01-01", "2024-02-01")).unwrap();
+        assert_eq!(m.total_sessions, 2);
+        assert!(
+            (m.bounce_rate - 0.5).abs() < f64::EPSILON,
+            "a bounced on a pageview plus passive events; b signed up: {m:?}"
+        );
+    }
+
+    #[test]
+    fn test_passive_event_names_match_the_extras_script() {
+        let script = include_str!("../../tracking/extras.js");
+        for name in sessions::PASSIVE_EVENTS {
+            assert!(
+                script.contains(&format!("'{name}'")),
+                "{name:?} is no longer an event the extras script sends"
+            );
+        }
     }
 
     #[test]
