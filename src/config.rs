@@ -31,6 +31,16 @@ pub struct Config {
     /// If not set or the file is missing, GeoIP lookups return None.
     #[serde(default)]
     pub geoip_db_path: Option<PathBuf>,
+    /// Path to an ASN database (GeoLite2-ASN or DB-IP ASN lite, `.mmdb`).
+    /// Setting it turns the datacenter traffic filter on; unset (the default)
+    /// leaves it off. Unlike `geoip_db_path`, a missing or unusable file is a
+    /// startup error.
+    #[serde(default)]
+    pub asn_db_path: Option<PathBuf>,
+    /// ASNs treated as hosting/datacenter traffic. Empty = the built-in list
+    /// (`ingest::asn::DEFAULT_DATACENTER_ASNS`); non-empty replaces it.
+    #[serde(default)]
+    pub datacenter_asns: Vec<u32>,
     /// Dashboard origin for CORS restrictions on stats/dashboard routes.
     /// If not set, stats routes allow all origins.
     #[serde(default)]
@@ -385,6 +395,8 @@ impl Default for Config {
             flush_interval_secs: default_flush_interval_secs(),
             site_ids: Vec::new(),
             geoip_db_path: None,
+            asn_db_path: None,
+            datacenter_asns: Vec::new(),
             dashboard_origin: None,
             filter_bots: default_filter_bots(),
             retention_days: 0,
@@ -598,6 +610,20 @@ impl Config {
         {
             config.geoip_db_path = Some(PathBuf::from(geoip));
         }
+        if let Ok(asn) = std::env::var("MALLARD_ASN_DB")
+            && !asn.trim().is_empty()
+        {
+            config.asn_db_path = Some(PathBuf::from(asn));
+        }
+        if let Ok(raw) = std::env::var("MALLARD_DATACENTER_ASNS") {
+            let (asns, bad) = crate::ingest::asn::parse_asn_list(&raw);
+            for token in bad {
+                warnings.push(format!(
+                    "MALLARD_DATACENTER_ASNS entry {token:?} is not an ASN (use 16509 or AS16509); ignored"
+                ));
+            }
+            config.datacenter_asns = asns;
+        }
         if let Ok(origin) = std::env::var("MALLARD_DASHBOARD_ORIGIN") {
             if origin.trim().is_empty() {
                 config.dashboard_origin = None;
@@ -743,6 +769,22 @@ impl Config {
         }
     }
 
+    /// The datacenter filter settings: the database must be a readable file.
+    fn validate_datacenter_filter(&self) -> Result<(), String> {
+        if let Some(path) = &self.asn_db_path {
+            // Open it here: a typo must stop startup, not leave the filter off.
+            std::fs::File::open(path)
+                .map_err(|e| format!("asn_db_path {} cannot be read: {e}", path.display()))?;
+            if !path.is_file() {
+                return Err(format!("asn_db_path {} is not a file", path.display()));
+            }
+        }
+        if self.datacenter_asns.contains(&0) {
+            return Err("datacenter_asns must not contain 0".to_string());
+        }
+        Ok(())
+    }
+
     /// The analytics query budgets as the query runner takes them.
     ///
     /// The runner interrupts a statement at `query_deadline_secs`, after at most
@@ -832,6 +874,7 @@ impl Config {
                 self.geoip_precision
             ));
         }
+        self.validate_datacenter_filter()?;
         if let Some(limit) = &self.duckdb_memory_limit
             && !is_valid_memory_limit(limit)
         {
@@ -1767,6 +1810,73 @@ visitor_salt_rotation_days = 30
             .config
             .validate()
             .unwrap_or_else(|e| panic!("the shipped example config must validate: {e}"));
+    }
+
+    #[test]
+    fn test_asn_filter_is_off_by_default_and_env_configures_it() {
+        let _guard = env_lock();
+        let defaults = Config::default();
+        assert!(defaults.asn_db_path.is_none() && defaults.datacenter_asns.is_empty());
+
+        let orig_db = std::env::var("MALLARD_ASN_DB").ok();
+        let orig_asns = std::env::var("MALLARD_DATACENTER_ASNS").ok();
+        set_env("MALLARD_ASN_DB", "  ");
+        set_env("MALLARD_DATACENTER_ASNS", "AS16509, 14061, bogus");
+        let loaded = Config::load(None).unwrap();
+        assert!(loaded.config.asn_db_path.is_none(), "blank means unset");
+        assert_eq!(loaded.config.datacenter_asns, vec![16509, 14061]);
+        assert!(
+            loaded.warnings.iter().any(|w| w.contains("bogus")),
+            "{:?}",
+            loaded.warnings
+        );
+        set_env("MALLARD_ASN_DB", "/data/asn.mmdb");
+        assert_eq!(
+            Config::load(None).unwrap().config.asn_db_path,
+            Some(PathBuf::from("/data/asn.mmdb"))
+        );
+        restore_env("MALLARD_ASN_DB", orig_db);
+        restore_env("MALLARD_DATACENTER_ASNS", orig_asns);
+    }
+
+    #[test]
+    fn test_validate_asn_db_path_must_be_a_readable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("asn.mmdb");
+        std::fs::write(&file, b"x").unwrap();
+
+        let ok = Config {
+            asn_db_path: Some(file),
+            ..Config::default()
+        };
+        assert!(ok.validate().is_ok());
+
+        let missing = Config {
+            asn_db_path: Some(dir.path().join("absent.mmdb")),
+            ..Config::default()
+        };
+        assert!(missing.validate().unwrap_err().contains("asn_db_path"));
+
+        let directory = Config {
+            asn_db_path: Some(dir.path().to_path_buf()),
+            ..Config::default()
+        };
+        assert!(directory.validate().unwrap_err().contains("asn_db_path"));
+
+        let zero = Config {
+            datacenter_asns: vec![0],
+            ..Config::default()
+        };
+        assert!(zero.validate().unwrap_err().contains("datacenter_asns"));
+    }
+
+    #[test]
+    fn test_asn_keys_parse_from_toml() {
+        let config: Config =
+            toml::from_str("asn_db_path = \"/d/a.mmdb\"\ndatacenter_asns = [16509, 24940]\n")
+                .unwrap();
+        assert_eq!(config.datacenter_asns, vec![16509, 24940]);
+        assert!(config.asn_db_path.is_some());
     }
 
     #[test]

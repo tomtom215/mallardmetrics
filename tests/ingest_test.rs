@@ -2022,6 +2022,21 @@ async fn test_tracking_script_is_served() {
 }
 
 #[tokio::test]
+async fn test_extras_script_is_served() {
+    let (state, _dir) = plain_state();
+    let response = get(&state, "/mallard-extras.js").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("*")
+    );
+    assert!(body_text(response).await.contains("window.mallard"));
+}
+
+#[tokio::test]
 async fn test_metrics_endpoint_is_open_without_a_token() {
     let (state, _dir) = plain_state();
     let response = get(&state, "/metrics").await;

@@ -39,7 +39,7 @@ const INDEX_CACHE_CONTROL: &str = "no-cache";
 ///
 /// Short enough that a fix reaches sites within the hour, long enough to avoid
 /// a request per pageview.
-const SCRIPT_CACHE_CONTROL: &str = "public, max-age=3600";
+pub(crate) const SCRIPT_CACHE_CONTROL: &str = "public, max-age=3600";
 
 /// One embedded file, ready to serve.
 struct Asset {

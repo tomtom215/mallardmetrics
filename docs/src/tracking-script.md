@@ -145,6 +145,12 @@ named `Outbound Link: Click` and `File Download`, and carry the destination in t
 custom property `url` (origin plus path unless `data-link-query` is set); break it
 down at `/api/stats/property-values?key=url&event=Outbound%20Link%3A%20Click`.
 
+## Optional extras
+
+Scroll depth, engagement time, 404 detection and form submits live in a second,
+separate script, [`/mallard-extras.js`](extras.md), so the main tracker stays
+small and sites that do not want them never download them.
+
 ## Opting out
 
 Two mechanisms, both entirely client-side. The script reads exactly one browser

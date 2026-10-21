@@ -53,6 +53,8 @@ into an image.
 | `MALLARD_DUCKDB_MEMORY_LIMIT` / `duckdb_memory_limit` | string | unset (about 80% of RAM) | number plus `B/KB/KiB/MB/MiB/GB/GiB/TB/TiB` | Cap on query memory, e.g. `1GB`. Set it below the container limit. |
 | `MALLARD_DUCKDB_THREADS` / `duckdb_threads` | u32 | unset (one per core) | `0` is an error in TOML; a non-positive env value is a warning | DuckDB worker threads. |
 | `MALLARD_GEOIP_DB` / `geoip_db_path` | path | unset | empty = unset; a missing file is not an error | MaxMind GeoLite2-City database; geography is `NULL` without it. |
+| `MALLARD_ASN_DB` / `asn_db_path` | path | unset (filter off) | empty = unset; **a missing, unreadable, corrupt or non-ASN file stops startup** | GeoLite2-ASN or DB-IP "ASN lite" `.mmdb`. Setting it turns on the [datacenter traffic filter](#datacenter-traffic-filter). |
+| `MALLARD_DATACENTER_ASNS` / `datacenter_asns` | list of u32 | unset (built-in list) | env: comma-separated, `AS16509` or `16509`, bad entries warn and are skipped; `0` is an error in TOML | ASNs treated as hosting. A non-empty list **replaces** the built-in one. |
 
 ## Ingestion
 
@@ -129,6 +131,56 @@ These are logged as warnings and never block startup:
 - `site_ids` empty **and** `rate_limit_per_ip = 0`: anyone who can reach the
   server can create sites and write events without limit.
 - `suppress_visitor_id` on.
+
+## Datacenter traffic filter
+
+Off unless `asn_db_path` points at an ASN database. Get one from MaxMind
+(GeoLite2-ASN, free with an account) or DB-IP ("IP to ASN Lite", CC-BY). When
+on, an event whose client address resolves to a listed ASN is dropped exactly
+like bot traffic: answered `202`, never stored, and counted in
+`mallard_datacenter_filtered_total` (see [Monitoring](monitoring.md)). It runs
+after rate limiting and bot filtering, and before the visitor ID is computed.
+
+The address is resolved by the same code as the rate limiter and GeoIP
+(`trust_proxy_headers` / `trusted_proxy_hops`, above): behind a proxy with
+`trust_proxy_headers` off, every visitor looks like your proxy, which is
+probably a datacenter address, and **everything would be dropped**. Mallard cannot
+detect that, so check `mallard_datacenter_filtered_total` after enabling it.
+The address is used transiently, as for GeoIP: it is never stored, logged, or
+put in a metric label.
+
+**Built-in list (11 ASNs).** Checked on 2026-10-21 against
+[PeeringDB](https://www.peeringdb.com/api/net?asn__in=16509,14618,396982,14061,24940,16276,63949,20473,12876,51167,31898)
+and, for AS14618 and AS396982, the ARIN registration
+(`https://rdap.arin.net/registry/autnum/<asn>`):
+
+| ASN | Owner |
+|---|---|
+| 16509 | Amazon.com (Amazon Web Services) |
+| 14618 | Amazon.com (AMAZON-AES, EC2) |
+| 396982 | Google LLC (Google Cloud Platform) |
+| 14061 | DigitalOcean |
+| 24940 | Hetzner Online |
+| 16276 | OVHcloud |
+| 63949 | Linode (Akamai Connected Cloud) |
+| 20473 | The Constant Company (Vultr, Choopa) |
+| 12876 | Scaleway (Online S.A.S.) |
+| 51167 | Contabo |
+| 31898 | Oracle Cloud Infrastructure |
+
+Left out on purpose: AS8075 (Microsoft: Azure, but also Microsoft's corporate
+network and consumer services), AS15169 (Google LLC: also corporate offices and
+Google-run proxies), AS45102 (Alibaba) and every residential, mobile or
+consumer-VPN network. Add any of them yourself in `datacenter_asns` if your
+audience makes that right for you.
+
+**False positives.** Anyone browsing through a datacenter is filtered: staff on
+a corporate VPN or cloud desktop that exits in AWS or Azure-adjacent space,
+privacy proxies and self-hosted VPNs on a VPS, and some browser-based preview
+tools. For a B2B product whose visitors sit behind corporate VPNs that cost can
+be real; leave the filter off, or trim the list. False negatives are certain too:
+scrapers on residential proxies pass. This is a coarse filter, not bot
+detection.
 
 ## Two settings that need a decision
 

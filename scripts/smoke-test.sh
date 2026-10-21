@@ -103,6 +103,8 @@ check metrics_http    'mallard_http_requests_total\{status="2xx"\}' "$(curl -sS 
 check metrics_latency 'mallard_http_request_duration_seconds_bucket' "$(curl -sS "$BASE/metrics")"
 check tracker         'sendBeacon'                  "$(curl -sS "$BASE/mallard.js")"
 check tracker_alias   'sendBeacon'                  "$(curl -sS "$BASE/js/script.js")"
+check extras_script   'window.mallard'              "$(curl -sS "$BASE/mallard-extras.js")"
+check extras_cors     'access-control-allow-origin: \*' "$(curl -sSI "$BASE/mallard-extras.js" | tr 'A-Z' 'a-z')"
 check dashboard       '<div id="app">'              "$(curl -sS "$BASE/")"
 check robots          'User-agent'                  "$(curl -sS "$BASE/robots.txt")"
 check security_txt    'Contact'                     "$(curl -sS "$BASE/.well-known/security.txt")"

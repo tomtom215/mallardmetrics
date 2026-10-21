@@ -121,6 +121,16 @@ log_format = "text"            # MALLARD_LOG_FORMAT — "text" or "json"
 # unset or missing.
 # geoip_db_path = "/data/GeoLite2-City.mmdb"   # MALLARD_GEOIP_DB
 
+# Datacenter / hosting traffic filter. OFF unless an ASN database is set. When
+# it is, events whose client IP is in a hosting ASN are dropped like bots (202,
+# not stored) and counted in mallard_datacenter_filtered_total. Needs a
+# GeoLite2-ASN or DB-IP "ASN lite" .mmdb; a missing or unusable file stops
+# startup. Corporate-VPN visitors exiting through a datacenter are filtered too.
+# asn_db_path = "/data/GeoLite2-ASN.mmdb"      # MALLARD_ASN_DB
+# ASNs to treat as hosting. Empty or unset = the built-in list of 11 (see
+# docs/src/configuration.md); a non-empty list REPLACES it.
+# datacenter_asns = [16509, 14061]             # MALLARD_DATACENTER_ASNS (comma-separated, "AS16509" accepted)
+
 # ─── Visitor identity ────────────────────────────────────────────────────────
 
 # Days a visitor-ID salt stays in use before rotating.

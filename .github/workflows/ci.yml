@@ -190,7 +190,7 @@ jobs:
       - name: Check JavaScript syntax
         run: |
           set -euo pipefail
-          for f in tracking/script.js src/dashboard/assets/app.js; do
+          for f in tracking/script.js tracking/extras.js src/dashboard/assets/app.js; do
             echo "Checking $f"
             node --check "$f"
           done
@@ -215,6 +215,19 @@ jobs:
           echo "tracking/script.js: ${SIZE} bytes gzipped (budget ${BUDGET})"
           if [ "$SIZE" -gt "$BUDGET" ]; then
             echo "::error file=tracking/script.js::Gzipped size ${SIZE} exceeds the ${BUDGET}-byte budget; update the documented size if this is intended."
+            exit 1
+          fi
+
+      - name: Check the optional extras script stays inside its size budget
+        run: |
+          set -euo pipefail
+          # Separate from the main tracker's budget: sites that do not opt in
+          # never download it.
+          BUDGET=2048
+          SIZE=$(gzip -9 -c tracking/extras.js | wc -c)
+          echo "tracking/extras.js: ${SIZE} bytes gzipped (budget ${BUDGET})"
+          if [ "$SIZE" -gt "$BUDGET" ]; then
+            echo "::error file=tracking/extras.js::Gzipped size ${SIZE} exceeds the ${BUDGET}-byte budget."
             exit 1
           fi
 

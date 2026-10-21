@@ -94,6 +94,18 @@ few startup conditions that used to be accepted are now refused; read
 
 ### Added
 
+- **Optional extras script** `/mallard-extras.js` (`tracking/extras.js`, 1.8 KB
+  gzipped, own 2,048-byte budget). Opt-in by attribute: scroll depth
+  (`data-scroll`), engagement time (`data-engagement`), 404 detection
+  (`data-404-selector` / `data-404-title`) and form submits (`data-forms`).
+  It sends through the main tracker, so every opt-out and server limit applies
+  unchanged. See [Tracker extras](docs/src/extras.md), including its effect on
+  bounce rate.
+- **Datacenter traffic filter**, off by default. `MALLARD_ASN_DB` / `asn_db_path`
+  (GeoLite2-ASN or DB-IP ASN lite) turns it on: events from a hosting ASN are
+  dropped like bots (`202`, not stored) and counted in
+  `mallard_datacenter_filtered_total`. `MALLARD_DATACENTER_ASNS` /
+  `datacenter_asns` replaces the built-in list of 11 verified hosting ASNs.
 - `MALLARD_QUERY_QUEUE_WAIT_SECS` (default 5) and `MALLARD_QUERY_DEADLINE_SECS`
   (default 20), TOML `query_queue_wait_secs` and `query_deadline_secs`: how long
   a request waits for a query slot (then `429`) and how long a statement may run

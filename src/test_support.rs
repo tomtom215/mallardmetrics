@@ -54,6 +54,7 @@ pub struct AppStateBuilder {
     suppress_os_version: bool,
     suppress_screen_size: bool,
     geoip_precision: String,
+    datacenter: crate::ingest::asn::DatacenterFilter,
     visitor_salt_rotation_days: u32,
     api_keys: ApiKeyStore,
 }
@@ -84,6 +85,7 @@ impl Default for AppStateBuilder {
             suppress_os_version: false,
             suppress_screen_size: false,
             geoip_precision: "city".to_string(),
+            datacenter: crate::ingest::asn::DatacenterFilter::disabled(),
             visitor_salt_rotation_days: 1,
             api_keys: ApiKeyStore::default(),
         }
@@ -131,6 +133,13 @@ impl AppStateBuilder {
     #[must_use]
     pub fn geoip_precision(mut self, value: &str) -> Self {
         self.geoip_precision = value.to_string();
+        self
+    }
+
+    /// Install a datacenter filter (disabled by default).
+    #[must_use]
+    pub fn datacenter(mut self, filter: crate::ingest::asn::DatacenterFilter) -> Self {
+        self.datacenter = filter;
         self
     }
 
@@ -211,6 +220,7 @@ impl AppStateBuilder {
             secret: "test-secret".to_string(),
             allowed_sites: self.allowed_sites,
             geoip: GeoIpReader::open(None),
+            datacenter: self.datacenter,
             filter_bots: self.filter_bots,
             sessions: SessionStore::new(3600),
             api_keys: self.api_keys,

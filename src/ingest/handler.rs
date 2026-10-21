@@ -152,6 +152,8 @@ pub struct AppState {
     pub secret: String,
     pub allowed_sites: Vec<String>,
     pub geoip: GeoIpReader,
+    /// Optional hosting/datacenter traffic filter (off unless `asn_db_path` is set).
+    pub datacenter: crate::ingest::asn::DatacenterFilter,
     pub filter_bots: bool,
     pub sessions: SessionStore,
     pub api_keys: ApiKeyStore,
@@ -240,6 +242,8 @@ pub enum RejectReason {
     RateLimited,
     /// Recognised as bot traffic while bot filtering is on.
     Bot,
+    /// The client address belongs to a listed hosting/datacenter ASN.
+    Datacenter,
 }
 
 impl RejectReason {
@@ -250,7 +254,7 @@ impl RejectReason {
             Self::Invalid | Self::SiteId => StatusCode::BAD_REQUEST,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             // Bot traffic is accepted-and-dropped so crawlers do not retry.
-            Self::Bot => StatusCode::ACCEPTED,
+            Self::Bot | Self::Datacenter => StatusCode::ACCEPTED,
         }
     }
 }
@@ -486,6 +490,10 @@ pub fn build_event(
     if state.filter_bots && parsed_ua.is_bot {
         return Err(RejectReason::Bot);
     }
+    // Same transient use of the address as GeoIP below: looked up, never kept.
+    if state.datacenter.is_datacenter(&ip) {
+        return Err(RejectReason::Datacenter);
+    }
 
     let now = Utc::now();
     let visitor_id = if state.suppress_visitor_id {
@@ -612,6 +620,8 @@ fn record_rejection(state: &AppState, reason: RejectReason) {
         state
             .rate_limit_rejections_total
             .fetch_add(1, Ordering::Relaxed);
+    } else if reason == RejectReason::Datacenter {
+        state.datacenter.record();
     }
 }
 
