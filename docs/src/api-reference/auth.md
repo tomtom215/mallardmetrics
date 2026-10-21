@@ -1,208 +1,212 @@
 # Authentication API
 
-Mallard Metrics supports two forms of authentication:
+Two kinds of credential:
 
-1. **Session cookies** — For human dashboard users.
-2. **API keys** — For programmatic access (CI/CD, integrations, monitoring).
+1. **Session cookie** (`mm_session`) for the dashboard.
+2. **API keys** (`mm_` prefix) for scripts, sent as `Authorization: Bearer <key>`
+   or `X-API-Key: <key>`.
+
+Handler errors on this page are `{"error": "..."}` **without** a `code` field
+(see [Errors](index.md#errors)).
 
 ---
 
-## Dashboard Authentication
+## Dashboard authentication
 
 ### `POST /api/auth/setup`
 
-Sets the admin password for the first time. Returns `409 Conflict` if a password is already configured.
+Sets the admin password for the first time. Available only while no password
+exists; afterwards it returns `409`.
 
-The Argon2id hash is written to `data_dir/admin.json` at mode 0600 and loaded on
-every subsequent start, so the password survives a restart. Before this it lived
-only in memory: a restart put the instance back into first-run mode, and whoever
-reached it first — not necessarily the operator — could claim it. If the hash
-cannot be written the request fails with `500` rather than accepting a password
-it would silently lose.
-
-`MALLARD_ADMIN_PASSWORD`, when set, takes precedence over the stored hash and is
-deliberately not written to disk, so removing the variable does not leave a
-stale credential behind.
-
-**No authentication required.**
-
-```json
-// Request — password must be at least 12 characters
-{"password": "your-secure-password"}
-
-// Response 200 — also sets HttpOnly, SameSite=Strict cookie mm_session
-{"token": "<session-token>"}
-
-// Response 400 — password too short
-{"error": "Password must be at least 12 characters"}
-
-// Response 409 — password already configured
-{"error": "Admin password already configured"}
+```bash
+curl -i -X POST http://localhost:8000/api/auth/setup \
+  -H 'Content-Type: application/json' \
+  -d '{"password": "a-long-enough-password"}'
 ```
 
-Passwords are hashed with Argon2id before storage. The plaintext password is never persisted.
+```
+HTTP/1.1 200 OK
+set-cookie: mm_session=<64 hex chars>; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400
+content-type: application/json
 
----
+{"status":"ok"}
+```
+
+The session token travels **only** in the cookie; the body does not repeat it.
+
+| Status | Body | When |
+|---|---|---|
+| 200 | `{"status":"ok"}` | Password stored; you are logged in. |
+| 400 | `{"error":"Password must be at least 12 characters"}` | Too short (counted in characters). |
+| 400 | `{"error":"Password is too common; choose something unpredictable"}` | A 12+ character value from a short built-in list (`mallardmetrics`, `123456789012`, ...). |
+| 403 | `{"error":"Cross-origin request refused"}` | `dashboard_origin` is set and `Origin`/`Referer` differs. |
+| 409 | `{"error":"Admin password already configured"}` | A password exists (from the environment or an earlier setup). |
+| 429 | `{"error":"Too many failed attempts. Try again later."}` + `Retry-After` | The caller's address is locked out (shares the login attempt counter). |
+| 500 | `{"error":"Could not store the admin password. ..."}` | `data_dir/admin.json` could not be written. Nothing was accepted. |
+
+The Argon2id hash is written to `data_dir/admin.json` (mode 0600) and loaded on
+every start. `MALLARD_ADMIN_PASSWORD`, when set, takes precedence, passes the
+same policy at startup (a rejected value stops the server), and is never written
+to disk.
 
 ### `POST /api/auth/login`
 
-Authenticates with the admin password and creates a session.
-
-**No authentication required.**
-
-```json
-// Request
-{"password": "your-secure-password"}
-
-// Response 200 — sets HttpOnly, SameSite=Strict cookie mm_session
-{"token": "<session-token>"}
-
-// Response 400 — no password configured yet
-{"error": "No admin password configured. Use /api/auth/setup first."}
-
-// Response 401 — wrong password
-{"error": "Invalid password"}
-
-// Response 429 — Too Many Requests (IP locked out after max failed attempts)
-// Retry-After header contains the remaining lockout seconds
-{"error": "Too many failed login attempts. Try again later."}
+```bash
+curl -i -c cookies.txt -X POST http://localhost:8000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"password": "your-password"}'
 ```
 
-Sessions are stored in memory and expire after `session_ttl_secs` (default 24 hours). Sessions are cleared on server restart.
+| Status | Body | When |
+|---|---|---|
+| 200 | `{"status":"ok"}` + `Set-Cookie: mm_session=...` | Success. |
+| 400 | `{"error":"No admin password configured. Use /api/auth/setup first."}` | Before setup. |
+| 401 | `{"error":"Invalid password"}` | Wrong password. |
+| 403 | `{"error":"Cross-origin request refused"}` | CSRF origin check failed. |
+| 429 | `{"error":"Too many failed attempts. Try again later."}` | Locked out. `Retry-After` is the remaining lockout in seconds. |
+| 503 | `{"error":"Server is busy. Try again shortly."}` + `Retry-After: 1` | Four password checks were already running and none finished within 10 s. The attempt is not counted. |
 
-**Brute-force protection:** After `max_login_attempts` (default 5) consecutive failures from the same IP, the IP is locked out for `login_lockout_secs` (default 300 seconds). A successful login clears the failure count. Configure via `MALLARD_MAX_LOGIN_ATTEMPTS` and `MALLARD_LOGIN_LOCKOUT` environment variables, or the corresponding TOML fields. Set `max_login_attempts = 0` to disable.
+The cookie has `HttpOnly; SameSite=Strict; Path=/; Max-Age=<session_ttl_secs>`
+and gains `Secure` when `secure_cookies` is true or `dashboard_origin` starts
+with `https://`. Sessions live in memory and are lost on restart.
 
----
+**Lockout.** Attempts are counted per client address (IPv4 address, or IPv6
+/64), *when the attempt is admitted*, not after the check. After
+`max_login_attempts` (default 5) consecutive failures the address is locked for
+`login_lockout_secs` (default 300). A success clears the count. At most four
+Argon2 operations run at once, process-wide.
 
 ### `POST /api/auth/logout`
 
-Invalidates the current session.
-
-**No authentication required.** If a valid session cookie is present, it is invalidated. Otherwise the endpoint is a no-op (always returns 200).
+Invalidates the session in the cookie, if any. Always `200`:
 
 ```json
-// Response 200 — clears mm_session cookie
-{"status": "logged_out"}
+{"status":"logged_out"}
 ```
 
----
+with a `Set-Cookie` that expires `mm_session` (same attributes, including
+`Secure`, as the cookie it replaces). `403` if the CSRF origin check fails.
 
 ### `GET /api/auth/status`
 
-Returns the current authentication state.
-
 ```json
-// No password configured (open access mode)
-{"setup_required": true, "authenticated": true}
-
-// Password configured, not logged in
 {"setup_required": false, "authenticated": false}
-
-// Password configured, logged in
-{"setup_required": false, "authenticated": true}
 ```
 
-| Field | Type | Notes |
-|---|---|---|
-| `setup_required` | boolean | `true` when no admin password has been set. Analytics reads are open in this state. |
-| `authenticated` | boolean | `true` when the request carries a valid session or API key, or when `setup_required` is `true`. |
+| Field | Notes |
+|---|---|
+| `setup_required` | `true` while no admin password exists. |
+| `authenticated` | `true` for a valid session or API key. **Also `true` while `setup_required` is true**, because reads are open in that state. |
 
 Open access covers **reads only**. Key management and `DELETE /api/gdpr/erase`
-return `401` until an admin password exists — before setup there is no admin to
-authorise, and a key minted in that window would keep working afterwards. Run
-`POST /api/auth/setup` before exposing an instance to a network.
+answer `401` until a password exists, so a key cannot be minted in the
+unconfigured window. Run setup before exposing an instance to a network.
 
 ---
 
-## API Key Management
+## API key management
 
-API keys are prefixed with `mm_` and are SHA-256 hashed before storage. The plaintext key is only returned once at creation time.
-
-All key management endpoints require **admin** authentication: a session, or an
-API key with the `admin` scope. A read-only key gets `403`, and every one of
-them gets `401` before setup has run.
-
-These endpoints are also reachable from the dashboard — the **API keys** button
-beside the period selector — which lists, creates and revokes keys. It appears
-once an admin password exists, because there is nothing to authorise before
-then.
+All three endpoints need **admin** authentication (a session, or an `Admin`
+key). Keys are SHA-256 hashed in `data_dir/api_keys.json`; the plaintext is
+returned once. The dashboard's **API keys** button wraps these endpoints.
 
 ### `POST /api/keys`
 
-Creates a new API key.
-
-```json
-// Request
-{"name": "ci-pipeline", "scope": "ReadOnly"}
-
-// Response 201
-{
-  "key": "mm_abc123...",
-  "key_hash": "a1b2c3...",
-  "name": "ci-pipeline",
-  "scope": "ReadOnly"
-}
+```bash
+curl -X POST http://localhost:8000/api/keys \
+  -H 'Authorization: Bearer mm_<admin key>' -H 'Content-Type: application/json' \
+  -d '{"name": "ci-pipeline", "scope": "ReadOnly"}'
 ```
 
-The `key` field is the only time the plaintext key is returned. Store it securely.
+```json
+{"key":"mm_e09d2a6e...","key_hash":"426db04a...","name":"ci-pipeline","scope":"ReadOnly"}
+```
 
-**Scopes:**
+Status `201`. `name` is 1–128 characters (`400` otherwise). `scope` is exactly
+`ReadOnly` or `Admin` (case-sensitive; `readonly` is a `422`). A `500` means the
+key store could not be written; the change was rolled back.
 
-| Value | Access |
+| Scope | Access |
 |---|---|
-| `ReadOnly` | Read-only access to stats queries. |
-| `Admin` | Full admin access (key management, config). |
-
----
+| `ReadOnly` | All read routes. |
+| `Admin` | Everything, including key management and erasure. |
 
 ### `GET /api/keys`
 
-Lists all API keys (without plaintext values).
-
 ```json
-[
-  {
-    "key_hash": "a1b2c3...",
-    "name": "ci-pipeline",
-    "scope": "ReadOnly",
-    "created_at": "2024-01-15T10:00:00Z",
-    "revoked": false
-  }
-]
+[{"key_hash":"426db04a...","name":"ci-pipeline","scope":"ReadOnly","created_at":"2026-10-21T00:19:25Z","revoked":false}]
 ```
 
----
+Revoked keys stay listed with `"revoked": true` until the periodic cleanup
+removes them.
 
 ### `DELETE /api/keys/{key_hash}`
 
-Revokes an API key by its SHA-256 hex hash.
+Revokes the key with that SHA-256 hex hash.
 
 ```json
-// Response 200
-{"status": "revoked"}
-
-// Response 404 if hash not found
-{"error": "Key not found"}
+{"status":"revoked"}
 ```
+
+`404` with `{"code":"not_found","error":"Key not found"}` for an unknown hash.
 
 ---
 
-## Using API Keys
+## Share tokens are not API keys
 
-API keys can be passed in two ways:
+A [share link](../share-links.md) carries a token (`ms_...`) in the
+`X-Share-Token` header. It opens only the read-only `/api/shared/` routes for
+one site. Offered as a key, a bearer token, a cookie or on any other route, it is
+refused (`401`), and an API key is likewise refused on the share routes. Share
+links are created and revoked with the admin endpoints in
+[Share Links](../share-links.md#api).
 
-**Authorization header (Bearer token):**
+---
+
+## `POST /api/admin/backup`
+
+Admin scope. Snapshots both storage tiers while serving; see
+[Backup and Restore](../backup-restore.md#online-backup-no-downtime) for what is
+in it and how to restore.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `name` | `mallard-<UTC timestamp>` | Directory name under `<data_dir>/backups`: 1-128 characters of letters, digits, `-`, `_` or `.`, not starting with a dot. |
+
+```bash
+curl -X POST "https://your-instance.com/api/admin/backup?name=before-upgrade" \
+  -H "Authorization: Bearer mm_admin..."
+```
+
+```json
+{
+  "status": "created",
+  "name": "before-upgrade",
+  "path": "/data/backups/before-upgrade",
+  "parquet_files": 212,
+  "parquet_bytes": 48123456,
+  "hot_rows": 318,
+  "state_files": 3
+}
+```
+
+`201` on success. `400` for an unsafe `name`, `409` (`code: conflict`) when a backup
+of that name exists (nothing is overwritten), `401`/`403` without an admin
+credential (including before setup), `500` if the copy fails (the partial
+directory is removed).
+
+---
+
+## Using API keys
 
 ```bash
 curl "https://your-instance.com/api/stats/main?site_id=example.com&period=30d" \
   -H "Authorization: Bearer mm_abc123..."
-```
 
-**X-API-Key header:**
-
-```bash
 curl "https://your-instance.com/api/stats/main?site_id=example.com&period=30d" \
   -H "X-API-Key: mm_abc123..."
 ```
 
-Both headers are accepted on all stats and admin endpoints. `ReadOnly` keys can access stats endpoints; all key management endpoints (`GET /api/keys`, `POST /api/keys`, `DELETE /api/keys/{hash}`) require an `Admin`-scoped key.
+A session cookie is checked first, then `Authorization`, then `X-API-Key`.
+Verified: a `ReadOnly` key reads stats (`200`) and gets `403` from
+`GET /api/keys`; an `Admin` key lists keys.

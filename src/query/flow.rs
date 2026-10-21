@@ -47,6 +47,21 @@ impl Direction {
 /// Uses `sequence_next_node` from the behavioral extension. The limit is a
 /// parameter rather than the hard-coded 10 of the previous release.
 ///
+/// # Definition
+///
+/// A flow is a walk over a visitor's **pageviews** with consecutive repeats of
+/// the same page collapsed. Custom events are not pages, and a reload is not a
+/// move: left in, a `signup` event fired on `/pricing` was reported as the page
+/// visitors went to next from `/pricing`, and a refresh made every page its own
+/// successor. Matomo's transitions report likewise treats reloads separately
+/// from navigation. A visitor who leaves and comes back (`/a`, `/b`, `/a`) is a
+/// real transition and still counts.
+///
+/// `share` is the fraction of visitors who viewed `target_page` that went on to
+/// each destination, so the shares sum to less than 1 by the proportion who
+/// left from it. One visitor contributes at most one destination (the first
+/// match), not one per visit.
+///
 /// # Errors
 ///
 /// Returns an error if the query fails, e.g. when the behavioral extension is
@@ -64,20 +79,30 @@ pub fn query_flow(
     let escaped_page = target_page.replace('\'', "''");
     let dir = direction.as_arg();
 
+    let events = scope.events();
     let sql = format!(
-        "WITH per_visitor AS (
+        "WITH moves AS (
+             SELECT visitor_id, timestamp, pathname
+             FROM (
+                 SELECT visitor_id, timestamp, pathname,
+                        LAG(pathname) OVER (
+                            PARTITION BY visitor_id ORDER BY timestamp) AS previous
+                 FROM {events}
+                 WHERE {where_clause} AND event_name = 'pageview'
+             )
+             WHERE previous IS DISTINCT FROM pathname
+         ),
+         per_visitor AS (
              SELECT visitor_id,
                  sequence_next_node('{dir}', 'first_match', timestamp, pathname,
                      TRUE, pathname = '{escaped_page}'
                  ) AS next_page
-             FROM events_all
-             WHERE {where_clause}
+             FROM moves
              GROUP BY visitor_id
          ),
          reached AS (
              SELECT COUNT(DISTINCT visitor_id) AS total
-             FROM events_all
-             WHERE {where_clause} AND pathname = '{escaped_page}'
+             FROM moves WHERE pathname = '{escaped_page}'
          )
          SELECT next_page,
                 COUNT(*) AS visitors,
@@ -91,19 +116,14 @@ pub fn query_flow(
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    // The scope parameters appear twice: once for each WHERE clause.
-    let bound: Vec<&str> = scope.params().into_iter().chain(scope.params()).collect();
-    let rows = stmt
-        .query_map(duckdb::params_from_iter(bound), |row| {
-            Ok(FlowNode {
-                next_page: row.get(0)?,
-                visitors: row.get(1)?,
-                share: row.get(2)?,
-            })
-        })?
-        .filter_map(Result::ok)
-        .collect();
-    Ok(rows)
+    stmt.query_map(duckdb::params_from_iter(scope.params()), |row| {
+        Ok(FlowNode {
+            next_page: row.get(0)?,
+            visitors: row.get(1)?,
+            share: row.get(2)?,
+        })
+    })?
+    .collect()
 }
 
 #[cfg(test)]
@@ -233,6 +253,63 @@ mod tests {
         )
         .unwrap();
         assert!(nodes.is_empty());
+    }
+
+    #[test]
+    fn test_a_custom_event_is_not_the_next_page() {
+        // Regression (S-04): the scan had no `event_name = 'pageview'`, so a
+        // `signup` event fired on /pricing was the "next page" after /pricing
+        // and the real destination was never reported.
+        let db = TestDb::new();
+        if !db.require_behavioral("flow analysis") {
+            return;
+        }
+        insert_pageview(&db.conn, "v1", "2024-01-15 10:00:00", "/pricing");
+        db.insert_event("v1", "2024-01-15 10:00:30", "signup", "/pricing");
+        insert_pageview(&db.conn, "v1", "2024-01-15 10:01:00", "/signup");
+
+        let nodes = query_flow(
+            &db.conn,
+            &scope("2024-01-01", "2024-02-01"),
+            "/pricing",
+            Direction::Forward,
+            10,
+        )
+        .unwrap();
+        assert_eq!(nodes.len(), 1, "{nodes:?}");
+        assert_eq!(nodes[0].next_page, "/signup");
+    }
+
+    #[test]
+    fn test_reloads_are_not_transitions() {
+        // Regression (S-04): a refresh put the page itself in its own "next
+        // pages". Matomo's transitions report likewise separates reloads from
+        // navigation; here they are collapsed so only a real move counts.
+        let db = TestDb::new();
+        if !db.require_behavioral("flow analysis") {
+            return;
+        }
+        insert_pageview(&db.conn, "v1", "2024-01-15 10:00:00", "/pricing");
+        insert_pageview(&db.conn, "v1", "2024-01-15 10:00:20", "/pricing");
+        insert_pageview(&db.conn, "v1", "2024-01-15 10:01:00", "/docs");
+        // Going away and coming back is a real transition and still counts.
+        insert_pageview(&db.conn, "v2", "2024-01-15 11:00:00", "/docs");
+        insert_pageview(&db.conn, "v2", "2024-01-15 11:01:00", "/pricing");
+        insert_pageview(&db.conn, "v2", "2024-01-15 11:02:00", "/docs");
+
+        let s = scope("2024-01-01", "2024-02-01");
+        let forward = query_flow(&db.conn, &s, "/pricing", Direction::Forward, 10).unwrap();
+        assert!(
+            forward.iter().all(|n| n.next_page != "/pricing"),
+            "{forward:?}"
+        );
+        assert_eq!(forward[0].next_page, "/docs");
+        assert_eq!(forward[0].visitors, 2);
+        assert!((forward[0].share - 1.0).abs() < 1e-9);
+
+        let backward = query_flow(&db.conn, &s, "/pricing", Direction::Backward, 10).unwrap();
+        assert_eq!(backward.len(), 1, "{backward:?}");
+        assert_eq!(backward[0].next_page, "/docs", "v2 came from /docs");
     }
 
     #[test]

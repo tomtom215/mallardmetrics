@@ -1,0 +1,25 @@
+# Example Prometheus scrape configuration for Mallard Metrics. Merge it into the
+# scrape_configs of your prometheus.yml; it is not a complete configuration.
+#
+# GET /metrics requires `Authorization: Bearer <MALLARD_METRICS_TOKEN>` whenever
+# that variable is set (the production compose file requires it). Keep the token
+# in a file readable only by Prometheus, not inline.
+#
+# The bundled production compose file does not publish Mallard's port, and Caddy
+# only proxies the site's own domain, so the simplest options are:
+#   * run Prometheus on the same Docker network (`proxy`) and scrape
+#     mallard:8000 directly, or
+#   * scrape https://<your domain>/metrics over the internet with the token
+#     (TLS and the bearer token are then the only protection; Caddy does not
+#     restrict /metrics).
+
+scrape_configs:
+  - job_name: mallard-metrics
+    metrics_path: /metrics
+    scheme: http
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/mallard-metrics-token
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["mallard:8000"]

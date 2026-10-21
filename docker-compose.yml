@@ -1,9 +1,21 @@
+# Single-container setup for trying Mallard Metrics or running it behind your
+# own reverse proxy. For a hardened internet-facing VPS deployment (TLS, Caddy,
+# encrypted data volume) use deploy/docker-compose.production.yml instead.
+#
+#   echo "MALLARD_SECRET=$(openssl rand -base64 48)" > .env
+#   docker compose up -d --build
+#
+# The image is built from the repository's Dockerfile (glibc, distroless,
+# UID 65532). The first build compiles DuckDB and takes several minutes.
 services:
   mallard-metrics:
     build: .
     image: mallard-metrics:local
     ports:
-      - "8000:8000"
+      # Bound to loopback by default: the dashboard is served over plain HTTP
+      # and must not be exposed without TLS. Set MALLARD_BIND=0.0.0.0 only
+      # behind a firewall or a TLS-terminating proxy.
+      - "${MALLARD_BIND:-127.0.0.1}:${MALLARD_HOST_PORT:-8000}:8000"
     volumes:
       - mallard-data:/data
     environment:
@@ -14,16 +26,35 @@ services:
       - MALLARD_SECURE_COOKIES=${MALLARD_SECURE_COOKIES:-false}
       - MALLARD_METRICS_TOKEN=${MALLARD_METRICS_TOKEN:-}
       - MALLARD_DASHBOARD_ORIGIN=${MALLARD_DASHBOARD_ORIGIN:-}
+      # Enable only when every request arrives through your own reverse proxy;
+      # otherwise clients choose their own IP. Set the hop count to the number of
+      # proxies in front (the client is that many entries from the RIGHT of
+      # X-Forwarded-For).
       - MALLARD_TRUST_PROXY_HEADERS=${MALLARD_TRUST_PROXY_HEADERS:-false}
+      - MALLARD_TRUSTED_PROXY_HOPS=${MALLARD_TRUSTED_PROXY_HOPS:-1}
+      # Cap DuckDB below the container limit so a heavy query fails with an
+      # error instead of getting the whole process OOM-killed.
+      - MALLARD_DUCKDB_MEMORY_LIMIT=${MALLARD_DUCKDB_MEMORY_LIMIT:-640MB}
+      - MALLARD_DUCKDB_THREADS=${MALLARD_DUCKDB_THREADS:-2}
       - RUST_LOG=mallard_metrics=info
     restart: unless-stopped
 
-    # The image ships a single static binary and writes only to /data.
+    # The shutdown path flushes the in-memory event buffer, which can take up to
+    # MALLARD_SHUTDOWN_TIMEOUT (30 s by default). Docker's default 10 s grace
+    # period would SIGKILL the process mid-flush and lose the buffered events.
+    stop_grace_period: 45s
+
+    # The image writes only to /data (the volume); everything else is read-only.
     read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
+    mem_limit: ${MALLARD_MEM_LIMIT:-1g}
+    cpus: ${MALLARD_CPUS:-2}
+    pids_limit: 256
 
     healthcheck:
       # /health/ready reports 503 until DuckDB is queryable, so it is the
@@ -31,7 +62,8 @@ services:
       test: ["CMD", "/mallard-metrics", "--healthcheck"]
       interval: 30s
       timeout: 5s
-      start_period: 20s
+      # The first start may download the behavioral extension before binding.
+      start_period: 30s
       retries: 3
 
 volumes:

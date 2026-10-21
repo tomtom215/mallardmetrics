@@ -1,0 +1,14 @@
+{
+  "name": "Mallard Metrics",
+  // The same image and Rust version the Dockerfile builds with, so a glibc build
+  // here can install the DuckDB `behavioral` extension (a musl build cannot).
+  "image": "rust:1.98.0-bookworm",
+  "hostRequirements": { "cpus": 4, "memory": "8gb", "storage": "40gb" },
+  "postCreateCommand": "rustup component add rustfmt clippy",
+  "forwardPorts": [8000],
+  "customizations": {
+    "vscode": {
+      "extensions": ["rust-lang.rust-analyzer", "tamasfe.even-better-toml"]
+    }
+  }
+}

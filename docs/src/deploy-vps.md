@@ -17,7 +17,7 @@ This guide deploys Mallard Metrics on a bare VPS using:
 | **vps-audit** | Automated security assessment and weekly re-audit |
 | **UFW + fail2ban** | Host-level firewall and brute-force protection |
 
-The `FROM scratch` Mallard binary runs with no shell, no OS utilities, read-only root filesystem, all Linux capabilities dropped, and no network port exposed to the host — all traffic flows through Caddy on the internal Docker network.
+The Mallard container (a glibc binary on distroless `cc-debian12`, UID 65532) runs with no shell, no OS utilities, a read-only root filesystem, all Linux capabilities dropped, and no network port exposed to the host — all traffic flows through Caddy on the internal Docker network. There is no musl image: the DuckDB `behavioral` extension is not published for musl (see [Deployment](deployment.md#what-the-image-is)).
 
 ---
 
@@ -37,14 +37,14 @@ Internet
 │  │                                         │  │
 │  │  ┌─────────────┐    ┌───────────────┐   │  │
 │  │  │   Caddy     │───▶│ mallard:8000  │   │  │
-│  │  │ :80/:443    │    │ (FROM scratch) │   │  │
+│  │  │ :80/:443    │    │ (distroless)  │   │  │
 │  │  │ TLS + proxy │    │               │   │  │
 │  │  └─────────────┘    └───────┬───────┘   │  │
 │  └───────────────────────────  │ ──────────┘  │
 │                                │              │
 │  ┌─────────────────────────────▼────────────┐ │
 │  │  LUKS encrypted volume (/srv/mallard/data)│ │
-│  │  mallard.duckdb  data/YYYY/MM/DD/*.parquet│ │
+│  │  mallard.duckdb  events/site_id=*/date=*/ │ │
 │  └───────────────────────────────────────────┘ │
 └───────────────────────────────────────────────┘
 ```
@@ -61,9 +61,9 @@ Internet
 | RAM | 512 MB | 1 GB |
 | Disk | 10 GB | 40 GB |
 | OS | Ubuntu 22.04 | Ubuntu 24.04 LTS |
-| Architecture | x86-64 | x86-64 |
+| Architecture | x86-64 or arm64 | x86-64 or arm64 |
 
-Mallard Metrics is a single static binary. Under light to medium traffic (< 50k daily events) the minimum spec is adequate. The disk budget is dominated by Parquet data growth and the LUKS image pre-allocation.
+Under light to medium traffic (< 50k daily events) the minimum spec is adequate, but **building the image on the server compiles DuckDB and can run out of memory on 1 GB**: set `MM_IMAGE=ghcr.io/tomtom215/mallardmetrics:<version>` when running `setup.sh` to pull a released image instead. The disk budget is dominated by Parquet data growth and the LUKS image pre-allocation. `arm64` hosts work: the release image is multi-arch.
 
 ### Domain and DNS
 
@@ -130,8 +130,12 @@ The script is interactive — it will prompt for your domain, email, and Cloudfl
 export MM_DOMAIN=analytics.example.com
 export MM_EMAIL=admin@example.com
 export MM_CF_TOKEN=your-cloudflare-token
+# optional: MM_ADMIN_PASS, MM_SECRET, MM_METRICS_TOKEN, MM_IMAGE (pull instead of build),
+#           MM_RUN_VPS_AUDIT=1 (opt in to the vps-audit step)
 sudo -E bash deploy/setup.sh
 ```
+
+`MM_SECRET` must be at least 16 characters and `MM_ADMIN_PASS` at least 12; Mallard refuses to start otherwise.
 
 ---
 
@@ -192,10 +196,10 @@ The script will:
 5. Apply kernel hardening sysctl settings
 6. Install Docker CE and the Compose plugin
 7. Create a 20 GB LUKS-encrypted image at `/srv/mallard/data.img` and mount it
-8. Download and run [vps-audit](https://github.com/tomtom215/vps-audit) — saving the report
+8. Optionally (`MM_RUN_VPS_AUDIT=1`) download and run [vps-audit](https://github.com/tomtom215/vps-audit), saving the report and installing a weekly re-audit cron job
 9. Prompt you to configure `deploy/.env` (or auto-generate secrets)
-10. Build the Docker images and start the stack
-11. Install weekly vps-audit and daily backup cron jobs
+10. Build (or pull) the images, seed the `behavioral` extension onto the data volume, and start the stack
+11. Install the daily consistent backup (`deploy/backup.sh`) as a cron job
 12. Print your admin password and a post-setup checklist
 
 ### Step 4 — Verify deployment
@@ -218,11 +222,12 @@ Open `https://<your-domain>` in a browser. You should see the Mallard Metrics da
 ### Step 5 — Seed the behavioral extension
 
 **This deployment has no internet access by design, so the extension cannot
-install itself.** Mallard runs on the `proxy` network, which is declared
-`internal: true`: Docker adds no default route, so the container cannot reach
-the internet even if Caddy is compromised. That is the point of the design — and
-it also means `INSTALL behavioral FROM community`, which downloads over HTTPS on
-first run, has nowhere to download from.
+install itself.** (`setup.sh` seeds it for you; this step is for a manual
+deployment or after an upgrade.) Mallard runs on the `proxy` network, which is
+declared `internal: true`: Docker adds no default route, so the container cannot
+reach the internet even if Caddy is compromised. That is the point of the
+design — and it also means `INSTALL behavioral FROM community`, which downloads
+from `community-extensions.duckdb.org` on first run, has nowhere to download from.
 
 Without the extension, `/api/stats/funnel`, `/retention`, `/sessions`,
 `/sequences` and `/flow` answer `503` and the dashboard shows "Not available" in
@@ -245,7 +250,7 @@ sudo docker run --rm \
   -v /srv/mallard/data:/data \
   mallard-metrics:latest --install-extension
 
-# Installed the behavioral extension (version 0.9.1) into /data/extensions
+# Installed the behavioral extension (version 0.10.0) into /data/extensions
 # Start the server normally; it will load the extension from disk.
 ```
 
@@ -253,14 +258,17 @@ It downloads, writes two files, and exits. It creates no database, so it is safe
 to run against a live data directory. Restart the stack and check again:
 
 ```bash
-docker compose -f deploy/docker-compose.production.yml restart mallard-metrics
+docker compose -f deploy/docker-compose.production.yml restart mallard
 curl -s https://analytics.example.com/health/detailed | grep behavioral
 # "behavioral_extension_loaded": true
 ```
 
 The extension is version-matched to DuckDB, so repeat this after an upgrade that
 changes the bundled DuckDB version. The paths under `extensions/` name both
-(`v1.5.5/linux_amd64/`), so a stale one is easy to spot.
+(`v1.5.6/linux_amd64/`), so a stale one is easy to spot. Mallard needs version
+0.10.0 or newer and refuses an older cached build: see
+[Upgrading](upgrading.md#cleaning-the-extension-cache). More variants and the
+failure messages: [Troubleshooting](troubleshooting.md#running-the-extension-install-step-offline).
 
 If you would rather not give the container a route even once, copy
 `/srv/mallard/data/extensions/` from any machine running the same release. It is
@@ -283,10 +291,10 @@ Here is the complete sequence of operations `setup.sh` performs, with the ration
 | 6 | Kernel sysctl hardening | Disables TCP redirects, restricts dmesg/BPF |
 | 7 | Docker CE from official repo | Ensures a current, vendor-supported version |
 | 8 | LUKS encrypted image + keyfile | Analytics data encrypted at rest |
-| 9 | vps-audit + weekly cron | Ongoing visibility into security posture |
+| 9 | vps-audit + weekly cron (opt-in, `MM_RUN_VPS_AUDIT=1`) | Ongoing visibility into security posture |
 | 10 | Secret generation + `deploy/.env` | Strong random credentials without manual work |
 | 11 | `docker compose build && up -d` | Brings the stack live |
-| 12 | Backup cron (rsync) | Daily snapshot of DuckDB + Parquet |
+| 12 | Backup cron (`deploy/backup.sh`) | Daily consistent snapshot: stops Mallard briefly, copies, verifies, always restarts. See [Backup and Restore](backup-restore.md) |
 
 ---
 
@@ -305,7 +313,7 @@ The decrypted volume is formatted ext4 and mounted at `/srv/mallard/data`. The M
         ↓ ext4 mount
 /srv/mallard/data/        ← Plaintext filesystem (only visible to root while mounted)
         ↓ Docker bind mount
-/data/ (inside container) ← mallard.duckdb, data/YYYY/MM/DD/*.parquet
+/data/ (inside container) ← mallard.duckdb, events/site_id=*/date=*/*.parquet
 ```
 
 If an attacker gains access to the raw disk image (e.g., by stealing a disk or snapshot), the data is unreadable without the keyfile.
@@ -484,8 +492,11 @@ All configuration is in `deploy/.env`. The file is created by `setup.sh` from `d
 |---|---|---|
 | `DOMAIN` | _(required)_ | Hostname Caddy serves |
 | `MALLARD_RETENTION_DAYS` | `365` | Delete Parquet partitions older than N days |
-| `MALLARD_RATE_LIMIT` | `0` (unlimited) | Max events/sec per site_id |
-| `MALLARD_CACHE_TTL` | `60` | Query result cache TTL (seconds) |
+| `MALLARD_RATE_LIMIT` | `200` (the application default is `0`, unlimited) | Max events/sec per site_id |
+| `MALLARD_CACHE_TTL` | `300` (the application default is `60`) | Query result cache TTL (seconds) |
+| `MALLARD_SITE_IDS` | _(blank)_ | Comma-separated ingest allowlist; set it |
+| `MALLARD_DUCKDB_MEMORY_LIMIT` | `1280MB` (2 GB container) | Cap on query memory |
+| `MALLARD_DUCKDB_THREADS` | `2` | DuckDB worker threads |
 | `MALLARD_MAX_CONCURRENT_QUERIES` | `10` | DuckDB concurrency cap |
 | `MALLARD_MAX_LOGIN_ATTEMPTS` | `5` | Failed logins before IP lockout |
 | `MALLARD_LOGIN_LOCKOUT` | `300` | Lockout duration (seconds) |
@@ -511,9 +522,9 @@ Add this to every page you want to track:
 </script>
 ```
 
-Replace `analytics.example.com` with your deployment domain and `example.com` with the site_id you want to use for this site.
+Replace `analytics.example.com` with your deployment domain and `example.com` with the site_id you want to use for this site (it must be in `MALLARD_SITE_IDS` if you set that).
 
-**Custom events:**
+**Custom events** (see [Tracking Script](tracking-script.md)):
 ```javascript
 window.mallard('Purchase', {
   revenue: 49.99,
@@ -522,9 +533,7 @@ window.mallard('Purchase', {
 });
 ```
 
-**Embed on GitHub Pages docs** (static site):
-
-Simply paste the `<script>` tag into your `mdBook` layout template or into individual markdown pages using HTML passthrough. The script is < 1 KB and has zero external dependencies.
+For a static site (such as GitHub Pages) paste the `<script>` tag into the page template. The script is about 4 KB gzipped and has no external dependencies.
 
 ---
 
@@ -547,8 +556,9 @@ docker compose -f deploy/docker-compose.production.yml logs -f
 # Mallard only (JSON structured logs)
 docker compose -f deploy/docker-compose.production.yml logs mallard | jq .
 
-# Caddy access log (on the LUKS volume)
-tail -f /srv/mallard/data/logs/caddy-access.log | jq .
+# Caddy access log: stdout of the caddy container, scrubbed of IPs, headers and query strings,
+# rotated by Docker (20 MB x 5). There is no log file on the data volume.
+docker compose -f deploy/docker-compose.production.yml logs -f caddy | jq .
 ```
 
 ### Update Mallard Metrics
@@ -572,26 +582,13 @@ docker compose -f deploy/docker-compose.production.yml up -d
 
 ### Backup and restore
 
-**Backup** (done automatically daily by the cron job):
-```bash
-# Manual backup
-rsync -a --delete /srv/mallard/data/ /srv/mallard/backup/
+**Do not `rsync` the live data directory**: the DuckDB file and its write-ahead log can be copied inconsistently. `setup.sh` installs a daily cron job that runs `deploy/backup.sh`, which stops Mallard, copies, verifies, always restarts it, and keeps 14 snapshots under `/srv/mallard/backups`.
 
-# Copy off-server (replace with your backup destination)
-rsync -az /srv/mallard/data/ backup-server:/backups/mallard/$(date +%Y%m%d)/
+```bash
+sudo deploy/backup.sh          # a consistent backup now (Mallard is stopped for the copy)
 ```
 
-**Restore:**
-```bash
-# Stop the stack
-docker compose -f deploy/docker-compose.production.yml down
-
-# Restore data files
-rsync -a /srv/mallard/backup/ /srv/mallard/data/
-
-# Restart
-docker compose -f deploy/docker-compose.production.yml up -d
-```
+Copy `/srv/mallard/backups/` to another machine; a snapshot on the same disk does not survive losing the disk. Restore and limits: [Backup and Restore](backup-restore.md).
 
 ### GeoIP setup
 
@@ -644,17 +641,25 @@ curl -s https://analytics.example.com/health/detailed | jq .
 Example response:
 ```json
 {
-  "status": "ok",
-  "version": "0.1.0",
-  "buffered_events": 0,
-  "auth_configured": true,
-  "geoip_loaded": false,
   "behavioral_extension_loaded": true,
-  "filter_bots": true,
+  "behavioral_version": "0.10.0",
+  "buffer_empty": true,
+  "buffered_events": 0,
+  "cache_empty": true,
   "cache_entries": 0,
-  "cache_empty": true
+  "cold_tier": "healthy",
+  "dropped_events": 0,
+  "filter_bots": true,
+  "geoip_loaded": false,
+  "read_connections": 4,
+  "session_window": "30 minutes",
+  "status": "ok",
+  "version": "0.2.0",
+  "visitor_salt_rotation_days": 1
 }
 ```
+
+It answers `503` with `"status": "degraded"` when the cold tier is unreadable. All fields: [Health & Metrics](api-reference/health.md).
 
 **Prometheus metrics** (requires `MALLARD_METRICS_TOKEN`):
 
@@ -663,17 +668,11 @@ curl -H "Authorization: Bearer $MALLARD_METRICS_TOKEN" \
   https://analytics.example.com/metrics
 ```
 
-Available metrics:
-- `mallard_events_ingested_total` — cumulative event count
-- `mallard_flush_failures_total` — Parquet flush failures
-- `mallard_rate_limit_rejections_total` — rate-limited requests
-- `mallard_login_failures_total` — failed dashboard logins
-- `mallard_cache_hits_total` / `mallard_cache_misses_total` — query cache
-- `mallard_behavioral_extension` — 1 if the behavioral extension loaded
+The 23 metric families are listed on [Monitoring](monitoring.md#metric-reference); `deploy/monitoring/` has alert rules and a Grafana dashboard. To scrape from a Prometheus container, join the `proxy` network and use `mallard:8000` (see `deploy/monitoring/prometheus-scrape.example.yml`).
 
 **UptimeRobot / Better Uptime:**
 
-Monitor `https://<domain>/health/ready` with a 1-minute interval. It returns HTTP 200 when the database is reachable, 503 otherwise.
+Monitor `https://<domain>/health/ready` (database reachable) **and** `https://<domain>/health/detailed` (cold tier readable; `503` when degraded) with a 1-minute interval.
 
 ---
 
@@ -697,8 +696,9 @@ docker compose -f deploy/docker-compose.production.yml logs caddy | grep -i "acm
 ```bash
 docker compose -f deploy/docker-compose.production.yml logs mallard
 
-# Common cause: MALLARD_SECRET is blank (required at startup)
-# Check deploy/.env has MALLARD_SECRET set to a non-empty value
+# Common causes: MALLARD_SECRET empty or shorter than 16 characters, MALLARD_ADMIN_PASSWORD
+# under 12 characters, or a data directory not owned by UID 65532.
+# The first log line names the setting. See Troubleshooting.
 ```
 
 ### Data volume not mounted after reboot
@@ -722,10 +722,12 @@ docker compose -f deploy/docker-compose.production.yml up -d
 ### Health check returns 503
 
 ```bash
-# Mallard is running but the DuckDB VIEW rebuild failed
+# /health/ready: DuckDB could not run SELECT 1 FROM events_all.
+# /health/detailed: "degraded" means Parquet files exist that the query view does not read.
 docker compose -f deploy/docker-compose.production.yml logs mallard | tail -50
 
-# Try restarting Mallard only (Caddy stays up, no TLS interruption)
+# Fix the cause (is the LUKS volume mounted? ownership 65532?), then restart Mallard only
+# (Caddy stays up, no TLS interruption)
 docker compose -f deploy/docker-compose.production.yml restart mallard
 ```
 
@@ -752,6 +754,8 @@ docker system prune -f
 # Then restart mallard
 ```
 
+While the disk is full Mallard keeps events in memory (up to `MALLARD_MAX_BUFFERED_EVENTS`, default 100,000) and retries; past that, ingest answers `503` and events are dropped (`mallard_events_dropped_total`). See [Troubleshooting](troubleshooting.md#disk-full).
+
 ---
 
 ## Frequently Asked Questions
@@ -762,7 +766,7 @@ Yes — use any DNS provider that Caddy supports. The DNS-01 plugin ecosystem in
 
 **Q: Can I run Mallard Metrics on a Raspberry Pi or ARM server?**
 
-The current `Dockerfile` targets `x86_64-unknown-linux-musl`. To build for ARM64, change the target to `aarch64-unknown-linux-musl` in the `Dockerfile` and add `platform: linux/arm64` to the compose service. The rest of the stack (Caddy, LUKS) is architecture-agnostic.
+Yes. The release image is multi-arch (`linux/amd64`, `linux/arm64`) and the `Dockerfile` builds natively on whichever architecture runs it (glibc; there is no musl target). Pull a released image with `MM_IMAGE=` rather than compiling DuckDB on a small board. The `behavioral` extension is published for `linux_arm64`. Caddy and LUKS are architecture-agnostic.
 
 **Q: How do I add multiple sites?**
 
@@ -775,12 +779,14 @@ The keyfile provides encryption at rest — protection against an attacker who o
 **Q: How do I change the admin password?**
 
 ```bash
-# Set the new password in deploy/.env
+# Set the new password (12+ characters) in deploy/.env
 sed -i 's/^MALLARD_ADMIN_PASSWORD=.*/MALLARD_ADMIN_PASSWORD=new-password-here/' deploy/.env
 
-# Restart mallard to pick it up
-docker compose -f deploy/docker-compose.production.yml restart mallard
+# Recreate mallard so it re-reads the environment (a plain restart does not)
+docker compose -f deploy/docker-compose.production.yml up -d mallard
 ```
+
+`MALLARD_ADMIN_PASSWORD` overrides any password stored through the setup endpoint, so this is the supported way to change it.
 
 **Q: Can I use a wildcard certificate?**
 
@@ -792,7 +798,7 @@ Since we use the DNS-01 challenge, the server does not need to be reachable on p
 
 **Q: What happens to data if the LUKS container runs out of space?**
 
-Mallard will return errors on write (DuckDB INSERT and Parquet COPY TO will fail). Flush failures are counted in the `mallard_flush_failures_total` Prometheus metric. In-memory buffered events are preserved and retried. To prevent this, monitor disk usage and enable `MALLARD_RETENTION_DAYS` to automatically delete old partitions.
+Flushes fail and are retried; failures are counted in `mallard_flush_failures_total` and `mallard_buffer_flush_failures_total`. Events stay in memory up to `MALLARD_MAX_BUFFERED_EVENTS`, then ingest answers `503` and `mallard_events_dropped_total` counts the loss; events in memory are lost if the process is killed. Monitor disk usage and enable `MALLARD_RETENTION_DAYS`.
 
 **Q: Can I enable Let's Encrypt staging to test without hitting rate limits?**
 
@@ -804,7 +810,7 @@ Your browser will show a certificate warning (staging certs aren't trusted), but
 
 **Q: How do I integrate this with Grafana or another dashboard?**
 
-Use the Prometheus `/metrics` endpoint as a data source. For detailed analytics data, the JSON export endpoint (`GET /api/stats/export?format=json`) produces daily rollups that can be ingested into any TSDB.
+Use the Prometheus `/metrics` endpoint for operational metrics (a dashboard JSON ships in `deploy/monitoring/`). For analytics data, `GET /api/stats/export?format=json` produces daily rollups, or `kind=raw` per-event rows (without visitor IDs).
 
 ---
 

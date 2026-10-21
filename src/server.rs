@@ -1,5 +1,7 @@
+use crate::api::admin;
 use crate::api::auth;
 use crate::api::stats;
+use crate::api::{segments, share};
 use crate::dashboard;
 use crate::ingest::handler::{AppState, ingest_event};
 use axum::Router;
@@ -26,8 +28,9 @@ const MAX_BODY_BYTES: usize = 65_536;
 const LATENCY_BUCKETS_SECS: [f64; 11] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
-/// Per-request timeout.
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Per-request timeout. The query queue wait plus the query deadline must fit
+/// inside it; `Config::validate` enforces that.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Request counts and latency, recorded for every HTTP request.
 ///
@@ -93,7 +96,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let ingestion_cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::POST, Method::GET])
-        .allow_headers([header::CONTENT_TYPE]);
+        .allow_headers([header::CONTENT_TYPE])
+        // `sendBeacon` with a JSON body preflights, so without this every event
+        // costs two requests.
+        .max_age(std::time::Duration::from_hours(24));
 
     let dashboard_cors = build_dashboard_cors(state.dashboard_origin.as_deref());
 
@@ -110,6 +116,16 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/keys", get(auth::list_api_keys))
         .route("/keys/{key_hash}", delete(auth::revoke_api_key_handler))
         .route("/gdpr/erase", delete(stats::gdpr_erase))
+        .route("/admin/backup", post(admin::create_backup))
+        .route("/share-links", post(share::create_share_link))
+        .route("/share-links", get(share::list_share_links))
+        .route("/share-links/{id}", delete(share::revoke_share_link))
+        .route("/segments", post(segments::create_segment))
+        // POST rather than PUT: the dashboard CORS policy allows GET, POST and
+        // DELETE only.
+        .route("/segments/{id}", post(segments::update_segment))
+        .route("/segments/{id}", delete(segments::delete_segment))
+        .route("/admin/export/parquet", get(stats::export_parquet))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_admin_auth,
@@ -117,6 +133,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     let stats_routes = Router::new()
         .route("/sites", get(stats::list_sites))
+        .route("/segments", get(segments::list_segments))
         .route("/stats/main", get(stats::get_main_stats))
         .route("/stats/timeseries", get(stats::get_timeseries))
         .route("/stats/sessions", get(stats::get_sessions))
@@ -144,14 +161,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // GET is the pixel / `<img>` tracker, for contexts without JavaScript.
     let ingestion_routes = Router::new()
-        .route("/event", post(ingest_event))
-        .route("/event", get(pixel_track))
+        .route(
+            "/event",
+            post(ingest_event).get(pixel_track).head(pixel_head),
+        )
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(ingestion_cors);
 
+    // Read-only, token-authorised, and deliberately outside `protected_routes`:
+    // a share token is not an API key and opens nothing listed there.
     let api_routes = Router::new()
         .merge(ingestion_routes)
         .merge(auth_routes)
+        .merge(share::view_routes(Arc::clone(&state)))
         .merge(protected_routes);
 
     Router::new()
@@ -165,6 +187,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // `/js/script.js` is an alias for people migrating from Plausible.
         .route("/mallard.js", get(dashboard::serve_tracking_script))
         .route("/js/script.js", get(dashboard::serve_tracking_script))
+        .route(
+            "/mallard-extras.js",
+            get(crate::ingest::extras::serve_extras_script),
+        )
         .nest("/api", api_routes)
         .route("/", get(dashboard::serve_index))
         .route("/{*path}", get(dashboard::serve_asset))
@@ -175,7 +201,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             StatusCode::REQUEST_TIMEOUT,
             REQUEST_TIMEOUT,
         ))
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(share::request_span))
         // Added last, so it is the outermost layer and sees the status the
         // client actually receives: a request the timeout layer converts into a
         // 408, or a body the compression layer rewrites, is counted as served.
@@ -196,10 +222,14 @@ async fn add_security_headers(mut response: Response) -> Response {
         HeaderValue::from_static("nosniff"),
     );
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    headers.insert(
-        "referrer-policy",
-        HeaderValue::from_static("strict-origin-when-cross-origin"),
-    );
+    // A response that set its own policy keeps it: share responses say
+    // `no-referrer`, which this must not weaken.
+    if !headers.contains_key("referrer-policy") {
+        headers.insert(
+            "referrer-policy",
+            HeaderValue::from_static("strict-origin-when-cross-origin"),
+        );
+    }
     headers.insert(
         "permissions-policy",
         HeaderValue::from_static("geolocation=(), microphone=(), camera=(), interest-cohort=()"),
@@ -293,6 +323,20 @@ const TRANSPARENT_GIF_1X1: &[u8] = &[
     0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x44, 0x01, 0x00, 0x3b,
 ];
 
+/// HEAD /api/event — answers like the pixel and records nothing.
+///
+/// Left to itself axum routes HEAD to the GET handler, so a link checker or a
+/// mail client's prefetch would register a pageview.
+async fn pixel_head() -> impl axum::response::IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/gif"),
+            (header::CACHE_CONTROL, "no-store, no-cache, must-revalidate"),
+        ],
+    )
+}
+
 /// GET /api/event — the pixel / `<img>` tracker.
 ///
 /// Takes the same core parameters as the POST endpoint via the query string and
@@ -377,28 +421,48 @@ async fn readiness_check(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// GET /health/detailed — component status and configuration summary.
-async fn detailed_health_check(
-    State(state): State<Arc<AppState>>,
-) -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({
-        "status": "ok",
+///
+/// Unauthenticated, so it leaves out what would help an attacker rather than an
+/// operator: whether an admin password is set (that is a claimable instance),
+/// how many sessions are live, and whether proxy headers are trusted. The same
+/// facts are on `/metrics`, which can be put behind a token.
+async fn detailed_health_check(State(state): State<Arc<AppState>>) -> Response {
+    // A cold tier that the view does not read means reports silently omit
+    // everything that has been flushed. That is an outage that looks healthy,
+    // so it fails the check.
+    let cold_tier = {
+        let writer = state.buffer.conn().clone();
+        let events_dir = state.events_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::storage::schema::cold_tier_status(&writer.lock(), &events_dir)
+        })
+        .await
+        .unwrap_or(crate::storage::schema::ColdTierStatus::Degraded)
+    };
+    let degraded = cold_tier == crate::storage::schema::ColdTierStatus::Degraded;
+    let status = if degraded {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    let body = axum::Json(serde_json::json!({
+        "status": if degraded { "degraded" } else { "ok" },
+        "cold_tier": format!("{cold_tier:?}").to_lowercase(),
         "version": env!("CARGO_PKG_VERSION"),
         "buffered_events": state.buffer.len(),
         "buffer_empty": state.buffer.is_empty(),
         "dropped_events": state.buffer.dropped_events.load(Ordering::Relaxed),
-        "auth_configured": state.admin_password.is_configured(),
-        "active_sessions": state.sessions.len(),
         "geoip_loaded": state.geoip.is_loaded(),
-        "behavioral_extension_loaded": state.behavioral_extension_loaded,
-        "behavioral_version": state.behavioral_version,
+        "behavioral_extension_loaded": state.behavioral.is_loaded(),
+        "behavioral_version": state.behavioral.version(),
         "read_connections": state.readers.len(),
         "filter_bots": state.filter_bots,
-        "trust_proxy_headers": state.trust_proxy_headers,
         "session_window": state.session_window,
         "visitor_salt_rotation_days": state.visitor_salt_rotation_days,
         "cache_entries": state.query_cache.len(),
         "cache_empty": state.query_cache.is_empty(),
-    }))
+    }));
+    axum::response::IntoResponse::into_response((status, body))
 }
 
 /// Emit one metric family: name, help text, type, and value.
@@ -508,7 +572,14 @@ fn write_gauges(out: &mut String, state: &AppState) {
         "mallard_behavioral_extension",
         "Whether the DuckDB behavioral extension is loaded",
         "gauge",
-        u64::from(state.behavioral_extension_loaded),
+        u64::from(state.behavioral.is_loaded()),
+    );
+    metric(
+        out,
+        "mallard_datacenter_filter",
+        "Whether the datacenter traffic filter is enabled",
+        "gauge",
+        u64::from(state.datacenter.is_enabled()),
     );
     metric(
         out,
@@ -544,10 +615,52 @@ fn write_counters(out: &mut String, state: &AppState) {
     );
     metric(
         out,
+        "mallard_buffer_flush_failures_total",
+        "Flushes of the in-memory buffer that failed after retries inside push",
+        "counter",
+        state.buffer.flush_failures.load(Ordering::Relaxed),
+    );
+    metric(
+        out,
+        "mallard_rate_limiter_evictions_total",
+        "Rate-limiter buckets dropped early because the key table was full",
+        "counter",
+        state
+            .rate_limiter
+            .capacity_evictions
+            .load(Ordering::Relaxed)
+            + state
+                .ip_rate_limiter
+                .capacity_evictions
+                .load(Ordering::Relaxed),
+    );
+    metric(
+        out,
+        "mallard_process_start_time_seconds",
+        "Unix time at which the process started",
+        "gauge",
+        state.started_at_unix,
+    );
+    metric(
+        out,
+        "mallard_last_flush_success_timestamp_seconds",
+        "Unix time of the last flush that completed without error (0 before the first)",
+        "gauge",
+        state.last_flush_success_unix.load(Ordering::Relaxed),
+    );
+    metric(
+        out,
         "mallard_rate_limit_rejections_total",
         "Ingest requests rejected by a rate limiter",
         "counter",
         state.rate_limit_rejections_total.load(Ordering::Relaxed),
+    );
+    metric(
+        out,
+        "mallard_datacenter_filtered_total",
+        "Events dropped because the client address is in a listed hosting/datacenter ASN",
+        "counter",
+        state.datacenter.filtered(),
     );
     metric(
         out,
@@ -582,10 +695,40 @@ fn write_counters(out: &mut String, state: &AppState) {
 /// Render the Prometheus exposition body.
 fn build_metrics_body(state: &AppState) -> String {
     let mut out = String::with_capacity(4096);
+    write_build_info(&mut out, state);
     write_gauges(&mut out, state);
     write_counters(&mut out, state);
     write_http_metrics(&mut out, state);
+    state.alert_metrics.write_prometheus(&mut out);
     out
+}
+
+/// Escape a Prometheus label value: backslash, double quote and newline.
+fn escape_label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
+/// Emit `mallard_build_info`: a constant `1` whose labels say what is running.
+///
+/// The behavioral extension is a separate download with its own version, and it
+/// decides what funnel results mean, so it belongs next to the binary's own.
+fn write_build_info(out: &mut String, state: &AppState) {
+    use std::fmt::Write;
+    let behavioral_version = state.behavioral.version();
+    let _ = writeln!(
+        out,
+        "# HELP mallard_build_info Version of this binary and of the loaded behavioral extension"
+    );
+    let _ = writeln!(out, "# TYPE mallard_build_info gauge");
+    let _ = writeln!(
+        out,
+        "mallard_build_info{{version=\"{}\",behavioral_version=\"{}\"}} 1",
+        escape_label(env!("CARGO_PKG_VERSION")),
+        escape_label(behavioral_version.as_deref().unwrap_or("none"))
+    );
 }
 
 /// GET /metrics — Prometheus exposition.
@@ -616,6 +759,104 @@ async fn prometheus_metrics(
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         build_metrics_body(&state),
     ))
+}
+
+// ── Listener ─────────────────────────────────────────────────────────────
+
+/// How long a client may take to send the head of a request, and how long a
+/// keep-alive connection may sit idle between requests (SI-14).
+///
+/// `axum::serve` sets no timer, so a connection that sent nothing, or sent half
+/// a request line every few minutes (slowloris), was held open for as long as
+/// the client liked, one file descriptor each. Thirty seconds is hyper's own
+/// default for the setting, long enough for a phone on a bad link to finish a
+/// request head and short enough that idle sockets do not pile up. Idle
+/// keep-alive connections share the limit; a reverse proxy that pools upstream
+/// connections for longer than this sees an occasional closed socket, which
+/// every HTTP/1.1 client must already retry.
+pub const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Serve `app` on `listener` until `shutdown` completes, then drain.
+///
+/// This is `axum::serve(..).with_graceful_shutdown(..)` with the one thing it
+/// lacks, a header-read timeout, and nothing else changed:
+///
+/// - the peer address reaches handlers as `ConnectInfo<SocketAddr>`;
+/// - HTTP/1.1 is served (axum's default features include no HTTP/2 either);
+/// - when `shutdown` completes the listener is dropped, so no new connection is
+///   accepted, every open connection is told to finish its current request and
+///   close, and the returned future resolves once all of them have. The caller
+///   (`main`) flushes only after that, so an event accepted by an in-flight
+///   request is still in the buffer when the final flush runs.
+///
+/// A connection that has not finished sending a request head within
+/// `header_read_timeout` of connecting (or of its previous response) is closed.
+///
+/// # Errors
+///
+/// Never in practice: accept errors are logged and retried, as `axum::serve`
+/// does. The `Result` keeps the signature `main` already handles.
+pub async fn serve<F>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    header_read_timeout: std::time::Duration,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    use axum::extract::ConnectInfo;
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use hyper_util::server::graceful::GracefulShutdown;
+    use hyper_util::service::TowerToHyperService;
+    use tower::ServiceExt;
+
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout);
+
+    let graceful = GracefulShutdown::new();
+    let mut shutdown = std::pin::pin!(shutdown);
+
+    loop {
+        let (stream, remote) = tokio::select! {
+            () = &mut shutdown => break,
+            accepted = listener.accept() => match accepted {
+                Ok(connection) => connection,
+                Err(e) => {
+                    // Usually descriptor exhaustion; spinning on it would only
+                    // burn a core, so back off as axum::serve does.
+                    tracing::warn!(error = %e, "Could not accept a connection");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            },
+        };
+
+        let service = app.clone().map_request(
+            move |mut request: axum::http::Request<hyper::body::Incoming>| {
+                request.extensions_mut().insert(ConnectInfo(remote));
+                request.map(axum::body::Body::new)
+            },
+        );
+        // No `.with_upgrades()`: nothing here upgrades a connection (no
+        // WebSocket, no CONNECT), and hyper-util cannot drain an upgradeable one.
+        let connection =
+            http.serve_connection(TokioIo::new(stream), TowerToHyperService::new(service));
+        // Registered before the task starts, so a shutdown that begins while
+        // this connection is being set up still waits for it.
+        let watched = graceful.watch(connection);
+        tokio::spawn(async move {
+            if let Err(e) = watched.await {
+                tracing::debug!(error = %e, peer = %remote, "Connection ended with an error");
+            }
+        });
+    }
+
+    // Stop accepting, then wait for every connection to finish.
+    drop(listener);
+    graceful.shutdown().await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -667,11 +908,112 @@ mod tests {
         assert_eq!(json["status"], "ok");
         assert!(json.get("version").is_some());
         assert_eq!(json["buffered_events"], 0);
-        assert_eq!(json["auth_configured"], false);
         assert_eq!(json["geoip_loaded"], false);
+        for hidden in ["auth_configured", "active_sessions", "trust_proxy_headers"] {
+            assert!(
+                json.get(hidden).is_none(),
+                "{hidden} must not be disclosed without authentication"
+            );
+        }
         assert!(json.get("behavioral_version").is_some());
         assert!(json.get("read_connections").is_some());
         assert!(json.get("visitor_salt_rotation_days").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_health_fails_when_flushed_files_are_not_being_read() {
+        // Parquet files exist on disk but the `events_all` view is hot-only, so
+        // every report silently omits what was flushed. That must not look healthy.
+        let (state, _dir) = state_builder().build();
+        let healthy = build_router(Arc::clone(&state))
+            .oneshot(get("/health/detailed"))
+            .await
+            .unwrap();
+        assert_eq!(healthy.status(), StatusCode::OK);
+
+        let partition = state.events_dir.join("site_id=example.com/date=2024-01-01");
+        std::fs::create_dir_all(&partition).unwrap();
+        std::fs::write(partition.join("0001.parquet"), b"not parquet").unwrap();
+
+        let response = build_router(state)
+            .oneshot(get("/health/detailed"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(json["status"], "degraded");
+        assert_eq!(json["cold_tier"], "degraded");
+    }
+
+    #[tokio::test]
+    async fn test_head_on_the_pixel_answers_without_recording_an_event() {
+        let (state, _dir) = state_builder().build();
+        let request = Request::builder()
+            .method(Method::HEAD)
+            .uri("/api/event?d=example.com&n=pageview&u=https%3A%2F%2Fexample.com%2F")
+            .body(Body::empty())
+            .unwrap();
+        let response = build_router(Arc::clone(&state))
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("image/gif")
+        );
+        assert_eq!(
+            state.buffer.len(),
+            0,
+            "a link checker's HEAD must not register a pageview"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ingest_preflight_is_cacheable() {
+        let (state, _dir) = state_builder().build();
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/api/event")
+            .header(header::ORIGIN, "https://example.com")
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+            .body(Body::empty())
+            .unwrap();
+        let response = build_router(state).oneshot(request).await.unwrap();
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ACCESS_CONTROL_MAX_AGE)
+                .and_then(|v| v.to_str().ok()),
+            Some("86400")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_report_build_flush_and_limiter_state() {
+        let (state, _dir) = state_builder().build();
+        state
+            .last_flush_success_unix
+            .store(1_700_000_000, Ordering::Relaxed);
+        let text = build_metrics_body(&state);
+        let build = format!(
+            "mallard_build_info{{version=\"{}\",behavioral_version=",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(text.contains(&build), "missing build info in:\n{text}");
+        assert!(text.contains("mallard_last_flush_success_timestamp_seconds 1700000000"));
+        assert!(text.contains("mallard_process_start_time_seconds"));
+        assert!(text.contains("mallard_rate_limiter_evictions_total 0"));
+        assert!(text.contains("mallard_buffer_flush_failures_total 0"));
+    }
+
+    #[test]
+    fn test_label_values_are_escaped() {
+        assert_eq!(escape_label("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
     }
 
     #[tokio::test]
@@ -835,7 +1177,7 @@ mod tests {
                 )))
                 .await
                 .unwrap();
-            let expected = if dim.requires_behavioral() && !state.behavioral_extension_loaded {
+            let expected = if dim.requires_behavioral() && !state.behavioral.is_loaded() {
                 StatusCode::SERVICE_UNAVAILABLE
             } else {
                 StatusCode::OK
@@ -902,7 +1244,7 @@ mod tests {
         // Reporting 200 with an empty body made a missing extension look like a
         // site with no data.
         let (state, _dir) = state_builder().build();
-        if state.behavioral_extension_loaded {
+        if state.behavioral.is_loaded() {
             return;
         }
         for uri in [
@@ -1196,5 +1538,189 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}
+
+#[cfg(test)]
+mod serve_tests {
+    //! The listener, over real sockets: `oneshot` cannot see a connection that
+    //! sends nothing, or a shutdown that has to wait for one that is mid-request.
+    use super::*;
+    use axum::extract::ConnectInfo;
+    use axum::routing::get;
+    use std::net::SocketAddr;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// A shutdown trigger the test can pull.
+    struct Server {
+        addr: SocketAddr,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        task: tokio::task::JoinHandle<std::io::Result<()>>,
+    }
+
+    fn app() -> Router {
+        Router::new()
+            .route("/fast", get(|| async { "fast" }))
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    "slow"
+                }),
+            )
+            .route(
+                "/peer",
+                get(|ConnectInfo(addr): ConnectInfo<SocketAddr>| async move { addr.to_string() }),
+            )
+    }
+
+    async fn start(header_timeout: Duration) -> Server {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(serve(listener, app(), header_timeout, async move {
+            let _ = stopped.await;
+        }));
+        Server {
+            addr,
+            stop: Some(stop),
+            task,
+        }
+    }
+
+    impl Server {
+        fn shutdown(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+        }
+    }
+
+    /// Read until the peer closes, returning how long that took. Panics if it
+    /// takes longer than `limit`.
+    async fn closed_within(stream: &mut TcpStream, limit: Duration) -> Duration {
+        let started = Instant::now();
+        let mut buf = [0u8; 1024];
+        loop {
+            match tokio::time::timeout(limit, stream.read(&mut buf)).await {
+                Ok(Ok(0) | Err(_)) => return started.elapsed(),
+                Ok(Ok(_)) => {} // a response (408) before the close is fine
+                Err(elapsed) => {
+                    panic!("the server still had the connection open after {limit:?}: {elapsed}")
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_sends_nothing_is_closed_within_the_timeout() {
+        let server = start(Duration::from_millis(300)).await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        let took = closed_within(&mut stream, Duration::from_secs(5)).await;
+        assert!(
+            took >= Duration::from_millis(250),
+            "closed after {took:?}, before the timeout could have fired"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_half_sent_request_head_is_closed_within_the_timeout() {
+        // Slowloris: start a request and never finish it.
+        let server = start(Duration::from_millis(300)).await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        stream
+            .write_all(b"GET /fast HTTP/1.1\r\nHost: x\r\nX-Slow: ")
+            .await
+            .unwrap();
+        closed_within(&mut stream, Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn a_normal_request_is_served_and_sees_the_peer_address() {
+        let server = start(Duration::from_secs(5)).await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        let local = stream.local_addr().unwrap();
+        stream
+            .write_all(b"GET /peer HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.ends_with(&local.to_string()),
+            "handlers must see the client's address as ConnectInfo: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keep_alive_connection_that_goes_quiet_is_closed() {
+        let server = start(Duration::from_millis(400)).await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        stream
+            .write_all(b"GET /fast HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+        // Same connection, no second request: the idle limit applies.
+        closed_within(&mut stream, Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_accepting_and_waits_for_the_request_in_flight() {
+        // The property main's final flush depends on: serve() must not return
+        // until a request that was already running has been answered.
+        let mut server = start(Duration::from_secs(5)).await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        stream
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        server.shutdown();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !server.task.is_finished(),
+            "serve returned while a request was still being handled"
+        );
+        // No new connections once shutdown has begun.
+        let refused = tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(server.addr))
+            .await
+            .map(|r| r.is_err());
+        assert_eq!(refused, Ok(true), "the listener must stop accepting");
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("slow"), "{response}");
+
+        let finished = tokio::time::timeout(Duration::from_secs(5), &mut server.task)
+            .await
+            .expect("serve must return once the connection has drained");
+        finished.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_idle_keep_alive_connections_at_once() {
+        let mut server = start(Duration::from_secs(30)).await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        stream
+            .write_all(b"GET /fast HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let _ = stream.read(&mut buf).await.unwrap();
+
+        server.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), &mut server.task)
+            .await
+            .expect("an idle connection must not hold up the drain")
+            .unwrap()
+            .unwrap();
     }
 }

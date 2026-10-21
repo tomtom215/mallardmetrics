@@ -40,13 +40,22 @@ rate_limit_per_ip = 0          # MALLARD_RATE_LIMIT_PER_IP
 
 # Trust X-Forwarded-For / X-Real-IP for the client address.
 #
-# Leave false unless EVERY request reaches this server through a reverse proxy
-# that overwrites those headers (the bundled Caddy config does). On a directly
-# reachable server they are attacker-controlled: trusting them lets a client
-# choose its own visitor ID, geolocation and rate-limit bucket.
+# Leave false unless EVERY request reaches this server through your reverse
+# proxy (the bundled Caddy config is one, and deploy/docker-compose.production.yml
+# turns this on). On a directly reachable server these headers are
+# attacker-controlled: trusting them lets a client choose its own visitor ID,
+# geolocation, rate-limit bucket and login-lockout key.
 #
 # When false, the peer socket address is used.
 trust_proxy_headers = false    # MALLARD_TRUST_PROXY_HEADERS
+
+# How many reverse proxies sit between the client and this server. The client
+# address is taken from that many entries from the RIGHT of X-Forwarded-For:
+# every proxy appends the address it received the connection from, so entries
+# further left were supplied by the client. One proxy (Caddy, or nginx with
+# $proxy_add_x_forwarded_for) is 1; a CDN in front of nginx is 2. Only used when
+# trust_proxy_headers is true; must then be between 1 and 8.
+trusted_proxy_hops = 1         # MALLARD_TRUSTED_PROXY_HOPS
 
 # Restrict dashboard/stats CORS to one origin. Must include the scheme and no
 # path. Credentialed cross-origin requests are only permitted when this is set.
@@ -77,6 +86,13 @@ cache_ttl_secs = 60            # MALLARD_CACHE_TTL          — 0 disables cachi
 cache_max_entries = 10000      # MALLARD_CACHE_MAX_ENTRIES  — 0 = unbounded; LRU eviction
 max_concurrent_queries = 10    # MALLARD_MAX_CONCURRENT_QUERIES — excess returns 429
 
+# How long a query may wait for one of those slots before the request gets 429,
+# and how long a statement may then run before it is interrupted and the request
+# gets 504. Both must be > 0, and together they must not exceed the 30 s request
+# timeout, so the query layer answers (with a message) before the timeout does.
+query_queue_wait_secs = 5      # MALLARD_QUERY_QUEUE_WAIT_SECS
+query_deadline_secs = 20       # MALLARD_QUERY_DEADLINE_SECS
+
 # Inactivity gap that ends a session. Used by every sessionize-based metric:
 # visits, bounce rate, visit duration, and entry/exit pages.
 session_window_minutes = 30    # MALLARD_SESSION_WINDOW_MINUTES
@@ -104,6 +120,16 @@ log_format = "text"            # MALLARD_LOG_FORMAT — "text" or "json"
 # MaxMind GeoLite2 database for IP geolocation. Lookups return nothing when
 # unset or missing.
 # geoip_db_path = "/data/GeoLite2-City.mmdb"   # MALLARD_GEOIP_DB
+
+# Datacenter / hosting traffic filter. OFF unless an ASN database is set. When
+# it is, events whose client IP is in a hosting ASN are dropped like bots (202,
+# not stored) and counted in mallard_datacenter_filtered_total. Needs a
+# GeoLite2-ASN or DB-IP "ASN lite" .mmdb; a missing or unusable file stops
+# startup. Corporate-VPN visitors exiting through a datacenter are filtered too.
+# asn_db_path = "/data/GeoLite2-ASN.mmdb"      # MALLARD_ASN_DB
+# ASNs to treat as hosting. Empty or unset = the built-in list of 11 (see
+# docs/src/configuration.md); a non-empty list REPLACES it.
+# datacenter_asns = [16509, 14061]             # MALLARD_DATACENTER_ASNS (comma-separated, "AS16509" accepted)
 
 # ─── Visitor identity ────────────────────────────────────────────────────────
 
@@ -165,12 +191,16 @@ geoip_precision = "city"       # MALLARD_GEOIP_PRECISION
 # Where DuckDB installs and loads community extensions from.
 # Default: data_dir/extensions.
 #
-# DuckDB's own default is $HOME/.duckdb/extensions, which does not exist in the
-# shipped container: the FROM scratch image sets no HOME, and the production
-# compose file runs with a read-only root filesystem. Keeping this on the data
-# volume is what makes `INSTALL behavioral FROM community` succeed there — and
+# DuckDB's own default is $HOME/.duckdb/extensions, which is not writable in the
+# shipped container: its root filesystem is read-only (the compose files set
+# read_only: true) and the non-root user's home is not on the data volume. The
+# image therefore sets HOME and this variable to /data, the one writable path.
+# That is what makes `INSTALL behavioral FROM community` succeed there — and
 # therefore what makes funnels, retention, sessions, sequences and flow answer
 # with data rather than 503.
+#
+# The extension exists only for glibc platforms (linux_amd64, linux_arm64,
+# osx_amd64, osx_arm64). A musl/Alpine build cannot install it at all.
 # extension_directory = "/data/extensions"   # MALLARD_EXTENSION_DIR
 
 # Cap on the memory a DuckDB query may use, e.g. "512MB" or "2GB".
@@ -182,6 +212,65 @@ geoip_precision = "city"       # MALLARD_GEOIP_PRECISION
 # DuckDB worker threads. Unset means one per core. Capping it leaves headroom
 # for the ingest path on a small box.
 # duckdb_threads = 2             # MALLARD_DUCKDB_THREADS
+
+# ─── Webhook alerts and scheduled reports ────────────────────────────────────
+#
+# Mallard can POST signed JSON notifications to one webhook: operational alerts
+# (flush stalled, events failing to reach disk, behavioral extension missing,
+# cold tier degraded, rate-limiter evictions spiking), traffic alerts (a site's
+# pageviews far below or above the same hour of previous weeks) and daily or
+# weekly reports. Nothing is sent until webhook_url is set. Payloads hold
+# aggregate counts only: no visitor IDs, no IP addresses.
+#
+# The destination comes from this file or the environment and can never be set
+# through the HTTP API. Treat the URL as a secret (Slack and Discord URLs are
+# bearer tokens); prefer the environment variable. The signing secret is
+# environment-only, like the other secrets below.
+#
+# Full reference: docs/src/alerts-and-reports.md
+[alerts]
+# webhook_url = "https://hooks.example.com/mallard"   # MALLARD_ALERTS_WEBHOOK_URL
+#   https:// is required. The host is resolved at delivery time and refused if
+#   any address is loopback, private, link-local (cloud metadata), CGNAT,
+#   multicast, unspecified or reserved. Redirects are never followed.
+# allow_http_webhook = false                  # MALLARD_ALERTS_ALLOW_HTTP_WEBHOOK
+#   Permit http://. Notifications then travel unencrypted.
+# allow_private_webhook_targets = false       # MALLARD_ALERTS_ALLOW_PRIVATE_WEBHOOK_TARGETS
+#   Permit internal destinations, for a receiver on your own network. This
+#   removes the SSRF protection: only set it when the configuration is trusted.
+# webhook_ca_file = "/etc/mallard/ca.pem"     # MALLARD_ALERTS_WEBHOOK_CA_FILE
+#   PEM bundle of extra CA certificates to trust (a private CA), added to the
+#   built-in Mozilla roots.
+# payload_format = "generic"                  # MALLARD_ALERTS_PAYLOAD_FORMAT
+#   "generic" (JSON with `text` and `content` fields), "slack" ({"text"}) or
+#   "discord" ({"content"}).
+# timeout_secs = 10                           # MALLARD_ALERTS_TIMEOUT_SECS (1-60)
+#   Total time for one delivery attempt, DNS and TLS included.
+# max_attempts = 4                            # MALLARD_ALERTS_MAX_ATTEMPTS (1-10)
+#   Attempts per notification, with exponential backoff and jitter between.
+# sites = ["example.com"]                     # MALLARD_ALERTS_SITES (comma list)
+#   Sites that traffic alerts and reports cover. Default: site_ids.
+# check_interval_secs = 60                    # MALLARD_ALERTS_CHECK_INTERVAL_SECS (10-3600)
+# renotify_secs = 14400                       # MALLARD_ALERTS_RENOTIFY_SECS (>= 60)
+#   An alert that stays firing is repeated at most this often.
+# operational = true                          # MALLARD_ALERTS_OPERATIONAL
+# flush_stalled_secs = 600                    # MALLARD_ALERTS_FLUSH_STALLED_SECS
+# failure_window_secs = 300                   # MALLARD_ALERTS_FAILURE_WINDOW_SECS
+#   Window for "events failing to reach disk" and "evictions spiking".
+# evictions_spike_threshold = 100             # MALLARD_ALERTS_EVICTIONS_SPIKE_THRESHOLD
+#   Rate-limiter evictions inside the window that count as a spike; 0 disables.
+# behavioral_grace_secs = 600                 # MALLARD_ALERTS_BEHAVIORAL_GRACE_SECS
+#   How long after start a missing behavioral extension is tolerated.
+# traffic_drop_percent = 50                   # MALLARD_ALERTS_TRAFFIC_DROP_PERCENT (0 = off)
+# traffic_rise_percent = 0                    # MALLARD_ALERTS_TRAFFIC_RISE_PERCENT (0 = off)
+# traffic_baseline_weeks = 4                  # MALLARD_ALERTS_TRAFFIC_BASELINE_WEEKS (1-12)
+# traffic_min_pageviews = 50                  # MALLARD_ALERTS_TRAFFIC_MIN_PAGEVIEWS
+#   A site whose baseline hour averages fewer pageviews than this is never
+#   judged, so quiet sites do not flap.
+# daily_report = false                        # MALLARD_ALERTS_DAILY_REPORT
+# weekly_report = false                       # MALLARD_ALERTS_WEEKLY_REPORT
+# report_hour_utc = 8                         # MALLARD_ALERTS_REPORT_HOUR_UTC (0-23)
+# weekly_report_day = "monday"                # MALLARD_ALERTS_WEEKLY_REPORT_DAY
 
 # ─── Secrets (environment only) ──────────────────────────────────────────────
 #
@@ -198,4 +287,8 @@ geoip_precision = "city"       # MALLARD_GEOIP_PRECISION
 #                            and survives a restart. Unset, and with no stored
 #                            hash, reads are open until someone completes setup.
 #   MALLARD_METRICS_TOKEN    Bearer token required by GET /metrics.
+#   MALLARD_ALERTS_WEBHOOK_SECRET
+#                            Key for the HMAC-SHA256 signature on webhook
+#                            notifications (at least 16 characters). Unset, they
+#                            are sent unsigned. Never read from this file.
 #   RUST_LOG                 Log filter, e.g. "mallard_metrics=debug,tower_http=info".

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Maximum funnel steps.
 ///
-/// The behavioral extension accepts 2–32 boolean conditions, matching
+/// The behavioral extension accepts up to 32 boolean conditions, matching
 /// ClickHouse. Asking for more produces a binder error rather than a result.
 pub const MAX_STEPS: usize = 32;
 /// Minimum funnel steps accepted by `window_funnel`.
@@ -39,7 +39,9 @@ pub const VALID_MODES: &[&str] = &[
 
 /// Validate a comma-separated mode list, returning the normalised form.
 ///
-/// Returns `None` if any mode is unrecognised.
+/// Returns `None` if any mode is unrecognised, or if `allow_reentry` is given
+/// without `strict_order`: the extension rejects that combination at query time
+/// (`behavioral` 0.10.0), which would otherwise surface as a 500 instead of a 400.
 pub fn normalize_modes(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -55,7 +57,52 @@ pub fn normalize_modes(raw: &str) -> Option<String> {
             modes.push(mode);
         }
     }
+    let has = |m: &str| modes.iter().any(|x| x == m);
+    if has("allow_reentry") && !has("strict_order") {
+        return None;
+    }
     Some(modes.join(", "))
+}
+
+/// Why [`normalize_modes`] refused `raw`, as a message for the caller.
+///
+/// An unknown name and a combination the extension rejects are different
+/// mistakes with different fixes, and saying "unknown mode" about a mode that
+/// is in the list sends people looking for a typo that is not there.
+pub fn modes_error(raw: &str) -> String {
+    let names: Vec<String> = raw
+        .split(',')
+        .map(|m| m.trim().to_ascii_lowercase())
+        .filter(|m| !m.is_empty())
+        .collect();
+    if names.iter().all(|m| VALID_MODES.contains(&m.as_str())) {
+        return "Funnel mode 'allow_reentry' requires 'strict_order' (pass both, e.g. \
+                modes=strict_order,allow_reentry)."
+            .to_string();
+    }
+    format!("Unknown funnel mode. Available: {}", VALID_MODES.join(", "))
+}
+
+/// Add `strict_once` unless the caller already chose a mode that gives each
+/// event a single step.
+///
+/// `behavioral` 0.10.0 follows ClickHouse: one event that satisfies several
+/// steps fills all of them. Steps built from `page:` and `event:` specifications
+/// overlap routinely (a `pageview` step followed by a `page:/` step), so without
+/// this a single pageview would count as having completed both. `strict_once`
+/// and `strict_increase` restore one event, one step.
+fn effective_modes(modes: &str) -> String {
+    let one_event_per_step = modes
+        .split(',')
+        .map(str::trim)
+        .any(|m| m == "strict_once" || m == "strict_increase");
+    if one_event_per_step {
+        modes.to_string()
+    } else if modes.trim().is_empty() {
+        "strict_once".to_string()
+    } else {
+        format!("{modes}, strict_once")
+    }
 }
 
 /// Run a funnel query.
@@ -92,16 +139,50 @@ pub fn query_funnel(
 
     let sql = funnel_sql(scope, window_interval, modes, steps);
     let mut stmt = conn.prepare(&sql)?;
-    let raw: Vec<(u32, u64)> = stmt
+    let by_furthest: Vec<(usize, u64)> = stmt
         .query_map(duckdb::params_from_iter(scope.params()), |row| {
-            let step: i64 = row.get(0)?;
-            let visitors: u64 = row.get(1)?;
-            Ok((u32::try_from(step).unwrap_or(0), visitors))
+            Ok((row.get::<_, usize>(0)?, row.get::<_, u64>(1)?))
         })?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<Result<_, _>>()?;
 
-    Ok(to_report(&raw))
+    Ok(to_report(&cumulative(&by_furthest, steps.len())?))
+}
+
+/// Turn "visitors whose furthest step was N" into "visitors who reached N".
+///
+/// `window_funnel` returns, per visitor, the furthest step reached (0 when not
+/// even the first). A visitor who got to step 3 also got to steps 1 and 2, so
+/// the count at step `k` is the sum over every `furthest >= k`. Doing this here
+/// rather than in SQL keeps the statement at one row per distinct `furthest`;
+/// the SQL version joined a step list to every visitor, materialising
+/// `steps x visitors` rows (up to 32 x 1M) to produce `steps` numbers.
+///
+/// # Errors
+///
+/// A `furthest` beyond the number of steps cannot come from the extension, and
+/// is reported rather than silently ignored.
+fn cumulative(
+    by_furthest: &[(usize, u64)],
+    steps: usize,
+) -> Result<Vec<(u32, u64)>, duckdb::Error> {
+    let mut exact = vec![0u64; steps + 1];
+    for &(furthest, visitors) in by_furthest {
+        let slot = exact.get_mut(furthest).ok_or_else(|| {
+            duckdb::Error::IntegralValueOutOfRange(0, i128::try_from(furthest).unwrap_or(i128::MAX))
+        })?;
+        *slot += visitors;
+    }
+    let mut out = Vec::with_capacity(steps);
+    let mut reached = 0u64;
+    for step in (1..=steps).rev() {
+        reached += exact[step];
+        let label = u32::try_from(step).map_err(|_| {
+            duckdb::Error::IntegralValueOutOfRange(0, i128::try_from(step).unwrap_or(i128::MAX))
+        })?;
+        out.push((label, reached));
+    }
+    out.reverse();
+    Ok(out)
 }
 
 /// Turn `(step, cumulative_visitors)` pairs into a full report.
@@ -136,32 +217,24 @@ fn to_report(raw: &[(u32, u64)]) -> Vec<FunnelStep> {
 /// SQL for the cumulative funnel. Split out so it can be unit-tested.
 fn funnel_sql(scope: &QueryScope, window_interval: &str, modes: &str, steps: &[&str]) -> String {
     let step_conditions = steps.join(", ");
-    let n = steps.len();
     // `window_funnel(window [, mode], timestamp, cond, ...)`: the mode argument
-    // is positional and must be omitted entirely when empty.
-    let mode_arg = if modes.trim().is_empty() {
-        String::new()
-    } else {
-        format!("'{}', ", modes.replace('\'', "''"))
-    };
+    // is positional. `effective_modes` is never empty, so it is always present.
+    let mode_arg = format!("'{}', ", effective_modes(modes).replace('\'', "''"));
 
+    // One row per distinct "furthest step reached"; `cumulative` does the rest.
+    let events = scope.events();
     format!(
-        "WITH per_visitor AS (
+        "SELECT furthest, COUNT(*) AS visitors
+         FROM (
              SELECT visitor_id,
                  window_funnel(INTERVAL '{window_interval}', {mode_arg}timestamp,
                      {step_conditions}
                  ) AS furthest
-             FROM events_all
+             FROM {events}
              WHERE {where_clause}
              GROUP BY visitor_id
-         ),
-         step_numbers AS (SELECT UNNEST(generate_series(1, {n})) AS step)
-         SELECT s.step,
-                COUNT(pv.visitor_id) FILTER (WHERE pv.furthest >= s.step) AS visitors
-         FROM step_numbers s
-         LEFT JOIN per_visitor pv ON TRUE
-         GROUP BY s.step
-         ORDER BY s.step",
+         )
+         GROUP BY furthest",
         where_clause = scope.where_clause()
     )
 }
@@ -341,20 +414,69 @@ mod tests {
         if !db.require_behavioral("funnel modes") {
             return;
         }
+        // "direct" goes straight from step 1 to step 2. "detour" views a page
+        // that matches no step in between, which strict_order treats as a break.
+        insert_pageview(&db.conn, "direct", "2024-01-15 10:00:00", "/");
+        insert_pageview(&db.conn, "direct", "2024-01-15 10:01:00", "/pricing");
+        insert_pageview(&db.conn, "detour", "2024-01-15 11:00:00", "/");
+        insert_pageview(&db.conn, "detour", "2024-01-15 11:01:00", "/about");
+        insert_pageview(&db.conn, "detour", "2024-01-15 11:02:00", "/pricing");
+        let two_steps = ["pathname = '/'", "pathname = '/pricing'"];
+        let s = scope("2024-01-01", "2024-02-01");
+
+        let relaxed = query_funnel(&db.conn, &s, "1 day", "", &two_steps).unwrap();
+        assert_eq!(
+            relaxed[1].visitors, 2,
+            "unrelated pages do not break a funnel"
+        );
+
+        let strict = query_funnel(&db.conn, &s, "1 day", "strict_order", &two_steps).unwrap();
+        assert_eq!(strict[0].visitors, 2);
+        assert_eq!(
+            strict[1].visitors, 1,
+            "strict_order must break the detour's chain"
+        );
+    }
+
+    #[test]
+    fn test_one_event_fills_only_one_step_by_default() {
+        let db = TestDb::new();
+        if !db.require_behavioral("overlapping steps") {
+            return;
+        }
+        // One pageview at "/" satisfies both `event_name = 'pageview'` and
+        // `pathname = '/'`. Left to the extension's ClickHouse semantics it would
+        // fill both steps and report a completed funnel from a single event.
+        insert_pageview(&db.conn, "once", "2024-01-15 10:00:00", "/");
+        insert_pageview(&db.conn, "twice", "2024-01-15 11:00:00", "/");
+        insert_pageview(&db.conn, "twice", "2024-01-15 11:01:00", "/");
+        let overlapping = ["event_name = 'pageview'", "pathname = '/'"];
+        let s = scope("2024-01-01", "2024-02-01");
+
+        let rows = query_funnel(&db.conn, &s, "1 day", "", &overlapping).unwrap();
+        assert_eq!(rows[0].visitors, 2);
+        assert_eq!(
+            rows[1].visitors, 1,
+            "only the visitor with two events converts"
+        );
+    }
+
+    #[test]
+    fn test_strict_order_and_allow_reentry_run_together() {
+        let db = TestDb::new();
+        if !db.require_behavioral("funnel mode combinations") {
+            return;
+        }
         seed(&db);
-        // v1's signup event also satisfies step 2 (same pathname), so under
-        // strict_order the chain cannot advance to step 3.
         let rows = query_funnel(
             &db.conn,
             &scope("2024-01-01", "2024-02-01"),
             "1 day",
-            "strict_order",
+            "strict_order, allow_reentry",
             STEPS,
         )
-        .unwrap();
-        assert_eq!(rows[0].visitors, 4);
-        assert_eq!(rows[1].visitors, 2);
-        assert_eq!(rows[2].visitors, 0, "strict_order must break v1's chain");
+        .expect("a mode combination normalize_modes accepts must execute");
+        assert_eq!(rows.len(), 3);
     }
 
     #[test]
@@ -390,29 +512,93 @@ mod tests {
             Some("strict_order".to_string()),
             "duplicates are collapsed"
         );
+        assert!(
+            normalize_modes("allow_reentry").is_none(),
+            "the extension rejects allow_reentry without strict_order"
+        );
+        assert_eq!(
+            normalize_modes("allow_reentry, strict_order"),
+            Some("allow_reentry, strict_order".to_string())
+        );
         assert!(normalize_modes("drop_tables").is_none());
         assert!(normalize_modes("strict_order; DROP TABLE events").is_none());
     }
 
     #[test]
-    fn test_sql_omits_the_mode_argument_when_empty() {
-        // window_funnel's mode is positional; passing an empty string would be
-        // read as the timestamp argument.
+    fn test_the_modes_error_names_the_actual_mistake() {
+        let combo = modes_error("allow_reentry");
+        assert!(combo.contains("requires 'strict_order'"), "{combo}");
+        assert!(!combo.contains("Unknown"), "{combo}");
+        let typo = modes_error("strict_ordr");
+        assert!(typo.starts_with("Unknown funnel mode"), "{typo}");
+        assert!(
+            typo.contains("strict_order"),
+            "the valid modes are listed: {typo}"
+        );
+    }
+
+    #[test]
+    fn test_effective_modes_adds_strict_once_unless_the_caller_chose_one() {
+        assert_eq!(effective_modes(""), "strict_once");
+        assert_eq!(effective_modes("strict_order"), "strict_order, strict_once");
+        assert_eq!(effective_modes("strict_once"), "strict_once");
+        assert_eq!(
+            effective_modes("strict_order, strict_increase"),
+            "strict_order, strict_increase"
+        );
+    }
+
+    #[test]
+    fn test_sql_always_passes_a_mode_argument() {
+        // window_funnel's mode is positional, and the default has to be explicit
+        // because the extension's own default lets one event fill several steps.
         let sql = funnel_sql(&scope("2024-01-01", "2024-02-01"), "1 day", "", STEPS);
-        assert!(sql.contains("window_funnel(INTERVAL '1 day', timestamp,"));
+        assert!(sql.contains("window_funnel(INTERVAL '1 day', 'strict_once', timestamp,"));
         let with_mode = funnel_sql(
             &scope("2024-01-01", "2024-02-01"),
             "1 day",
             "strict_order",
             STEPS,
         );
-        assert!(with_mode.contains("window_funnel(INTERVAL '1 day', 'strict_order', timestamp,"));
+        assert!(
+            with_mode.contains(
+                "window_funnel(INTERVAL '1 day', 'strict_order, strict_once', timestamp,"
+            )
+        );
     }
 
     #[test]
     fn test_sql_uses_bound_parameters_for_scope() {
         let sql = funnel_sql(&scope("2024-01-01", "2024-02-01"), "1 day", "", STEPS);
         assert_eq!(sql.matches('?').count(), 3);
+    }
+
+    #[test]
+    fn test_sql_does_not_join_steps_to_every_visitor() {
+        // Regression (S-07): the final SELECT was `step_numbers LEFT JOIN
+        // per_visitor ON TRUE`, a cross join that built steps x visitors rows.
+        let sql = funnel_sql(&scope("2024-01-01", "2024-02-01"), "1 day", "", STEPS);
+        assert!(!sql.contains("JOIN"), "{sql}");
+        assert!(!sql.contains("generate_series"), "{sql}");
+    }
+
+    #[test]
+    fn test_cumulative_sums_from_the_furthest_step_down() {
+        // 1 visitor reached nothing, 2 stopped at step 1, 3 at step 2, 4 at 3.
+        let rows = cumulative(&[(0, 1), (1, 2), (2, 3), (3, 4)], 3).unwrap();
+        assert_eq!(rows, vec![(1, 9), (2, 7), (3, 4)]);
+    }
+
+    #[test]
+    fn test_cumulative_keeps_a_row_for_a_step_nobody_reached() {
+        let rows = cumulative(&[(1, 5)], 3).unwrap();
+        assert_eq!(rows, vec![(1, 5), (2, 0), (3, 0)]);
+        assert_eq!(cumulative(&[], 2).unwrap(), vec![(1, 0), (2, 0)]);
+    }
+
+    #[test]
+    fn test_cumulative_rejects_a_furthest_step_beyond_the_funnel() {
+        assert!(cumulative(&[(4, 1)], 3).is_err());
     }
 
     #[test]

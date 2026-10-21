@@ -128,12 +128,13 @@ fn query_daily_top(
     scope: &QueryScope,
     column: &str,
 ) -> Result<Vec<(String, String)>, duckdb::Error> {
+    let events = scope.events();
     let sql = format!(
         "WITH per_day AS (
              SELECT STRFTIME(DATE_TRUNC('day', timestamp), '%Y-%m-%d') AS day,
                     COALESCE({column}, '(unknown)') AS value,
                     COUNT(DISTINCT visitor_id) AS visitors
-             FROM events_all
+             FROM {events}
              WHERE {where_clause}
              GROUP BY day, value
          ),
@@ -186,16 +187,14 @@ pub const RAW_COLUMNS: &[&str] = &[
     "revenue_currency",
 ];
 
-/// Export raw events as rows of nullable strings.
-///
-/// # Errors
-///
-/// Returns an error if the query fails.
-pub fn query_raw_export(
-    conn: &Connection,
-    scope: &QueryScope,
-    limit: usize,
-) -> Result<Vec<Vec<Option<String>>>, duckdb::Error> {
+/// Rows buffered per chunk by [`stream_raw_export`] callers that have no
+/// better number. 10k rows of 23 short strings is a few MB.
+pub const EXPORT_CHUNK_ROWS: usize = 10_000;
+
+/// The raw-export statement. `limit` is interpolated: it is a `usize` already
+/// capped by MAX_RAW_ROWS, so it cannot carry SQL, and binding it would place
+/// an integer parameter after a variable number of filter values.
+fn raw_export_sql(scope: &QueryScope, limit: usize) -> String {
     let limit = limit.min(MAX_RAW_ROWS);
     // Every column is cast to VARCHAR so one row-mapping path handles them all.
     let projection = RAW_COLUMNS
@@ -203,24 +202,92 @@ pub fn query_raw_export(
         .map(|c| format!("CAST({c} AS VARCHAR)"))
         .collect::<Vec<_>>()
         .join(", ");
-    // `limit` is interpolated: it is a `usize` already capped by MAX_RAW_ROWS, so
-    // it cannot carry SQL, and binding it would place an integer parameter after
-    // a variable number of filter values.
-    let sql = format!(
-        "SELECT {projection} FROM events_all WHERE {} ORDER BY timestamp LIMIT {limit}",
+    let events = scope.events();
+    format!(
+        "SELECT {projection} FROM {events} WHERE {} ORDER BY timestamp LIMIT {limit}",
         scope.where_clause()
-    );
+    )
+}
 
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(duckdb::params_from_iter(scope.params()), |row| {
-            (0..RAW_COLUMNS.len())
-                .map(|i| row.get::<_, Option<String>>(i))
-                .collect::<Result<Vec<_>, _>>()
-        })?
-        .filter_map(Result::ok)
-        .collect();
-    Ok(rows)
+fn read_raw_row(row: &duckdb::Row<'_>) -> Result<Vec<Option<String>>, duckdb::Error> {
+    (0..RAW_COLUMNS.len())
+        .map(|i| row.get::<_, Option<String>>(i))
+        .collect()
+}
+
+/// Export raw events as rows of nullable strings.
+///
+/// This materialises every row (and `to_csv`/`raw_to_json` then build a second
+/// full copy), so memory is a multiple of the result size. Prefer
+/// [`stream_raw_export`] for anything near [`MAX_RAW_ROWS`].
+///
+/// # Errors
+///
+/// Returns an error if the query fails or a row cannot be read. A row that
+/// cannot be read used to be dropped silently, which produced an export that
+/// looked complete and was not.
+pub fn query_raw_export(
+    conn: &Connection,
+    scope: &QueryScope,
+    limit: usize,
+) -> Result<Vec<Vec<Option<String>>>, duckdb::Error> {
+    let mut stmt = conn.prepare(&raw_export_sql(scope, limit))?;
+    stmt.query_map(duckdb::params_from_iter(scope.params()), |row| {
+        read_raw_row(row)
+    })?
+    .collect()
+}
+
+/// Export raw events in chunks of at most `chunk_rows`, handing each to `sink`
+/// instead of collecting them (S-12).
+///
+/// Peak memory is one chunk plus whatever the sink retains, rather than the
+/// whole result several times over. `sink` returns `false` to stop early, for
+/// example when the HTTP client has gone away. Returns the number of rows
+/// delivered.
+///
+/// The statement stays open across chunks, so the caller must keep whatever
+/// protects the read (the tier read lock, and the connection) for the whole
+/// call. A handler streaming to a socket would run this on a blocking thread
+/// and push each chunk into a bounded channel.
+///
+/// # Errors
+///
+/// Returns an error if the query fails or a row cannot be read. Chunks already
+/// delivered cannot be recalled, so a streaming consumer must treat an error as
+/// a truncated body.
+pub fn stream_raw_export<F>(
+    conn: &Connection,
+    scope: &QueryScope,
+    limit: usize,
+    chunk_rows: usize,
+    mut sink: F,
+) -> Result<usize, duckdb::Error>
+where
+    F: FnMut(&[Vec<Option<String>>]) -> bool,
+{
+    let chunk_rows = chunk_rows.max(1);
+    let mut stmt = conn.prepare(&raw_export_sql(scope, limit))?;
+    let mut rows = stmt.query(duckdb::params_from_iter(scope.params()))?;
+
+    let mut delivered = 0usize;
+    let mut chunk: Vec<Vec<Option<String>>> = Vec::with_capacity(chunk_rows.min(EXPORT_CHUNK_ROWS));
+    while let Some(row) = rows.next()? {
+        chunk.push(read_raw_row(row)?);
+        if chunk.len() >= chunk_rows {
+            delivered += chunk.len();
+            let keep_going = sink(&chunk);
+            chunk.clear();
+            if !keep_going {
+                return Ok(delivered);
+            }
+        }
+    }
+    if !chunk.is_empty() {
+        delivered += chunk.len();
+        sink(&chunk);
+    }
+    Ok(delivered)
 }
 
 /// Escape a CSV field.
@@ -236,17 +303,20 @@ pub fn escape_csv_field(field: &str) -> String {
     }
 }
 
-/// Render a header row and data rows as CSV.
-pub fn to_csv(header: &[&str], rows: &[Vec<Option<String>>]) -> String {
-    let mut out = String::with_capacity(rows.len() * 128 + 128);
-    out.push_str(
-        &header
-            .iter()
-            .map(|h| escape_csv_field(h))
-            .collect::<Vec<_>>()
-            .join(","),
-    );
+/// The CSV header line, with its newline.
+pub fn csv_header_line(header: &[&str]) -> String {
+    let mut out = header
+        .iter()
+        .map(|h| escape_csv_field(h))
+        .collect::<Vec<_>>()
+        .join(",");
     out.push('\n');
+    out
+}
+
+/// Render data rows as CSV lines, without a header. Chunks concatenate.
+pub fn csv_rows(rows: &[Vec<Option<String>>]) -> String {
+    let mut out = String::with_capacity(rows.len() * 128);
     for row in rows {
         let line = row
             .iter()
@@ -255,6 +325,13 @@ pub fn to_csv(header: &[&str], rows: &[Vec<Option<String>>]) -> String {
             .join(",");
         let _ = writeln!(out, "{line}");
     }
+    out
+}
+
+/// Render a header row and data rows as CSV.
+pub fn to_csv(header: &[&str], rows: &[Vec<Option<String>>]) -> String {
+    let mut out = csv_header_line(header);
+    out.push_str(&csv_rows(rows));
     out
 }
 
@@ -275,25 +352,52 @@ pub fn daily_to_csv(rows: &[DailyRow]) -> String {
     out
 }
 
-/// Render raw rows as a JSON array of objects.
-pub fn raw_to_json(rows: &[Vec<Option<String>>]) -> String {
-    let objects: Vec<serde_json::Value> = rows
+fn raw_row_object(row: &[Option<String>]) -> serde_json::Value {
+    let map: serde_json::Map<String, serde_json::Value> = RAW_COLUMNS
         .iter()
-        .map(|row| {
-            let map: serde_json::Map<String, serde_json::Value> = RAW_COLUMNS
-                .iter()
-                .zip(row.iter())
-                .map(|(name, value)| {
-                    let json = value.as_deref().map_or(serde_json::Value::Null, |v| {
-                        serde_json::Value::String(v.to_string())
-                    });
-                    ((*name).to_string(), json)
-                })
-                .collect();
-            serde_json::Value::Object(map)
+        .zip(row.iter())
+        .map(|(name, value)| {
+            let json = value.as_deref().map_or(serde_json::Value::Null, |v| {
+                serde_json::Value::String(v.to_string())
+            });
+            ((*name).to_string(), json)
         })
         .collect();
+    serde_json::Value::Object(map)
+}
+
+/// Render raw rows as a JSON array of objects.
+pub fn raw_to_json(rows: &[Vec<Option<String>>]) -> String {
+    let objects: Vec<serde_json::Value> = rows.iter().map(|r| raw_row_object(r)).collect();
     serde_json::to_string(&objects).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Opening bracket of a streamed raw JSON export.
+pub const JSON_STREAM_OPEN: &str = "[";
+/// Closing bracket of a streamed raw JSON export.
+pub const JSON_STREAM_CLOSE: &str = "]";
+
+/// One chunk of a streamed raw JSON export.
+///
+/// The row objects are comma separated, with a leading comma unless this is
+/// the first chunk. Emit
+/// [`JSON_STREAM_OPEN`], every chunk in order, then [`JSON_STREAM_CLOSE`], and
+/// the concatenation equals [`raw_to_json`] of all the rows.
+pub fn raw_json_chunk(rows: &[Vec<Option<String>>], first_chunk: bool) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let body = rows
+        .iter()
+        // `Value`'s Display is infallible, unlike `to_string` on arbitrary types.
+        .map(|r| raw_row_object(r).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    if first_chunk {
+        body
+    } else {
+        format!(",{body}")
+    }
 }
 
 #[cfg(test)]
@@ -457,5 +561,79 @@ mod tests {
     fn test_format_metadata() {
         assert!(ExportFormat::Csv.content_type().contains("text/csv"));
         assert_eq!(ExportFormat::Json.extension(), "json");
+    }
+
+    fn seeded(n: usize) -> TestDb {
+        let db = TestDb::new();
+        for i in 0..n {
+            insert_pageview(
+                &db.conn,
+                &format!("v{i}"),
+                &format!("2024-01-15 10:{:02}:00", i % 60),
+                &format!("/p{i}"),
+            );
+        }
+        db
+    }
+
+    #[test]
+    fn test_streamed_export_equals_the_materialised_one() {
+        // S-12: the chunked path must produce exactly the bytes the
+        // collect-everything path does, for CSV and JSON, whatever the chunking.
+        let db = seeded(7);
+        let sc = scope("2024-01-15", "2024-01-16");
+        let all = query_raw_export(&db.conn, &sc, 100).unwrap();
+        assert_eq!(all.len(), 7);
+
+        for chunk_rows in [1, 2, 3, 7, 100] {
+            let mut csv = csv_header_line(RAW_COLUMNS);
+            let mut json = String::from(JSON_STREAM_OPEN);
+            let mut first = true;
+            let mut chunks = 0;
+            let n = stream_raw_export(&db.conn, &sc, 100, chunk_rows, |rows| {
+                assert!(rows.len() <= chunk_rows, "chunk exceeded its bound");
+                csv.push_str(&csv_rows(rows));
+                json.push_str(&raw_json_chunk(rows, first));
+                first = false;
+                chunks += 1;
+                true
+            })
+            .unwrap();
+            json.push_str(JSON_STREAM_CLOSE);
+            assert_eq!(n, 7);
+            assert_eq!(chunks, 7usize.div_ceil(chunk_rows));
+            assert_eq!(csv, to_csv(RAW_COLUMNS, &all), "chunk_rows={chunk_rows}");
+            assert_eq!(json, raw_to_json(&all), "chunk_rows={chunk_rows}");
+        }
+    }
+
+    #[test]
+    fn test_streamed_export_stops_when_the_sink_says_so() {
+        let db = seeded(10);
+        let sc = scope("2024-01-15", "2024-01-16");
+        let mut seen = 0;
+        let n = stream_raw_export(&db.conn, &sc, 100, 3, |rows| {
+            seen += rows.len();
+            false
+        })
+        .unwrap();
+        assert_eq!((n, seen), (3, 3), "no chunk may be produced after a stop");
+    }
+
+    #[test]
+    fn test_streamed_export_of_nothing_calls_the_sink_never() {
+        let db = TestDb::new();
+        let sc = scope("2024-01-15", "2024-01-16");
+        let n = stream_raw_export(&db.conn, &sc, 100, 5, |_| panic!("no rows, no chunks")).unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(raw_json_chunk(&[], true), "");
+    }
+
+    #[test]
+    fn test_streamed_export_honours_the_limit() {
+        let db = seeded(10);
+        let sc = scope("2024-01-15", "2024-01-16");
+        let n = stream_raw_export(&db.conn, &sc, 4, 3, |_| true).unwrap();
+        assert_eq!(n, 4);
     }
 }

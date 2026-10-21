@@ -1,230 +1,194 @@
 # Monitoring
 
-## Health Checks
+## Health checks
 
-Three health endpoints are available without authentication:
+Three unauthenticated endpoints (full schemas in
+[Health & Metrics](api-reference/health.md)):
 
-### `GET /health`
-
-Returns `ok` with HTTP 200 when the server is running. Use this for:
-- Load balancer health checks.
-- Container orchestrator liveness probes.
+| Endpoint | Use it for | Notes |
+|---|---|---|
+| `GET /health` | Liveness | `200 ok`. Does not touch the database. |
+| `GET /health/ready` | Readiness, container health | `200 ready`, or `503 database not ready`. |
+| `GET /health/detailed` | Humans and synthetic checks | `503` with `"status":"degraded"` when the cold tier is unreadable. |
 
 ```yaml
-# Kubernetes liveness probe
+# Kubernetes
 livenessProbe:
-  httpGet:
-    path: /health
-    port: 8000
+  httpGet: { path: /health, port: 8000 }
   initialDelaySeconds: 5
   periodSeconds: 10
-```
-
-### `GET /health/ready`
-
-Executes a lightweight DuckDB query (`SELECT 1 FROM events_all LIMIT 0`) to verify the database is operational. Returns:
-
-- `200 OK` — database is ready and accepting queries.
-- `503 Service Unavailable` — database is not ready (use this as a readiness probe, not liveness).
-
-```yaml
-# Kubernetes readiness probe
 readinessProbe:
-  httpGet:
-    path: /health/ready
-    port: 8000
+  httpGet: { path: /health/ready, port: 8000 }
   initialDelaySeconds: 10
   periodSeconds: 15
   failureThreshold: 3
 ```
 
-### `GET /health/detailed`
+Give the first start enough time: if the `behavioral` extension has to be
+downloaded, the server does not bind its port until that attempt has finished.
+The shipped images declare `HEALTHCHECK ... --start-period=20s` for this reason.
 
-Returns a JSON object with component-level status. See [Health & Metrics API](api-reference/health.md) for the full schema.
+For an external uptime monitor, alert on `/health/detailed` returning a non-200
+status: it is the only check that notices a cold tier that has fallen out of the
+query view while ingestion keeps succeeding.
 
 ---
 
-## Prometheus Metrics
+## Prometheus metrics
 
-`GET /metrics` returns Prometheus text format metrics (`text/plain; version=0.0.4`).
+`GET /metrics`, `text/plain; version=0.0.4`, protected by
+`Authorization: Bearer $MALLARD_METRICS_TOKEN` when that variable is set.
+The tables below were generated from a real response; names, types and `HELP`
+text are exact.
 
-If `MALLARD_METRICS_TOKEN` is set, this endpoint requires `Authorization: Bearer <token>`.
+### Metric reference
 
-### Gauges
-
-| Metric | Type | Description |
+| Metric | Type | `HELP` text |
 |---|---|---|
-| `mallard_buffered_events` | gauge | Events in memory, not yet flushed to Parquet |
-| `mallard_cache_entries` | gauge | Cached query results in memory |
-| `mallard_auth_configured` | gauge | `1` if admin password is set, `0` otherwise |
-| `mallard_geoip_loaded` | gauge | `1` if GeoIP database loaded successfully |
-| `mallard_filter_bots` | gauge | `1` if bot filtering is active |
-| `mallard_behavioral_extension` | gauge | `1` if behavioral extension loaded, `0` otherwise |
+| `mallard_build_info{version,behavioral_version}` | gauge (always 1) | Version of this binary and of the loaded behavioral extension (`behavioral_version="none"` when not loaded) |
+| `mallard_buffered_events` | gauge | Events in the in-memory buffer |
+| `mallard_cache_entries` | gauge | Cached query results |
 | `mallard_active_sessions` | gauge | Live dashboard sessions |
 | `mallard_read_connections` | gauge | DuckDB connections serving analytics queries |
-
-### Counters
-
-| Metric | Type | Description |
-|---|---|---|
-| `mallard_events_ingested_total` | counter | Total events accepted through `POST /api/event` |
-| `mallard_flush_failures_total` | counter | Total buffer flush failures |
-| `mallard_rate_limit_rejections_total` | counter | Total requests rejected by the per-site rate limiter |
-| `mallard_login_failures_total` | counter | Total failed login attempts |
-| `mallard_cache_hits_total` | counter | Total query cache hits |
-| `mallard_cache_misses_total` | counter | Total query cache misses |
-| `mallard_cache_evictions_total` | counter | Cache entries evicted to stay within the entry cap |
+| `mallard_auth_configured` | gauge | Whether an admin password is set |
+| `mallard_geoip_loaded` | gauge | Whether a GeoIP database is loaded |
+| `mallard_behavioral_extension` | gauge | Whether the DuckDB behavioral extension is loaded |
+| `mallard_filter_bots` | gauge | Whether bot filtering is enabled |
+| `mallard_datacenter_filter` | gauge | Whether the datacenter traffic filter is enabled |
+| `mallard_events_ingested_total` | counter | Events buffered since startup |
 | `mallard_events_dropped_total` | counter | Events discarded because the buffer was at capacity |
+| `mallard_flush_failures_total` | counter | Parquet flush failures since startup (periodic flush task) |
+| `mallard_buffer_flush_failures_total` | counter | Flushes of the in-memory buffer that failed after retries inside push (threshold-triggered flushes) |
+| `mallard_rate_limiter_evictions_total` | counter | Rate-limiter buckets dropped early because the key table was full (sum of the site and IP limiters) |
+| `mallard_process_start_time_seconds` | gauge | Unix time at which the process started |
+| `mallard_last_flush_success_timestamp_seconds` | gauge | Unix time of the last flush that completed without error (0 before the first) |
+| `mallard_rate_limit_rejections_total` | counter | Ingest requests rejected by a rate limiter (per-site and per-IP, POST and pixel) |
+| `mallard_datacenter_filtered_total` | counter | Events dropped because the client address is in a listed hosting ASN (always 0 unless `asn_db_path` is set) |
+| `mallard_login_failures_total` | counter | Failed login attempts since startup |
+| `mallard_cache_hits_total` | counter | Query cache hits since startup |
+| `mallard_cache_misses_total` | counter | Query cache misses since startup |
+| `mallard_cache_evictions_total` | counter | Cache entries evicted to stay within the entry cap |
+| `mallard_notifications_sent_total{kind}` | counter | Webhook notifications the receiver accepted, by kind (`alert`, `resolved`, `report`) |
+| `mallard_notifications_failed_total{kind}` | counter | Webhook notifications abandoned after their retries, by kind |
+| `mallard_notifications_dropped_total{kind}` | counter | Webhook notifications discarded unsent (queue full or shutdown), by kind |
+| `mallard_notification_last_success_timestamp_seconds` | gauge | Unix time of the last webhook delivery the receiver accepted (0 before the first) |
+| `mallard_notification_queue_depth` | gauge | Webhook notifications waiting to be delivered |
+| `mallard_alerts_active` | gauge | Alerts currently firing, as seen by the alert evaluator |
+| `mallard_http_requests_total{status}` | counter | HTTP responses served, by status class (`1xx`..`5xx`) |
+| `mallard_http_request_duration_seconds` | histogram | Time to produce a response. Buckets (`le`): 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, `+Inf`, plus `_sum` and `_count` |
 
-### HTTP traffic
+Notes:
 
-| Metric | Type | Meaning |
-|---|---|---|
-| `mallard_http_requests_total{status="2xx"}` | counter | Responses served, labelled by status class (`1xx`–`5xx`) |
-| `mallard_http_request_duration_seconds` | histogram | Time to produce a response, on the conventional Prometheus bucket spread |
+- `mallard_process_start_time_seconds` and
+  `mallard_last_flush_success_timestamp_seconds` are gauges even though they sit
+  beside the counters in the output.
+- A flush that finds nothing to write still counts as a success: the timestamp
+  says "the flush loop is alive", not "traffic arrived".
+- Counts are by status class, not by route: `/{*path}` matches anything a
+  crawler asks for, so a per-route label would have unbounded cardinality.
+- The histogram is recorded by the outermost middleware, so it sees the status
+  the client received (a request cut off by the timeout is a `408`).
+- All counters reset on restart; `rate()` and `increase()` handle that.
 
-Counted by status class rather than by route: `/{*path}` matches anything a
-crawler asks for, so a per-route label set would be unbounded — the classic way
-to take a Prometheus server down with cardinality.
-
-The histogram is recorded by the outermost middleware, so it sees the status the
-client actually receives: a request the timeout layer converts into a `408` is
-counted as a `408`.
-
-A useful pair of alerts:
+### Useful expressions
 
 ```promql
-# 5xx rate above 1% over five minutes
-  sum(rate(mallard_http_requests_total{status="5xx"}[5m]))
-/ sum(rate(mallard_http_requests_total[5m])) > 0.01
+# 5xx ratio above 1% for 5 minutes
+sum(rate(mallard_http_requests_total{status="5xx"}[5m]))
+  / sum(rate(mallard_http_requests_total[5m])) > 0.01
 
-# 95th-percentile latency above two seconds
+# 95th percentile latency above 2 s
 histogram_quantile(0.95, sum(rate(mallard_http_request_duration_seconds_bucket[5m])) by (le)) > 2
+
+# The flush loop has stopped (needs one flush interval of grace; default 60 s)
+time() - mallard_last_flush_success_timestamp_seconds > 300
+
+# Any dropped event means data loss
+increase(mallard_events_dropped_total[15m]) > 0
+
+# The extension version changed (after an upgrade)
+changes(mallard_build_info[1d]) > 0
 ```
 
-`mallard_events_dropped_total` is the one to alert on. It only moves when flushes
-are failing — a full disk, bad permissions — and the buffer has hit
-`max_buffered_events`. Any non-zero value means events are being lost.
+`mallard_events_dropped_total` is the one to page on. It only moves when flushes
+fail (full disk, bad permissions) long enough for the buffer to reach
+`max_buffered_events`.
 
-`mallard_rate_limit_rejections_total` covers both the per-site and the per-IP
-limiter.
+### Ready-made rules and dashboard
 
-### Prometheus Scrape Configuration
+The repository ships `deploy/monitoring/`:
 
-```yaml
-scrape_configs:
-  - job_name: mallard_metrics
-    static_configs:
-      - targets: ['localhost:8000']
-    metrics_path: /metrics
-    scrape_interval: 30s
-    # If MALLARD_METRICS_TOKEN is set:
-    authorization:
-      credentials: your-metrics-token
-```
+| File | Content |
+|---|---|
+| `prometheus-scrape.example.yml` | Scrape job with the bearer token read from a file |
+| `prometheus-rules.yml` | Alerts: `MallardDown`, `MallardAdminNotConfigured`, `MallardBehavioralExtensionMissing`, `MallardFlushFailing`, `MallardEventsDropped`, `MallardBufferBacklog`, `MallardNoEventsReceived`, `MallardServerErrors`, `MallardSlowResponses`, `MallardLoginFailuresSpike`, `MallardRateLimiting`, `MallardNotificationsFailing`, `MallardNotificationsDropped` |
+| `prometheus-rules.test.yml` | `promtool test rules` unit tests for the alerts |
+| `grafana-dashboard.json` | Dashboard: up, extension, admin password, GeoIP, ingest rate, buffer, flush failures, HTTP classes, latency, cache, failed logins, sessions |
 
-### Example Output
-
-```
-# HELP mallard_buffered_events Number of events in the in-memory buffer
-# TYPE mallard_buffered_events gauge
-mallard_buffered_events 42
-
-# HELP mallard_cache_entries Number of cached query results
-# TYPE mallard_cache_entries gauge
-mallard_cache_entries 3
-
-# HELP mallard_behavioral_extension Whether behavioral extension is loaded
-# TYPE mallard_behavioral_extension gauge
-mallard_behavioral_extension 1
-
-# HELP mallard_events_ingested_total Total events ingested
-# TYPE mallard_events_ingested_total counter
-mallard_events_ingested_total 158432
-
-# HELP mallard_cache_hits_total Total query cache hits
-# TYPE mallard_cache_hits_total counter
-mallard_cache_hits_total 9871
-
-# HELP mallard_cache_misses_total Total query cache misses
-# TYPE mallard_cache_misses_total counter
-mallard_cache_misses_total 1204
-```
-
-### Grafana Dashboard
-
-A minimal Grafana panel configuration for key metrics:
-
-```json
-{
-  "panels": [
-    {
-      "title": "Ingestion Rate",
-      "targets": [{"expr": "rate(mallard_events_ingested_total[5m])"}]
-    },
-    {
-      "title": "Buffered Events",
-      "targets": [{"expr": "mallard_buffered_events"}]
-    },
-    {
-      "title": "Cache Hit Rate",
-      "targets": [{"expr": "rate(mallard_cache_hits_total[5m]) / (rate(mallard_cache_hits_total[5m]) + rate(mallard_cache_misses_total[5m]))"}]
-    },
-    {
-      "title": "Rate Limit Rejections",
-      "targets": [{"expr": "rate(mallard_rate_limit_rejections_total[5m])"}]
-    }
-  ]
-}
-```
+Validate with `promtool check rules deploy/monitoring/prometheus-rules.yml`.
+(The header note in `prometheus-rules.yml` that lists "last successful flush"
+and "build/behavioral version" as not yet alertable predates the metrics above.)
+Disk space is not exported by Mallard; use `node_exporter`
+(`node_filesystem_avail_bytes` on the data volume).
 
 ---
 
-## Structured Logging
+## Logs
 
-Mallard Metrics uses [`tracing`](https://crates.io/crates/tracing) for structured logging. Two formats are supported:
+Mallard uses [`tracing`](https://crates.io/crates/tracing) and writes to
+**stderr**. Two formats:
 
-### Text (default)
-
-Human-readable output with timestamps, log levels, and structured fields:
+**Text (default):**
 
 ```
-2024-01-15T10:00:00.123Z  INFO mallard_metrics: Starting Mallard Metrics host="0.0.0.0" port=8000
-2024-01-15T10:00:00.456Z  INFO mallard_metrics: Behavioral extension loaded
-2024-01-15T10:00:00.457Z  INFO mallard_metrics: Listening addr="0.0.0.0:8000"
+2026-10-21T00:18:40.131642Z  INFO mallard_metrics: Starting Mallard Metrics version="0.2.0" host=127.0.0.1 port=18741 data_dir=/data
+2026-10-21T00:18:40.889017Z  INFO mallard_metrics: Behavioral extension loaded version="0.10.0"
+2026-10-21T00:18:41.496418Z  INFO mallard_metrics: Listening addr=127.0.0.1:18741
 ```
 
-### JSON
+Text output is coloured even when redirected to a file (observed); set `NO_COLOR=1`
+to remove the escape codes (verified).
 
-Set `MALLARD_LOG_FORMAT=json` for machine-parseable output compatible with log aggregators (Loki, Elasticsearch, Splunk):
+**JSON** (`MALLARD_LOG_FORMAT=json`), one object per line:
 
 ```json
-{"timestamp":"2024-01-15T10:00:00.123Z","level":"INFO","fields":{"message":"Flushed events to Parquet","count":42},"target":"mallard_metrics::ingest::buffer","request_id":"a3f2c1d8-..."}
+{"timestamp":"2026-10-21T00:26:56.314757Z","level":"INFO","fields":{"message":"Behavioral extension loaded","version":"0.10.0"},"target":"mallard_metrics"}
 ```
 
-Every log line emitted during a request carries a `request_id` field matching the `X-Request-ID` response header, enabling end-to-end log correlation.
+Lines emitted while serving a request carry a `request_id` matching the
+`X-Request-ID` response header.
 
-### Log Level Control
+**Level:** `RUST_LOG`, standard `tracing-subscriber` filter syntax. Default
+`mallard_metrics=info,tower_http=info`.
 
-Use the `RUST_LOG` environment variable (standard `tracing-subscriber` env-filter syntax):
-
-```bash
-RUST_LOG=mallard_metrics=debug,tower_http=info
-```
-
-Default: `mallard_metrics=info,tower_http=info`
+See [Troubleshooting](troubleshooting.md#reading-the-logs) for which messages
+matter.
 
 ---
 
-## Alerting Recommendations
+## Webhook alerts and reports
+
+Prometheus is the right tool when you run one. When you do not, Mallard can push
+its own alerts (flush stalled, events failing to reach disk, extension missing,
+cold tier degraded, rate-limiter evictions spiking, abnormal traffic) and daily
+or weekly reports to a signed webhook, including Slack and Discord. It is off by
+default and has its own page: [Webhook Alerts and Reports](alerts-and-reports.md).
+The notifier's own health is on `/metrics` (the `mallard_notification*` family
+above) and `MallardNotificationsFailing` fires when deliveries are abandoned.
+
+---
+
+## Alerting recommendations
 
 | Alert | Condition | Severity |
 |---|---|---|
-| Server down | `up{job="mallard_metrics"} == 0` | Critical |
-| Large event buffer | `mallard_buffered_events > 5000` | Warning |
-| High flush failures | `increase(mallard_flush_failures_total[5m]) > 0` | Warning |
-| Auth not configured | `mallard_auth_configured == 0` | Warning |
-| High rate limit rejections | `rate(mallard_rate_limit_rejections_total[5m]) > 10` | Info |
-| Low cache hit rate | `(cache_hits / (cache_hits + cache_misses)) < 0.5` | Info |
-| GeoIP not loaded | `mallard_geoip_loaded == 0` | Info |
-| Behavioral extension missing | `mallard_behavioral_extension == 0` | Info |
+| Server down | `up == 0` for 5 min | Critical |
+| Admin password not set | `mallard_auth_configured == 0` | Critical on a networked host |
+| Data loss | `increase(mallard_events_dropped_total[15m]) > 0` | Critical |
+| Flush failing | `increase(mallard_flush_failures_total[15m]) > 0` or the stalled-flush expression above | Warning |
+| `/health/detailed` degraded | External check, non-200 | Critical |
+| Behavioral extension missing | `mallard_behavioral_extension == 0` for 10 min | Warning |
+| 5xx rate, slow responses | expressions above | Warning |
+| Login failures spike | `increase(mallard_login_failures_total[10m]) > 20` | Warning |
+| Rate limiting | `increase(mallard_rate_limit_rejections_total[10m]) > 100` | Info |
+| Disk filling | `node_exporter` on the data volume | Warning |

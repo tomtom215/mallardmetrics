@@ -4,7 +4,13 @@ use duckdb::Connection;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Upper bound on the flush rounds `shutdown_flush` will run. Each round
+/// writes at most the storage layer's per-flush partition cap, so this only
+/// matters if the hot table holds an absurd number of partitions or flushing
+/// keeps failing; either way shutdown must still terminate.
+const MAX_SHUTDOWN_ROUNDS: usize = 1024;
 
 /// A single analytics event ready for storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +59,17 @@ pub struct EventBuffer {
     tier_lock: crate::storage::TierLock,
     /// Events discarded because the buffer was at capacity.
     pub dropped_events: Arc<AtomicU64>,
+    /// Flushes that failed after the triggering event was already safe (in the
+    /// retry buffer or the hot table). Exposed so `/metrics` can show a
+    /// persistently failing flush without failing the requests that hit it.
+    pub flush_failures: Arc<AtomicU64>,
+    /// Set by [`shutdown_flush`](Self::shutdown_flush); later pushes are refused.
+    closed: AtomicBool,
+    /// Rows may remain in the hot table that a previous flush did not move to
+    /// Parquet (a failure, or the per-flush partition cap). They are durable
+    /// and queryable, but only a flush moves them, and `flush` returns early on
+    /// an empty buffer unless this is set (SI-26).
+    hot_dirty: AtomicBool,
 }
 
 impl EventBuffer {
@@ -71,6 +88,9 @@ impl EventBuffer {
             storage,
             tier_lock,
             dropped_events: Arc::new(AtomicU64::new(0)),
+            flush_failures: Arc::new(AtomicU64::new(0)),
+            closed: AtomicBool::new(false),
+            hot_dirty: AtomicBool::new(false),
         }
     }
 
@@ -95,13 +115,27 @@ impl EventBuffer {
     /// Returns `Ok(Some(n))` when a flush wrote `n` events, `Ok(None)` when the
     /// event was merely buffered.
     ///
+    /// A flush that fails after this event was accepted does **not** fail the
+    /// call. The event is either back in the retry buffer or already committed
+    /// to the hot table, so reporting an error would make the one unlucky
+    /// request that tipped the threshold answer 5xx for an event that is safe,
+    /// and a client that retries would then duplicate it (F-12, SI-26). The
+    /// failure is logged and counted in [`flush_failures`](Self::flush_failures).
+    ///
     /// # Errors
     ///
-    /// Returns [`BufferError::AtCapacity`] when the buffer is full — which only
-    /// happens if flushes have been failing — and propagates flush errors.
+    /// Returns [`BufferError::AtCapacity`] when the buffer is full (which only
+    /// happens if flushes have been failing) or when this event was discarded
+    /// while restoring a failed flush, and [`BufferError::Closed`] after
+    /// [`shutdown_flush`](Self::shutdown_flush).
     pub fn push(&self, event: Event) -> Result<Option<usize>, BufferError> {
         let should_flush = {
             let mut events = self.events.lock();
+            // Checked under the lock `shutdown_flush` drains with, so an event
+            // is either drained by it or refused here, never silently stranded.
+            if self.closed.load(Ordering::Acquire) {
+                return Err(BufferError::Closed);
+            }
             if self.max_buffered > 0 && events.len() >= self.max_buffered {
                 // Refusing the newest event (rather than growing without bound)
                 // keeps memory flat when flushes are failing — e.g. a full disk.
@@ -112,10 +146,25 @@ impl EventBuffer {
             events.len() >= self.flush_threshold
         };
 
-        if should_flush {
-            Ok(Some(self.flush()?))
-        } else {
-            Ok(None)
+        if !should_flush {
+            return Ok(None);
+        }
+
+        let dropped_before = self.dropped_events.load(Ordering::Relaxed);
+        match self.flush() {
+            Ok(n) => Ok(Some(n)),
+            Err(e @ (BufferError::Flush(_) | BufferError::Insert(_))) => {
+                self.flush_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(error = %e, "Flush failed; the event stays buffered or in the hot table");
+                if self.dropped_events.load(Ordering::Relaxed) > dropped_before {
+                    // Restoring the failed batch overflowed the cap; this event
+                    // may be among those discarded, so it is not safe to say Ok.
+                    Err(BufferError::AtCapacity(self.max_buffered))
+                } else {
+                    Ok(None)
+                }
+            }
+            Err(other) => Err(other),
         }
     }
 
@@ -163,27 +212,88 @@ impl EventBuffer {
     ///
     /// If the inserts succeed but the Parquet write fails, the events are
     /// already durable in the DuckDB table (and visible through `events_all`),
-    /// and will be written to Parquet by the next flush.
+    /// and the next flush writes them to Parquet even if no new event arrives.
+    ///
+    /// Compaction runs after the tier lock is released: it only reads immutable
+    /// files and takes the lock just for the final swap (F-07).
     ///
     /// # Errors
     ///
     /// Returns an error if the DuckDB insert or the Parquet write fails.
     pub fn flush(&self) -> Result<usize, BufferError> {
-        let events: Vec<Event> = {
-            let mut buf = self.events.lock();
-            if buf.is_empty() {
-                return Ok(0);
-            }
-            std::mem::take(&mut *buf)
-        };
+        // Nothing buffered and nothing stranded in the hot table: do not queue
+        // for the exclusive lock just to find that out.
+        if self.events.lock().is_empty() && !self.hot_dirty.load(Ordering::Acquire) {
+            return Ok(0);
+        }
 
+        let (flushed, touched) = self.flush_exclusive()?;
+        self.compact(&touched);
+        if flushed > 0 {
+            tracing::debug!(count = flushed, "Flushed events to Parquet");
+        }
+        Ok(flushed)
+    }
+
+    /// Flush on the way out. Safe to call after the server has stopped
+    /// accepting requests and drained the ones in flight (SI-03).
+    ///
+    /// Closes the buffer first, so a request that somehow still arrives is
+    /// refused with [`BufferError::Closed`] instead of being buffered after the
+    /// final drain and lost. Then flushes until neither the buffer nor the hot
+    /// table holds anything, waiting out a periodic flush that is mid-flight
+    /// (it holds the same locks). Idempotent.
+    ///
+    /// Returns the number of events written to Parquet by this call.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first flush error. Events that could not reach Parquet are
+    /// still committed to the hot table, which survives the restart.
+    pub fn shutdown_flush(&self) -> Result<usize, BufferError> {
+        self.closed.store(true, Ordering::Release);
+        // A periodic flush may be mid-flight with a drained batch the buffer no
+        // longer shows. It holds both locks, so waiting for them is how this
+        // call learns that batch has landed (or failed and set `hot_dirty`).
+        drop((self.tier_lock.write(), self.conn.lock()));
+        let mut total = 0;
+        for _ in 0..MAX_SHUTDOWN_ROUNDS {
+            total += self.flush()?;
+            if self.events.lock().is_empty() && !self.hot_dirty.load(Ordering::Acquire) {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    /// The part of a flush that runs under the exclusive tier lock. Returns the
+    /// number of events written and the partitions that received a file.
+    fn flush_exclusive(&self) -> Result<(usize, Vec<(String, String)>), BufferError> {
         // Taken before the connection lock, and in the same order by every
         // reader, so the two locks cannot deadlock against each other. Held for
         // the whole insert-and-copy sequence: between the Parquet write and the
         // matching DELETE the same rows exist in both tiers, and a query that
         // ran in that window would count them twice.
+        //
+        // The buffer is drained only after both locks are held: draining first
+        // left a batch outside the `max_buffered` accounting for as long as a
+        // long dashboard query kept the flusher waiting (SI-26).
         let _tier = self.tier_lock.write();
         let conn = self.conn.lock();
+
+        // Finish any flush a crash interrupted before inserting new rows: the
+        // recovery rule relies on the hot table holding only pre-crash data.
+        if let Err(e) = self.storage.ensure_recovered(&conn) {
+            tracing::error!(error = %e, "Could not check for interrupted flushes");
+        }
+
+        let events: Vec<Event> = {
+            let mut buf = self.events.lock();
+            if buf.is_empty() && !self.hot_dirty.load(Ordering::Acquire) {
+                return Ok((0, Vec::new()));
+            }
+            std::mem::take(&mut *buf)
+        };
 
         // Bulk-insert with DuckDB's Appender, which bypasses per-row SQL parsing.
         //
@@ -196,47 +306,52 @@ impl EventBuffer {
         // through would leave the earlier chunks durably inserted while
         // `restore` puts every event back for the next attempt — silently
         // duplicating everything up to the failure point.
-        let insert_result = (|| -> Result<(), duckdb::Error> {
-            conn.execute_batch("BEGIN TRANSACTION")?;
-            let mut appender = conn.appender("events")?;
-            for event in &events {
-                // The timestamp is appended as a typed chrono value rather than a
-                // formatted string. The old "%Y-%m-%d %H:%M:%S" round-trip silently
-                // truncated every event to whole seconds, which collapsed the
-                // ordering of events arriving within the same second — exactly the
-                // ordering that sessionize, window_funnel and sequence_match need.
-                appender.append_row(duckdb::params![
-                    event.site_id,
-                    event.visitor_id,
-                    event.timestamp,
-                    event.event_name,
-                    event.pathname,
-                    event.hostname,
-                    event.referrer,
-                    event.referrer_source,
-                    event.utm_source,
-                    event.utm_medium,
-                    event.utm_campaign,
-                    event.utm_content,
-                    event.utm_term,
-                    event.browser,
-                    event.browser_version,
-                    event.os,
-                    event.os_version,
-                    event.device_type,
-                    event.screen_size,
-                    event.country_code,
-                    event.region,
-                    event.city,
-                    event.props,
-                    event.revenue_amount,
-                    event.revenue_currency,
-                ])?;
-            }
-            appender.flush()?;
-            drop(appender);
-            conn.execute_batch("COMMIT")
-        })();
+        let insert_result = if events.is_empty() {
+            Ok(())
+        } else {
+            (|| -> Result<(), duckdb::Error> {
+                conn.execute_batch("BEGIN TRANSACTION")?;
+                let mut appender = conn.appender("events")?;
+                for event in &events {
+                    // The timestamp is appended as a typed chrono value rather
+                    // than a formatted string. The old "%Y-%m-%d %H:%M:%S"
+                    // round-trip silently truncated every event to whole
+                    // seconds, which collapsed the ordering of events arriving
+                    // within the same second — exactly the ordering that
+                    // sessionize, window_funnel and sequence_match need.
+                    appender.append_row(duckdb::params![
+                        event.site_id,
+                        event.visitor_id,
+                        event.timestamp,
+                        event.event_name,
+                        event.pathname,
+                        event.hostname,
+                        event.referrer,
+                        event.referrer_source,
+                        event.utm_source,
+                        event.utm_medium,
+                        event.utm_campaign,
+                        event.utm_content,
+                        event.utm_term,
+                        event.browser,
+                        event.browser_version,
+                        event.os,
+                        event.os_version,
+                        event.device_type,
+                        event.screen_size,
+                        event.country_code,
+                        event.region,
+                        event.city,
+                        event.props,
+                        event.revenue_amount,
+                        event.revenue_currency,
+                    ])?;
+                }
+                appender.flush()?;
+                drop(appender);
+                conn.execute_batch("COMMIT")
+            })()
+        };
 
         if let Err(e) = insert_result {
             // Undo whatever the transaction had staged so the restored events
@@ -249,16 +364,48 @@ impl EventBuffer {
             return Err(BufferError::Insert(e));
         }
 
-        let flushed = self
-            .storage
-            .flush_events(&conn)
-            .map_err(BufferError::Flush)?;
-        drop(conn);
-
-        if flushed > 0 {
-            tracing::debug!(count = flushed, "Flushed events to Parquet");
+        // From here the events are durable in the hot table; anything that goes
+        // wrong now leaves them there for the next flush.
+        match self.storage.flush_events_deferred(&conn) {
+            Ok(report) => {
+                self.hot_dirty
+                    .store(report.deferred_partitions > 0, Ordering::Release);
+                Ok((report.flushed, report.touched))
+            }
+            Err(e) => {
+                self.hot_dirty.store(true, Ordering::Release);
+                Err(BufferError::Flush(e))
+            }
         }
-        Ok(flushed)
+    }
+
+    /// Compact the partitions a flush just wrote, outside the tier lock.
+    fn compact(&self, touched: &[(String, String)]) {
+        if touched.is_empty() {
+            return;
+        }
+        // A separate connection: the merge only reads Parquet, and running it
+        // on the writer connection would hold the writer mutex (and so every
+        // flush) for the length of the merge. Never fall back to the writer
+        // here: compaction takes the tier lock for its swap, and tier-then-
+        // writer is the order every other path uses.
+        let cloned = self.conn.lock().try_clone();
+        let conn = match cloned {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::warn!(error = %e, "Could not open a connection for compaction; skipping");
+                return;
+            }
+        };
+        for (site_id, date) in touched {
+            if let Err(e) = self
+                .storage
+                .compact_partition(&conn, &self.tier_lock, site_id, date)
+            {
+                // Compaction is an optimisation; the flush already succeeded.
+                tracing::warn!(site_id, date, error = %e, "Parquet compaction failed");
+            }
+        }
     }
 }
 
@@ -268,6 +415,8 @@ pub enum BufferError {
     Flush(crate::storage::parquet::FlushError),
     /// The buffer is full because flushes are failing.
     AtCapacity(usize),
+    /// The buffer was closed by `shutdown_flush`.
+    Closed,
 }
 
 impl std::fmt::Display for BufferError {
@@ -279,6 +428,7 @@ impl std::fmt::Display for BufferError {
                 f,
                 "Event buffer is at capacity ({cap} events); flushes are not draining"
             ),
+            Self::Closed => write!(f, "Event buffer is closed: the server is shutting down"),
         }
     }
 }
@@ -288,7 +438,7 @@ impl std::error::Error for BufferError {
         match self {
             Self::Insert(e) => Some(e),
             Self::Flush(e) => Some(e),
-            Self::AtCapacity(_) => None,
+            Self::AtCapacity(_) | Self::Closed => None,
         }
     }
 }
@@ -566,5 +716,256 @@ mod tests {
         let err = BufferError::AtCapacity(10);
         assert!(std::error::Error::source(&err).is_none());
         assert!(err.to_string().contains("capacity"));
+    }
+}
+
+/// Failure-path, shutdown and tiering tests that need a real file-backed
+/// database and separate reader connections (L28).
+#[cfg(test)]
+mod tiering_tests {
+    use super::*;
+    use crate::storage::{ReaderPool, TierLock};
+    use chrono::NaiveDate;
+
+    fn event(site: &str, minute: u32, path: &str) -> Event {
+        Event {
+            site_id: site.to_string(),
+            visitor_id: "v".to_string(),
+            timestamp: NaiveDate::from_ymd_opt(2024, 1, 15)
+                .unwrap()
+                .and_hms_opt(10, minute % 60, 0)
+                .unwrap(),
+            event_name: "pageview".to_string(),
+            pathname: path.to_string(),
+            hostname: None,
+            referrer: None,
+            referrer_source: None,
+            utm_source: None,
+            utm_medium: None,
+            utm_campaign: None,
+            utm_content: None,
+            utm_term: None,
+            browser: None,
+            browser_version: None,
+            os: None,
+            os_version: None,
+            device_type: None,
+            screen_size: None,
+            country_code: None,
+            region: None,
+            city: None,
+            props: None,
+            revenue_amount: None,
+            revenue_currency: None,
+        }
+    }
+
+    struct Rig {
+        _dir: tempfile::TempDir,
+        events_dir: std::path::PathBuf,
+        writer: Arc<Mutex<Connection>>,
+        buffer: Arc<EventBuffer>,
+        tier: TierLock,
+    }
+
+    fn rig(threshold: usize, cap: usize, compact_after: usize) -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("t.duckdb")).unwrap();
+        crate::storage::schema::init_schema(&conn).unwrap();
+        let events_dir = dir.path().join("events");
+        std::fs::create_dir_all(&events_dir).unwrap();
+        crate::storage::schema::setup_query_view(&conn, &events_dir).unwrap();
+        let writer = Arc::new(Mutex::new(conn));
+        let tier = TierLock::new();
+        let storage = ParquetStorage::new(&events_dir, compact_after);
+        let buffer = Arc::new(EventBuffer::new(
+            threshold,
+            cap,
+            Arc::clone(&writer),
+            storage,
+            tier.clone(),
+        ));
+        Rig {
+            _dir: dir,
+            events_dir,
+            writer,
+            buffer,
+            tier,
+        }
+    }
+
+    fn count(conn: &Connection, table: &str) -> i64 {
+        conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_a_failed_threshold_flush_does_not_fail_the_request() {
+        // F-12 / SI-26: the push that tipped the threshold used to return Err
+        // although its event was safely restored, so the client saw a 5xx and
+        // retried a duplicate. Reproduced before the fix: `push` returned
+        // Err(Insert(..)).
+        let r = rig(2, 0, 0);
+        r.writer.lock().execute_batch("DROP TABLE events").unwrap();
+        assert!(r.buffer.push(event("a.com", 0, "/1")).unwrap().is_none());
+        let tipped = r.buffer.push(event("a.com", 1, "/2"));
+        assert!(matches!(tipped, Ok(None)), "{tipped:?}");
+        assert_eq!(r.buffer.len(), 2, "both events are retained for the retry");
+        assert_eq!(r.buffer.flush_failures.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_a_failed_parquet_stage_keeps_the_event_and_is_retried_without_new_traffic() {
+        // The event commits to the hot table, the Parquet stage then fails. The
+        // request must succeed, and the stranded rows must reach Parquet on a
+        // later flush even though the buffer is empty by then (SI-26: `flush`
+        // returned early on an empty buffer).
+        let r = rig(2, 0, 0);
+        // A plain file where the site directory must go makes the stage fail.
+        std::fs::write(r.events_dir.join("site_id=a.com"), b"squatter").unwrap();
+
+        r.buffer.push(event("a.com", 0, "/1")).unwrap();
+        let tipped = r.buffer.push(event("a.com", 1, "/2"));
+        assert!(matches!(tipped, Ok(None)), "{tipped:?}");
+        assert_eq!(r.buffer.flush_failures.load(Ordering::Relaxed), 1);
+        assert!(r.buffer.is_empty());
+        assert_eq!(
+            count(&r.writer.lock(), "events"),
+            2,
+            "durable in the hot table"
+        );
+        assert_eq!(
+            count(&r.writer.lock(), "events_all"),
+            2,
+            "and still queryable"
+        );
+
+        // The buffer is empty; a periodic flush must still retry.
+        assert!(
+            r.buffer.flush().is_err(),
+            "still blocked: the squatter remains"
+        );
+        std::fs::remove_file(r.events_dir.join("site_id=a.com")).unwrap();
+        assert_eq!(r.buffer.flush().unwrap(), 2);
+        assert_eq!(count(&r.writer.lock(), "events"), 0);
+        assert_eq!(count(&r.writer.lock(), "events_all"), 2);
+        // And once drained, an empty flush is a no-op again.
+        assert_eq!(r.buffer.flush().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_shutdown_flush_writes_everything_and_refuses_later_events() {
+        // SI-03 (buffer side).
+        let r = rig(1000, 0, 0);
+        for i in 0..5 {
+            r.buffer.push(event("a.com", i, "/x")).unwrap();
+        }
+        assert_eq!(r.buffer.shutdown_flush().unwrap(), 5);
+        assert_eq!(count(&r.writer.lock(), "events"), 0);
+        assert_eq!(count(&r.writer.lock(), "events_all"), 5);
+
+        assert!(matches!(
+            r.buffer.push(event("a.com", 9, "/late")),
+            Err(BufferError::Closed)
+        ));
+        // Safe to call again, and from the shutdown path after the drain.
+        assert_eq!(r.buffer.shutdown_flush().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_shutdown_flush_waits_for_a_flush_that_is_mid_flight() {
+        // A periodic flush holds the tier lock with a drained batch the buffer
+        // no longer shows. shutdown_flush must not return "nothing to do" while
+        // that batch has not landed.
+        let r = rig(1000, 0, 0);
+        r.buffer.push(event("a.com", 0, "/x")).unwrap();
+
+        let in_flight = r.tier.write(); // stands in for the running flush
+        let done = Arc::new(AtomicBool::new(false));
+        let handle = {
+            let (buffer, done) = (Arc::clone(&r.buffer), Arc::clone(&done));
+            std::thread::spawn(move || {
+                let n = buffer.shutdown_flush().unwrap();
+                done.store(true, Ordering::SeqCst);
+                n
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "shutdown raced past the flush"
+        );
+        drop(in_flight);
+        assert_eq!(handle.join().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_compaction_runs_outside_the_tier_lock_and_queries_stay_exact() {
+        // End to end with real reader connections: pushes flush on every event
+        // and compact every three files while a reader counts `events_all`.
+        // A count that ever drops means a window with rows in neither tier; one
+        // above what was pushed means rows in both.
+        let r = rig(1, 0, 3);
+        let readers = ReaderPool::new(&r.writer, 2);
+        assert_eq!(
+            readers.len(),
+            2,
+            "the bug needs independent read connections"
+        );
+
+        let pushed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let producer = {
+            let (buffer, pushed, done) = (
+                Arc::clone(&r.buffer),
+                Arc::clone(&pushed),
+                Arc::clone(&done),
+            );
+            std::thread::spawn(move || {
+                for i in 0..40u32 {
+                    pushed.fetch_add(1, Ordering::SeqCst);
+                    buffer.push(event("a.com", i, "/x")).unwrap();
+                }
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+
+        let mut last = 0i64;
+        let mut queries = 0u32;
+        while !done.load(Ordering::SeqCst) {
+            let n = {
+                let _tier = r.tier.read();
+                count(&readers.acquire().lock(), "events_all")
+            };
+            let ceiling = i64::try_from(pushed.load(Ordering::SeqCst)).unwrap();
+            assert!(n <= ceiling, "saw {n} rows but only {ceiling} were pushed");
+            assert!(
+                n >= last,
+                "the count went from {last} to {n}: rows vanished"
+            );
+            last = n;
+            queries += 1;
+        }
+        producer.join().unwrap();
+        assert!(queries > 0);
+        assert_eq!(count(&readers.acquire().lock(), "events_all"), 40);
+
+        let files: Vec<_> =
+            std::fs::read_dir(r.events_dir.join("site_id=a.com").join("date=2024-01-15"))
+                .unwrap()
+                .flatten()
+                .collect();
+        assert!(
+            files.len() < 40,
+            "compaction never ran: {} files",
+            files.len()
+        );
+        assert!(
+            files
+                .iter()
+                .all(|f| !f.file_name().to_string_lossy().contains(".del")
+                    && !f.file_name().to_string_lossy().ends_with(".tmp")),
+            "no leftovers: {files:?}"
+        );
     }
 }

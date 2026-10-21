@@ -1,11 +1,31 @@
-import { h, render, Component } from '/preact.js';
+import { h, render, Component, createRef } from '/preact.js';
 import htm from '/htm.js';
+import {
+  DASH, num, compact, tick, pct, fixed, duration, money, fmtDate, fmtDay, fmtMonth, fmtHour, hasTime,
+  todayUTC, shiftDay, rangePreset, periodRange, validateRange, serializeFilters, parseFilters, readViewState,
+  writeViewState, niceMax, axisTicks, retentionCellState, MAX_RANGE_DAYS,
+} from '/format.js';
+import { Api } from '/api.js';
+import { readShareToken, wantsSharedView, makeShareFetch, shareLink, EXPIRY_CHOICES, expiryDays, linkStatusLabel } from '/share.js';
 
 const html = htm.bind(h);
+// A shared view is opened with  /#share=<token>.  The token lives in the URL
+// fragment, which no browser sends to a server, and in memory here; the API
+// client then speaks for the link (see share.js). Anything else is the ordinary
+// dashboard.
+const shareToken = readShareToken(location.hash);
+const shareRequested = wantsSharedView(location.hash);
+const api = new Api(shareToken ? { fetchImpl: makeShareFetch(shareToken) } : {});
+// The browser check reads this to prove a cold load stayed within the server's
+// concurrency cap and never had to fall back on retries.
+window.__mallardApi = api.stats;
 
-/* ── Small helpers ─────────────────────────────────────────────────────── */
+/* ── Preferences ───────────────────────────────────────────────────────── */
 
-const STORAGE_KEY = 'mallard.dashboard.v2';
+// A viewer of a shared link shares this origin with the admin dashboard, so it
+// gets its own key, and keeps only its theme: no site, filters or other state
+// of the admin's browser is read or overwritten.
+const STORAGE_KEY = shareRequested ? 'mallard.share.v1' : 'mallard.dashboard.v2';
 
 /** Read persisted UI state. Storage can throw in private mode. */
 function loadPrefs() {
@@ -18,71 +38,256 @@ function loadPrefs() {
 
 function savePrefs(prefs) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(shareRequested ? { theme: prefs.theme } : prefs));
   } catch (e) {
     /* storage unavailable; preferences simply do not persist */
   }
 }
 
-/** Format a count with thousands separators. */
-function num(value) {
-  if (value == null) return '—';
-  return value.toLocaleString();
+/* ── Loading, error and empty states ───────────────────────────────────── */
+
+function Skel({ width, height, className = '' }) {
+  const style = {};
+  if (width) style.width = width;
+  if (height) style.height = height;
+  return html`<span class=${`skeleton ${className}`} style=${style} aria-hidden="true"></span>`;
 }
 
-/** Format a 0–1 fraction as a percentage. */
-function pct(value, digits = 1) {
-  if (value == null) return '—';
-  return `${(value * 100).toFixed(digits)}%`;
-}
-
-/** Format a duration in seconds as m:ss, or "—" when unavailable. */
-function duration(seconds) {
-  if (seconds == null) return '—';
-  const total = Math.round(seconds);
-  const mins = Math.floor(total / 60);
-  const secs = total % 60;
-  return mins > 0 ? `${mins}m ${String(secs).padStart(2, '0')}s` : `${secs}s`;
-}
-
-function money(amount, currency) {
-  if (amount == null) return '—';
-  try {
-    return new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(amount);
-  } catch (e) {
-    return `${amount.toFixed(2)} ${currency}`;
-  }
+function SkelRows({ rows = 5 }) {
+  return html`
+    <div class="skel-rows" role="status" aria-label="Loading">
+      ${Array.from({ length: rows }, (_, i) => html`<${Skel} className="skel-row" width=${`${95 - (i % 3) * 12}%`} />`)}
+    </div>
+  `;
 }
 
 /**
- * Fetch JSON, distinguishing the outcomes the dashboard must render
- * differently: unauthenticated, feature-unavailable, and everything else.
+ * Placeholder for a ten-row table, sized to the real thing (a header plus ten
+ * rows), so the panels below do not jump down when a breakdown arrives.
  */
-async function getJSON(url) {
-  const res = await fetch(url, { headers: { Accept: 'application/json' } });
-  if (res.status === 401) return { kind: 'unauthorized' };
-  if (res.ok) return { kind: 'ok', data: await res.json() };
+function SkelTable({ rows = 11 }) {
+  return html`
+    <div class="skel-rows skel-table" role="status" aria-label="Loading">
+      ${Array.from({ length: rows }, (_, i) => html`<${Skel} className="skel-row" width=${`${96 - (i % 3) * 10}%`} />`)}
+    </div>
+  `;
+}
 
-  let message = `HTTP ${res.status}`;
-  try {
-    const body = await res.json();
-    if (body && body.error) message = body.error;
-  } catch (e) {
-    /* keep the status-code message */
+function SkelCards({ count = 8 }) {
+  return html`
+    <div class="metrics-grid" role="status" aria-label="Loading">
+      ${Array.from({ length: count }, () => html`<div class="metric-card"><${Skel} className="skel-value" /><${Skel} className="skel-label" /></div>`)}
+    </div>
+  `;
+}
+
+function SkelChart() {
+  return html`<div class="chart-plot" role="status" aria-label="Loading"><${Skel} className="skel-chart" /></div>`;
+}
+
+/**
+ * Catches a render crash caused by an unexpected payload shape, so one panel
+ * degrades to a sentence instead of blanking the whole page.
+ */
+class Boundary extends Component {
+  constructor() {
+    super();
+    this.state = { failed: false };
   }
-  // 503 means the behavioral extension is missing: the deployment is healthy,
-  // the feature simply is not available, and saying so beats an empty panel.
-  return { kind: res.status === 503 ? 'unavailable' : 'error', message };
+
+  componentDidCatch(error) {
+    console.error('dashboard panel failed to render', error);
+    this.setState({ failed: true });
+  }
+
+  componentDidUpdate(prev) {
+    if (this.state.failed && prev.resetKey !== this.props.resetKey) this.setState({ failed: false });
+  }
+
+  render({ children, fallback }, { failed }) {
+    if (failed) {
+      return (
+        fallback ||
+        html`<div class="placeholder placeholder-error">This panel could not display the server's response.</div>`
+      );
+    }
+    return children;
+  }
+}
+
+/** Calls `fn(data)` inside a component so a throw is caught by the nearest Boundary. */
+function Render({ fn, data }) {
+  return fn(data);
+}
+
+/** The explanation shown wherever the `behavioral` extension is missing. */
+function BehavioralHelp({ detail, compactView }) {
+  return html`
+    <div class="placeholder placeholder-unavailable behavioral-help">
+      <strong>Behavioral analytics is unavailable on this server</strong>
+      <p>
+        ${compactView
+          ? html`This report needs DuckDB's${' '}<code>behavioral</code> extension, which is not loaded. See Overview.`
+          : html`Visits, bounce rate, funnels, retention, sequences, flow and entry and exit pages depend on
+              DuckDB's${' '}<code>behavioral</code> community extension, and it is not loaded. Page views,
+              events, breakdowns, goals and revenue are unaffected.`}
+      </p>
+      ${!compactView &&
+      html`
+        <details>
+          <summary>How to fix it</summary>
+          <ol>
+            <li>Look for a <code>behavioral</code> line in the server log; it names the reason.</li>
+            <li>
+              The extension is installed from the DuckDB community repository at start-up, so the
+              server needs outbound HTTP access (port 80) to it. Offline hosts can place the extension file in
+              the extension directory (<code>MALLARD_EXTENSION_DIR</code>, default${' '}
+              <code>&lt;data dir&gt;/extensions</code>).
+            </li>
+            <li>
+              That directory must be writable. On a read-only container, mount the data volume
+              read-write.
+            </li>
+            <li>Restart the server, then reload this page.</li>
+          </ol>
+          ${detail && html`<p class="muted">The server said: ${detail}</p>`}
+        </details>
+      `}
+    </div>
+  `;
+}
+
+/**
+ * The explanation shown wherever a report needs exact timestamps.
+ *
+ * `gdpr_mode` rounds every event to the top of its hour, which destroys the
+ * order and spacing of events inside the hour that sessions, funnels, sequences
+ * and flow are built from. That is a deliberate privacy setting, not a failure,
+ * so it is presented as information in the accent colour, with no error styling.
+ */
+function RoundedHelp({ compactView }) {
+  return html`
+    <div class="placeholder placeholder-info rounded-help">
+      <strong>This report needs session data that gdpr_mode rounds away</strong>
+      <p>
+        ${compactView
+          ? 'Timestamps are rounded to the hour, so visits cannot be reconstructed.'
+          : html`With <code>gdpr_mode</code> every timestamp is rounded to the hour. The server then
+              cannot tell which events belong to one visit or in what order they happened, so it does
+              not report visits, bounce rate, visit duration, funnels, sequences, flow or entry and
+              exit pages. Visitors, pageviews, breakdowns, goals, revenue and weekly retention are
+              unaffected.`}
+      </p>
+      ${!compactView &&
+      html`<p class="muted">
+        This is the privacy setting working as designed. To get these reports, turn off${' '}
+        <code>gdpr_mode</code> (or <code>round_timestamps</code>) and restart; the data collected
+        from then on keeps its exact times.
+      </p>`}
+    </div>
+  `;
+}
+
+/** Why a report is unavailable: the extension is missing, or timestamps are rounded. */
+function Unavailable({ reason, detail, compactView }) {
+  return reason === 'rounded'
+    ? html`<${RoundedHelp} compactView=${compactView} />`
+    : html`<${BehavioralHelp} detail=${detail} compactView=${compactView} />`;
+}
+
+/**
+ * Renders whichever of loading, unavailable, failed or loaded applies, then
+ * hands loaded data to `render`. While a refresh is under way the previous
+ * data stays on screen, dimmed, so the layout does not jump.
+ */
+function Async({ state, onRetry, skeleton, render: renderData, behavioral }) {
+  const first = !state || (state.loading && state.kind !== 'ok');
+  if (first) return skeleton || html`<${SkelRows} />`;
+  if (state.kind === 'unavailable') {
+    return html`<${Unavailable} reason=${state.reason} detail=${state.message} compactView=${behavioral === 'compact'} />`;
+  }
+  if (state.kind === 'network') {
+    // A lost connection hits every panel at once. The banner at the top says so
+    // and offers the one Retry; repeating the sentence and button in all twenty
+    // panels buried the page in identical errors.
+    return html`<div class="placeholder placeholder-offline" role="status">Waiting for the server…</div>`;
+  }
+  if (state.kind === 'timeout') {
+    return html`
+      <div class="placeholder placeholder-notice">
+        <strong>${state.message}</strong>
+        <p>
+          The server stopped it at its time limit. Choose a shorter date range or remove a filter, then
+          try again.
+        </p>
+        ${onRetry && html`<button type="button" class="btn-secondary" onClick=${onRetry}>Try again</button>`}
+      </div>
+    `;
+  }
+  if (state.kind === 'busy') {
+    return html`
+      <div class="placeholder placeholder-notice">
+        <strong>${state.message}</strong>
+        <p>It is answering other requests. Try again in a moment.</p>
+        ${onRetry && html`<button type="button" class="btn-secondary" onClick=${onRetry}>Try again</button>`}
+      </div>
+    `;
+  }
+  if (state.kind === 'error') {
+    return html`
+      <div class="placeholder placeholder-error">
+        <p>${state.message}</p>
+        ${onRetry && html`<button type="button" class="btn-secondary" onClick=${onRetry}>Retry</button>`}
+      </div>
+    `;
+  }
+  if (state.kind !== 'ok') return skeleton || html`<${SkelRows} />`;
+  return html`
+    <div class=${state.loading ? 'is-stale' : ''} aria-busy=${state.loading ? 'true' : 'false'}>
+      <${Boundary} resetKey=${state}><${Render} fn=${renderData} data=${state.data} /></${Boundary}>
+    </div>
+  `;
+}
+
+const Empty = ({ children }) => html`<div class="placeholder">${children}</div>`;
+
+/** Calls `onVisible` once when it scrolls near the viewport, so off-screen panels load lazily. */
+class Sentinel extends Component {
+  componentDidMount() {
+    if (!('IntersectionObserver' in window)) {
+      this.props.onVisible();
+      return;
+    }
+    this.io = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          this.io.disconnect();
+          this.props.onVisible();
+        }
+      },
+      { rootMargin: '500px 0px' },
+    );
+    this.io.observe(this.base);
+  }
+
+  componentWillUnmount() {
+    if (this.io) this.io.disconnect();
+  }
+
+  render() {
+    return html`<span class="sentinel" aria-hidden="true"></span>`;
+  }
 }
 
 /* ── Presentational components ─────────────────────────────────────────── */
 
-function Panel({ title, subtitle, children, actions }) {
+function Panel({ id, title, subtitle, children, actions, focusTitle }) {
+  const titleId = `${id}-title`;
   return html`
-    <section class="panel">
+    <section class="panel" id=${id} aria-labelledby=${titleId}>
       <header class="panel-header">
         <div>
-          <h2>${title}</h2>
+          <h2 id=${titleId} tabindex=${focusTitle ? '-1' : undefined}>${title}</h2>
           ${subtitle && html`<p class="panel-subtitle">${subtitle}</p>`}
         </div>
         ${actions}
@@ -92,381 +297,561 @@ function Panel({ title, subtitle, children, actions }) {
   `;
 }
 
-/** Renders whichever of loading / unavailable / error / empty applies. */
-function Placeholder({ state, empty }) {
-  if (!state) return null;
-  if (state.loading) return html`<div class="placeholder">Loading…</div>`;
-  if (state.kind === 'unavailable') {
-    return html`
-      <div class="placeholder placeholder-unavailable">
-        <strong>Not available</strong>
-        <p>${state.message}</p>
-      </div>
-    `;
-  }
-  if (state.kind === 'error') {
-    return html`<div class="placeholder placeholder-error">${state.message}</div>`;
-  }
-  if (empty) return html`<div class="placeholder">No data for this period</div>`;
-  return null;
-}
-
 /**
  * Relative change from `before` to `after`, as a rendered chip.
  *
  * Returns null when there is nothing honest to say: no comparison was
- * requested, a value is missing, or the baseline was zero — "up from zero" has
- * no percentage, and showing one anyway (or a bare "+100%") is the kind of
- * number people quote in a meeting.
+ * requested, a value is missing, or the baseline was zero. "Up from zero" has no
+ * percentage, and showing one anyway is the kind of number people quote in a
+ * meeting.
  */
 function Delta({ before, after, invert }) {
-  if (before == null || after == null || before === 0) return null;
+  if (typeof before !== 'number' || typeof after !== 'number' || before === 0) return null;
   const change = (after - before) / before;
   if (!Number.isFinite(change)) return null;
 
   const rounded = Math.round(change * 1000) / 10;
   if (rounded === 0) {
-    return html`<div class="metric-delta metric-delta-flat" title="No change">±0%</div>`;
+    return html`<div class="metric-delta metric-delta-flat">±0%<span class="sr-only"> versus the comparison period</span></div>`;
   }
-  // For bounce rate, down is the good direction — so the colour follows the
+  // For bounce rate, down is the good direction, so the colour follows the
   // metric's meaning, not the arithmetic sign.
   const good = invert ? rounded < 0 : rounded > 0;
   return html`
     <div class=${`metric-delta ${good ? 'metric-delta-up' : 'metric-delta-down'}`}>
-      ${rounded > 0 ? '▲' : '▼'} ${Math.abs(rounded).toFixed(1)}%
+      <span aria-hidden="true">${rounded > 0 ? '▲' : '▼'}</span> ${Math.abs(rounded).toFixed(1)}%
+      <span class="sr-only"> ${rounded > 0 ? 'higher' : 'lower'} than the comparison period</span>
     </div>
   `;
 }
 
-function MetricCard({ label, value, hint, muted, delta }) {
+// What each headline figure means, in the server's own terms. The same words
+// are the hover text on a card and the list under the cards, so a reader who
+// never opens the list still gets the one-line version.
+const HELP = {
+  visitors: 'Distinct visitor IDs. IDs are replaced on a schedule the server sets (visitor_salt_rotation_days), so over a long range one person can be counted more than once.',
+  pageviews: 'Page loads, including navigation inside single-page apps.',
+  events: 'Every recorded event: pageviews plus custom events such as sign-ups.',
+  viewsPerVisitor: 'Pageviews divided by unique visitors.',
+  visits: 'A run of one visitor’s events with no gap longer than the session window (30 minutes by default). Only visits containing at least one pageview count.',
+  bounce: 'The share of visits that were exactly one event, and that event a pageview. A visit with one pageview and a click or other custom event is not a bounce.',
+  duration: 'Time from a visit’s first event to its last, averaged over visits. A one-event visit lasts 0 seconds, so a high bounce rate pulls this down.',
+  viewsPerVisit: 'Pageviews divided by visits.',
+};
+const DEFINITIONS = [
+  ['Unique visitors', HELP.visitors],
+  ['Pageviews and events', 'A pageview is a page load. Total events add custom events (sign-ups, clicks you track, purchases) to that.'],
+  ['Visit', HELP.visits + ' Custom events keep a visit alive, so a visitor who watches a video between two pageviews stays in one visit.'],
+  ['Bounce rate', HELP.bounce],
+  ['Visit duration', HELP.duration],
+  ['Views per visit', 'Pageviews divided by visits. Views per visitor divides by people instead, so it is higher whenever people come back.'],
+  ['Entry and exit pages', 'The entry page is the first pageview of a visit and the exit page is the last. Each counts visits, not pageviews.'],
+  ['Filters', 'A filter keeps every visit that contains at least one matching event, and measures that visit in full. Filtering to one page therefore does not turn two-page visits into bounces.'],
+  ['Date ranges', 'All dates are UTC. “Today” is midnight UTC until now. “7D” is the last seven days including today, and likewise 30D and 90D; 12M is the twelve months ending today.'],
+];
+
+function MetricCard({ label, value, full, hint, muted, delta, help }) {
   return html`
-    <div class=${`metric-card${muted ? ' metric-muted' : ''}`}>
-      <div class="metric-value">${value}</div>
-      <div class="metric-label">${label}</div>
-      ${delta}
-      ${hint && html`<div class="metric-hint">${hint}</div>`}
+    <div class=${`metric-card${muted ? ' metric-muted' : ''}`} title=${help}>
+      <dt class="metric-label">${label}</dt>
+      <dd class="metric-value" title=${full}>${value}</dd>
+      ${delta && html`<dd class="metric-extra">${delta}</dd>`}
+      ${hint && html`<dd class="metric-hint">${hint}</dd>`}
     </div>
   `;
+}
+
+/** Label for one chart bucket, in the finest unit the series carries. */
+function bucketLabel(date, spanDays, long) {
+  if (hasTime(date)) return long ? `${fmtDate(date)} ${fmtHour(date)}` : fmtHour(date);
+  if (long) return fmtDate(date);
+  return spanDays > 150 ? fmtMonth(date) : fmtDay(date);
 }
 
 /**
  * A line chart with a hover readout.
  *
- * Kept as hand-written SVG: the dashboard ships with no build step and no
- * third-party chart library, and its content security policy allows scripts
- * only from this origin.
+ * Hand-written SVG: the dashboard has no build step and no chart library, and
+ * its content security policy allows scripts only from this origin. The SVG is
+ * drawn in real pixels (measured from its container) rather than scaled from a
+ * fixed viewBox, because scaling a 900-wide drawing onto a phone turned its
+ * 11px labels into 5px ones. The same data is available as a table.
  */
 class TimeseriesChart extends Component {
   constructor() {
     super();
-    this.state = { hover: null };
+    this.state = { hover: null, width: 0, table: false };
+    this.plot = createRef();
   }
 
-  render({ data }, { hover }) {
-    if (!data || data.length === 0) {
-      return html`<div class="placeholder">No data for this period</div>`;
+  componentDidMount() {
+    this.measure();
+    if ('ResizeObserver' in window && this.plot.current) {
+      this.ro = new ResizeObserver(() => this.measure());
+      this.ro.observe(this.plot.current);
     }
+  }
 
-    const W = 900;
-    const H = 260;
-    const PAD = { top: 16, right: 16, bottom: 32, left: 56 };
+  componentWillUnmount() {
+    if (this.ro) this.ro.disconnect();
+  }
+
+  measure() {
+    const el = this.plot.current;
+    if (el && Math.round(el.clientWidth) !== this.state.width) {
+      this.setState({ width: Math.round(el.clientWidth) });
+    }
+  }
+
+  summary(data, spanDays) {
+    let peak = data[0];
+    let views = 0;
+    for (const d of data) {
+      views += d.pageviews;
+      if (d.visitors > peak.visitors) peak = d;
+    }
+    const first = bucketLabel(data[0].date, spanDays, true);
+    const last = bucketLabel(data[data.length - 1].date, spanDays, true);
+    return (
+      `Visitors and pageviews from ${first} to ${last}, ${num(data.length)} points. ` +
+      `${num(views)} pageviews in total. Peak: ${num(peak.visitors)} visitors on ` +
+      `${bucketLabel(peak.date, spanDays, true)}.`
+    );
+  }
+
+  render({ data }, { hover, width, table }) {
+    if (!data || data.length === 0) return html`<${Empty}>No data for this period</${Empty}>`;
+
+    const spanDays = data.length;
+    const W = Math.max(280, width || 640);
+    const H = W < 520 ? 220 : 280;
+    const PAD = { top: 12, right: 12, bottom: 28, left: W < 520 ? 40 : 48 };
     const cw = W - PAD.left - PAD.right;
     const ch = H - PAD.top - PAD.bottom;
 
-    const maxY = Math.max(1, ...data.map((d) => Math.max(d.visitors, d.pageviews)));
+    const top = niceMax(Math.max(1, ...data.map((d) => Math.max(d.visitors, d.pageviews))));
+    const ticks = axisTicks(top);
     const xAt = (i) => (data.length > 1 ? PAD.left + (i * cw) / (data.length - 1) : PAD.left + cw / 2);
-    const yAt = (v) => PAD.top + ch - (v / maxY) * ch;
+    const yAt = (v) => PAD.top + ch - (v / top) * ch;
 
-    const line = (key) => data.map((d, i) => `${xAt(i)},${yAt(d[key])}`).join(' ');
-    const area = (key) =>
-      `${PAD.left},${PAD.top + ch} ${line(key)} ${xAt(data.length - 1)},${PAD.top + ch}`;
+    const line = (key) => data.map((d, i) => `${xAt(i).toFixed(1)},${yAt(d[key]).toFixed(1)}`).join(' ');
+    const area = (key) => `${PAD.left},${PAD.top + ch} ${line(key)} ${xAt(data.length - 1).toFixed(1)},${PAD.top + ch}`;
 
-    const ticks = [0, Math.round(maxY / 2), maxY].filter((v, i, a) => a.indexOf(v) === i);
-    const labelStep = Math.max(1, Math.ceil(data.length / 7));
+    // About one label per 80px, and the last point always labelled.
+    const labelStep = Math.max(1, Math.ceil(data.length / Math.max(2, Math.floor(cw / 80))));
+    const labelled = (i) => i % labelStep === 0 && (data.length - 1 - i >= labelStep * 0.6 || i === data.length - 1);
 
-    const onMove = (event) => {
-      const svg = event.currentTarget;
-      const rect = svg.getBoundingClientRect();
-      const x = ((event.clientX - rect.left) / rect.width) * W;
-      const ratio = (x - PAD.left) / (cw || 1);
-      const index = Math.round(ratio * (data.length - 1));
-      this.setState({ hover: index >= 0 && index < data.length ? index : null });
+    const pick = (index) => {
+      const bounded = Math.min(data.length - 1, Math.max(0, index));
+      if (bounded !== this.state.hover) this.setState({ hover: bounded });
+    };
+    const onPointer = (event) => {
+      const rect = this.plot.current.getBoundingClientRect();
+      const ratio = (event.clientX - rect.left - PAD.left) / (cw || 1);
+      pick(Math.round(ratio * (data.length - 1)));
+    };
+    const onKey = (event) => {
+      const at = hover == null ? data.length - 1 : hover;
+      const moves = { ArrowLeft: at - 1, ArrowRight: at + 1, Home: 0, End: data.length - 1 };
+      if (event.key in moves) {
+        event.preventDefault();
+        pick(moves[event.key]);
+      } else if (event.key === 'Escape') {
+        this.setState({ hover: null });
+      }
     };
 
     const point = hover != null ? data[hover] : null;
+    const summaryId = 'chart-summary';
 
     return html`
       <div class="chart">
-        <svg
-          viewBox="0 0 ${W} ${H}"
-          class="chart-svg"
-          role="img"
-          aria-label="Visitors and pageviews over time"
-          onMouseMove=${onMove}
-          onMouseLeave=${() => this.setState({ hover: null })}
+        <div
+          class="chart-plot"
+          ref=${this.plot}
+          tabindex="0"
+          role="group"
+          aria-label="Visitors and pageviews chart. Use the arrow keys to read each point."
+          aria-describedby=${summaryId}
+          onPointerMove=${onPointer}
+          onPointerDown=${onPointer}
+          onPointerLeave=${() => this.setState({ hover: null })}
+          onKeyDown=${onKey}
+          onBlur=${() => this.setState({ hover: null })}
         >
-          ${ticks.map(
-            (v) => html`
-              <line class="chart-gridline" x1=${PAD.left} y1=${yAt(v)} x2=${W - PAD.right} y2=${yAt(v)} />
-              <text class="chart-tick" x=${PAD.left - 10} y=${yAt(v) + 4} text-anchor="end">${num(v)}</text>
-            `,
-          )}
-
-          <polygon class="chart-area" points=${area('pageviews')} />
-          <polyline class="chart-line chart-line-pageviews" points=${line('pageviews')} />
-          <polyline class="chart-line chart-line-visitors" points=${line('visitors')} />
-
-          ${data.map((d, i) =>
-            i % labelStep === 0 || i === data.length - 1
-              ? html`<text class="chart-tick" x=${xAt(i)} y=${H - 10} text-anchor="middle">
-                  ${d.date.length > 10 ? d.date.slice(5) : d.date.slice(5)}
-                </text>`
-              : null,
-          )}
-
-          ${point &&
-          html`
-            <line class="chart-cursor" x1=${xAt(hover)} y1=${PAD.top} x2=${xAt(hover)} y2=${PAD.top + ch} />
-            <circle class="chart-dot chart-dot-visitors" cx=${xAt(hover)} cy=${yAt(point.visitors)} r="4" />
-            <circle class="chart-dot chart-dot-pageviews" cx=${xAt(hover)} cy=${yAt(point.pageviews)} r="4" />
-          `}
-        </svg>
+          <svg width=${W} height=${H} viewBox=${`0 0 ${W} ${H}`} class="chart-svg" aria-hidden="true" focusable="false">
+            ${ticks.map(
+              (v) => html`
+                <line class="chart-gridline" x1=${PAD.left} y1=${yAt(v)} x2=${W - PAD.right} y2=${yAt(v)} />
+                <text class="chart-tick" x=${PAD.left - 8} y=${yAt(v) + 4} text-anchor="end">${tick(v)}</text>
+              `,
+            )}
+            <polygon class="chart-area" points=${area('pageviews')} />
+            <polyline class="chart-line chart-line-pageviews" points=${line('pageviews')} />
+            <polyline class="chart-line chart-line-visitors" points=${line('visitors')} />
+            ${data.length === 1 &&
+            html`
+              <circle class="chart-dot chart-dot-visitors" cx=${xAt(0)} cy=${yAt(data[0].visitors)} r="4" />
+              <circle class="chart-dot chart-dot-pageviews" cx=${xAt(0)} cy=${yAt(data[0].pageviews)} r="4" />
+            `}
+            ${data.map((d, i) =>
+              labelled(i)
+                ? html`<text class="chart-tick" x=${xAt(i)} y=${H - 8} text-anchor=${i === 0 && data.length > 1 ? 'start' : i === data.length - 1 && data.length > 1 ? 'end' : 'middle'}>${bucketLabel(d.date, spanDays, false)}</text>`
+                : null,
+            )}
+            ${point &&
+            html`
+              <line class="chart-cursor" x1=${xAt(hover)} y1=${PAD.top} x2=${xAt(hover)} y2=${PAD.top + ch} />
+              <circle class="chart-dot chart-dot-visitors" cx=${xAt(hover)} cy=${yAt(point.visitors)} r="4" />
+              <circle class="chart-dot chart-dot-pageviews" cx=${xAt(hover)} cy=${yAt(point.pageviews)} r="4" />
+            `}
+          </svg>
+        </div>
+        <p id=${summaryId} class="sr-only">${this.summary(data, spanDays)}</p>
 
         <div class="chart-footer">
-          <div class="chart-legend">
+          <div class="chart-legend" aria-hidden="true">
             <span class="legend-item"><span class="legend-swatch swatch-visitors"></span> Visitors</span>
             <span class="legend-item"><span class="legend-swatch swatch-pageviews"></span> Pageviews</span>
           </div>
-          <div class="chart-readout">
+          <div class="chart-readout" aria-live="off">
             ${point
-              ? html`<strong>${point.date}</strong> · ${num(point.visitors)} visitors ·
-                  ${num(point.pageviews)} pageviews`
-              : html`<span class="muted">Hover the chart for a breakdown</span>`}
+              ? html`<strong>${bucketLabel(point.date, spanDays, true)}</strong> · ${num(point.visitors)} visitors · ${num(point.pageviews)} pageviews`
+              : html`<span class="muted">Hover, touch or focus the chart to read a point</span>`}
           </div>
+          <button
+            type="button"
+            class="btn-link"
+            aria-expanded=${table}
+            onClick=${() => this.setState({ table: !table })}
+          >
+            ${table ? 'Hide table' : 'View as table'}
+          </button>
         </div>
+
+        ${table &&
+        html`
+          <div class="table-scroll chart-table" tabindex="0" role="region" aria-label="Chart data as a table">
+            <table class="data-table">
+              <caption class="sr-only">Visitors and pageviews per point in the chart</caption>
+              <thead><tr><th scope="col">Date</th><th scope="col" class="numeric">Visitors</th><th scope="col" class="numeric">Pageviews</th></tr></thead>
+              <tbody>
+                ${data.map(
+                  (d) => html`<tr><td>${bucketLabel(d.date, spanDays, true)}</td><td class="numeric">${num(d.visitors)}</td><td class="numeric">${num(d.pageviews)}</td></tr>`,
+                )}
+              </tbody>
+            </table>
+          </div>
+        `}
       </div>
     `;
   }
 }
 
 /** A ranked list with an inline bar for relative magnitude. */
-function BreakdownList({ rows, valueLabel = 'Visitors', onFilter }) {
-  if (!rows || rows.length === 0) {
-    return html`<div class="placeholder">No data</div>`;
-  }
-  const max = Math.max(...rows.map((r) => r.visitors), 1);
+function BreakdownList({ rows, label = 'Value', columns, onFilter, caption, empty = 'No data for this period' }) {
+  if (!rows || rows.length === 0) return html`<${Empty}>${empty}</${Empty}>`;
+  const cols = columns || [['Visitors', 'visitors'], ['Pageviews', 'pageviews']];
+  const max = Math.max(...rows.map((r) => r[cols[0][1]] || 0), 1);
   return html`
-    <table class="data-table">
+    <table class="data-table breakdown-table">
+      ${caption && html`<caption class="sr-only">${caption}</caption>`}
       <thead>
         <tr>
-          <th>Value</th>
-          <th class="numeric">${valueLabel}</th>
-          <th class="numeric">Pageviews</th>
+          <th scope="col">${label}</th>
+          ${cols.map(([name]) => html`<th scope="col" class="numeric">${name}</th>`)}
         </tr>
       </thead>
       <tbody>
-        ${rows.map(
-          (row) => html`
+        ${rows.map((row) => {
+          const value = row.value == null || row.value === '' ? '(unknown)' : String(row.value);
+          return html`
             <tr>
               <td class="bar-cell">
-                <span class="bar" style=${`width:${(row.visitors / max) * 100}%`}></span>
+                <span class="bar" style=${{ width: `${Math.max(1, ((row[cols[0][1]] || 0) / max) * 100)}%` }} aria-hidden="true"></span>
                 ${onFilter
-                  ? html`<button
-                      class="bar-label bar-link"
-                      title=${`Filter to ${row.value}`}
-                      onClick=${() => onFilter(row.value)}
-                    >
-                      ${row.value}
-                    </button>`
-                  : html`<span class="bar-label" title=${row.value}>${row.value}</span>`}
+                  ? html`<button type="button" class="bar-label bar-link" title=${`${value} - click to filter everything to this`} onClick=${() => onFilter(row.value == null ? '(unknown)' : row.value)}>${value}</button>`
+                  : html`<span class="bar-label" title=${value}>${value}</span>`}
               </td>
-              <td class="numeric">${num(row.visitors)}</td>
-              <td class="numeric">${num(row.pageviews)}</td>
+              ${cols.map(([, key, fmt]) => html`<td class="numeric">${(fmt || num)(row[key])}</td>`)}
             </tr>
-          `,
-        )}
+          `;
+        })}
       </tbody>
     </table>
   `;
 }
 
 /** The active segment, with a chip per condition. */
-function FilterBar({ filters, onRemove, onClear }) {
-  if (!filters || filters.length === 0) return null;
+function FilterBar({ filters, onRemove, onToggle, onClear, menu }) {
+  const active = filters && filters.length > 0;
+  if (!active && !menu) return null;
   return html`
     <div class="filter-bar" role="region" aria-label="Active filters">
-      <span class="filter-bar-label">Filtered by</span>
-      ${filters.map(
+      ${menu}
+      ${active && html`<span class="filter-bar-label">Filtered by</span>`}
+      ${(active ? filters : []).map(
         (f, i) => html`
           <span class="filter-chip">
             <span class="filter-chip-dim">${FILTER_LABELS[f.dimension] || f.dimension}</span>
-            <span class="filter-chip-op">${f.negated ? 'is not' : 'is'}</span>
+            <button
+              type="button"
+              class="filter-chip-op"
+              title="Switch between is and is not"
+              onClick=${() => onToggle(i)}
+            >${f.negated ? 'is not' : 'is'}</button>
             <span class="filter-chip-value" title=${f.value}>${f.value}</span>
             <button
+              type="button"
               class="filter-chip-remove"
-              aria-label=${`Remove filter ${f.dimension} ${f.value}`}
+              aria-label=${`Remove filter: ${FILTER_LABELS[f.dimension] || f.dimension} ${f.negated ? 'is not' : 'is'} ${f.value}`}
               onClick=${() => onRemove(i)}
-            >
-              ×
-            </button>
+            >×</button>
           </span>
         `,
       )}
-      <button class="filter-clear" onClick=${onClear}>Clear all</button>
+      ${active && html`<button type="button" class="filter-clear" onClick=${onClear}>Clear all</button>`}
     </div>
   `;
 }
 
-/** Tabbed group of breakdowns sharing one panel. */
-class BreakdownTabs extends Component {
-  constructor(props) {
-    super(props);
-    this.state = { active: props.tabs[0].slug };
-  }
-
-  render({ tabs, data, onFilter }, { active }) {
-    const current = data[active];
-    const filterable = onFilter && FILTERABLE_SLUGS.has(active);
-    return html`
-      <div class="tabs">
-        <div class="tab-strip" role="tablist">
-          ${tabs.map(
-            (tab) => html`
-              <button
-                role="tab"
-                aria-selected=${active === tab.slug}
-                class=${`tab${active === tab.slug ? ' tab-active' : ''}`}
-                onClick=${() => this.setState({ active: tab.slug })}
-              >
-                ${tab.label}
-              </button>
-            `,
-          )}
-        </div>
-        <div class="tab-panel">
-          ${current && current.kind !== 'ok'
-            ? html`<${Placeholder} state=${current} />`
-            : html`<${BreakdownList}
-                rows=${(current && current.data) || []}
-                onFilter=${filterable ? (value) => onFilter(active, value) : null}
-              />`}
-        </div>
-      </div>
-    `;
-  }
+/** Segmented control: a group of toggle buttons with a visible selected state. */
+function Segmented({ label, options, value, onChange, pressedOverride }) {
+  return html`
+    <div class="segmented" role="group" aria-label=${label}>
+      ${options.map((o) => {
+        const on = pressedOverride ? pressedOverride(o.value) : o.value === value;
+        return html`<button type="button" class=${`seg${on ? ' seg-on' : ''}`} aria-pressed=${on ? 'true' : 'false'} title=${o.title} onClick=${() => onChange(o.value)}>${o.label}</button>`;
+      })}
+    </div>
+  `;
 }
 
-function RealtimePanel({ state }) {
-  if (!state || state.kind !== 'ok') {
-    return html`<${Panel} title="Right now"><${Placeholder} state=${state} /></${Panel}>`;
-  }
-  const data = state.data;
-  const max = Math.max(...data.per_minute, 1);
-  return html`
-    <${Panel}
-      title="Right now"
-      subtitle=${`Last ${data.window_minutes} minutes`}
-    >
-      <div class="realtime">
-        <div class="realtime-headline">
-          <div class="realtime-count">${num(data.current_visitors)}</div>
-          <div class="realtime-label">current visitors</div>
-        </div>
-        <div class="realtime-spark" aria-hidden="true">
-          ${data.per_minute.map(
-            (value) => html`<span class="spark-bar" style=${`height:${Math.max(2, (value / max) * 100)}%`}></span>`,
-          )}
-        </div>
+// Rows a breakdown asks for, in the order "Show more" steps through them. The
+// server caps a request at 1000; 250 is already more than a person scans, and
+// the list scrolls inside its panel instead of lengthening the page.
+const LIMIT_STEPS = [10, 50, 250];
+
+// Entry and exit pages are counted per visit, so their figure is a count of
+// visits that began or ended there. The server reports it as `sessions`, and
+// the other numbers are totals over those visits.
+const SESSION_COLUMNS = {
+  'entry-pages': [['Entrances', 'sessions'], ['Visitors', 'visitors']],
+  'exit-pages': [['Exits', 'sessions'], ['Visitors', 'visitors']],
+};
+const TAB_HELP = {
+  'entry-pages': 'Entrances: visits that began on this page, that is, whose first pageview was this one.',
+  'exit-pages': 'Exits: visits that ended on this page, that is, whose last pageview was this one.',
+};
+
+/** Tabbed group of breakdowns sharing one panel. Fully keyboard operable. */
+function BreakdownGroup({ group, active, data, limits, onTab, onFilter, onRetry, onLimit }) {
+  const current = data[`bd:${active}`];
+  const filterable = FILTERABLE_SLUGS.has(active);
+  const tabLabel = group.tabs.find((t) => t.slug === active).label;
+  const slugs = group.tabs.map((t) => t.slug);
+  const limit = limits[active] || LIMIT_STEPS[0];
+  const onKey = (event) => {
+    const i = slugs.indexOf(active);
+    const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: slugs.length - 1 }[event.key];
+    if (next === undefined) return;
+    event.preventDefault();
+    const slug = slugs[(next + slugs.length) % slugs.length];
+    onTab(group, slug);
+    requestAnimationFrame(() => document.getElementById(`tab-${slug}`)?.focus());
+  };
+  const panelId = `bd-${group.id}`;
+  const render = (rows) => {
+    const sessionCols = SESSION_COLUMNS[active];
+    // Older servers do not send `sessions`; fall back to the plain columns.
+    const columns = sessionCols && rows.length > 0 && rows.every((r) => typeof r.sessions === 'number') ? sessionCols : undefined;
+    const more = rows.length >= limit && limit < LIMIT_STEPS[LIMIT_STEPS.length - 1];
+    const nextLimit = LIMIT_STEPS[LIMIT_STEPS.indexOf(limit) + 1];
+    const scrolls = limit > LIMIT_STEPS[0] && rows.length > LIMIT_STEPS[0];
+    return html`
+      ${TAB_HELP[active] && html`<p class="table-note muted">${TAB_HELP[active]}</p>`}
+      <div class=${scrolls ? 'breakdown-scroll' : ''} tabindex=${scrolls ? '0' : undefined} role=${scrolls ? 'region' : undefined} aria-label=${scrolls ? `${tabLabel}, ${rows.length} rows` : undefined}>
+        <${BreakdownList} rows=${rows} label=${FILTER_LABELS[active] || tabLabel} columns=${columns} caption=${`${group.title}: ${tabLabel}`} onFilter=${filterable ? (value) => onFilter(active, value) : null} />
       </div>
-      <div class="realtime-lists">
-        <div>
-          <h3>Top pages</h3>
-          <${BreakdownList}
-            rows=${data.top_pages.map((p) => ({ ...p, pageviews: p.visitors }))}
-          />
+      ${(more || limit > LIMIT_STEPS[0]) &&
+      html`
+        <div class="list-more">
+          ${more && html`<button type="button" class="btn-link" onClick=${() => onLimit(active, nextLimit)}>Show more (up to ${nextLimit})</button>`}
+          ${limit > LIMIT_STEPS[0] && html`<button type="button" class="btn-link" onClick=${() => onLimit(active, LIMIT_STEPS[0])}>Show top ${LIMIT_STEPS[0]}</button>`}
+          <span class="muted" aria-live="polite">Showing ${num(rows.length)} ${rows.length === 1 ? 'row' : 'rows'}</span>
         </div>
-        <div>
-          <h3>Top sources</h3>
-          <${BreakdownList}
-            rows=${data.top_sources.map((p) => ({ ...p, pageviews: p.visitors }))}
-          />
-        </div>
+      `}
+    `;
+  };
+  return html`
+    <${Panel} id=${panelId} title=${group.title}>
+      <${Sentinel} onVisible=${() => onTab(group, active, true)} />
+      <div class="tab-strip" role="tablist" aria-label=${`${group.title} breakdowns`} onKeyDown=${onKey}>
+        ${group.tabs.map(
+          (tab) => html`
+            <button
+              type="button"
+              role="tab"
+              id=${`tab-${tab.slug}`}
+              aria-selected=${active === tab.slug ? 'true' : 'false'}
+              aria-controls=${`${panelId}-body`}
+              tabindex=${active === tab.slug ? '0' : '-1'}
+              class=${`tab${active === tab.slug ? ' tab-active' : ''}`}
+              onClick=${() => onTab(group, tab.slug)}
+            >${tab.label}</button>
+          `,
+        )}
+      </div>
+      <div class="tab-panel" id=${`${panelId}-body`} role="tabpanel" aria-labelledby=${`tab-${active}`}>
+        <${Async}
+          state=${current}
+          behavioral="compact"
+          skeleton=${html`<${SkelTable} />`}
+          onRetry=${() => onRetry(`bd:${active}`)}
+          render=${render}
+        />
       </div>
     </${Panel}>
   `;
 }
 
-function FunnelChart({ state }) {
-  if (!state || state.kind !== 'ok') return html`<${Placeholder} state=${state} />`;
-  const steps = state.data;
-  if (steps.length === 0) return html`<div class="placeholder">No funnel data</div>`;
-
-  const entered = steps[0].visitors;
+function RealtimePanel({ state, onRetry, onVisible, filtered }) {
   return html`
-    <div class="funnel">
-      ${steps.map(
-        (step) => html`
-          <div class="funnel-step">
-            <div class="funnel-meta">
-              <span class="funnel-step-name">Step ${step.step}</span>
-              <span class="funnel-step-figures">
-                ${num(step.visitors)} visitors · ${pct(step.conversion_rate)} of entrants
-                ${step.dropped_off > 0
-                  ? html`<span class="funnel-drop">−${num(step.dropped_off)} dropped</span>`
-                  : null}
-              </span>
+    <${Panel} id="realtime" title="Right now" subtitle=${state && state.kind === 'ok' ? `Last ${state.data.window_minutes} minutes` : undefined}>
+      <${Sentinel} onVisible=${onVisible} />
+      <${Async}
+        state=${state}
+        onRetry=${onRetry}
+        skeleton=${html`<${SkelTable} rows=${8} />`}
+        render=${(data) => {
+          const max = Math.max(...data.per_minute, 1);
+          const total = data.per_minute.reduce((a, b) => a + b, 0);
+          if (data.current_visitors === 0 && total === 0) {
+            return html`
+              <div class="placeholder realtime-empty">
+                <strong>No one is on ${filtered ? 'the filtered part of ' : ''}the site right now</strong>
+                <p>
+                  No pageviews in the last ${data.window_minutes} minutes${filtered ? ' that match the active filters' : ''}.
+                  This panel checks again every ${REALTIME_REFRESH_MS / 1000} seconds${state.offline ? html` <span class="offline-tag">(offline, retrying)</span>` : ''}.
+                </p>
+              </div>
+            `;
+          }
+          return html`
+            <div class="realtime">
+              <div class="realtime-headline">
+                <div class="realtime-count">${num(data.current_visitors)}</div>
+                <div class="realtime-label">current visitors${state.offline ? html` <span class="offline-tag">offline, retrying</span>` : ''}</div>
+              </div>
+              <div class="realtime-spark" role="img" aria-label=${`${num(total)} pageviews in the last ${data.window_minutes} minutes, one bar per minute`}>
+                ${data.per_minute.map((value, i) => html`<span class="spark-bar" title=${`${num(value)} ${i === data.per_minute.length - 1 ? 'in the current minute' : `${data.per_minute.length - 1 - i} min ago`}`} style=${{ height: `${Math.max(4, (value / max) * 100)}%` }}></span>`)}
+              </div>
             </div>
-            <div class="funnel-track">
-              <div
-                class="funnel-fill"
-                style=${`width:${entered > 0 ? (step.visitors / entered) * 100 : 0}%`}
-              ></div>
+            <div class="realtime-lists">
+              <div>
+                <h3>Top pages</h3>
+                <${BreakdownList} rows=${data.top_pages} label="Page" columns=${[['Visitors', 'visitors']]} caption="Top pages right now" empty="No pageviews in this window" />
+              </div>
+              <div>
+                <h3>Top sources</h3>
+                <${BreakdownList} rows=${data.top_sources} label="Source" columns=${[['Visitors', 'visitors']]} caption="Top sources right now" empty="No sources in this window" />
+              </div>
             </div>
-          </div>
-        `,
-      )}
-    </div>
+          `;
+        }}
+      />
+    </${Panel}>
   `;
 }
 
-function RetentionGrid({ state }) {
-  if (!state || state.kind !== 'ok') return html`<${Placeholder} state=${state} />`;
-  const { cohorts, caveat } = state.data;
-  if (!cohorts || cohorts.length === 0) {
-    return html`
-      ${caveat && html`<div class="notice">${caveat}</div>`}
-      <div class="placeholder">No cohorts in this period</div>
-    `;
-  }
-
-  const width = Math.max(...cohorts.map((c) => c.retained.length));
+function FunnelChart({ steps, specs }) {
+  if (steps.length === 0) return html`<${Empty}>No funnel data</${Empty}>`;
+  const entered = steps[0].visitors;
   return html`
-    ${caveat && html`<div class="notice">${caveat}</div>`}
-    <div class="table-scroll">
+    <ol class="funnel">
+      ${steps.map(
+        (step, i) => html`
+          <li class="funnel-step">
+            <div class="funnel-meta">
+              <span class="funnel-step-name">Step ${step.step}${specs[i] ? html` <code title=${specs[i]}>${specs[i]}</code>` : ''}</span>
+              <span class="funnel-step-figures">
+                ${num(step.visitors)} visitors · ${pct(step.conversion_rate)} of entrants
+                ${step.dropped_off > 0 ? html`<span class="funnel-drop">−${num(step.dropped_off)} dropped</span>` : null}
+              </span>
+            </div>
+            <div class="funnel-track" aria-hidden="true">
+              <div class="funnel-fill" style=${{ width: `${entered > 0 ? (step.visitors / entered) * 100 : 0}%` }}></div>
+            </div>
+          </li>
+        `,
+      )}
+    </ol>
+  `;
+}
+
+// Weeks requested from the retention report, and so how long a visitor ID has
+// to survive for the later columns to mean anything: week N needs 7 x N days.
+const RETENTION_WEEKS = 4;
+const RETENTION_MIN_ROTATION_DAYS = (RETENTION_WEEKS - 1) * 7;
+
+/**
+ * Weekly cohorts.
+ *
+ * A cell is only a percentage when its week is over. Weeks that have not
+ * finished (`complete_weeks`) are not yet a measurement, and printing them as 0%
+ * told people nobody came back when the week had simply not happened. A cohort
+ * whose first week began before the report's start (`partial_first_week`) is
+ * missing the visitors first seen earlier that week, so it is labelled.
+ */
+function RetentionGrid({ data }) {
+  const { cohorts, identity_supports_cohorts: supported, visitor_salt_rotation_days: rotation } = data;
+  // An informational note, not an error: nothing is broken, the server is set up
+  // to forget visitors faster than this report needs it to remember them.
+  const notice =
+    supported === false &&
+    html`
+      <div class="notice notice-info" role="note">
+        <strong>Weeks after the first cannot be measured with the current setting.</strong>
+        Retention follows the same visitor from one week to the next, but this server replaces visitor
+        IDs${Number.isFinite(rotation) ? html` every ${rotation} day${rotation === 1 ? '' : 's'}` : ' sooner than that'}, so a returning visitor looks like a new one. To measure ${RETENTION_WEEKS}-week
+        cohorts, set <code>visitor_salt_rotation_days</code> (environment variable${' '}
+        <code>MALLARD_VISITOR_SALT_ROTATION_DAYS</code>) to at least ${RETENTION_MIN_ROTATION_DAYS} and
+        restart. It applies to events collected from then on, and a longer setting lets a visitor be
+        recognised for longer.
+      </div>
+    `;
+  if (!cohorts || cohorts.length === 0) {
+    return html`${notice}<${Empty}>No cohorts in this period</${Empty}>`;
+  }
+  const width = Math.max(...cohorts.map((c) => c.retained.length));
+  const stateOf = (row, i) => retentionCellState(row, i, supported);
+  const anyPending = cohorts.some((row) => row.retention_rates.some((_, i) => stateOf(row, i) === 'pending'));
+  const anyPartial = cohorts.some((row) => row.partial_first_week);
+  return html`
+    ${notice}
+    <div class="table-scroll retention-scroll" tabindex="0" role="region" aria-label="Retention cohort table. Scroll sideways to see later weeks.">
       <table class="data-table retention-table">
+        <caption class="sr-only">Share of each weekly cohort that returned in each following week</caption>
         <thead>
           <tr>
-            <th>Cohort</th>
-            <th class="numeric">Size</th>
-            ${Array.from({ length: width }, (_, i) => html`<th class="numeric">W${i}</th>`)}
+            <th scope="col">Cohort (week of)</th>
+            <th scope="col" class="numeric">Size</th>
+            ${Array.from({ length: width }, (_, i) => html`<th scope="col" class="numeric" title=${i === 0 ? 'The cohort week itself' : `${i} week${i === 1 ? '' : 's'} later`}>${i === 0 ? 'Week 0' : `Week ${i}`}</th>`)}
           </tr>
         </thead>
         <tbody>
           ${cohorts.map(
             (row) => html`
               <tr>
-                <td>${row.cohort_date}</td>
+                <th scope="row">
+                  ${fmtDate(row.cohort_date)}
+                  ${row.partial_first_week && html` <span class="tag" title="This cohort's first week began before the report's start date, so visitors first seen earlier that week are not counted.">partial week</span>`}
+                </th>
                 <td class="numeric">${num(row.cohort_size)}</td>
-                ${row.retention_rates.map(
-                  (rate, i) => html`
-                    <td
-                      class="numeric retention-cell"
-                      style=${`background-color: color-mix(in srgb, var(--accent) ${Math.round(rate * 70)}%, transparent)`}
-                      title=${`${num(row.retained[i])} of ${num(row.cohort_size)}`}
-                    >
-                      ${pct(rate, 0)}
-                    </td>
-                  `,
+                ${row.retention_rates.map((rate, i) =>
+                  stateOf(row, i) === 'value'
+                    ? html`<td class="numeric retention-cell" style=${{ '--r': Math.min(1, Math.max(0, rate)) }} title=${`${num(row.retained[i])} of ${num(row.cohort_size)}`}>${pct(rate, 0)}</td>`
+                    : html`<td class="numeric retention-pending" title=${stateOf(row, i) === 'unmeasurable' ? 'Not measurable: visitor IDs do not last this long' : 'This week has not finished yet'}><span aria-hidden="true">–</span><span class="sr-only">${stateOf(row, i) === 'unmeasurable' ? 'not measurable' : 'not finished yet'}</span></td>`,
                 )}
               </tr>
             `,
@@ -474,66 +859,54 @@ function RetentionGrid({ state }) {
         </tbody>
       </table>
     </div>
+    ${(anyPending || anyPartial) &&
+    html`<p class="table-note muted">
+      ${anyPending ? html`A dash means that week has not finished yet, so there is nothing to compare. ` : ''}
+      ${anyPartial ? html`A partial-week cohort began before the start of the report, so it leaves out visitors first seen earlier that week.` : ''}
+    </p>`}
   `;
 }
 
-function RevenuePanel({ state }) {
-  if (!state || state.kind !== 'ok') {
-    return html`<${Panel} title="Revenue"><${Placeholder} state=${state} /></${Panel}>`;
-  }
-  const report = state.data;
-  if (report.by_currency.length === 0) {
-    return html`
-      <${Panel} title="Revenue" subtitle="Send a revenue amount with mallard() to populate this">
-        <div class="placeholder">No revenue recorded in this period</div>
-      </${Panel}>
-    `;
-  }
+function MoneyTable({ rows, label }) {
   return html`
-    <${Panel} title="Revenue" subtitle="Totals are reported per currency and never summed across them">
-      <div class="metrics-grid">
-        ${report.by_currency.map(
-          (row) => html`
-            <${MetricCard}
-              label=${`${row.currency} revenue`}
-              value=${money(row.total, row.currency)}
-              hint=${`${num(row.transactions)} orders · ${money(row.average_order_value, row.currency)} average`}
-            />
-          `,
-        )}
-      </div>
-      <div class="two-column">
-        <div>
-          <h3>By event</h3>
-          <table class="data-table">
-            <thead><tr><th>Event</th><th class="numeric">Revenue</th><th class="numeric">Orders</th></tr></thead>
-            <tbody>
-              ${report.by_event.map(
-                (row) => html`<tr>
-                  <td>${row.value}</td>
-                  <td class="numeric">${money(row.total, row.currency)}</td>
-                  <td class="numeric">${num(row.transactions)}</td>
-                </tr>`,
-              )}
-            </tbody>
-          </table>
-        </div>
-        <div>
-          <h3>By page</h3>
-          <table class="data-table">
-            <thead><tr><th>Page</th><th class="numeric">Revenue</th><th class="numeric">Orders</th></tr></thead>
-            <tbody>
-              ${report.by_page.map(
-                (row) => html`<tr>
-                  <td>${row.value}</td>
-                  <td class="numeric">${money(row.total, row.currency)}</td>
-                  <td class="numeric">${num(row.transactions)}</td>
-                </tr>`,
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
+    <div class="table-scroll">
+      <table class="data-table">
+        <thead><tr><th scope="col">${label}</th><th scope="col" class="numeric">Revenue</th><th scope="col" class="numeric">Orders</th></tr></thead>
+        <tbody>
+          ${rows.map((row) => html`<tr>
+            <td class="cell-text" title=${row.value}>${row.value}</td>
+            <td class="numeric">${money(row.total, row.currency)}</td>
+            <td class="numeric">${num(row.transactions)}</td>
+          </tr>`)}
+        </tbody>
+      </table>
+    </div>
+  `;
+}
+
+function RevenuePanel({ state, onRetry, onVisible }) {
+  const report = state && state.kind === 'ok' ? state.data : null;
+  const none = report && Array.isArray(report.by_currency) && report.by_currency.length === 0;
+  return html`
+    <${Panel} id="revenue" title="Revenue" subtitle=${none ? 'Send a revenue amount with mallard() to populate this' : 'Totals are reported per currency and never summed across them'}>
+      <${Sentinel} onVisible=${onVisible} />
+      <${Async}
+        state=${state}
+        onRetry=${onRetry}
+        skeleton=${html`<${SkelCards} count=${2} />`}
+        render=${(r) =>
+          r.by_currency.length === 0
+            ? html`<${Empty}>No revenue recorded in this period</${Empty}>`
+            : html`
+                <dl class="metrics-grid">
+                  ${r.by_currency.map((row) => html`<${MetricCard} label=${`${row.currency} revenue`} value=${money(row.total, row.currency)} hint=${`${num(row.transactions)} orders · ${money(row.average_order_value, row.currency)} average`} />`)}
+                </dl>
+                <div class="two-column">
+                  <div><h3>By event</h3><${MoneyTable} rows=${r.by_event} label="Event" /></div>
+                  <div><h3>By page</h3><${MoneyTable} rows=${r.by_page} label="Page" /></div>
+                </div>
+              `}
+      />
     </${Panel}>
   `;
 }
@@ -543,51 +916,51 @@ class GoalsPanel extends Component {
   constructor() {
     super();
     this.state = { propertyKey: '', values: null };
+    this.token = 0;
   }
 
   async loadValues(key) {
+    const token = ++this.token;
     if (!key) {
       this.setState({ propertyKey: '', values: null });
       return;
     }
     this.setState({ propertyKey: key, values: { loading: true } });
-    const query = `${this.props.query}&key=${encodeURIComponent(key)}`;
-    this.setState({ values: await getJSON(`/api/stats/property-values?${query}`) });
+    const values = await api.get(`/api/stats/property-values?${this.props.query}&key=${encodeURIComponent(key)}`);
+    if (token === this.token) this.setState({ values });
   }
 
-  render({ goals, propertyKeys }, { propertyKey, values }) {
+  componentDidUpdate(prev) {
+    // A new range or segment makes the old drill-down stale.
+    if (prev.query !== this.props.query && this.state.propertyKey) this.loadValues(this.state.propertyKey);
+  }
+
+  render({ goals, propertyKeys, onRetry, onVisible }, { propertyKey, values }) {
     return html`
-      <${Panel}
-        title="Goals & custom events"
-        subtitle="Every event other than a pageview, with the share of visitors who triggered it"
-      >
-        ${goals && goals.kind !== 'ok'
-          ? html`<${Placeholder} state=${goals} />`
-          : (goals && goals.data.length > 0
-              ? html`
-                  <table class="data-table">
-                    <thead>
-                      <tr>
-                        <th>Event</th>
-                        <th class="numeric">Visitors</th>
-                        <th class="numeric">Events</th>
-                        <th class="numeric">Conversion</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      ${goals.data.map(
-                        (row) => html`<tr>
-                          <td>${row.name}</td>
+      <${Panel} id="goals" title="Goals & custom events" subtitle="Every event other than a pageview, with the share of visitors who triggered it">
+        <${Sentinel} onVisible=${onVisible} />
+        <${Async}
+          state=${goals}
+          onRetry=${() => onRetry('goals')}
+          render=${(rows) =>
+            rows.length === 0
+              ? html`<${Empty}>No custom events in this period</${Empty}>`
+              : html`
+                  <div class="table-scroll">
+                    <table class="data-table">
+                      <thead><tr><th scope="col">Event</th><th scope="col" class="numeric">Visitors</th><th scope="col" class="numeric">Events</th><th scope="col" class="numeric">Conversion</th></tr></thead>
+                      <tbody>
+                        ${rows.map((row) => html`<tr>
+                          <td class="cell-text" title=${row.name}>${row.name}</td>
                           <td class="numeric">${num(row.visitors)}</td>
                           <td class="numeric">${num(row.events)}</td>
                           <td class="numeric">${pct(row.conversion_rate)}</td>
-                        </tr>`,
-                      )}
-                    </tbody>
-                  </table>
-                `
-              : html`<div class="placeholder">No custom events in this period</div>`)}
-
+                        </tr>`)}
+                      </tbody>
+                    </table>
+                  </div>
+                `}
+        />
         ${propertyKeys && propertyKeys.kind === 'ok' && propertyKeys.data.length > 0
           ? html`
               <div class="property-drilldown">
@@ -598,9 +971,8 @@ class GoalsPanel extends Component {
                     ${propertyKeys.data.map((key) => html`<option value=${key}>${key}</option>`)}
                   </select>
                 </label>
-                ${values && values.kind === 'ok'
-                  ? html`<${BreakdownList} rows=${values.data.map((v) => ({ ...v, pageviews: v.events }))} />`
-                  : html`<${Placeholder} state=${values} />`}
+                ${values &&
+                html`<${Async} state=${values} onRetry=${() => this.loadValues(propertyKey)} render=${(rows) => html`<${BreakdownList} rows=${rows} label=${propertyKey} columns=${[['Events', 'events']]} />`} />`}
               </div>
             `
           : null}
@@ -609,29 +981,168 @@ class GoalsPanel extends Component {
   }
 }
 
+/* ── Copy and install ──────────────────────────────────────────────────── */
+
+/** Copy text, with a selection fallback for plain-HTTP origins where the Clipboard API is blocked. */
+async function copyText(text, fallbackEl) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (e) {
+    /* fall through to the selection fallback */
+  }
+  try {
+    if (fallbackEl) {
+      const range = document.createRange();
+      range.selectNodeContents(fallbackEl);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return document.execCommand('copy');
+    }
+  } catch (e) {
+    /* nothing more to try */
+  }
+  return false;
+}
+
+class CopyButton extends Component {
+  constructor() {
+    super();
+    this.state = { status: '' };
+  }
+
+  componentWillUnmount() {
+    clearTimeout(this.timer);
+  }
+
+  async copy() {
+    const ok = await copyText(this.props.text, this.props.source?.current);
+    this.setState({ status: ok ? 'Copied to clipboard' : 'Copy failed: select the text and copy it manually' });
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.setState({ status: '' }), 2500);
+  }
+
+  render({ label = 'Copy' }, { status }) {
+    return html`
+      <button type="button" class="btn-secondary" onClick=${() => this.copy()}>${status === 'Copied to clipboard' ? 'Copied' : label}</button>
+      <span class="sr-only" role="status">${status}</span>
+      ${status && status !== 'Copied to clipboard' && html`<span class="copy-status" aria-hidden="true">${status}</span>`}
+    `;
+  }
+}
+
+function snippetFor(site) {
+  return `<script defer data-domain="${site || 'yourdomain.com'}"\n  src="${location.origin}/mallard.js"></script>`;
+}
+
+function Snippet({ site }) {
+  const code = snippetFor(site);
+  const ref = createRef();
+  return html`
+    <div class="snippet">
+      <pre class="snippet-code" tabindex="0" aria-label="Tracking snippet"><code ref=${ref}>${code}</code></pre>
+      <${CopyButton} text=${code} source=${ref} label="Copy snippet" />
+    </div>
+  `;
+}
+
+function InstallPanel({ site, onClose }) {
+  return html`
+    <${ToolPanel} id="install" title="Install the tracking snippet" subtitle=${`Add this to every page of ${site || 'your site'}, before the closing </head> tag.`} onClose=${onClose}>
+      <${Snippet} site=${site} />
+      <p class="muted">
+        Pageviews are recorded automatically, including single-page-app navigation. Optional
+        attributes such as <code>data-exclude</code>, <code>data-outbound</code> and${' '}
+        <code>data-hash</code> are described in the tracking script's header. Record a custom event
+        or revenue from your own code with <code>mallard('signup')</code> or${' '}
+        <code>mallard('purchase', { revenue: 49, currency: 'USD' })</code>.
+      </p>
+    </${ToolPanel}>
+  `;
+}
+
+function Welcome({ siteDraft, onDraft, onUse }) {
+  return html`
+    <${Panel} id="welcome" title="Welcome to Mallard Metrics" subtitle="No site has reported an event yet.">
+      <p>Add the tracking snippet to your site. The site appears in the selector as soon as its first pageview arrives.</p>
+      <form class="inline-controls" onSubmit=${(e) => { e.preventDefault(); onUse(); }}>
+        <label for="welcome-site">Your site's domain<input id="welcome-site" type="text" value=${siteDraft} placeholder="example.com" autocomplete="off" onInput=${(e) => onDraft(e.target.value.trim())} /></label>
+        <button type="submit" class="btn-secondary">Look up this site</button>
+      </form>
+      <${Snippet} site=${siteDraft} />
+    </${Panel}>
+  `;
+}
+
+/** A panel opened from the header: takes focus when it appears, closes with Escape. */
+class ToolPanel extends Component {
+  componentDidMount() {
+    const heading = this.base.querySelector('h2');
+    if (heading) heading.focus();
+    if (this.base.scrollIntoView) this.base.scrollIntoView({ block: 'nearest' });
+  }
+
+  render({ id, title, subtitle, onClose, children }) {
+    return html`
+      <div onKeyDown=${(e) => e.key === 'Escape' && onClose()}>
+        <${Panel} id=${id} title=${title} subtitle=${subtitle} focusTitle=${true} actions=${html`<button type="button" class="btn-secondary" onClick=${onClose}>Close</button>`}>
+          ${children}
+        </${Panel}>
+      </div>
+    `;
+  }
+}
+
 /* ── Authentication ────────────────────────────────────────────────────── */
 
 /**
- * API key management.
- *
- * `POST/GET/DELETE /api/keys` shipped with no way to reach them from the
- * dashboard, so issuing a key for a script or a Grafana scrape meant hand-
- * writing a curl command with a session cookie pasted out of devtools. The
- * plaintext key is returned once and never again, which is exactly the kind of
- * thing a UI should be careful about — so it stays on screen until dismissed
- * rather than disappearing on the next render.
+ * API key management. The plaintext key is returned once and never again, so it
+ * stays on screen until dismissed rather than vanishing on the next render.
  */
+/** Snapshot the data on the server. Admin only: a 403 or 409 is shown in the server's own words. */
+class BackupSection extends Component {
+  constructor() {
+    super();
+    this.state = { busy: false, result: null };
+  }
+
+  async run() {
+    this.setState({ busy: true, result: null });
+    const res = await api.send('POST', '/api/admin/backup');
+    if (res.kind === 'unauthorized') return this.props.onAuthExpired();
+    this.setState({
+      busy: false,
+      result: res.kind === 'ok'
+        ? { ok: true, ...res.data }
+        : { ok: false, message: res.status === 403 ? 'This needs an admin key or an admin session.' : res.message },
+    });
+  }
+
+  render(_, { busy, result }) {
+    return html`
+      <section aria-labelledby="backup-title">
+        <h3 class="subhead" id="backup-title">Backup</h3>
+        <p class="muted">Snapshot the database and event files into the server's <code>backups</code> folder while it keeps running. Restoring is done on the server.</p>
+        <div class="inline-controls">
+          <button type="button" class="btn-secondary" disabled=${busy} onClick=${() => this.run()}>${busy ? 'Creating backup…' : 'Create backup'}</button>
+        </div>
+        <div role="status">
+          ${result && result.ok && html`<p>Backup <strong>${result.name}</strong> created: <code>${result.path}</code> (${num(result.hot_rows)} recent events, ${num(result.parquet_files)} archive files).</p>`}
+          ${result && !result.ok && html`<div class="placeholder placeholder-error">${result.message}</div>`}
+        </div>
+      </section>
+    `;
+  }
+}
+
 class KeysPanel extends Component {
   constructor() {
     super();
-    this.state = {
-      keys: null,
-      name: '',
-      scope: 'ReadOnly',
-      created: null,
-      error: null,
-      busy: false,
-    };
+    this.state = { keys: null, name: '', scope: 'ReadOnly', created: null, error: null, busy: false };
+    this.keyRef = createRef();
   }
 
   componentDidMount() {
@@ -639,13 +1150,10 @@ class KeysPanel extends Component {
   }
 
   async load() {
-    const result = await getJSON('/api/keys');
+    const result = await api.get('/api/keys');
     if (result.kind === 'unauthorized') return this.props.onAuthExpired();
-    if (result.kind === 'ok') {
-      this.setState({ keys: result.data, error: null });
-    } else {
-      this.setState({ keys: [], error: result.message });
-    }
+    if (result.kind === 'ok') this.setState({ keys: result.data, error: null });
+    else this.setState({ keys: this.state.keys || [], error: result.message });
   }
 
   async create(event) {
@@ -653,77 +1161,45 @@ class KeysPanel extends Component {
     const name = this.state.name.trim();
     if (!name) return;
     this.setState({ busy: true, error: null });
-    try {
-      const res = await fetch('/api/keys', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, scope: this.state.scope }),
-      });
-      const body = await res.json().catch(() => ({}));
-      if (res.ok) {
-        this.setState({ created: body, name: '', busy: false });
-        await this.load();
-      } else {
-        this.setState({ error: body.error || `Error ${res.status}`, busy: false });
-      }
-    } catch (e) {
-      this.setState({ error: 'Could not reach the server.', busy: false });
+    const res = await api.send('POST', '/api/keys', { name, scope: this.state.scope });
+    if (res.kind === 'unauthorized') return this.props.onAuthExpired();
+    if (res.kind === 'ok') {
+      this.setState({ created: res.data, name: '', busy: false });
+      await this.load();
+    } else {
+      this.setState({ error: res.message, busy: false });
     }
   }
 
   async revoke(keyHash, name) {
-    // A revoked key stops working immediately and cannot be restored, so the
-    // one destructive action in this panel asks first.
-    if (!window.confirm(`Revoke the API key "${name}"? Anything using it stops working immediately.`)) {
-      return;
-    }
+    // A revoked key stops working immediately and cannot be restored, so the one
+    // destructive action in this panel asks first.
+    if (!window.confirm(`Revoke the API key "${name}"? Anything using it stops working immediately.`)) return;
     this.setState({ busy: true, error: null });
-    try {
-      const res = await fetch(`/api/keys/${encodeURIComponent(keyHash)}`, { method: 'DELETE' });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        this.setState({ error: body.error || `Error ${res.status}` });
-      }
-    } catch (e) {
-      this.setState({ error: 'Could not reach the server.' });
-    }
-    this.setState({ busy: false });
+    const res = await api.send('DELETE', `/api/keys/${encodeURIComponent(keyHash)}`);
+    if (res.kind === 'unauthorized') return this.props.onAuthExpired();
+    this.setState({ busy: false, error: res.kind === 'ok' ? null : res.message });
     await this.load();
   }
 
   render({ onClose }, { keys, name, scope, created, error, busy }) {
     const live = (keys || []).filter((k) => !k.revoked);
     return html`
-      <${Panel}
-        title="API keys"
-        subtitle="Programmatic access to the stats endpoints. Keys are stored as SHA-256 hashes; the key itself is shown once."
-        actions=${html`<button class="btn-secondary" onClick=${onClose}>Close</button>`}
-      >
-        ${created &&
-        html`
+      <${ToolPanel} id="keys" title="API keys" onClose=${onClose}
+        subtitle="Programmatic access to the stats endpoints. Keys are stored as SHA-256 hashes; the key itself is shown once.">
+        ${created && html`
           <div class="banner banner-key" role="alert">
             <strong>Copy this key now — it is not shown again.</strong>
-            <code class="key-value">${created.key}</code>
-            <button class="btn-secondary" onClick=${() => this.setState({ created: null })}>
-              Done
-            </button>
+            <code class="key-value" ref=${this.keyRef}>${created.key}</code>
+            <${CopyButton} text=${created.key} source=${this.keyRef} label="Copy key" />
+            <button type="button" class="btn-secondary" onClick=${() => this.setState({ created: null })}>Done</button>
           </div>
         `}
-
         <form class="inline-controls" onSubmit=${(e) => this.create(e)}>
-          <label>
-            Name
-            <input
-              type="text"
-              value=${name}
-              maxlength="128"
-              placeholder="grafana-scraper"
-              onInput=${(e) => this.setState({ name: e.target.value })}
-              required
-            />
+          <label>Name
+            <input type="text" value=${name} maxlength="128" placeholder="grafana-scraper" autocomplete="off" onInput=${(e) => this.setState({ name: e.target.value })} required />
           </label>
-          <label>
-            Scope
+          <label>Scope
             <select value=${scope} onChange=${(e) => this.setState({ scope: e.target.value })}>
               <option value="ReadOnly">Read only — stats endpoints</option>
               <option value="Admin">Admin — also key management and erasure</option>
@@ -731,48 +1207,264 @@ class KeysPanel extends Component {
           </label>
           <button type="submit" disabled=${busy || !name.trim()}>Create key</button>
         </form>
-
-        ${error && html`<div class="placeholder placeholder-error">${error}</div>`}
-
+        ${error && html`<div class="placeholder placeholder-error" role="alert">${error}</div>`}
         ${keys === null
-          ? html`<div class="placeholder">Loading…</div>`
+          ? html`<${SkelRows} rows=${2} />`
           : live.length === 0
-            ? html`<div class="placeholder">No API keys yet</div>`
+            ? html`<${Empty}>No API keys yet</${Empty}>`
             : html`
-                <table class="data-table">
-                  <thead>
-                    <tr>
-                      <th>Name</th>
-                      <th>Scope</th>
-                      <th>Created</th>
-                      <th>Fingerprint</th>
-                      <th></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    ${live.map(
-                      (key) => html`
+                <div class="table-scroll">
+                  <table class="data-table">
+                    <thead><tr><th scope="col">Name</th><th scope="col">Scope</th><th scope="col">Created</th><th scope="col">Fingerprint</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+                    <tbody>
+                      ${live.map((key) => html`
                         <tr>
-                          <td>${key.name}</td>
+                          <td class="cell-text" title=${key.name}>${key.name}</td>
                           <td>${key.scope === 'Admin' ? 'Admin' : 'Read only'}</td>
-                          <td>${key.created_at.slice(0, 10)}</td>
-                          <td><code>${key.key_hash.slice(0, 12)}…</code></td>
+                          <td>${fmtDate(key.created_at)}</td>
+                          <td><code>${String(key.key_hash).slice(0, 12)}…</code></td>
+                          <td><button type="button" class="btn-secondary" disabled=${busy} onClick=${() => this.revoke(key.key_hash, key.name)}>Revoke<span class="sr-only"> ${key.name}</span></button></td>
+                        </tr>
+                      `)}
+                    </tbody>
+                  </table>
+                </div>
+              `}
+        <${BackupSection} onAuthExpired=${this.props.onAuthExpired} />
+      </${ToolPanel}>
+    `;
+  }
+}
+
+/** "Oct 21, 2026, 2:05 PM" in UTC, for when something last happened. */
+const fmtWhen = (text) => (text ? `${fmtDate(text)}, ${fmtHour(text)}` : DASH);
+
+/** The filters of a saved segment as a sentence fragment: "Browser is Chrome · Country is not US". */
+function describeSegment(text) {
+  const filters = parseFilters(text, null);
+  if (filters.length === 0) return text;
+  return filters.map((f) => `${FILTER_LABELS[f.dimension] || f.dimension} ${f.negated ? 'is not' : 'is'} ${f.value}`).join(' · ');
+}
+
+/**
+ * Saved segments for the selected site. A segment is a named set of filters
+ * kept on the server; the toolbar's Segment menu applies one, and a share link
+ * can be limited to one. Saving takes the filters currently on screen.
+ */
+class SegmentsPanel extends Component {
+  constructor() {
+    super();
+    this.state = { name: '', busy: false, error: null, editing: null, editName: '' };
+  }
+
+  async call(method, url, payload) {
+    this.setState({ busy: true, error: null });
+    const res = await api.send(method, url, payload);
+    if (res.kind === 'unauthorized') {
+      this.props.onAuthExpired();
+      return false;
+    }
+    this.setState({ busy: false, error: res.kind === 'ok' ? null : res.message });
+    if (res.kind === 'ok') await this.props.onChanged();
+    return res.kind === 'ok';
+  }
+
+  async save(event) {
+    event.preventDefault();
+    const name = this.state.name.trim();
+    const { site, filters } = this.props;
+    if (!name || filters.length === 0) return;
+    if (await this.call('POST', '/api/segments', { site_id: site, name, filters: serializeFilters(filters) })) this.setState({ name: '' });
+  }
+
+  async rename(segment, event) {
+    event.preventDefault();
+    const name = this.state.editName.trim();
+    if (!name) return;
+    if (await this.call('POST', `/api/segments/${encodeURIComponent(segment.id)}`, { name })) this.setState({ editing: null });
+  }
+
+  overwrite(segment) {
+    return this.call('POST', `/api/segments/${encodeURIComponent(segment.id)}`, { filters: serializeFilters(this.props.filters) });
+  }
+
+  remove(segment) {
+    // Links already made from a segment keep the filters they were made with.
+    if (!window.confirm(`Delete the segment "${segment.name}"? Share links already made from it keep working.`)) return;
+    return this.call('DELETE', `/api/segments/${encodeURIComponent(segment.id)}`);
+  }
+
+  render({ site, segments, filters, onApply, onClose }, { name, busy, error, editing, editName }) {
+    const hasFilters = filters.length > 0;
+    return html`
+      <${ToolPanel} id="segments" title="Segments" onClose=${onClose}
+        subtitle=${`Named sets of filters for ${site}. Pick one from the Segment menu to apply it, or limit a share link to one.`}>
+        <form class="inline-controls" onSubmit=${(e) => this.save(e)}>
+          <label>Name
+            <input type="text" value=${name} maxlength="64" placeholder="Desktop Chrome" autocomplete="off" onInput=${(e) => this.setState({ name: e.target.value })} required />
+          </label>
+          <button type="submit" disabled=${busy || !name.trim() || !hasFilters}>Save current filters</button>
+        </form>
+        ${!hasFilters && html`<p class="muted">Click a value in any breakdown to add a filter, then save the filters as a segment.</p>`}
+        ${hasFilters && html`<p class="muted">Saves: ${describeSegment(serializeFilters(filters))}</p>`}
+        ${error && html`<div class="placeholder placeholder-error" role="alert">${error}</div>`}
+        ${segments === null
+          ? html`<${SkelRows} rows=${2} />`
+          : segments.length === 0
+            ? html`<${Empty}>No segments for this site yet</${Empty}>`
+            : html`
+                <div class="table-scroll" tabindex="0" role="region" aria-label="Saved segments">
+                  <table class="data-table">
+                    <thead><tr><th scope="col">Name</th><th scope="col">Filters</th><th scope="col"><span class="sr-only">Actions</span></th></tr></thead>
+                    <tbody>
+                      ${segments.map((segment) => html`
+                        <tr>
+                          <td class="cell-text" title=${segment.name}>
+                            ${editing === segment.id
+                              ? html`<form class="inline-controls inline-edit" onSubmit=${(e) => this.rename(segment, e)}>
+                                  <label><span class="sr-only">New name for ${segment.name}</span>
+                                    <input type="text" value=${editName} maxlength="64" autocomplete="off" onInput=${(e) => this.setState({ editName: e.target.value })} required />
+                                  </label>
+                                  <button type="submit" disabled=${busy || !editName.trim()}>Save</button>
+                                  <button type="button" class="btn-secondary" onClick=${() => this.setState({ editing: null })}>Cancel</button>
+                                </form>`
+                              : segment.name}
+                          </td>
+                          <td class="cell-wrap">${describeSegment(segment.filters)}</td>
                           <td>
-                            <button
-                              class="btn-secondary"
-                              disabled=${busy}
-                              onClick=${() => this.revoke(key.key_hash, key.name)}
-                            >
-                              Revoke
-                            </button>
+                            <div class="row-actions">
+                              <button type="button" class="btn-secondary" onClick=${() => onApply(segment)}>Apply<span class="sr-only"> ${segment.name}</span></button>
+                              <button type="button" class="btn-secondary" disabled=${busy} onClick=${() => this.setState({ editing: segment.id, editName: segment.name })}>Rename<span class="sr-only"> ${segment.name}</span></button>
+                              <button type="button" class="btn-secondary" disabled=${busy || !hasFilters} title=${hasFilters ? 'Replace its filters with the ones on screen' : 'Add a filter first'} onClick=${() => this.overwrite(segment)}>Use current filters<span class="sr-only"> for ${segment.name}</span></button>
+                              <button type="button" class="btn-secondary" disabled=${busy} onClick=${() => this.remove(segment)}>Delete<span class="sr-only"> ${segment.name}</span></button>
+                            </div>
                           </td>
                         </tr>
-                      `,
-                    )}
-                  </tbody>
-                </table>
+                      `)}
+                    </tbody>
+                  </table>
+                </div>
               `}
-      </${Panel}>
+      </${ToolPanel}>
+    `;
+  }
+}
+
+/**
+ * Share links: a revocable, read-only, no-login view of one site, optionally
+ * limited to a saved segment. The link is shown once, at creation; the server
+ * keeps only a hash, so it cannot be shown again.
+ */
+class SharePanel extends Component {
+  constructor() {
+    super();
+    this.state = { links: null, label: '', segmentId: '', expiry: '30', created: null, error: null, busy: false };
+    this.linkRef = createRef();
+  }
+
+  componentDidMount() {
+    this.load();
+  }
+
+  async load() {
+    const res = await api.get('/api/share-links');
+    if (res.kind === 'unauthorized') return this.props.onAuthExpired();
+    if (res.kind === 'ok') this.setState({ links: res.data, error: null });
+    else this.setState({ links: this.state.links || [], error: res.message });
+  }
+
+  async create(event) {
+    event.preventDefault();
+    const label = this.state.label.trim();
+    if (!label) return;
+    const body = { label, site_id: this.props.site };
+    if (this.state.segmentId) body.segment_id = this.state.segmentId;
+    const days = expiryDays(this.state.expiry);
+    if (days) body.expires_in_days = days;
+    this.setState({ busy: true, error: null });
+    const res = await api.send('POST', '/api/share-links', body);
+    if (res.kind === 'unauthorized') return this.props.onAuthExpired();
+    if (res.kind === 'ok') {
+      const { token, ...link } = res.data;
+      this.setState({ created: { ...link, url: shareLink(location.origin, token) }, label: '', busy: false });
+      await this.load();
+    } else {
+      this.setState({ error: res.message, busy: false });
+    }
+  }
+
+  async revoke(link) {
+    if (!window.confirm(`Revoke the share link "${link.label}"? Anyone using it loses access on their next request.`)) return;
+    this.setState({ busy: true, error: null });
+    const res = await api.send('DELETE', `/api/share-links/${encodeURIComponent(link.id)}`);
+    if (res.kind === 'unauthorized') return this.props.onAuthExpired();
+    this.setState({ busy: false, error: res.kind === 'ok' ? null : res.message });
+    await this.load();
+  }
+
+  render({ site, segments, onClose }, { links, label, segmentId, expiry, created, error, busy }) {
+    const available = (segments || []).filter((s) => s.site_id === site);
+    return html`
+      <${ToolPanel} id="share" title="Share links" onClose=${onClose}
+        subtitle="Give someone a read-only view of one site without a login. The link is shown once; revoke it here at any time.">
+        ${created && html`
+          <div class="banner banner-key" role="alert">
+            <strong>Copy this link now — it is not shown again.</strong>
+            <code class="key-value" ref=${this.linkRef}>${created.url}</code>
+            <${CopyButton} text=${created.url} source=${this.linkRef} label="Copy link" />
+            <button type="button" class="btn-secondary" onClick=${() => this.setState({ created: null })}>Done</button>
+            <span class="banner-note">Anyone who has this link can see ${created.site_id}${created.segment ? ` (segment: ${created.segment})` : ''} until ${created.expires_at ? fmtDate(created.expires_at) : 'it is revoked'}. Treat it like a password.</span>
+          </div>
+        `}
+        <form class="inline-controls" onSubmit=${(e) => this.create(e)}>
+          <label>Label (private)
+            <input type="text" value=${label} maxlength="128" placeholder="Q4 board pack" autocomplete="off" onInput=${(e) => this.setState({ label: e.target.value })} required />
+          </label>
+          <label>Segment
+            <select value=${segmentId} onChange=${(e) => this.setState({ segmentId: e.target.value })}>
+              <option value="">All traffic of ${site}</option>
+              ${available.map((s) => html`<option value=${s.id}>${s.name}</option>`)}
+            </select>
+          </label>
+          <label>Expires
+            <select value=${expiry} onChange=${(e) => this.setState({ expiry: e.target.value })}>
+              ${EXPIRY_CHOICES.map((c) => html`<option value=${c.value}>${c.label}</option>`)}
+            </select>
+          </label>
+          <button type="submit" disabled=${busy || !label.trim() || !site}>Create link</button>
+        </form>
+        ${error && html`<div class="placeholder placeholder-error" role="alert">${error}</div>`}
+        ${links === null
+          ? html`<${SkelRows} rows=${2} />`
+          : links.length === 0
+            ? html`<${Empty}>No share links yet</${Empty}>`
+            : html`
+                <div class="table-scroll" tabindex="0" role="region" aria-label="Share links">
+                  <table class="data-table share-table">
+                    <thead><tr>
+                      <th scope="col">Label</th><th scope="col">Site</th><th scope="col">Segment</th><th scope="col">Created</th>
+                      <th scope="col">Expires</th><th scope="col">Last used</th><th scope="col">Status</th><th scope="col"><span class="sr-only">Actions</span></th>
+                    </tr></thead>
+                    <tbody>
+                      ${links.map((link) => html`
+                        <tr>
+                          <td class="cell-text" title=${link.label}>${link.label}</td>
+                          <td class="cell-text" title=${link.site_id}>${link.site_id}</td>
+                          <td class="cell-text" title=${link.filters || ''}>${link.segment || 'All traffic'}</td>
+                          <td>${fmtDate(link.created_at)}</td>
+                          <td>${link.expires_at ? fmtDate(link.expires_at) : 'Never'}</td>
+                          <td>${link.last_used_at ? fmtWhen(link.last_used_at) : 'Never'}</td>
+                          <td><span class=${`status status-${link.status}`}>${linkStatusLabel(link.status)}</span></td>
+                          <td>${link.status === 'active'
+                            ? html`<button type="button" class="btn-secondary" disabled=${busy} onClick=${() => this.revoke(link)}>Revoke<span class="sr-only"> ${link.label}</span></button>`
+                            : null}</td>
+                        </tr>
+                      `)}
+                    </tbody>
+                  </table>
+                </div>
+              `}
+      </${ToolPanel}>
     `;
   }
 }
@@ -781,59 +1473,42 @@ class LoginForm extends Component {
   constructor() {
     super();
     this.state = { error: null, busy: false };
+    this.input = createRef();
+  }
+
+  componentDidMount() {
+    if (this.input.current) this.input.current.focus();
   }
 
   async submit(event) {
     event.preventDefault();
     const password = event.target.elements.password.value;
-    const endpoint = this.props.setupRequired ? '/api/auth/setup' : '/api/auth/login';
     this.setState({ busy: true, error: null });
-    try {
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password }),
-      });
-      if (res.ok) {
-        this.props.onLogin();
-        return;
-      }
-      const body = await res.json().catch(() => ({}));
-      this.setState({ error: body.error || `Error ${res.status}`, busy: false });
-    } catch (e) {
-      this.setState({ error: 'Could not reach the server.', busy: false });
+    const res = await api.send('POST', this.props.setupRequired ? '/api/auth/setup' : '/api/auth/login', { password });
+    if (res.kind === 'ok') {
+      this.props.onLogin();
+      return;
     }
+    this.setState({ error: res.kind === 'unauthorized' ? 'That password is not correct.' : res.message, busy: false });
   }
 
   render({ setupRequired, onCancel }, { error, busy }) {
     return html`
-      <div class="auth-overlay">
+      <main class="auth-overlay">
         <form class="auth-card" onSubmit=${(e) => this.submit(e)}>
-          <h1>Mallard Metrics</h1>
+          <h1><img src="/favicon.svg" alt="" width="28" height="28" /> Mallard Metrics</h1>
           <h2>${setupRequired ? 'Set admin password' : 'Sign in'}</h2>
-          <p class="auth-hint">
-            ${setupRequired
-              ? 'No password is set yet. Choose one to protect this dashboard.'
-              : 'Enter your admin password to continue.'}
+          <p class="auth-hint" id="auth-hint">
+            ${setupRequired ? 'No password is set yet. Choose one to protect this dashboard. At least 12 characters.' : 'Enter your admin password to continue.'}
           </p>
-          <input
-            type="password"
-            name="password"
-            placeholder="Password"
-            minlength=${setupRequired ? 12 : 1}
-            autocomplete=${setupRequired ? 'new-password' : 'current-password'}
-            required
-            autofocus
-          />
-          ${setupRequired && html`<p class="auth-hint">At least 12 characters.</p>`}
+          <label class="sr-only" for="password">Admin password</label>
+          <input id="password" ref=${this.input} type="password" name="password" placeholder="Password" minlength=${setupRequired ? 12 : 1}
+            autocomplete=${setupRequired ? 'new-password' : 'current-password'} aria-describedby="auth-hint" required />
           ${error && html`<p class="auth-error" role="alert">${error}</p>`}
-          <button type="submit" disabled=${busy}>
-            ${busy ? 'Working…' : setupRequired ? 'Set password' : 'Sign in'}
-          </button>
-          ${onCancel &&
-          html`<button type="button" class="btn-secondary" onClick=${onCancel}>Not now</button>`}
+          <button type="submit" disabled=${busy}>${busy ? 'Working…' : setupRequired ? 'Set password' : 'Sign in'}</button>
+          ${onCancel && html`<button type="button" class="btn-secondary" onClick=${onCancel}>Not now</button>`}
         </form>
-      </div>
+      </main>
     `;
   }
 }
@@ -841,628 +1516,820 @@ class LoginForm extends Component {
 /* ── Dashboard ─────────────────────────────────────────────────────────── */
 
 const BREAKDOWN_GROUPS = [
-  {
-    title: 'Pages',
-    tabs: [
-      { slug: 'pages', label: 'Top pages' },
-      { slug: 'entry-pages', label: 'Entry pages' },
-      { slug: 'exit-pages', label: 'Exit pages' },
-    ],
-  },
-  {
-    title: 'Acquisition',
-    tabs: [
-      { slug: 'sources', label: 'Sources' },
-      { slug: 'referrers', label: 'Referrers' },
-      { slug: 'utm-sources', label: 'UTM source' },
-      { slug: 'utm-mediums', label: 'UTM medium' },
-      { slug: 'utm-campaigns', label: 'UTM campaign' },
-      { slug: 'utm-contents', label: 'UTM content' },
-      { slug: 'utm-terms', label: 'UTM term' },
-    ],
-  },
-  {
-    title: 'Locations',
-    tabs: [
-      { slug: 'countries', label: 'Countries' },
-      { slug: 'regions', label: 'Regions' },
-      { slug: 'cities', label: 'Cities' },
-    ],
-  },
-  {
-    title: 'Devices',
-    tabs: [
-      { slug: 'browsers', label: 'Browsers' },
-      { slug: 'browser-versions', label: 'Browser versions' },
-      { slug: 'os', label: 'Operating systems' },
-      { slug: 'os-versions', label: 'OS versions' },
-      { slug: 'devices', label: 'Device types' },
-      { slug: 'screen-sizes', label: 'Screen widths' },
-    ],
-  },
+  { id: 'pages', title: 'Pages', tabs: [
+    { slug: 'pages', label: 'Top pages' }, { slug: 'entry-pages', label: 'Entry pages' }, { slug: 'exit-pages', label: 'Exit pages' } ] },
+  { id: 'acquisition', title: 'Acquisition', tabs: [
+    { slug: 'sources', label: 'Sources' }, { slug: 'referrers', label: 'Referrers' }, { slug: 'utm-sources', label: 'UTM source' },
+    { slug: 'utm-mediums', label: 'UTM medium' }, { slug: 'utm-campaigns', label: 'UTM campaign' },
+    { slug: 'utm-contents', label: 'UTM content' }, { slug: 'utm-terms', label: 'UTM term' } ] },
+  { id: 'locations', title: 'Locations', tabs: [
+    { slug: 'countries', label: 'Countries' }, { slug: 'regions', label: 'Regions' }, { slug: 'cities', label: 'Cities' } ] },
+  { id: 'devices', title: 'Devices', tabs: [
+    { slug: 'browsers', label: 'Browsers' }, { slug: 'browser-versions', label: 'Browser versions' },
+    { slug: 'os', label: 'Operating systems' }, { slug: 'os-versions', label: 'OS versions' },
+    { slug: 'devices', label: 'Device types' }, { slug: 'screen-sizes', label: 'Screen widths' } ] },
 ];
 
 const ALL_BREAKDOWN_SLUGS = BREAKDOWN_GROUPS.flatMap((g) => g.tabs.map((t) => t.slug));
 
-// Filter chips read as a sentence — "Page is /pricing" — so they need singular
-// labels, not the tab headings ("Top pages is /pricing" reads as nonsense).
+// Filter chips read as a sentence ("Page is /pricing"), so they need singular
+// labels, not the tab headings.
 const FILTER_LABELS = {
-  pages: 'Page',
-  referrers: 'Referrer',
-  sources: 'Source',
-  countries: 'Country',
-  regions: 'Region',
-  cities: 'City',
-  browsers: 'Browser',
-  'browser-versions': 'Browser version',
-  os: 'OS',
-  'os-versions': 'OS version',
-  devices: 'Device',
-  'screen-sizes': 'Screen width',
-  'utm-sources': 'UTM source',
-  'utm-mediums': 'UTM medium',
-  'utm-campaigns': 'UTM campaign',
-  'utm-contents': 'UTM content',
-  'utm-terms': 'UTM term',
+  pages: 'Page', 'entry-pages': 'Entry page', 'exit-pages': 'Exit page', referrers: 'Referrer', sources: 'Source',
+  countries: 'Country', regions: 'Region', cities: 'City', browsers: 'Browser', 'browser-versions': 'Browser version',
+  os: 'OS', 'os-versions': 'OS version', devices: 'Device', 'screen-sizes': 'Screen width', 'utm-sources': 'UTM source',
+  'utm-mediums': 'UTM medium', 'utm-campaigns': 'UTM campaign', 'utm-contents': 'UTM content', 'utm-terms': 'UTM term',
   events: 'Event',
 };
 
 // Entry and exit pages are derived from a whole session rather than stored on
 // an event, so the server has no per-event predicate for them and answers 400.
-// Rows in those tables are therefore not clickable.
-const FILTERABLE_SLUGS = new Set(
-  ALL_BREAKDOWN_SLUGS.filter((slug) => slug !== 'entry-pages' && slug !== 'exit-pages'),
-);
+const FILTERABLE_SLUGS = new Set(ALL_BREAKDOWN_SLUGS.filter((slug) => slug !== 'entry-pages' && slug !== 'exit-pages'));
 
-/** Render the active segment the way the API parses it. */
-function serializeFilters(filters) {
-  return filters.map((f) => `${f.dimension}${f.negated ? '!=' : '=='}${f.value}`).join(';');
-}
+/**
+ * Why session data is missing, from what the server says: 'rounded'
+ * (gdpr_mode / round_timestamps), 'extension' (the behavioral extension is not
+ * loaded) or 'unknown' (an older server that names no cause).
+ */
+const reasonFromMain = (value) => (value === 'timestamps_rounded' ? 'rounded' : value === 'extension_missing' ? 'extension' : 'unknown');
+const reasonFromCode = (code) => (code === 'session_data_unavailable' ? 'rounded' : code === 'behavioral_unavailable' ? 'extension' : 'unknown');
 
+// Reports computed from sessions or ordered events. `retention` is separate: it
+// needs the extension but not exact timestamps, so gdpr_mode leaves it working.
+const BEHAVIORAL_KEYS = new Set(['funnel', 'retention', 'sequences', 'flow']);
+const NEEDS_EXACT_TIME = (key) => key === 'bd:entry-pages' || key === 'bd:exit-pages' || (BEHAVIORAL_KEYS.has(key) && key !== 'retention');
 const REALTIME_REFRESH_MS = 15000;
+const RANGE_OPTIONS = [
+  { value: 'day', label: 'Today', title: 'Today so far: midnight UTC until now' },
+  { value: '7d', label: '7D', title: 'The last 7 days, including today' },
+  { value: '30d', label: '30D', title: 'The last 30 days, including today' },
+  { value: '90d', label: '90D', title: 'The last 90 days, including today' },
+  { value: '12mo', label: '12M', title: 'The last 12 months, ending today' },
+  { value: 'custom', label: 'Custom', title: 'Pick exact dates' },
+];
+const COMPARE_OPTIONS = [
+  { value: 'none', label: 'Off', title: 'Do not compare' },
+  { value: 'previous_period', label: 'Previous period', title: 'Compare with the equally long period immediately before this one' },
+  { value: 'year_over_year', label: 'Last year', title: 'Compare with the same dates 365 days earlier, the same length' },
+];
 
 class Dashboard extends Component {
   constructor(props) {
     super(props);
     const prefs = loadPrefs();
+    // The address bar wins over saved preferences: a shared link must open
+    // exactly the view it was copied from.
+    const url = readViewState(location.search, FILTERABLE_SLUGS);
+    const period = url.period || prefs.period || '30d';
     this.state = {
-      sites: [],
-      siteId: prefs.siteId || '',
-      period: prefs.period || '30d',
-      startDate: prefs.startDate || '',
-      endDate: prefs.endDate || '',
+      sites: null,
+      siteEvents: {},
+      // The address bar names a site; otherwise the busiest one is chosen once
+      // the list arrives (a remembered site would hide that default). A shared
+      // view has exactly one site and ignores the address bar's.
+      siteId: props.share ? props.share.site_id : url.siteId || '',
+      segments: props.share ? [] : null,
+      siteDraft: '',
+      period: period === 'today' ? 'day' : period,
+      startDate: url.startDate || prefs.startDate || '',
+      endDate: url.endDate || prefs.endDate || '',
+      compare: url.compare || prefs.compare || 'none',
+      filters: url.filters || [],
       theme: prefs.theme || 'auto',
-      loading: false,
-      error: null,
-      main: null,
-      timeseries: null,
-      breakdowns: {},
-      realtime: null,
-      revenue: null,
-      goals: null,
-      propertyKeys: null,
-      funnel: null,
-      retention: null,
-      sequences: null,
-      flow: null,
+      res: {},
+      reason: null,
+      limits: {},
+      tabs: Object.fromEntries(BREAKDOWN_GROUPS.map((g) => [g.id, prefs.tabs?.[g.id] && g.tabs.some((t) => t.slug === prefs.tabs[g.id]) ? prefs.tabs[g.id] : g.tabs[0].slug])),
       funnelSteps: prefs.funnelSteps || 'page:/,page:/pricing,event:signup',
       funnelModes: prefs.funnelModes || '',
+      funnelError: '',
       sequenceSteps: prefs.sequenceSteps || 'page:/,event:signup',
       flowPage: prefs.flowPage || '/',
       flowDirection: prefs.flowDirection || 'forward',
-      compare: prefs.compare || 'none',
-      // Active segment, as [{dimension, negated, value}]. Not persisted: a
-      // filter is a question you are asking right now, not a preference.
-      filters: [],
-      showKeys: false,
+      rangeOpen: false,
+      draftStart: '',
+      draftEnd: '',
+      rangeError: '',
+      panel: null,
+      notice: null,
+      updatedAt: null,
+    };
+    this.res = {};
+    this.segmentsFor = null;
+    this.gen = 0;
+    this.abort = null;
+    this.wanted = new Set();
+    this.fetched = new Set();
+    this.behavioral = null;
+    this.reason = null;
+    this.mainWaiters = [];
+    this.onPop = () => this.restoreFromUrl();
+    this.onVisibility = () => {
+      if (!document.hidden) this.pollRealtime();
     };
   }
 
   async componentDidMount() {
     this.applyTheme();
+    if (this.props.share) {
+      // Whatever a viewer follows from here learns nothing about where it was
+      // opened, on top of the server's own Referrer-Policy on every response.
+      const meta = document.createElement('meta');
+      meta.name = 'referrer';
+      meta.content = 'no-referrer';
+      document.head.appendChild(meta);
+    }
+    window.addEventListener('popstate', this.onPop);
+    document.addEventListener('visibilitychange', this.onVisibility);
     await this.loadSites();
-    // Load immediately rather than waiting for the operator to press a button.
-    if (this.state.siteId) await this.refresh();
-    this.realtimeTimer = setInterval(() => this.refreshRealtime(), REALTIME_REFRESH_MS);
+    if (this.state.siteId) this.refresh({ push: false });
+    this.timer = setInterval(() => this.pollRealtime(), REALTIME_REFRESH_MS);
   }
 
   componentWillUnmount() {
-    clearInterval(this.realtimeTimer);
+    clearInterval(this.timer);
+    window.removeEventListener('popstate', this.onPop);
+    document.removeEventListener('visibilitychange', this.onVisibility);
+    if (this.abort) this.abort.abort();
   }
 
   applyTheme() {
     const { theme } = this.state;
-    document.documentElement.dataset.theme = theme === 'auto' ? '' : theme;
+    if (theme === 'auto') delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = theme;
   }
 
   persist() {
-    const { siteId, period, startDate, endDate, theme, funnelSteps, funnelModes, sequenceSteps, flowPage, flowDirection, compare } =
-      this.state;
-    savePrefs({ siteId, period, startDate, endDate, theme, funnelSteps, funnelModes, sequenceSteps, flowPage, flowDirection, compare });
+    const { siteId, period, startDate, endDate, theme, funnelSteps, funnelModes, sequenceSteps, flowPage, flowDirection, compare, tabs } = this.state;
+    savePrefs({ siteId, period, startDate, endDate, theme, funnelSteps, funnelModes, sequenceSteps, flowPage, flowDirection, compare, tabs });
   }
 
   /** The shared query string for the selected site, range and segment. */
   query() {
     const { siteId, period, startDate, endDate, filters } = this.state;
     const parts = [`site_id=${encodeURIComponent(siteId)}`];
-    if (period === 'custom' && startDate && endDate) {
-      parts.push(`start_date=${startDate}`, `end_date=${endDate}`);
-    } else {
-      parts.push(`period=${period}`);
-    }
-    if (filters.length > 0) {
-      parts.push(`filters=${encodeURIComponent(serializeFilters(filters))}`);
-    }
+    if (period === 'custom' && startDate && endDate) parts.push(`start_date=${startDate}`, `end_date=${endDate}`);
+    else parts.push(`period=${period}`);
+    if (filters.length > 0) parts.push(`filters=${encodeURIComponent(serializeFilters(filters))}`);
     return parts.join('&');
-  }
-
-  /** Add a filter, replacing any existing one on the same dimension. */
-  addFilter(dimension, value, negated = false) {
-    if (!FILTERABLE_SLUGS.has(dimension)) return;
-    const filters = this.state.filters
-      .filter((f) => f.dimension !== dimension)
-      .concat([{ dimension, value, negated }]);
-    this.setState({ filters }, () => this.refresh());
-  }
-
-  removeFilter(index) {
-    const filters = this.state.filters.filter((_, i) => i !== index);
-    this.setState({ filters }, () => this.refresh());
-  }
-
-  clearFilters() {
-    if (this.state.filters.length === 0) return;
-    this.setState({ filters: [] }, () => this.refresh());
-  }
-
-  async loadSites() {
-    const result = await getJSON('/api/sites');
-    if (result.kind === 'unauthorized') return this.props.onAuthExpired();
-    if (result.kind !== 'ok') return;
-    const sites = result.data.sites || [];
-    this.setState((prev) => ({
-      sites,
-      siteId: prev.siteId || sites[0] || '',
-    }));
   }
 
   /** Realtime takes the segment but not the date range: its window is its own. */
   realtimeQuery() {
     const { siteId, filters } = this.state;
     const parts = [`site_id=${encodeURIComponent(siteId)}`];
-    if (filters.length > 0) {
-      parts.push(`filters=${encodeURIComponent(serializeFilters(filters))}`);
-    }
+    if (filters.length > 0) parts.push(`filters=${encodeURIComponent(serializeFilters(filters))}`);
     return parts.join('&');
   }
 
-  async refreshRealtime() {
-    if (!this.state.siteId) return;
-    const result = await getJSON(`/api/stats/realtime?${this.realtimeQuery()}`);
-    if (result.kind === 'unauthorized') return this.props.onAuthExpired();
-    this.setState({ realtime: result });
+  urlFor(key) {
+    const s = this.state;
+    const q = this.query();
+    switch (key) {
+      case 'main': return `/api/stats/main?${q}${s.compare === 'none' ? '' : `&compare=${s.compare}`}`;
+      case 'timeseries': return `/api/stats/timeseries?${q}`;
+      case 'realtime': return `/api/stats/realtime?${this.realtimeQuery()}`;
+      case 'revenue': return `/api/stats/revenue?${q}`;
+      case 'goals': return `/api/stats/goals?${q}`;
+      case 'properties': return `/api/stats/properties?${q}`;
+      case 'funnel':
+        return `/api/stats/funnel?${q}&steps=${encodeURIComponent(s.funnelSteps)}&window=${encodeURIComponent('1 day')}${s.funnelModes ? `&modes=${encodeURIComponent(s.funnelModes)}` : ''}`;
+      case 'retention': return `/api/stats/retention?${q}&weeks=${RETENTION_WEEKS}`;
+      case 'sequences': return `/api/stats/sequences?${q}&steps=${encodeURIComponent(s.sequenceSteps)}`;
+      case 'flow': return `/api/stats/flow?${q}&page=${encodeURIComponent(s.flowPage)}&direction=${s.flowDirection}`;
+      default: return `/api/stats/breakdown/${key.slice(3)}?${q}&limit=${s.limits[key.slice(3)] || LIMIT_STEPS[0]}`;
+    }
   }
 
-  async refresh() {
-    const { siteId, funnelSteps, funnelModes, sequenceSteps, flowPage, flowDirection } = this.state;
-    if (!siteId) return;
+  setRes(key, value) {
+    this.res = { ...this.res, [key]: value };
+    this.setState({ res: this.res, updatedAt: new Date() });
+  }
 
-    this.setState({ loading: true, error: null });
-    this.persist();
-    const query = this.query();
+  whenMain() {
+    return this.mainSettled ? Promise.resolve() : new Promise((resolve) => this.mainWaiters.push(resolve));
+  }
 
-    const breakdownRequests = ALL_BREAKDOWN_SLUGS.map((slug) =>
-      getJSON(`/api/stats/breakdown/${slug}?${query}&limit=10`).then((result) => [slug, result]),
-    );
+  /** Fetch one report. Stale results from an earlier view are dropped. */
+  async load(key, { quiet = false } = {}) {
+    const gen = this.gen;
+    const signal = this.abort ? this.abort.signal : undefined;
+    const prev = this.res[key];
+    this.fetched.add(key);
 
-    const [
-      main,
-      timeseries,
-      realtime,
-      revenue,
-      goals,
-      propertyKeys,
-      funnel,
-      retention,
-      sequences,
-      flow,
-      ...breakdownResults
-    ] = await Promise.all([
-      getJSON(
-        `/api/stats/main?${query}` +
-          (this.state.compare === 'none' ? '' : `&compare=${this.state.compare}`),
-      ),
-      getJSON(`/api/stats/timeseries?${query}`),
-      getJSON(`/api/stats/realtime?${this.realtimeQuery()}`),
-      getJSON(`/api/stats/revenue?${query}`),
-      getJSON(`/api/stats/goals?${query}`),
-      getJSON(`/api/stats/properties?${query}`),
-      getJSON(
-        `/api/stats/funnel?${query}&steps=${encodeURIComponent(funnelSteps)}&window=1 day` +
-          (funnelModes ? `&modes=${encodeURIComponent(funnelModes)}` : ''),
-      ),
-      getJSON(`/api/stats/retention?${query}&weeks=4`),
-      getJSON(`/api/stats/sequences?${query}&steps=${encodeURIComponent(sequenceSteps)}`),
-      getJSON(`/api/stats/flow?${query}&page=${encodeURIComponent(flowPage)}&direction=${flowDirection}`),
-      ...breakdownRequests,
-    ]);
+    // Reports built from sessions answer 503 (`behavioral_unavailable`) when the
+    // extension is missing or gdpr_mode has rounded the timestamps. `main`
+    // already says whether session data exists, so ask it first rather than
+    // provoke an error (and a console message) per panel.
+    if (BEHAVIORAL_KEYS.has(key) || NEEDS_EXACT_TIME(key)) {
+      await this.whenMain();
+      if (gen !== this.gen) return;
+      if (this.behavioral === false) {
+        const reason = this.reason;
+        // Weekly retention does not depend on the order of events inside an
+        // hour, so a rounded-timestamp server can still answer it.
+        if (!(key === 'retention' && reason === 'rounded')) {
+          this.setRes(key, { kind: 'unavailable', reason, message: '' });
+          return;
+        }
+      }
+    }
+    if (!quiet) this.setRes(key, prev && prev.kind === 'ok' ? { ...prev, loading: true } : { loading: true });
 
-    if (main.kind === 'unauthorized') {
+    const result = await api.get(this.urlFor(key), { signal });
+    if (gen !== this.gen || result.kind === 'aborted') return;
+    if (result.kind === 'unauthorized') {
       this.props.onAuthExpired();
       return;
     }
+    if (key === 'main') {
+      this.behavioral = result.kind === 'ok' ? result.data.behavioral_available !== false : null;
+      // The server names the cause itself (`sessions_unavailable_reason`); an
+      // older one that does not leaves it 'unknown' and the generic help shows.
+      this.reason = this.behavioral === false ? reasonFromMain(result.data.sessions_unavailable_reason) : null;
+      this.setState({ reason: this.reason });
+      this.mainSettled = true;
+      this.mainWaiters.splice(0).forEach((resolve) => resolve());
+    }
+    if (result.kind === 'unavailable') {
+      result.reason = reasonFromCode(result.code);
+    }
+    if (quiet && result.kind !== 'ok' && prev && prev.kind === 'ok') {
+      this.setRes(key, { ...prev, loading: false, offline: true });
+      return;
+    }
+    this.setRes(key, result);
+  }
 
-    const breakdowns = {};
-    for (const [slug, result] of breakdownResults) breakdowns[slug] = result;
+  /** A panel scrolled into view: load its reports once per view. */
+  want(...keys) {
+    for (const key of keys) {
+      this.wanted.add(key);
+      if (!this.fetched.has(key) && this.state.siteId) this.load(key);
+    }
+  }
 
-    this.setState({
-      loading: false,
-      error: main.kind === 'error' ? main.message : null,
-      main,
-      timeseries,
-      breakdowns,
-      realtime,
-      revenue,
-      goals,
-      propertyKeys,
-      funnel,
-      retention,
-      sequences,
-      flow,
+  retry(key) {
+    if (key === 'main' || key === 'timeseries') this.refresh({ push: false });
+    else this.load(key);
+  }
+
+  /** Reload everything on screen for the current view. */
+  refresh({ push = false } = {}) {
+    if (!this.state.siteId) return;
+    if (this.abort) this.abort.abort();
+    this.abort = new AbortController();
+    this.gen += 1;
+    this.fetched.clear();
+    this.mainSettled = false;
+    this.behavioral = null;
+    this.reason = null;
+    this.persist();
+    this.syncUrl(push);
+    document.title = `${this.state.siteId} · ${this.props.share ? 'Shared view' : 'Mallard Metrics'}`;
+    if (!this.props.share && this.segmentsFor !== this.state.siteId) this.loadSegments();
+
+    // Only the tab each group is showing is reloaded; the others were fetched
+    // for a different view and would be stale if the operator switched to them.
+    const active = new Set(BREAKDOWN_GROUPS.map((g) => `bd:${this.state.tabs[g.id]}`));
+    this.res = Object.fromEntries(Object.entries(this.res).filter(([k]) => !k.startsWith('bd:') || active.has(k)));
+    this.load('main');
+    this.load('timeseries');
+    for (const key of this.wanted) {
+      if (!key.startsWith('bd:') || active.has(key)) this.load(key);
+    }
+  }
+
+  syncUrl(push) {
+    // A shared view keeps its fragment: it is the link, and a reload needs it.
+    const qs = writeViewState(this.props.share ? { ...this.state, siteId: '' } : this.state);
+    const next = `${location.pathname}${qs ? `?${qs}` : ''}${location.hash}`;
+    if (next === `${location.pathname}${location.search}${location.hash}`) return;
+    try {
+      history[push ? 'pushState' : 'replaceState'](null, '', next);
+    } catch (e) {
+      /* a sandboxed frame may forbid it; the view just is not shareable */
+    }
+  }
+
+  restoreFromUrl() {
+    const url = readViewState(location.search, FILTERABLE_SLUGS);
+    this.setState(
+      {
+        siteId: this.props.share ? this.props.share.site_id : url.siteId || this.state.siteId,
+        period: url.period || '30d',
+        startDate: url.startDate || this.state.startDate,
+        endDate: url.endDate || this.state.endDate,
+        compare: url.compare || 'none',
+        filters: url.filters || [],
+        rangeOpen: false,
+      },
+      () => this.refresh({ push: false }),
+    );
+  }
+
+  /** Change part of the view, then reload and record it in the address bar. */
+  change(partial) {
+    this.setState(partial, () => this.refresh({ push: true }));
+  }
+
+  addFilter(dimension, value) {
+    if (!FILTERABLE_SLUGS.has(dimension)) return;
+    const filters = this.state.filters.filter((f) => f.dimension !== dimension).concat([{ dimension, value, negated: false }]);
+    this.change({ filters });
+  }
+
+  toggleFilter(index) {
+    this.change({ filters: this.state.filters.map((f, i) => (i === index ? { ...f, negated: !f.negated } : f)) });
+  }
+
+  removeFilter(index) {
+    this.change({ filters: this.state.filters.filter((_, i) => i !== index) });
+  }
+
+  clearFilters() {
+    if (this.state.filters.length > 0) this.change({ filters: [] });
+  }
+
+  /** The saved segments of the selected site, for the Segment menu and the panels. */
+  async loadSegments() {
+    const site = this.state.siteId;
+    if (!site) return;
+    this.segmentsFor = site;
+    // Another site's segments must not linger in the menu while these load.
+    if (this.state.segments && this.state.segments.some((x) => x.site_id !== site)) this.setState({ segments: null });
+    const result = await api.get(`/api/segments?site_id=${encodeURIComponent(site)}`);
+    if (result.kind === 'unauthorized') return this.props.onAuthExpired();
+    if (this.state.siteId !== site) return;
+    // A failure leaves the menu empty rather than blocking the reports.
+    this.setState({ segments: result.kind === 'ok' ? result.data : [] });
+  }
+
+  /** Apply a saved segment as the active filters. */
+  applySegment(segment) {
+    this.change({ filters: parseFilters(segment.filters, FILTERABLE_SLUGS) });
+  }
+
+  /** The Segment menu: pick a saved one, or clear back to all traffic. */
+  pickSegment(id) {
+    if (id === '') return this.clearFilters();
+    const segment = (this.state.segments || []).find((s) => s.id === id);
+    if (segment) this.applySegment(segment);
+  }
+
+  async loadSites() {
+    if (this.props.share) {
+      // A viewer is shown the one site its link is for, and is never told of others.
+      this.setState({ sites: [this.props.share.site_id], siteEvents: {} });
+      return;
+    }
+    const result = await api.get('/api/sites');
+    if (result.kind === 'unauthorized') return this.props.onAuthExpired();
+    if (result.kind !== 'ok') {
+      this.setState({ sites: [], notice: { tone: 'error', text: result.message } });
+      return;
+    }
+    const sites = result.data.sites || [];
+    // `details` carries each site's events in the last 30 days, busiest first.
+    // An older server sends only the IDs; then no counts are shown.
+    const details = Array.isArray(result.data.details) ? result.data.details : [];
+    const siteEvents = Object.fromEntries(details.map((d) => [d.site_id, d.events_30d]));
+    const busiest = details.find((d) => sites.includes(d.site_id))?.site_id ?? sites[0];
+    this.setState((prev) => ({
+      sites,
+      siteEvents,
+      // A linked site that does not exist falls back to the busiest real one.
+      siteId: sites.length > 0 && !sites.includes(prev.siteId) ? busiest : prev.siteId,
+    }));
+  }
+
+  pollRealtime() {
+    if (document.hidden || !this.state.siteId || !this.fetched.has('realtime')) return;
+    const offline = Object.values(this.res).some((r) => r && r.kind === 'network');
+    if (offline) this.refresh({ push: false });
+    else this.load('realtime', { quiet: true });
+  }
+
+  /* Range controls ------------------------------------------------------ */
+
+  effectiveRange() {
+    const { period, startDate, endDate } = this.state;
+    if (period === 'custom' && startDate && endDate) return { start: startDate, end: endDate };
+    return periodRange(period);
+  }
+
+  pickRange(value) {
+    if (value === 'custom') {
+      if (this.state.rangeOpen) return this.setState({ rangeOpen: false });
+      const { start, end } = this.effectiveRange();
+      return this.setState({ rangeOpen: true, draftStart: start, draftEnd: end, rangeError: '' });
+    }
+    this.setState({ rangeOpen: false, rangeError: '' });
+    if (value !== this.state.period) this.change({ period: value });
+  }
+
+  applyRange(start = this.state.draftStart, end = this.state.draftEnd) {
+    const rangeError = validateRange(start, end);
+    if (rangeError) return this.setState({ draftStart: start, draftEnd: end, rangeError });
+    this.setState({ rangeError: '', rangeOpen: false });
+    this.change({ period: 'custom', startDate: start, endDate: end });
+  }
+
+  presetRange(name) {
+    const r = rangePreset(name);
+    this.setState({ draftStart: r.start, draftEnd: r.end }, () => this.applyRange(r.start, r.end));
+  }
+
+  /* Export --------------------------------------------------------------- */
+
+  async exportData(kind, format) {
+    const label = `${kind} ${format.toUpperCase()}`;
+    this.setState({ notice: { tone: 'info', text: `Preparing ${label} export…` } });
+    const res = await api.download(`/api/stats/export?${this.query()}&kind=${kind}&format=${format}`);
+    if (res.kind === 'unauthorized') return this.props.onAuthExpired();
+    if (res.kind !== 'ok') {
+      const hint = res.status === 504 ? ' Try a shorter date range or fewer filters.' : '';
+      this.setState({ notice: { tone: 'error', text: `The ${label} export failed: ${res.message}${hint}` } });
+      return;
+    }
+    const name = res.filename || `mallard-${this.state.siteId}-${kind}.${format}`;
+    const url = URL.createObjectURL(res.blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+    this.setState({ notice: { tone: 'ok', text: `Downloaded ${name}` } });
+  }
+
+  /* Panels --------------------------------------------------------------- */
+
+  togglePanel(name, event) {
+    if (this.state.panel === name) return this.closePanel();
+    this.panelTrigger = event.currentTarget;
+    this.setState({ panel: name });
+  }
+
+  closePanel() {
+    this.setState({ panel: null }, () => {
+      if (this.panelTrigger && this.panelTrigger.isConnected) this.panelTrigger.focus();
     });
   }
 
-  renderControls() {
-    const { sites, siteId, period, startDate, endDate, loading, theme } = this.state;
+  setTab(group, slug, visible = false) {
+    if (visible) {
+      this.want(`bd:${slug}`);
+      return;
+    }
+    this.setState((s) => ({ tabs: { ...s.tabs, [group.id]: slug } }), () => {
+      this.persist();
+      this.want(`bd:${slug}`);
+    });
+  }
+
+  /** "Show more" / "Show top 10" on a breakdown: refetch just that list with its new row count. */
+  setLimit(slug, limit) {
+    this.setState((s) => ({ limits: { ...s.limits, [slug]: limit } }), () => this.load(`bd:${slug}`));
+  }
+
+  applyFunnel(event) {
+    event.preventDefault();
+    const steps = this.state.funnelSteps.split(',').map((s) => s.trim()).filter(Boolean);
+    if (steps.length < 2) {
+      this.setState({ funnelError: 'A funnel needs at least two steps, separated by commas.' });
+      return;
+    }
+    this.setState({ funnelError: '' });
+    this.persist();
+    this.want('funnel');
+    this.load('funnel');
+  }
+
+  applyFlow(event) {
+    event.preventDefault();
+    if (!this.state.flowPage.trim()) return;
+    this.persist();
+    this.load('flow');
+  }
+
+  applySequence(event) {
+    event.preventDefault();
+    this.persist();
+    this.load('sequences');
+  }
+
+  /* Rendering ------------------------------------------------------------ */
+
+  renderToolbar() {
+    const { sites, siteEvents, siteId, siteDraft, period, startDate, endDate, compare, rangeOpen, draftStart, draftEnd, rangeError, updatedAt } = this.state;
+    const refreshing = Object.values(this.state.res).some((r) => r && r.loading);
+    const today = todayUTC();
     return html`
-      <div class="controls">
-        ${sites.length > 0
+      <div class="toolbar" role="group" aria-label="Report settings">
+        ${this.props.share
+          ? html`<div class="field"><span class="field-label">Site</span><span class="field-static" title=${siteId}>${siteId}</span></div>`
+          : sites && sites.length > 0
           ? html`
-              <select
-                aria-label="Site"
-                value=${siteId}
-                onChange=${(e) => this.setState({ siteId: e.target.value }, () => this.refresh())}
-              >
-                ${sites.map((site) => html`<option value=${site}>${site}</option>`)}
-              </select>
-            `
+              <label class="field"><span class="field-label">Site</span>
+                <select value=${siteId} onChange=${(e) => this.change({ siteId: e.target.value })}>
+                  ${sites.map((site) => html`<option value=${site} title=${site}>${Object.hasOwn(siteEvents, site) ? `${site} · ${num(siteEvents[site])} events (30d)` : site}</option>`)}
+                </select>
+              </label>`
           : html`
-              <input
-                type="text"
-                aria-label="Site ID"
-                placeholder="Site ID (e.g. example.com)"
-                value=${siteId}
-                onInput=${(e) => this.setState({ siteId: e.target.value })}
-              />
-            `}
+              <form class="field" onSubmit=${(e) => { e.preventDefault(); if (siteDraft) this.change({ siteId: siteDraft }); }}>
+                <label><span class="field-label">Site ID</span>
+                  <input type="text" placeholder="example.com" value=${siteDraft} onInput=${(e) => this.setState({ siteDraft: e.target.value.trim() })} />
+                </label>
+              </form>`}
 
-        <select
-          aria-label="Period"
-          value=${period}
-          onChange=${(e) => this.setState({ period: e.target.value }, () => {
-            if (e.target.value !== 'custom') this.refresh();
-          })}
-        >
-          <option value="day">Today</option>
-          <option value="7d">Last 7 days</option>
-          <option value="30d">Last 30 days</option>
-          <option value="90d">Last 90 days</option>
-          <option value="12mo">Last 12 months</option>
-          <option value="custom">Custom range…</option>
-        </select>
+        <div class="field"><span class="field-label" id="range-label">Date range (UTC)</span>
+          <${Segmented} label="Date range" options=${RANGE_OPTIONS} value=${period}
+            pressedOverride=${(v) => (v === 'custom' ? period === 'custom' : v === period && period !== 'custom')}
+            onChange=${(v) => this.pickRange(v)} />
+        </div>
 
-        ${period === 'custom' &&
-        html`
-          <input
-            type="date"
-            aria-label="Start date"
-            value=${startDate}
-            onInput=${(e) => this.setState({ startDate: e.target.value })}
-          />
-          <input
-            type="date"
-            aria-label="End date"
-            value=${endDate}
-            onInput=${(e) => this.setState({ endDate: e.target.value })}
-          />
-        `}
+        <div class="field"><span class="field-label">Compare with</span>
+          <${Segmented} label="Compare with" options=${COMPARE_OPTIONS} value=${compare} onChange=${(v) => this.change({ compare: v })} />
+        </div>
 
-        <button onClick=${() => this.refresh()} disabled=${loading}>
-          ${loading ? 'Loading…' : 'Refresh'}
-        </button>
-
-        <select
-          aria-label="Compare against"
-          value=${this.state.compare}
-          onChange=${(e) => this.setState({ compare: e.target.value }, () => this.refresh())}
-        >
-          <option value="none">No comparison</option>
-          <option value="previous_period">vs. previous period</option>
-          <option value="year_over_year">vs. same period last year</option>
-        </select>
-
-        <select
-          aria-label="Theme"
-          value=${theme}
-          onChange=${(e) => this.setState({ theme: e.target.value }, () => {
-            this.applyTheme();
-            this.persist();
-          })}
-        >
-          <option value="auto">Auto theme</option>
-          <option value="light">Light</option>
-          <option value="dark">Dark</option>
-        </select>
-
-        ${this.props.onLogout &&
-        html`
-          <button
-            class="btn-secondary"
-            aria-pressed=${this.state.showKeys}
-            onClick=${() => this.setState((prev) => ({ showKeys: !prev.showKeys }))}
-          >
-            API keys
-          </button>
-        `}
-
-        ${this.props.onLogout &&
-        html`<button class="btn-secondary" onClick=${this.props.onLogout}>Sign out</button>`}
+        <div class="field field-end">
+          <button type="button" class="btn-secondary" onClick=${() => this.refresh({ push: false })} disabled=${refreshing}>${refreshing ? 'Loading…' : 'Refresh'}</button>
+        </div>
       </div>
+
+      ${rangeOpen && html`
+        <form class="range-editor" onSubmit=${(e) => { e.preventDefault(); this.applyRange(); }} aria-label="Custom date range">
+          <label class="field"><span class="field-label">From</span>
+            <input type="date" value=${draftStart} min=${shiftDay(today, MAX_RANGE_DAYS + 1)} max=${today} onInput=${(e) => this.setState({ draftStart: e.target.value })} aria-invalid=${rangeError ? 'true' : 'false'} aria-describedby="range-error" />
+          </label>
+          <label class="field"><span class="field-label">To</span>
+            <input type="date" value=${draftEnd} max=${today} onInput=${(e) => this.setState({ draftEnd: e.target.value })} aria-invalid=${rangeError ? 'true' : 'false'} aria-describedby="range-error" />
+          </label>
+          <button type="submit">Apply range</button>
+          <span class="range-presets">
+            <button type="button" class="btn-link" onClick=${() => this.presetRange('yesterday')}>Yesterday</button>
+            <button type="button" class="btn-link" onClick=${() => this.presetRange('this-month')}>This month</button>
+            <button type="button" class="btn-link" onClick=${() => this.presetRange('last-month')}>Last month</button>
+          </span>
+          <p class="range-hint muted">Dates are inclusive and in UTC, up to ${MAX_RANGE_DAYS} days.</p>
+          <p id="range-error" class="field-error" role="alert">${rangeError}</p>
+        </form>
+      `}
+      ${!rangeOpen && html`<p class="range-summary muted">${this.rangeSummary()}</p>`}
     `;
   }
 
-  renderHeadline() {
-    const { main } = this.state;
-    if (!main || main.kind !== 'ok') return html`<${Placeholder} state=${main} />`;
-    const m = main.data;
-    const behavioralHint = m.behavioral_available ? null : 'Needs the behavioral extension';
-    const prev = m.comparison || null;
-    // `invert` marks the metrics where a fall is the good news.
-    const delta = (key, invert) =>
-      prev ? html`<${Delta} before=${prev[key]} after=${m[key]} invert=${invert} />` : null;
-
-    // A baseline of zero produces no percentages — see `Delta` — so the note
-    // has to say why, or it reads as a comparison that silently failed.
-    const baselineEmpty = prev != null && prev.total_pageviews === 0 && prev.unique_visitors === 0;
-
+  /** The Segment menu, shown with the active filters: pick a saved set, or go back to all traffic. */
+  renderSegmentMenu() {
+    const { segments, filters } = this.state;
+    if (this.props.share || !segments || segments.length === 0) return null;
+    const matched = this.activeSegmentId();
+    const custom = filters.length > 0 && matched === '';
     return html`
-      ${prev &&
-      html`
-        <p class="comparison-note">
-          Compared with ${prev.start_date} – ${prev.end_date}${baselineEmpty
-            ? ' — no data in that period, so there is nothing to compare against'
-            : ''}
-        </p>
-      `}
-      <div class="metrics-grid">
-        <${MetricCard}
-          label="Unique visitors"
-          value=${num(m.unique_visitors)}
-          delta=${delta('unique_visitors')}
-        />
-        <${MetricCard}
-          label="Pageviews"
-          value=${num(m.total_pageviews)}
-          delta=${delta('total_pageviews')}
-        />
-        <${MetricCard}
-          label="Total events"
-          value=${num(m.total_events)}
-          delta=${delta('total_events')}
-        />
-        <${MetricCard} label="Views per visitor" value=${m.views_per_visitor.toFixed(2)} />
-        <${MetricCard}
-          label="Visits"
-          value=${num(m.total_sessions)}
-          hint=${behavioralHint}
-          muted=${!m.behavioral_available}
-          delta=${delta('total_sessions')}
-        />
-        <${MetricCard}
-          label="Bounce rate"
-          value=${pct(m.bounce_rate)}
-          hint=${behavioralHint}
-          muted=${!m.behavioral_available}
-          delta=${delta('bounce_rate', true)}
-        />
-        <${MetricCard}
-          label="Visit duration"
-          value=${duration(m.avg_visit_duration_secs)}
-          hint=${behavioralHint}
-          muted=${!m.behavioral_available}
-          delta=${delta('avg_visit_duration_secs')}
-        />
-        <${MetricCard}
-          label="Views per visit"
-          value=${m.views_per_visit == null ? '—' : m.views_per_visit.toFixed(2)}
-          hint=${behavioralHint}
-          muted=${!m.behavioral_available}
-        />
-      </div>
+      <label class="segment-menu"><span class="filter-bar-label">Segment</span>
+        <select value=${matched || (custom ? '__custom' : '')} onChange=${(e) => this.pickSegment(e.target.value)}>
+          <option value="">${custom ? 'Clear filters (all traffic)' : 'All traffic'}</option>
+          ${segments.map((s) => html`<option value=${s.id}>${s.name}</option>`)}
+          ${custom && html`<option value="__custom" disabled>Unsaved filters</option>`}
+        </select>
+      </label>`;
+  }
+
+  /** The saved segment whose filters are exactly the active ones, or ''. */
+  activeSegmentId() {
+    const { segments, filters } = this.state;
+    if (!segments || filters.length === 0) return '';
+    const current = serializeFilters(filters);
+    return segments.find((s) => s.filters === current)?.id ?? '';
+  }
+
+  /** The exact dates on screen, so "7D" is never ambiguous about whether it includes today. */
+  rangeSummary() {
+    const { period } = this.state;
+    const { start, end } = this.effectiveRange();
+    if (period === 'day') return `Today, ${fmtDate(end)}, so far (UTC). The chart shows hours.`;
+    const label = { '7d': 'Last 7 days', '30d': 'Last 30 days', '90d': 'Last 90 days', '12mo': 'Last 12 months' }[period];
+    return `${label ? `${label}, including today: ` : 'Showing '}${fmtDate(start)} – ${fmtDate(end)} (UTC)`;
+  }
+
+  renderOverview() {
+    const { res, filters, compare } = this.state;
+    const main = res.main;
+    const m = main && main.kind === 'ok' ? main.data : null;
+    const empty = m && m.total_events === 0 && filters.length === 0;
+    const q = this.query();
+    return html`
+      <${Panel} id="overview" title="Overview"
+        actions=${this.props.share ? null : html`
+          <div class="panel-actions" role="group" aria-label="Export this view">
+            <button type="button" class="btn-link" onClick=${() => this.exportData('daily', 'csv')}>Daily CSV</button>
+            <button type="button" class="btn-link" onClick=${() => this.exportData('raw', 'csv')}>Raw CSV</button>
+            <button type="button" class="btn-link" onClick=${() => this.exportData('raw', 'json')}>Raw JSON</button>
+          </div>`}
+      >
+        <${Async} state=${main} onRetry=${() => this.retry('main')} skeleton=${html`<${SkelCards} />`} render=${(d) => this.renderHeadline(d)} />
+        ${empty
+          ? html`
+              <div class="empty-site">
+                <h3>No events for ${this.state.siteId} in this period</h3>
+                ${this.props.share
+                  ? html`<p>Try a longer date range.</p>`
+                  : html`<p>If this site is new, add the tracking snippet. Otherwise try a longer date range.</p>
+                <${Snippet} site=${this.state.siteId} />`}
+              </div>`
+          : html`
+              <${Async} state=${res.timeseries} onRetry=${() => this.retry('timeseries')} skeleton=${html`<${SkelChart} />`}
+                render=${(data) => html`<${TimeseriesChart} data=${data} />`} />`}
+      </${Panel}>
+    `;
+  }
+
+  renderHeadline(m) {
+    const prev = m.comparison || null;
+    const unavailable = m.behavioral_available === false;
+    const rounded = unavailable && this.state.reason === 'rounded';
+    const hint = unavailable ? (rounded ? 'Needs exact times' : 'Unavailable') : null;
+    const delta = (key, invert) => (prev ? html`<${Delta} before=${prev[key]} after=${m[key]} invert=${invert} />` : null);
+    // A baseline of zero produces no percentages (see `Delta`), so the note has
+    // to say why, or it reads as a comparison that silently failed.
+    const baselineEmpty = prev && prev.total_pageviews === 0 && prev.unique_visitors === 0;
+    return html`
+      ${prev && html`<p class="comparison-note">Compared with ${fmtDate(prev.start_date)} – ${fmtDate(prev.end_date)}${baselineEmpty ? ' — no data in that period, so there is nothing to compare against' : ''}</p>`}
+      ${unavailable && html`<${Unavailable} reason=${this.state.reason} />`}
+      <dl class="metrics-grid metrics-grid-overview">
+        <${MetricCard} label="Unique visitors" help=${HELP.visitors} value=${compact(m.unique_visitors)} full=${num(m.unique_visitors)} delta=${delta('unique_visitors')} />
+        <${MetricCard} label="Pageviews" help=${HELP.pageviews} value=${compact(m.total_pageviews)} full=${num(m.total_pageviews)} delta=${delta('total_pageviews')} />
+        <${MetricCard} label="Total events" help=${HELP.events} value=${compact(m.total_events)} full=${num(m.total_events)} delta=${delta('total_events')} />
+        <${MetricCard} label="Views per visitor" help=${HELP.viewsPerVisitor} value=${fixed(m.views_per_visitor)} />
+        <${MetricCard} label="Visits" help=${HELP.visits} value=${compact(m.total_sessions)} full=${num(m.total_sessions)} hint=${hint} muted=${unavailable} delta=${delta('total_sessions')} />
+        <${MetricCard} label="Bounce rate" help=${HELP.bounce} value=${pct(m.bounce_rate)} hint=${hint} muted=${unavailable} delta=${delta('bounce_rate', true)} />
+        <${MetricCard} label="Visit duration" help=${HELP.duration} value=${duration(m.avg_visit_duration_secs)} hint=${hint} muted=${unavailable} delta=${delta('avg_visit_duration_secs')} />
+        <${MetricCard} label="Views per visit" help=${HELP.viewsPerVisit} value=${fixed(m.views_per_visit)} hint=${hint} muted=${unavailable} />
+      </dl>
+      <details class="definitions">
+        <summary>How these figures are measured</summary>
+        <dl>
+          ${DEFINITIONS.map(([term, text]) => html`<div><dt>${term}</dt><dd>${text}</dd></div>`)}
+        </dl>
+      </details>
+    `;
+  }
+
+  renderFunnel() {
+    const { res, funnelSteps, funnelModes, funnelError } = this.state;
+    const specs = funnelSteps.split(',').map((s) => s.trim()).filter(Boolean);
+    return html`
+      <${Panel} id="funnel" title="Funnel" subtitle="Visitors reaching at least each step, within the conversion window">
+        <${Sentinel} onVisible=${() => this.want('funnel')} />
+        <form class="inline-controls" onSubmit=${(e) => this.applyFunnel(e)}>
+          <label>Steps (page:/path or event:name, comma separated)
+            <input type="text" value=${funnelSteps} placeholder="page:/,page:/pricing,event:signup" aria-invalid=${funnelError ? 'true' : 'false'} onInput=${(e) => this.setState({ funnelSteps: e.target.value })} />
+          </label>
+          <label>Modes (optional)
+            <input type="text" value=${funnelModes} placeholder="e.g. strict_order, strict_increase" onInput=${(e) => this.setState({ funnelModes: e.target.value })} />
+          </label>
+          <button type="submit">Apply</button>
+        </form>
+        ${funnelError && html`<p class="field-error" role="alert">${funnelError}</p>`}
+        <${Async} behavioral="compact" state=${res.funnel} onRetry=${() => this.load('funnel')} render=${(steps) => html`<${FunnelChart} steps=${steps} specs=${specs} />`} />
+      </${Panel}>
+    `;
+  }
+
+  renderBehavioralPanels() {
+    const { res, sequenceSteps, flowPage, flowDirection } = this.state;
+    return html`
+      ${this.renderFunnel()}
+
+      <${Panel} id="retention" title="Retention cohorts" subtitle="Weekly cohorts by first visit">
+        <${Sentinel} onVisible=${() => this.want('retention')} />
+        <${Async} behavioral="compact" state=${res.retention} onRetry=${() => this.load('retention')} render=${(data) => html`<${RetentionGrid} data=${data} />`} />
+      </${Panel}>
+
+      <${Panel} id="sequence" title="Sequence" subtitle="Visitors whose events matched this ordered pattern">
+        <${Sentinel} onVisible=${() => this.want('sequences')} />
+        <form class="inline-controls" onSubmit=${(e) => this.applySequence(e)}>
+          <label>Steps (comma separated)
+            <input type="text" value=${sequenceSteps} placeholder="page:/,event:signup" onInput=${(e) => this.setState({ sequenceSteps: e.target.value })} />
+          </label>
+          <button type="submit">Apply</button>
+        </form>
+        <${Async} behavioral="compact" state=${res.sequences} onRetry=${() => this.load('sequences')} skeleton=${html`<${SkelCards} count=${4} />`}
+          render=${(d) => html`
+            <dl class="metrics-grid">
+              <${MetricCard} label="Converting visitors" value=${compact(d.converting_visitors)} full=${num(d.converting_visitors)} />
+              <${MetricCard} label="Total visitors" value=${compact(d.total_visitors)} full=${num(d.total_visitors)} />
+              <${MetricCard} label="Conversion rate" value=${pct(d.conversion_rate)} />
+              <${MetricCard} label="Total completions" value=${compact(d.total_matches)} full=${num(d.total_matches)} />
+            </dl>`} />
+      </${Panel}>
+
+      <${Panel} id="flow" title="Flow" subtitle="Where visitors go next, or where they came from">
+        <${Sentinel} onVisible=${() => this.want('flow')} />
+        <form class="inline-controls" onSubmit=${(e) => this.applyFlow(e)}>
+          <label>Page
+            <input type="text" value=${flowPage} onInput=${(e) => this.setState({ flowPage: e.target.value })} />
+          </label>
+          <label>Direction
+            <select value=${flowDirection} onChange=${(e) => this.setState({ flowDirection: e.target.value })}>
+              <option value="forward">Next page</option>
+              <option value="backward">Previous page</option>
+            </select>
+          </label>
+          <button type="submit">Apply</button>
+        </form>
+        <${Async} behavioral="compact" state=${res.flow} onRetry=${() => this.load('flow')}
+          render=${(rows) => rows.length === 0
+            ? html`<${Empty}>No flow data for this page</${Empty}>`
+            : html`<${BreakdownList} rows=${rows.map((r) => ({ value: r.next_page, visitors: r.visitors, share: r.share }))} label=${flowDirection === 'forward' ? 'Next page' : 'Previous page'} columns=${[['Visitors', 'visitors'], ['Share', 'share', pct]]} />`} />
+      </${Panel}>
     `;
   }
 
   render() {
-    const {
-      siteId, error, loading, timeseries, breakdowns, realtime, revenue, goals, propertyKeys,
-      funnel, retention, sequences, flow, funnelSteps, funnelModes, sequenceSteps, flowPage, flowDirection,
-    } = this.state;
+    const { siteId, sites, res, filters, tabs, panel, notice, theme, siteDraft, updatedAt, segments } = this.state;
+    const share = this.props.share;
     const query = this.query();
-
+    const offline = Object.values(res).some((r) => r && r.kind === 'network');
+    const noSites = sites && sites.length === 0 && !siteId;
     return html`
       <div class="dashboard">
+        <a class="skip-link" href="#main" onClick=${(e) => { e.preventDefault(); const m = document.getElementById('main'); if (m) m.focus(); }}>Skip to content</a>
         <header class="app-header">
-          <h1>Mallard Metrics</h1>
-          ${this.renderControls()}
+          <h1 class="brand"><img src="/favicon.svg" alt="" width="28" height="28" /> Mallard Metrics</h1>
+          <div class="header-actions">
+            ${!share && html`<button type="button" class="btn-secondary" aria-expanded=${panel === 'install'} aria-controls="install" onClick=${(e) => this.togglePanel('install', e)}>Install snippet</button>`}
+            ${this.props.onLogout && html`<button type="button" class="btn-secondary" aria-expanded=${panel === 'segments'} aria-controls="segments" onClick=${(e) => this.togglePanel('segments', e)}>Segments</button>`}
+            ${this.props.onLogout && html`<button type="button" class="btn-secondary" aria-expanded=${panel === 'share'} aria-controls="share" onClick=${(e) => this.togglePanel('share', e)}>Share links</button>`}
+            ${this.props.onLogout && html`<button type="button" class="btn-secondary" aria-expanded=${panel === 'keys'} aria-controls="keys" onClick=${(e) => this.togglePanel('keys', e)}>API keys</button>`}
+            <label class="theme-field"><span class="sr-only">Theme</span>
+              <select value=${theme} onChange=${(e) => this.setState({ theme: e.target.value }, () => { this.applyTheme(); this.persist(); })}>
+                <option value="auto">Auto theme</option>
+                <option value="light">Light theme</option>
+                <option value="dark">Dark theme</option>
+              </select>
+            </label>
+            ${this.props.onLogout && html`<button type="button" class="btn-secondary" onClick=${this.props.onLogout}>Sign out</button>`}
+          </div>
         </header>
 
-        ${error && html`<div class="banner banner-error" role="alert">${error}</div>`}
-
-        ${this.props.setupRequired &&
-        html`
-          <div class="banner banner-warning" role="alert">
-            <strong>This instance has no admin password.</strong>
+        <main id="main" tabindex="-1">
+        ${share && html`
+          <div class="banner banner-shared" role="note" aria-label="Shared view">
+            <strong>Shared view</strong>
             <span>
-              Anyone who can reach it can read every site's analytics. Set one
-              before exposing it to a network.
+              Read-only. ${share.segment ? html`Segment: <strong class="inline-strong">${share.segment}</strong>. ` : 'All traffic. '}
+              ${share.expires_at ? `This link expires ${fmtDate(share.expires_at)}.` : ''}
             </span>
-            <button onClick=${this.props.onStartSetup}>Set admin password</button>
-          </div>
-        `}
+          </div>`}
+        ${siteId || !noSites ? this.renderToolbar() : null}
+        <div class="sr-only" role="status" aria-live="polite">${notice && notice.tone !== 'error' ? notice.text : ''}</div>
 
-        ${this.state.showKeys &&
-        html`
-          <${KeysPanel}
-            onClose=${() => this.setState({ showKeys: false })}
-            onAuthExpired=${this.props.onAuthExpired}
-          />
-        `}
+          ${notice && html`<div class=${`banner banner-${notice.tone}`} role=${notice.tone === 'error' ? 'alert' : 'note'}>
+            <span>${notice.text}</span>
+            <button type="button" class="btn-secondary" onClick=${() => this.setState({ notice: null })}>Dismiss</button>
+          </div>`}
 
-        ${!siteId && html`<div class="banner">Choose a site to see its analytics.</div>`}
+          ${offline && html`<div class="banner banner-error banner-offline" role="alert">
+            <span><strong>Cannot reach the server.</strong> Nothing on this page is being refreshed. The dashboard retries on its own, or you can try now.</span>
+            <button type="button" class="btn-secondary" onClick=${() => this.refresh({ push: false })}>Retry now</button>
+          </div>`}
 
-        ${siteId &&
-        html`
-          <${Panel}
-            title="Overview"
-            actions=${html`
-              <div class="panel-actions">
-                <a class="btn-link" href=${`/api/stats/export?${query}&kind=daily&format=csv`}>Daily CSV</a>
-                <a class="btn-link" href=${`/api/stats/export?${query}&kind=raw&format=csv`}>Raw CSV</a>
-                <a class="btn-link" href=${`/api/stats/export?${query}&kind=raw&format=json`}>Raw JSON</a>
-              </div>
-            `}
-          >
-            <${FilterBar}
-              filters=${this.state.filters}
-              onRemove=${(i) => this.removeFilter(i)}
-              onClear=${() => this.clearFilters()}
-            />
-            ${this.renderHeadline()}
-            ${timeseries && timeseries.kind === 'ok'
-              ? html`<${TimeseriesChart} data=${timeseries.data} />`
-              : html`<${Placeholder} state=${timeseries} />`}
-          </${Panel}>
+          ${this.props.setupRequired && html`
+            <div class="banner banner-warning">
+              <strong>This instance has no admin password.</strong>
+              <span>Anyone who can reach it can read every site's analytics. Set one before exposing it to a network.</span>
+              <button type="button" onClick=${this.props.onStartSetup}>Set admin password</button>
+            </div>`}
 
-          <${RealtimePanel} state=${realtime} />
+          ${panel === 'keys' && this.props.onLogout && html`<${KeysPanel} onClose=${() => this.closePanel()} onAuthExpired=${this.props.onAuthExpired} />`}
+          ${panel === 'segments' && this.props.onLogout && html`<${SegmentsPanel} site=${siteId} segments=${segments} filters=${filters}
+            onApply=${(segment) => this.applySegment(segment)} onChanged=${() => this.loadSegments()} onClose=${() => this.closePanel()} onAuthExpired=${this.props.onAuthExpired} />`}
+          ${panel === 'share' && this.props.onLogout && html`<${SharePanel} site=${siteId} segments=${segments} onClose=${() => this.closePanel()} onAuthExpired=${this.props.onAuthExpired} />`}
+          ${panel === 'install' && !share && html`<${InstallPanel} site=${siteId || siteDraft} onClose=${() => this.closePanel()} />`}
 
-          <div class="panel-grid">
-            ${BREAKDOWN_GROUPS.map(
-              (group) => html`
-                <${Panel} title=${group.title}>
-                  <${BreakdownTabs}
-                    tabs=${group.tabs}
-                    data=${breakdowns}
-                    onFilter=${(dimension, value) => this.addFilter(dimension, value)}
-                  />
-                </${Panel}>
-              `,
-            )}
-          </div>
+          ${noSites && !share && html`<${Welcome} siteDraft=${siteDraft} onDraft=${(v) => this.setState({ siteDraft: v })} onUse=${() => siteDraft && this.change({ siteId: siteDraft })} />`}
 
-          <${GoalsPanel} goals=${goals} propertyKeys=${propertyKeys} query=${query} />
-          <${RevenuePanel} state=${revenue} />
+          ${siteId && html`
+            <${FilterBar} filters=${filters} menu=${this.renderSegmentMenu()} onRemove=${(i) => this.removeFilter(i)} onToggle=${(i) => this.toggleFilter(i)} onClear=${() => this.clearFilters()} />
+            ${this.renderOverview()}
 
-          <${Panel}
-            title="Funnel"
-            subtitle="Visitors reaching at least each step, within the conversion window"
-          >
-            <div class="inline-controls">
-              <label>
-                Steps
-                <input
-                  type="text"
-                  value=${funnelSteps}
-                  placeholder="page:/,page:/pricing,event:signup"
-                  onInput=${(e) => this.setState({ funnelSteps: e.target.value })}
-                />
-              </label>
-              <label>
-                Modes
-                <input
-                  type="text"
-                  value=${funnelModes}
-                  placeholder="e.g. strict_order, strict_increase"
-                  onInput=${(e) => this.setState({ funnelModes: e.target.value })}
-                />
-              </label>
-              <button onClick=${() => this.refresh()} disabled=${loading}>Apply</button>
+            <${RealtimePanel} state=${res.realtime} filtered=${filters.length > 0} onRetry=${() => this.load('realtime')} onVisible=${() => this.want('realtime')} />
+
+            <div class="panel-grid">
+              ${BREAKDOWN_GROUPS.map((group) => html`
+                <${BreakdownGroup} group=${group} active=${tabs[group.id]} data=${res} limits=${this.state.limits} onLimit=${(slug, limit) => this.setLimit(slug, limit)} onTab=${(g, slug, visible) => this.setTab(g, slug, visible)}
+                  onFilter=${(dimension, value) => this.addFilter(dimension, value)} onRetry=${(key) => this.load(key)} />`)}
             </div>
-            <${FunnelChart} state=${funnel} />
-          </${Panel}>
 
-          <${Panel} title="Retention cohorts" subtitle="Weekly cohorts by first visit">
-            <${RetentionGrid} state=${retention} />
-          </${Panel}>
-
-          <${Panel} title="Sequence" subtitle="Visitors whose events matched this ordered pattern">
-            <div class="inline-controls">
-              <label>
-                Steps
-                <input
-                  type="text"
-                  value=${sequenceSteps}
-                  placeholder="page:/,event:signup"
-                  onInput=${(e) => this.setState({ sequenceSteps: e.target.value })}
-                />
-              </label>
-              <button onClick=${() => this.refresh()} disabled=${loading}>Apply</button>
-            </div>
-            ${sequences && sequences.kind === 'ok'
-              ? html`
-                  <div class="metrics-grid">
-                    <${MetricCard} label="Converting visitors" value=${num(sequences.data.converting_visitors)} />
-                    <${MetricCard} label="Total visitors" value=${num(sequences.data.total_visitors)} />
-                    <${MetricCard} label="Conversion rate" value=${pct(sequences.data.conversion_rate)} />
-                    <${MetricCard} label="Total completions" value=${num(sequences.data.total_matches)} />
-                  </div>
-                `
-              : html`<${Placeholder} state=${sequences} />`}
-          </${Panel}>
-
-          <${Panel} title="Flow" subtitle="Where visitors go next, or where they came from">
-            <div class="inline-controls">
-              <label>
-                Page
-                <input
-                  type="text"
-                  value=${flowPage}
-                  onInput=${(e) => this.setState({ flowPage: e.target.value })}
-                />
-              </label>
-              <label>
-                Direction
-                <select
-                  value=${flowDirection}
-                  onChange=${(e) => this.setState({ flowDirection: e.target.value })}
-                >
-                  <option value="forward">Next page</option>
-                  <option value="backward">Previous page</option>
-                </select>
-              </label>
-              <button onClick=${() => this.refresh()} disabled=${loading}>Apply</button>
-            </div>
-            ${flow && flow.kind === 'ok'
-              ? (flow.data.length > 0
-                  ? html`
-                      <table class="data-table">
-                        <thead>
-                          <tr><th>Page</th><th class="numeric">Visitors</th><th class="numeric">Share</th></tr>
-                        </thead>
-                        <tbody>
-                          ${flow.data.map(
-                            (row) => html`<tr>
-                              <td>${row.next_page}</td>
-                              <td class="numeric">${num(row.visitors)}</td>
-                              <td class="numeric">${pct(row.share)}</td>
-                            </tr>`,
-                          )}
-                        </tbody>
-                      </table>
-                    `
-                  : html`<div class="placeholder">No flow data for this page</div>`)
-              : html`<${Placeholder} state=${flow} />`}
-          </${Panel}>
-        `}
+            <${GoalsPanel} goals=${res.goals} propertyKeys=${res.properties} query=${query}
+              onRetry=${(key) => this.load(key)} onVisible=${() => this.want('goals', 'properties')} />
+            <${RevenuePanel} state=${res.revenue} onRetry=${() => this.load('revenue')} onVisible=${() => this.want('revenue')} />
+            ${this.renderBehavioralPanels()}
+          `}
+        </main>
       </div>
     `;
   }
@@ -1473,7 +2340,7 @@ class Dashboard extends Component {
 class App extends Component {
   constructor() {
     super();
-    this.state = { checked: false, authenticated: false, setupRequired: false, showSetup: false };
+    this.state = { checked: false, authenticated: false, setupRequired: false, showSetup: false, unreachable: false, share: null, shareEnded: false };
   }
 
   componentDidMount() {
@@ -1481,49 +2348,79 @@ class App extends Component {
   }
 
   async checkAuth() {
-    try {
-      const res = await fetch('/api/auth/status');
-      if (res.ok) {
-        const { authenticated, setup_required } = await res.json();
-        this.setState({ checked: true, authenticated, setupRequired: setup_required });
-        return;
-      }
-    } catch (e) {
-      /* fall through to unauthenticated */
+    if (shareRequested) return this.checkShare();
+    const res = await api.get('/api/auth/status');
+    if (res.kind === 'ok') {
+      const { authenticated, setup_required: setupRequired } = res.data;
+      this.setState({ checked: true, authenticated, setupRequired, unreachable: false });
+    } else {
+      this.setState({ checked: true, authenticated: false, setupRequired: false, unreachable: res.kind === 'network' || res.kind === 'error' });
     }
-    this.setState({ checked: true, authenticated: false, setupRequired: false });
+  }
+
+  /** Open a shared view: ask the server what this link is for. No login is involved. */
+  async checkShare() {
+    if (!shareToken) {
+      this.setState({ checked: true, shareEnded: true });
+      return;
+    }
+    const res = await api.get('/api/shared/session');
+    if (res.kind === 'ok') this.setState({ checked: true, share: res.data, shareEnded: false, unreachable: false });
+    else if (res.kind === 'network' || res.status >= 500) this.setState({ checked: true, unreachable: true });
+    else this.setState({ checked: true, shareEnded: true });
   }
 
   async logout() {
-    await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {});
+    await api.send('POST', '/api/auth/logout');
     this.setState({ authenticated: false });
   }
 
-  render(_, { checked, authenticated, setupRequired, showSetup }) {
-    if (!checked) return html`<div class="loading-screen">Loading…</div>`;
-    // Before setup the API reports `authenticated: true` — reads are open, and
-    // that is a deliberate deployment mode. It also meant the login form was
-    // never shown, so there was no way to set an admin password from the
-    // dashboard at all, despite the README promising a first-run prompt. The
-    // setup form is now reachable from the banner below.
+  render(_, { checked, authenticated, setupRequired, showSetup, unreachable }) {
+    if (!checked) return html`<div class="loading-screen" role="status">Loading…</div>`;
+    if (this.state.shareEnded) {
+      return html`
+        <main class="auth-overlay">
+          <div class="auth-card share-ended">
+            <h1><img src="/favicon.svg" alt="" width="28" height="28" /> Mallard Metrics</h1>
+            <h2>This link no longer works</h2>
+            <p class="auth-hint" role="alert">The share link is invalid, has expired, or was revoked. Ask whoever sent it for a new one.</p>
+          </div>
+        </main>`;
+    }
+    if (unreachable) {
+      return html`
+        <main class="auth-overlay">
+          <div class="auth-card">
+            <h1><img src="/favicon.svg" alt="" width="28" height="28" /> Mallard Metrics</h1>
+            <p class="auth-error" role="alert">Cannot reach the server.</p>
+            <button type="button" onClick=${() => { this.setState({ checked: false }); this.checkAuth(); }}>Try again</button>
+          </div>
+        </main>`;
+    }
+    // Before setup the API reports `authenticated: true` because reads are open,
+    // a deliberate deployment mode. The setup form is reachable from the banner.
+    if (this.state.share) {
+      return html`
+        <${Boundary} fallback=${html`<main class="auth-overlay"><div class="auth-card"><h1>Something went wrong</h1><p class="auth-error" role="alert">The dashboard hit an unexpected error.</p><button type="button" onClick=${() => location.reload()}>Reload</button></div></main>`}>
+        <${Dashboard} share=${this.state.share} setupRequired=${false}
+          onAuthExpired=${() => this.setState({ shareEnded: true })} />
+        </${Boundary}>`;
+    }
     if (!authenticated || showSetup) {
       return html`
-        <${LoginForm}
-          setupRequired=${setupRequired}
+        <${LoginForm} setupRequired=${setupRequired}
           onLogin=${() => this.setState({ showSetup: false }, () => this.checkAuth())}
-          onCancel=${showSetup ? () => this.setState({ showSetup: false }) : null}
-        />
-      `;
+          onCancel=${showSetup ? () => this.setState({ showSetup: false }) : null} />`;
     }
     return html`
-      <${Dashboard}
-        setupRequired=${setupRequired}
-        onStartSetup=${() => this.setState({ showSetup: true })}
+      <${Boundary} fallback=${html`<main class="auth-overlay"><div class="auth-card"><h1>Something went wrong</h1><p class="auth-error" role="alert">The dashboard hit an unexpected error.</p><button type="button" onClick=${() => location.reload()}>Reload</button></div></main>`}>
+      <${Dashboard} setupRequired=${setupRequired} onStartSetup=${() => this.setState({ showSetup: true })}
         onLogout=${setupRequired ? null : () => this.logout()}
-        onAuthExpired=${() => this.setState({ authenticated: false })}
-      />
-    `;
+        onAuthExpired=${() => this.setState({ authenticated: false })} />
+      </${Boundary}>`;
   }
 }
 
-render(html`<${App} />`, document.getElementById('app'));
+const root = document.getElementById('app');
+root.replaceChildren();
+render(html`<${App} />`, root);

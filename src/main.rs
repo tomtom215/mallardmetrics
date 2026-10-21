@@ -14,11 +14,10 @@ use mallard_metrics::ingest::ratelimit::RateLimiter;
 use mallard_metrics::query::cache::QueryCache;
 use mallard_metrics::storage::parquet::ParquetStorage;
 use mallard_metrics::storage::{ReaderPool, TierLock};
-use mallard_metrics::{server, storage};
+use mallard_metrics::{query, server, storage};
 
 use duckdb::Connection;
 use parking_lot::Mutex;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -27,6 +26,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const HOUSEKEEPING_INTERVAL: std::time::Duration = std::time::Duration::from_mins(15);
 /// How often data-retention cleanup runs.
 const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_hours(24);
+
+/// How long shutdown lets a webhook delivery in flight finish.
+const WEBHOOK_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Exit code used for a configuration or startup failure.
 const EXIT_FAILURE: i32 = 1;
@@ -38,6 +40,8 @@ async fn main() {
     match args.first().map(String::as_str) {
         Some("--healthcheck") => std::process::exit(run_healthcheck().await),
         Some("--install-extension") => std::process::exit(run_install_extension()),
+        Some("--test-webhook") => std::process::exit(run_test_webhook().await),
+        Some("import") => std::process::exit(mallard_metrics::import::cli::run(&args[1..])),
         Some("--version" | "-V") => {
             println!("mallard-metrics {}", env!("CARGO_PKG_VERSION"));
             return;
@@ -60,7 +64,9 @@ fn print_help() {
          USAGE:\n    \
              mallard-metrics [CONFIG_FILE]\n    \
              mallard-metrics --healthcheck\n    \
-             mallard-metrics --install-extension\n\n\
+             mallard-metrics --install-extension\n    \
+             mallard-metrics --test-webhook\n    \
+             mallard-metrics import <FORMAT> --site-id <ID> --file <PATH>\n\n\
          OPTIONS:\n    \
              CONFIG_FILE           Path to a TOML configuration file (optional)\n    \
              --healthcheck         Probe a running instance and exit 0 when healthy\n    \
@@ -68,6 +74,10 @@ fn print_help() {
                                    the data directory and exit. For deployments\n                          \
                                    whose runtime network has no outbound route:\n                          \
                                    run this once with one, then start normally.\n    \
+             --test-webhook        Send one test notification to the configured alert\n                          \
+                                   webhook (MALLARD_ALERTS_*) and exit 0 if it was accepted\n    \
+             import                Load another product's export while the server is\n                          \
+                                   stopped; see `mallard-metrics import --help`\n    \
              --version, -V         Print the version and exit\n    \
              --help, -h            Print this message\n\n\
          Configuration may also be supplied through MALLARD_* environment\n\
@@ -144,10 +154,39 @@ fn run_install_extension() -> i32 {
         Err(e) => {
             eprintln!("Could not install the behavioral extension: {e}");
             eprintln!(
-                "This step needs outbound HTTPS to the DuckDB community extension \
-                 repository. Run it from a host or network that has one, against the \
+                "This step needs outbound HTTP (plain port 80, not HTTPS) to \
+                 community-extensions.duckdb.org. Run it from a host or network that has one, against the \
                  same data directory."
             );
+            EXIT_FAILURE
+        }
+    }
+}
+
+/// Send one test notification to the configured webhook and exit.
+///
+/// Reads the environment only, like `--healthcheck`, and applies the same
+/// validation and the same address checks as the running server, so a URL that
+/// would be refused at startup is refused here with the same message.
+async fn run_test_webhook() -> i32 {
+    let loaded = match Config::load(None) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("Configuration error: {e}");
+            return EXIT_FAILURE;
+        }
+    };
+    if let Err(e) = loaded.config.alerts.validate() {
+        eprintln!("Configuration error: {e}");
+        return EXIT_FAILURE;
+    }
+    match mallard_metrics::alerts::send_test(&loaded.config.alerts).await {
+        Ok(message) => {
+            println!("{message}");
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
             EXIT_FAILURE
         }
     }
@@ -283,6 +322,18 @@ async fn run(config_path: Option<&std::path::Path>) {
     };
 
     spawn_background_tasks(&config, &state);
+    let alerts = match mallard_metrics::alerts::start(
+        &state,
+        &config.alerts,
+        &config.site_ids,
+        config.flush_interval_secs,
+    ) {
+        Ok(handle) => handle,
+        Err(e) => {
+            eprintln!("Startup failed: webhook alerts: {e}");
+            std::process::exit(EXIT_FAILURE);
+        }
+    };
 
     let app = server::build_router(Arc::clone(&state));
     let addr = format!("{}:{}", config.host, config.port);
@@ -296,18 +347,62 @@ async fn run(config_path: Option<&std::path::Path>) {
 
     tracing::info!(addr = %addr, "Listening");
 
-    // ConnectInfo makes the peer address available to handlers, which is what
-    // the client-IP fallback uses when no proxy headers are trusted.
-    let service = app.into_make_service_with_connect_info::<SocketAddr>();
-    let shutdown_timeout = config.shutdown_timeout_secs;
+    let shutdown_timeout = std::time::Duration::from_secs(config.shutdown_timeout_secs.max(1));
 
-    if let Err(e) = axum::serve(listener, service)
-        .with_graceful_shutdown(shutdown_signal(Arc::clone(&state), shutdown_timeout))
-        .await
-    {
+    // The final flush has to come after the server has drained, not before.
+    // `with_graceful_shutdown` stops accepting connections when its future
+    // completes, but requests already in flight keep running — and an event
+    // they accept lands in a buffer that a flush started at the signal has
+    // already emptied. So the future below only waits for the signal; the flush
+    // runs once `serve` returns.
+    //
+    // `server::serve` is `axum::serve` plus a header-read timeout (SI-14): the
+    // peer address still reaches handlers as ConnectInfo, which the client-IP
+    // fallback uses when no proxy headers are trusted, and shutdown still stops
+    // accepting and then drains.
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+    let serving = server::serve(listener, app, server::HEADER_READ_TIMEOUT, async move {
+        wait_for_shutdown_signal().await;
+        // The receiver only goes away if `serve` has already returned.
+        let _ = signalled_tx.send(());
+    });
+    tokio::pin!(serving);
+
+    // A connection that never finishes must not keep the process alive past the
+    // drain budget: orchestrators follow SIGTERM with SIGKILL, and the flush
+    // below still has to run.
+    let outcome = tokio::select! {
+        result = &mut serving => Some(result),
+        () = async {
+            if signalled_rx.await.is_ok() {
+                tokio::time::sleep(shutdown_timeout).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        } => {
+            tracing::warn!(
+                timeout_secs = shutdown_timeout.as_secs(),
+                "Connections did not drain in time; shutting down with some still open"
+            );
+            None
+        }
+    };
+
+    // Before the flush: a webhook receiver that hangs must not eat the time the
+    // flush needs, so the delivery in flight gets a short, fixed grace.
+    if let Some(alerts) = alerts {
+        alerts
+            .shutdown(WEBHOOK_SHUTDOWN_GRACE.min(shutdown_timeout))
+            .await;
+    }
+
+    flush_on_shutdown(&state, shutdown_timeout).await;
+
+    if let Some(Err(e)) = outcome {
         tracing::error!(error = %e, "Server error");
         std::process::exit(EXIT_FAILURE);
     }
+    tracing::info!("Shutdown complete");
 }
 
 /// Initialise the tracing subscriber.
@@ -333,6 +428,7 @@ fn init_tracing(log_format: &str) {
 struct Database {
     writer: Arc<Mutex<Connection>>,
     readers: ReaderPool,
+    /// Loaded on the writer and on every reader.
     behavioral_loaded: bool,
     behavioral_version: Option<String>,
 }
@@ -349,7 +445,7 @@ fn open_database(config: &Config, storage: &ParquetStorage) -> Result<Database, 
     apply_duckdb_settings(&conn, config)?;
     storage::migrations::run_migrations(&conn).map_err(|e| format!("migrations failed: {e}"))?;
 
-    let behavioral_loaded = match storage::schema::load_behavioral_extension(&conn) {
+    let writer_loaded = match storage::schema::load_behavioral_extension(&conn) {
         Ok(()) => {
             tracing::info!(
                 version = storage::schema::behavioral_version(&conn),
@@ -361,7 +457,9 @@ fn open_database(config: &Config, storage: &ParquetStorage) -> Result<Database, 
             tracing::warn!(
                 error = %e,
                 "Behavioral extension unavailable; funnels, retention, sessions, \
-                 sequences and flow analysis will report 503 until it loads"
+                 sequences and flow analysis will report 503 until it loads \
+                 (it is retried every {} s)",
+                query::extension::RETRY_INTERVAL.as_secs()
             );
             false
         }
@@ -378,17 +476,40 @@ fn open_database(config: &Config, storage: &ParquetStorage) -> Result<Database, 
         Err(e) => tracing::warn!(error = %e, "Could not clean up interrupted Parquet writes"),
     }
 
+    // A flush interrupted after its rows were committed to Parquet staging but
+    // before the file was published is finished here, before the view exists.
+    match storage.recover_pending_flushes(&conn) {
+        Ok(report) => tracing::info!(?report, "Checked for interrupted flushes"),
+        Err(e) => tracing::warn!(error = %e, "Could not recover interrupted flushes"),
+    }
+
     if let Err(e) = storage::schema::setup_query_view(&conn, &events_dir) {
         tracing::warn!(error = %e, "Could not create the events_all view; queries will be limited");
     }
 
     let writer = Arc::new(Mutex::new(conn));
     let readers = ReaderPool::new(&writer, config.read_connections);
-    if readers.len() > 1 {
-        // Only the extension needs arming per connection; the view the writer
-        // just created is already in the shared catalog.
-        let _ = readers.for_each(storage::schema::load_behavioral_extension);
-    }
+    // The view the writer just created is already in the shared catalog, and
+    // `LOAD` on the writer arms readers cloned from it too (pinned by
+    // `query::extension::tests::loading_on_the_writer_arms_cloned_readers`).
+    // A query is handed whichever reader is next, so "loaded" is still asked of
+    // every connection rather than of the writer alone, and a failure is
+    // reported: it used to be dropped (`let _ =`), and the first one ended the
+    // loop.
+    let behavioral_loaded = if writer_loaded && readers.len() > 1 {
+        let report = query::extension::load_everywhere(&writer, &readers);
+        if !report.complete() {
+            tracing::warn!(
+                failed = report.attempted - report.loaded,
+                of = readers.len(),
+                "Behavioral extension did not load on every read connection; \
+                 reporting it as unavailable and retrying"
+            );
+        }
+        report.complete()
+    } else {
+        writer_loaded
+    };
 
     Ok(Database {
         writer,
@@ -484,6 +605,7 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
     } else {
         config.max_concurrent_queries
     };
+    let query_limits = config.query_limits();
 
     if config.gdpr_mode {
         tracing::info!(
@@ -500,9 +622,11 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
         secret: load_or_create_secret(config),
         allowed_sites: config.site_ids.clone(),
         geoip: GeoIpReader::open(config.geoip_db_path.as_deref()),
+        datacenter: open_datacenter_filter(config)?,
         filter_bots: config.filter_bots,
         sessions: SessionStore::with_capacity(config.session_ttl_secs, config.max_sessions),
         api_keys: ApiKeyStore::load_from_disk(config.data_dir.join("api_keys.json")),
+        share: mallard_metrics::api::share::ShareState::load(&config.data_dir),
         admin_password: AdminPasswordStore::load_from_disk(
             config.data_dir.join("admin.json"),
             load_admin_password(),
@@ -519,14 +643,21 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
         http_metrics: Arc::default(),
         events_ingested_total: Arc::new(AtomicU64::new(0)),
         flush_failures_total: Arc::new(AtomicU64::new(0)),
+        last_flush_success_unix: Arc::new(AtomicU64::new(0)),
+        started_at_unix: unix_now(),
         rate_limit_rejections_total: Arc::new(AtomicU64::new(0)),
         login_failures_total: Arc::new(AtomicU64::new(0)),
+        alert_metrics: Arc::default(),
         metrics_token,
         query_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+        query_limits,
         secure_cookies: config.secure_cookies,
-        behavioral_extension_loaded: db.behavioral_loaded,
-        behavioral_version: db.behavioral_version,
+        behavioral: query::extension::ExtensionState::new(
+            db.behavioral_loaded,
+            db.behavioral_version,
+        ),
         trust_proxy_headers: config.trust_proxy_headers,
+        trusted_proxy_hops: config.trusted_proxy_hops,
         session_window: config.session_window_interval(),
         realtime_window_minutes: config.realtime_window_minutes,
         visitor_salt_rotation_days: config.visitor_salt_rotation_days,
@@ -538,7 +669,27 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
         suppress_screen_size: config.suppress_screen_size,
         geoip_precision: config.geoip_precision.clone(),
         events_dir,
+        data_dir: config.data_dir.clone(),
+        backup_dir: config.data_dir.join("backups"),
     }))
+}
+
+/// The datacenter filter: off unless `asn_db_path` is set, and a database that
+/// cannot be used stops startup (a silent downgrade would look like filtering).
+fn open_datacenter_filter(
+    config: &Config,
+) -> Result<mallard_metrics::ingest::asn::DatacenterFilter, String> {
+    use mallard_metrics::ingest::asn::DatacenterFilter;
+    let Some(path) = config.asn_db_path.as_deref() else {
+        return Ok(DatacenterFilter::disabled());
+    };
+    let filter = DatacenterFilter::open(path, &config.datacenter_asns)?;
+    tracing::info!(
+        path = %path.display(),
+        asns = filter.asn_count(),
+        "Datacenter traffic filter enabled"
+    );
+    Ok(filter)
 }
 
 /// Hash the admin password supplied through the environment, if any.
@@ -546,6 +697,13 @@ fn load_admin_password() -> Option<String> {
     let password = std::env::var("MALLARD_ADMIN_PASSWORD")
         .ok()
         .filter(|p| !p.is_empty())?;
+
+    // The same policy as the setup endpoint: an environment variable is not a
+    // way around the minimum length.
+    if let Err(msg) = mallard_metrics::api::auth::validate_password(&password) {
+        eprintln!("MALLARD_ADMIN_PASSWORD rejected: {msg}");
+        std::process::exit(EXIT_FAILURE);
+    }
 
     match mallard_metrics::api::auth::hash_password(&password) {
         Ok(hash) => {
@@ -561,6 +719,9 @@ fn load_admin_password() -> Option<String> {
     }
 }
 
+/// Shortest accepted `MALLARD_SECRET`.
+const MIN_SECRET_CHARS: usize = 16;
+
 /// Resolve the visitor-ID secret, generating and persisting one if needed.
 ///
 /// Priority: `MALLARD_SECRET`, then `data_dir/.secret`, then a fresh value.
@@ -574,16 +735,39 @@ fn load_or_create_secret(config: &Config) -> String {
     if let Ok(secret) = std::env::var("MALLARD_SECRET") {
         let secret = secret.trim().to_string();
         if !secret.is_empty() {
+            // The visitor ID is an HMAC keyed with this value; a short, guessable
+            // key lets anyone who sees an ID brute-force the IP behind it.
+            if secret.chars().count() < MIN_SECRET_CHARS {
+                eprintln!(
+                    "MALLARD_SECRET is shorter than {MIN_SECRET_CHARS} characters. \
+                     Use a random value, e.g. `openssl rand -hex 32`."
+                );
+                std::process::exit(EXIT_FAILURE);
+            }
             return secret;
         }
     }
 
     let secret_path = config.data_dir.join(".secret");
-    if let Ok(existing) = std::fs::read_to_string(&secret_path) {
-        let existing = existing.trim().to_string();
-        if !existing.is_empty() {
+    // Clear temp files an interrupted write left beside the secret.
+    mallard_metrics::api::auth::remove_stale_temp_files(&secret_path);
+    match std::fs::read_to_string(&secret_path) {
+        Ok(existing) if !existing.trim().is_empty() => {
+            mallard_metrics::api::auth::restrict_to_owner(&secret_path);
             tracing::info!(path = %secret_path.display(), "Loaded the persisted visitor-ID secret");
-            return existing;
+            return existing.trim().to_string();
+        }
+        // An empty file carries no secret; fall through and generate one.
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            // Generating a fresh secret here would replace the one on disk and
+            // silently break every visitor ID derived from it.
+            eprintln!(
+                "Cannot read {}: {e}; refusing to replace the visitor-ID secret",
+                secret_path.display()
+            );
+            std::process::exit(EXIT_FAILURE);
         }
     }
 
@@ -611,6 +795,15 @@ fn spawn_background_tasks(config: &Config, state: &Arc<AppState>) {
         spawn_retention_task(config.retention_days, state);
     }
     spawn_housekeeping_task(state);
+    if !state.behavioral.is_loaded() {
+        // Started without the extension on every connection (no network at
+        // boot, a reader that failed to load): keep trying instead of serving
+        // 503 until the next restart.
+        tokio::spawn(query::extension::retry_until_loaded(
+            Arc::clone(state),
+            query::extension::RETRY_INTERVAL,
+        ));
+    }
 }
 
 /// Flush buffered events to Parquet on a timer.
@@ -629,8 +822,14 @@ fn spawn_flush_task(interval_secs: u64, state: &Arc<AppState>) {
             let task_state = Arc::clone(&state);
             let result = tokio::task::spawn_blocking(move || task_state.buffer.flush()).await;
             match result {
-                Ok(Ok(count)) if count > 0 => tracing::info!(count, "Periodic flush completed"),
-                Ok(Ok(_)) => {}
+                Ok(Ok(count)) => {
+                    state
+                        .last_flush_success_unix
+                        .store(unix_now(), Ordering::Relaxed);
+                    if count > 0 {
+                        tracing::info!(count, "Periodic flush completed");
+                    }
+                }
                 Ok(Err(e)) => {
                     state.flush_failures_total.fetch_add(1, Ordering::Relaxed);
                     tracing::error!(error = %e, "Periodic flush failed");
@@ -644,16 +843,27 @@ fn spawn_flush_task(interval_secs: u64, state: &Arc<AppState>) {
     });
 }
 
+/// Seconds since the Unix epoch. Zero if the clock is before it, which a
+/// monotonic-failure metric can only read as "never".
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Delete Parquet partitions past the retention horizon, daily.
 fn spawn_retention_task(retention_days: u32, state: &Arc<AppState>) {
     let storage = state.buffer.storage().clone();
+    let writer = state.buffer.conn().clone();
     let tier_lock = state.tier_lock.clone();
+    let cache_state = Arc::clone(state);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(RETENTION_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
             let storage = storage.clone();
+            let writer = writer.clone();
             let tier_lock = tier_lock.clone();
             let result = tokio::task::spawn_blocking(move || {
                 // The read glob is expanded when a query starts and the files
@@ -661,12 +871,16 @@ fn spawn_retention_task(retention_days: u32, state: &Arc<AppState>) {
                 // makes the query fail on a file that no longer exists. Taking
                 // the tier lock keeps deletions out of that window.
                 let _tier = tier_lock.write();
-                storage.cleanup_old_partitions(retention_days)
+                // Refreshes the view too: removing the last partition would
+                // otherwise leave `events_all` reading a glob that matches nothing.
+                storage.cleanup_old_partitions_and_refresh(&writer.lock(), retention_days)
             })
             .await;
             match result {
                 Ok(Ok(0)) => {}
                 Ok(Ok(removed)) => {
+                    // Reports cached before the cleanup still include what was removed.
+                    cache_state.query_cache.clear();
                     tracing::info!(removed, retention_days, "Data retention cleanup completed");
                 }
                 Ok(Err(e)) => tracing::error!(error = %e, "Data retention cleanup failed"),
@@ -700,8 +914,8 @@ fn spawn_housekeeping_task(state: &Arc<AppState>) {
     });
 }
 
-/// Wait for SIGINT or SIGTERM, then flush buffered events.
-async fn shutdown_signal(state: Arc<AppState>, timeout_secs: u64) {
+/// Wait for SIGINT or SIGTERM.
+async fn wait_for_shutdown_signal() {
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
             tracing::error!(error = %e, "Failed to install the Ctrl+C handler");
@@ -728,19 +942,25 @@ async fn shutdown_signal(state: Arc<AppState>, timeout_secs: u64) {
         () = ctrl_c => tracing::info!("Received SIGINT"),
         () = terminate => tracing::info!("Received SIGTERM"),
     }
+}
 
+/// Flush whatever is still buffered, within `timeout`.
+///
+/// Called after the server has drained, so no handler can add to the buffer
+/// behind it.
+async fn flush_on_shutdown(state: &Arc<AppState>, timeout: std::time::Duration) {
     tracing::info!(
-        timeout_secs,
+        timeout_secs = timeout.as_secs(),
         buffered = state.buffer.len(),
         "Shutting down gracefully, flushing buffered events"
     );
 
+    // `shutdown_flush` also closes the buffer, so nothing can be pushed behind it.
     let flush = tokio::task::spawn_blocking({
-        let state = Arc::clone(&state);
-        move || state.buffer.flush()
+        let state = Arc::clone(state);
+        move || state.buffer.shutdown_flush()
     });
 
-    let timeout = std::time::Duration::from_secs(timeout_secs.max(1));
     match tokio::time::timeout(timeout, flush).await {
         Ok(Ok(Ok(count))) if count > 0 => {
             tracing::info!(count, "Flushed remaining events during shutdown");
@@ -749,10 +969,8 @@ async fn shutdown_signal(state: Arc<AppState>, timeout_secs: u64) {
         Ok(Ok(Err(e))) => tracing::error!(error = %e, "Failed to flush events during shutdown"),
         Ok(Err(e)) => tracing::error!(error = %e, "Flush task panicked during shutdown"),
         Err(_) => tracing::warn!(
-            timeout_secs,
+            timeout_secs = timeout.as_secs(),
             "Graceful shutdown flush timed out; some buffered events may be lost"
         ),
     }
-
-    tracing::info!("Shutdown complete");
 }

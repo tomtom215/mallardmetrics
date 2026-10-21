@@ -1,6 +1,8 @@
+pub mod alerts;
 pub mod api;
 pub mod config;
 pub mod dashboard;
+pub mod import;
 pub mod ingest;
 pub mod query;
 pub mod server;

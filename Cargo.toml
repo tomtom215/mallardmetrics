@@ -18,13 +18,23 @@ testing = ["dep:tempfile"]
 
 [dependencies]
 axum = { version = "0.8.9", features = ["macros"] }
-duckdb = { version = "1.10505.0", features = ["bundled", "parquet", "chrono"] }
+duckdb = { version = "1.10506.1", features = ["bundled", "parquet", "chrono"] }
 hmac = "0.13"
 sha2 = "0.11"
 # Constant-time primitives for secret comparison; see api::auth::constant_time_eq.
 subtle = "2.6.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# The `Stream` trait that `axum::body::Body::from_stream` takes; already in the
+# tree through tokio and axum.
+futures-core = "0.3.34"
+# The listener (`server::serve`) is hyper's HTTP/1 connection builder instead of
+# `axum::serve`, which has no way to set a header-read timeout (SI-14). HTTP/1
+# only, as axum's default features give today (no `http2`, so no `h2` crate).
+# hyper-util supplies the graceful-shutdown helper, the Tokio timer and the
+# tower adapter.
+hyper = { version = "1.11.1", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["server-graceful", "service", "tokio"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["cors", "compression-gzip", "trace", "timeout"] }
@@ -37,10 +47,19 @@ parking_lot = "0.12.5"
 rust-embed = { version = "8.12", features = ["compression"] }
 mime_guess = "2.0.5"
 toml = "1.1.4"
-maxminddb = "0.30.3"
+maxminddb = "0.32.0"
 argon2 = "0.6"
 rand = "0.10.2"
 tempfile = { version = "3.27", optional = true }
+# Outbound webhook client (src/alerts). Hand-rolled HTTP/1.1 over tokio-rustls so
+# the connection can be pinned to the address that passed the SSRF check; see
+# docs/src/alerts-and-reports.md for why this beat reqwest, ureq and hyper-rustls.
+# `ring` only: no aws-lc C++ build. The trust store is Mozilla's, compiled in.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1.0.10"
+# Already in the tree through hyper; parses the receiver's status line and headers.
+httparse = "1.10.1"
 
 [dev-dependencies]
 # Self-dependency so integration tests and benches see the `testing`
@@ -52,10 +71,21 @@ proptest = "1.11"
 tempfile = "3.27"
 tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1.5"
+# Test-only: a throwaway certificate for the local HTTPS receiver, so no private
+# key is committed to the repository.
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
 
 [[bench]]
 name = "ingest_bench"
 harness = false
+
+# The bundled DuckDB is built once per distinct feature set and profile
+# (`cargo test`, `clippy`, `build` and `doc` each get their own copy). With debug
+# info each copy is about 4.4 GB, enough to fill a CI runner or a small
+# development disk and stall the C++ compile rather than fail it. Our own code
+# keeps full debug info.
+[profile.dev.package.libduckdb-sys]
+debug = false
 
 [profile.release]
 lto = true

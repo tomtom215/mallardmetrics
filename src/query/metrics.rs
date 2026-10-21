@@ -1,4 +1,4 @@
-use super::QueryScope;
+use super::{QueryScope, sessions};
 use duckdb::Connection;
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +30,7 @@ pub struct CoreMetrics {
 
     /// Sessions derived by `sessionize`. Requires the behavioral extension.
     pub total_sessions: Option<u64>,
-    /// Fraction of sessions with exactly one pageview, 0.0–1.0.
+    /// Fraction of sessions that were a single pageview and nothing else, 0.0–1.0.
     pub bounce_rate: Option<f64>,
     /// Mean session duration in seconds.
     pub avg_visit_duration_secs: Option<f64>,
@@ -38,6 +38,11 @@ pub struct CoreMetrics {
     pub views_per_visit: Option<f64>,
     /// Whether session-derived fields above could be computed.
     pub behavioral_available: bool,
+    /// Why they could not: `"timestamps_rounded"` (a privacy setting; the fix is
+    /// to turn `round_timestamps`/`gdpr_mode` off) or `"extension_missing"`
+    /// (the `behavioral` extension is not loaded). Absent when they could.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions_unavailable_reason: Option<String>,
 
     /// The same site over an earlier window, when the caller asked to compare.
     ///
@@ -110,18 +115,50 @@ struct SessionAggregates {
 /// and the session query ran twice because `/stats/main` and `/stats/sessions`
 /// both called it.
 ///
+/// Counts (`unique_visitors`, `total_pageviews`, `total_events`) are
+/// *event-level*: they count the events that match the scope's filters. The
+/// session figures are *session-level*: under a filter they describe the whole
+/// of every session that contains a matching event. See
+/// [`crate::query::sessions`] for the definitions.
+///
 /// # Errors
 ///
-/// Returns an error if the base counts cannot be read. A failure of the
-/// session pass is not an error: it means the behavioral extension is
-/// unavailable, and the affected fields are reported as `None`.
+/// Returns an error if the base counts cannot be read, or if the session pass
+/// fails for any reason other than the behavioral extension being absent. Only
+/// absence reports the session fields as `None`: an out-of-memory, an I/O
+/// error, a timeout or a bad Parquet file used to be reported the same way and
+/// the degraded body was then cached, so a transient failure read as "this
+/// deployment has no session data" for a whole TTL.
 pub fn query_core_metrics(
     conn: &Connection,
     scope: &QueryScope,
 ) -> Result<CoreMetrics, duckdb::Error> {
     let base = query_base_counts(conn, scope)?;
-    let sessions = query_session_aggregates(conn, scope).ok();
+    let sessions = match query_session_aggregates(conn, scope) {
+        Ok(aggregates) => Some(aggregates),
+        Err(e) if super::behavioral_loaded(conn) => return Err(e),
+        Err(_) => None,
+    };
+    Ok(assemble(&base, sessions.as_ref()))
+}
 
+/// The same metrics without the session pass.
+///
+/// For deployments whose timestamps are rounded (`gdpr_mode`): every session
+/// figure computed from hour-rounded times is an artefact of the rounding, so
+/// they are reported as unavailable rather than as plausible-looking numbers.
+///
+/// # Errors
+///
+/// Returns an error if the base counts cannot be read.
+pub fn query_event_metrics(
+    conn: &Connection,
+    scope: &QueryScope,
+) -> Result<CoreMetrics, duckdb::Error> {
+    Ok(assemble(&query_base_counts(conn, scope)?, None))
+}
+
+fn assemble(base: &BaseCounts, sessions: Option<&SessionAggregates>) -> CoreMetrics {
     #[allow(clippy::cast_precision_loss)]
     let views_per_visitor = if base.unique_visitors > 0 {
         base.total_pageviews as f64 / base.unique_visitors as f64
@@ -129,27 +166,30 @@ pub fn query_core_metrics(
         0.0
     };
 
-    Ok(CoreMetrics {
+    CoreMetrics {
         unique_visitors: base.unique_visitors,
         total_pageviews: base.total_pageviews,
         total_events: base.total_events,
         views_per_visitor,
-        total_sessions: sessions.as_ref().map(|s| s.total_sessions),
-        bounce_rate: sessions.as_ref().map(|s| s.bounce_rate),
-        avg_visit_duration_secs: sessions.as_ref().map(|s| s.avg_duration_secs),
-        views_per_visit: sessions.as_ref().map(|s| s.avg_pages),
+        total_sessions: sessions.map(|s| s.total_sessions),
+        bounce_rate: sessions.map(|s| s.bounce_rate),
+        avg_visit_duration_secs: sessions.map(|s| s.avg_duration_secs),
+        views_per_visit: sessions.map(|s| s.avg_pages),
         behavioral_available: sessions.is_some(),
+        // The caller knows why sessions were skipped; it fills this in.
+        sessions_unavailable_reason: None,
         comparison: None,
-    })
+    }
 }
 
 /// Visitor, pageview and event counts in one scan.
 fn query_base_counts(conn: &Connection, scope: &QueryScope) -> Result<BaseCounts, duckdb::Error> {
+    let events = scope.events();
     let sql = format!(
         "SELECT COUNT(DISTINCT visitor_id),
                 COUNT(*) FILTER (WHERE event_name = 'pageview'),
                 COUNT(*)
-         FROM events_all WHERE {}",
+         FROM {events} WHERE {}",
         scope.where_clause()
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -169,50 +209,35 @@ fn query_session_aggregates(
 ) -> Result<SessionAggregates, duckdb::Error> {
     let sql = session_aggregate_sql(scope);
     let mut stmt = conn.prepare(&sql)?;
-    stmt.query_row(duckdb::params_from_iter(scope.params()), |row| {
-        Ok(SessionAggregates {
-            total_sessions: row.get(0)?,
-            bounce_rate: row.get(1)?,
-            avg_duration_secs: row.get(2)?,
-            avg_pages: row.get(3)?,
-        })
-    })
+    stmt.query_row(
+        duckdb::params_from_iter(sessions::per_session_params(scope)),
+        |row| {
+            Ok(SessionAggregates {
+                total_sessions: row.get(0)?,
+                bounce_rate: row.get(1)?,
+                avg_duration_secs: row.get(2)?,
+                avg_pages: row.get(3)?,
+            })
+        },
+    )
 }
 
 /// SQL for the session aggregate pass. Split out so it can be unit-tested.
+///
+/// A bounce is a counted session whose only interaction is its pageview: a
+/// custom event ends it, a background event from the extras script
+/// ([`sessions::PASSIVE_EVENTS`]) does not. The full set of definitions is in
+/// [`crate::query::sessions`].
 fn session_aggregate_sql(scope: &QueryScope) -> String {
-    // The session window comes from operator config, not request input, and is
-    // validated by `Config::validate`; it is re-checked here so a future caller
-    // cannot interpolate something arbitrary.
-    let window = if scope.session_window_is_safe() {
-        scope.session_window.clone()
-    } else {
-        "30 minutes".to_string()
-    };
     format!(
-        "WITH scoped AS (
-             SELECT visitor_id, timestamp, event_name
-             FROM events_all WHERE {where_clause}
-         ),
-         sessionized AS (
-             SELECT visitor_id, timestamp, event_name,
-                    sessionize(timestamp, INTERVAL '{window}') OVER (
-                        PARTITION BY visitor_id ORDER BY timestamp) AS session_id
-             FROM scoped
-         ),
-         per_session AS (
-             SELECT visitor_id, session_id,
-                    COUNT(*) FILTER (WHERE event_name = 'pageview') AS page_count,
-                    EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp))) AS duration_secs
-             FROM sessionized GROUP BY visitor_id, session_id
-         )
+        "{cte}
          SELECT COUNT(*),
-                COALESCE(COUNT(*) FILTER (WHERE page_count = 1)::DOUBLE
+                COALESCE(COUNT(*) FILTER (WHERE interaction_count = 1 AND page_count = 1)::DOUBLE
                          / NULLIF(COUNT(*), 0), 0.0),
                 COALESCE(AVG(duration_secs), 0.0),
                 COALESCE(AVG(page_count), 0.0)
          FROM per_session",
-        where_clause = scope.where_clause()
+        cte = sessions::per_session_cte(scope)
     )
 }
 
@@ -426,6 +451,205 @@ mod tests {
         )
         .unwrap();
         assert_eq!(m.total_sessions, 1);
+    }
+
+    /// The audit's scenario: `c` views `/home` then `/pricing` in one visit,
+    /// `d` views `/x` and leaves.
+    fn seed_two_page_visit(db: &TestDb) {
+        insert_pageview(&db.conn, "c", "2024-01-15 10:00:00", "/home");
+        insert_pageview(&db.conn, "c", "2024-01-15 10:05:00", "/pricing");
+        insert_pageview(&db.conn, "d", "2024-01-15 11:00:00", "/x");
+    }
+
+    #[test]
+    fn test_page_filter_keeps_whole_sessions_not_just_the_matching_events() {
+        // Regression (S-02): sessions were rebuilt from the filtered rows, so a
+        // two-page visit narrowed to its `/pricing` pageview looked like a
+        // one-page visit and was reported as a bounce lasting 0 seconds.
+        // Plausible and Matomo both treat a segment as "visits containing a
+        // matching action" and measure the visit in full.
+        let db = TestDb::new();
+        if !db.require_behavioral("filtered session metrics") {
+            return;
+        }
+        seed_two_page_visit(&db);
+        let m = query_core_metrics(
+            &db.conn,
+            &crate::query::test_support::filtered_scope(
+                "2024-01-01",
+                "2024-02-01",
+                "pages==/pricing",
+            ),
+        )
+        .unwrap();
+        assert_eq!(m.total_sessions, Some(1), "only c's visit touched /pricing");
+        assert_eq!(m.bounce_rate, Some(0.0), "c viewed two pages");
+        assert_eq!(m.avg_visit_duration_secs, Some(300.0));
+        assert_eq!(
+            m.views_per_visit,
+            Some(2.0),
+            "the whole visit, not one view"
+        );
+        // Event-level counts stay event-level: one matching pageview.
+        assert_eq!(m.total_pageviews, 1);
+    }
+
+    #[test]
+    fn test_a_pageview_plus_a_custom_event_is_not_a_bounce() {
+        // Regression (S-03): bounce was `pageviews = 1`, so a visitor who viewed
+        // one page and then clicked a tracked button bounced. Both Plausible
+        // (an interactive event ends the bounce) and Matomo (events are
+        // actions) count that visit as engaged.
+        let db = TestDb::new();
+        if !db.require_behavioral("bounce definition") {
+            return;
+        }
+        insert_pageview(&db.conn, "a", "2024-01-15 10:00:00", "/");
+        db.insert_event("a", "2024-01-15 10:01:00", "signup", "/");
+        insert_pageview(&db.conn, "b", "2024-01-15 11:00:00", "/");
+
+        let m = query_session_metrics(&db.conn, &scope("2024-01-01", "2024-02-01")).unwrap();
+        assert_eq!(m.total_sessions, 2);
+        assert!((m.bounce_rate - 0.5).abs() < f64::EPSILON, "{m:?}");
+        assert!(
+            (m.avg_pages_per_session - 1.0).abs() < f64::EPSILON,
+            "a custom event is not a page"
+        );
+        assert!(
+            (m.avg_session_duration_secs - 30.0).abs() < f64::EPSILON,
+            "duration spans every event in the visit: (60 + 0) / 2"
+        );
+    }
+
+    #[test]
+    fn test_background_events_from_the_extras_script_do_not_end_a_bounce() {
+        // The extras script reports scroll depth and engaged time as the page is
+        // hidden. The visitor did nothing, so the visit is still a bounce; a real
+        // custom event still ends it.
+        let db = TestDb::new();
+        if !db.require_behavioral("passive events") {
+            return;
+        }
+        insert_pageview(&db.conn, "a", "2024-01-15 10:00:00", "/");
+        db.insert_event("a", "2024-01-15 10:00:20", "Scroll Depth", "/");
+        db.insert_event("a", "2024-01-15 10:00:20", "Engagement", "/");
+        insert_pageview(&db.conn, "b", "2024-01-15 11:00:00", "/");
+        db.insert_event("b", "2024-01-15 11:00:30", "Scroll Depth", "/");
+        db.insert_event("b", "2024-01-15 11:00:40", "signup", "/");
+
+        let m = query_session_metrics(&db.conn, &scope("2024-01-01", "2024-02-01")).unwrap();
+        assert_eq!(m.total_sessions, 2);
+        assert!(
+            (m.bounce_rate - 0.5).abs() < f64::EPSILON,
+            "a bounced on a pageview plus passive events; b signed up: {m:?}"
+        );
+    }
+
+    #[test]
+    fn test_a_segment_that_cuts_events_measures_only_what_is_inside_it() {
+        // A share link's segment is a confidentiality boundary. Selecting
+        // sessions would report the whole three-page visit that merely touched
+        // /p1; cutting events must report only the /p1 part of it.
+        let db = TestDb::new();
+        if !db.require_behavioral("segment cutting") {
+            return;
+        }
+        insert_pageview(&db.conn, "a", "2024-01-15 10:00:00", "/p1");
+        insert_pageview(&db.conn, "a", "2024-01-15 10:01:00", "/p2");
+        insert_pageview(&db.conn, "a", "2024-01-15 10:02:00", "/p3");
+        let segment =
+            crate::query::test_support::filtered_scope("2024-01-01", "2024-02-01", "pages==/p1");
+
+        let selected = query_session_metrics(&db.conn, &segment).unwrap();
+        assert!(
+            (selected.avg_pages_per_session - 3.0).abs() < f64::EPSILON,
+            "selecting sessions measures the whole visit: {selected:?}"
+        );
+
+        let cut = query_session_metrics(&db.conn, &segment.with_cut_events(true)).unwrap();
+        assert_eq!(cut.total_sessions, 1);
+        assert!(
+            (cut.avg_pages_per_session - 1.0).abs() < f64::EPSILON,
+            "cutting events sees one page: {cut:?}"
+        );
+        assert!(
+            (cut.avg_session_duration_secs - 0.0).abs() < f64::EPSILON,
+            "{cut:?}"
+        );
+        assert!((cut.bounce_rate - 1.0).abs() < f64::EPSILON, "{cut:?}");
+    }
+
+    #[test]
+    fn test_passive_event_names_match_the_extras_script() {
+        let script = include_str!("../../tracking/extras.js");
+        for name in sessions::PASSIVE_EVENTS {
+            assert!(
+                script.contains(&format!("'{name}'")),
+                "{name:?} is no longer an event the extras script sends"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_visit_with_no_pageview_is_not_a_session() {
+        // Regression (S-03): a custom event with no pageview in range (a
+        // script firing after the range began, a pageview that predates it)
+        // counted as a session, diluting views-per-visit and the bounce rate.
+        let db = TestDb::new();
+        if !db.require_behavioral("session definition") {
+            return;
+        }
+        db.insert_event("only-event", "2024-01-15 10:00:00", "signup", "/");
+        insert_pageview(&db.conn, "real", "2024-01-15 11:00:00", "/");
+
+        let m = query_core_metrics(&db.conn, &scope("2024-01-01", "2024-02-01")).unwrap();
+        assert_eq!(m.total_sessions, Some(1));
+        assert_eq!(m.bounce_rate, Some(1.0));
+        assert_eq!(m.views_per_visit, Some(1.0));
+        assert_eq!(m.unique_visitors, 2, "visitor counts are event-level");
+    }
+
+    #[test]
+    fn test_custom_events_keep_a_session_alive() {
+        // A pageview, a custom event 20 minutes on, and a pageview 20 minutes
+        // after that are one visit: the visitor was never idle for 30 minutes.
+        let db = TestDb::new();
+        if !db.require_behavioral("session definition") {
+            return;
+        }
+        insert_pageview(&db.conn, "e", "2024-01-15 12:00:00", "/e1");
+        db.insert_event("e", "2024-01-15 12:20:00", "signup", "/e1");
+        insert_pageview(&db.conn, "e", "2024-01-15 12:40:00", "/e2");
+
+        let m = query_session_metrics(&db.conn, &scope("2024-01-01", "2024-02-01")).unwrap();
+        assert_eq!(m.total_sessions, 1);
+        assert!((m.avg_session_duration_secs - 2400.0).abs() < f64::EPSILON);
+        assert!((m.avg_pages_per_session - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_a_failing_session_pass_is_an_error_not_missing_data() {
+        // Regression (S-06): `query_session_aggregates(..).ok()` turned every
+        // failure into `behavioral_available: false`, and the degraded body was
+        // then cached. Subtracting an infinite timestamp is a genuine runtime
+        // error that has nothing to do with the extension being absent.
+        let db = TestDb::new();
+        if !db.require_behavioral("error propagation") {
+            return;
+        }
+        db.conn
+            .execute(
+                "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname)
+                 VALUES ('test.com', 'inf', CAST('-infinity' AS TIMESTAMP), 'pageview', '/'),
+                        ('test.com', 'inf', CAST('2024-01-15 10:00:00' AS TIMESTAMP), 'pageview', '/')",
+                [],
+            )
+            .unwrap();
+        let everything = scope("-infinity", "2024-02-01");
+        assert!(
+            query_core_metrics(&db.conn, &everything).is_err(),
+            "a real failure must reach the caller, not read as \"extension unavailable\""
+        );
     }
 
     #[test]

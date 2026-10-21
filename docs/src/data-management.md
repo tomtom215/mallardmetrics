@@ -1,100 +1,156 @@
 # Data Management
 
-## Storage Layout
+## Storage layout
 
-Events are stored as date-partitioned, ZSTD-compressed Parquet files under `data_dir/events/`:
+Events live in two places and are always queried together (the `events_all`
+view):
+
+| Tier | Where | Holds |
+|---|---|---|
+| Buffer | process memory | Events accepted but not yet flushed. **Not queryable, and lost if the process is killed** (`SIGKILL`, power loss, OOM). |
+| Hot table | `data_dir/mallard.duckdb` (table `events`) | Rows inserted by a flush that have not yet been moved to Parquet. Normally empty or tiny: a flush inserts and moves them in the same exclusive step. It holds rows when a Parquet write failed or a flush hit its per-flush partition cap; it is durable (WAL). |
+| Cold tier | `data_dir/events/` (Parquet, ZSTD) | Everything else. |
 
 ```
-data/events/
-├── site_id=example.com/
-│   ├── date=2024-01-15/
-│   │   ├── 0001.parquet   ← first flush for this day
-│   │   └── 0002.parquet   ← second flush for this day
-│   └── date=2024-01-16/
-│       └── 0001.parquet
-└── site_id=other.org/
-    └── date=2024-01-15/
-        └── 0001.parquet
+data/
+├── mallard.duckdb            hot table + catalog (and mallard.duckdb.wal while running)
+├── events/
+│   ├── site_id=example.com/
+│   │   ├── date=2026-10-20/
+│   │   │   ├── 0001.parquet        output of one flush
+│   │   │   ├── 0002.parquet
+│   │   │   └── 0025.m1.parquet     merge of 24 flush files (compaction level 1)
+│   │   └── date=2026-10-21/
+│   └── site_id=other.org/
+├── extensions/               the behavioral extension (v1.5.6/linux_amd64/...)
+├── exports/                  transient Parquet exports (empty unless one is in flight)
+├── .secret                   visitor-ID secret, mode 0600 (only if MALLARD_SECRET is unset)
+├── admin.json                Argon2id hash set through /api/auth/setup, mode 0600
+├── api_keys.json             SHA-256 hashes of API keys
+├── share_links.json          share link hashes, labels, segments, expiry, mode 0600
+└── segments.json             saved segments, mode 0600
 ```
 
-Each Parquet file contains one batch of flushed events for a specific site and date. Files are numbered sequentially within each partition. Parquet files are self-describing and can be read by any Parquet-compatible tool.
+`.mN` in a file name is the compaction level. Files are plain Parquet and can be
+read by any tool. Do not put `* ? [ ]` in the data directory's path: DuckDB would
+read them as glob characters, so startup refuses such a path.
 
----
+Leftovers you may see after a crash, all handled at startup:
+`NNNN.parquet.pending` (a flushed file not yet published), `NNNN.parquet.del`
+(a compaction source moved aside), `compact.parquet.tmp` (a merge in progress),
+and, only if a staged file was unreadable and its rows were not in the hot
+table, `NNNN.parquet.pending.corrupt`, which is left for you to inspect and is
+never deleted automatically.
 
-## Buffer and Flush Lifecycle
+## Buffer and flush lifecycle
 
 ```mermaid
 flowchart TD
-    EVENT["Incoming Event\nPOST /api/event"]
-    EVENT --> BUF["In-Memory Buffer\nVec&lt;Event&gt;"]
+    EVENT["POST /api/event\n202 Accepted"] --> BUF["In-memory buffer\nnot queryable yet"]
 
-    BUF --> T1{"Count reached\nflush_event_count?"}
-    BUF --> T2{"Periodic timer\nevery flush_interval_secs?"}
-    BUF --> T3{"SIGINT or SIGTERM\ngraceful shutdown?"}
+    BUF --> T1{"Buffer holds\nflush_event_count?"}
+    BUF --> T2{"Every\nflush_interval_secs?"}
+    BUF --> T3{"SIGTERM / SIGINT\nafter the server drained"}
+    T1 -->|"yes"| FLUSH
+    T2 -->|"yes"| FLUSH
+    T3 -->|"yes (until empty)"| FLUSH
 
-    T1 -->|"Yes"| FLUSH
-    T2 -->|"Yes"| FLUSH
-    T3 -->|"Yes"| FLUSH
-
-    FLUSH["Flush — spawn_blocking\nDuckDB Appender API\nbatch column insert"]
-    FLUSH --> PARQUET["COPY TO Parquet\nZSTD compression\ndate-partitioned file"]
-    PARQUET --> DELETE["DELETE FROM events\nhot table cleared"]
-    DELETE --> VIEW["Refresh events_all VIEW\nglobbed over new Parquet files"]
-    VIEW --> READY(["All data queryable\nevents_all VIEW\nhot union cold"])
+    FLUSH["Flush: take the exclusive tier lock\nthen the writer connection"] --> INS["Appender: one transaction\ninto the hot events table"]
+    INS --> STAGE["Per site-day partition (at most 256 per flush):\nwrite NNNN.parquet.pending and fsync"]
+    STAGE --> DEL["DELETE those rows from the hot table\n(committed)"]
+    DEL --> PUB["Rename to NNNN.parquet\nand fsync the directory"]
+    PUB --> VIEW["Refresh events_all"]
+    VIEW --> COMPACT["Release the lock, then compact\npartitions that received a file"]
+    COMPACT --> READY(["Rows are queryable"])
 ```
 
-> **Failure safety:** If the Appender insertion fails, drained events are restored to the front of the buffer and the flush returns an error. No events are lost due to a failed flush attempt.
+Order matters. A crash leaves one of two states, and startup recovery
+(`recover_pending_flushes`) tells them apart by comparing the staged file with
+the hot table row by row (`EXCEPT ALL`):
 
-**Flush triggers:**
+- every staged row is still in the hot table: the `DELETE` never committed, so
+  the staged file is a duplicate and is dropped;
+- some staged rows are no longer hot: the `DELETE` committed, the staged file is
+  the only copy, and it is published.
 
-1. Event count reaches `flush_event_count` (default 1000).
-2. Periodic timer fires every `flush_interval_secs` (default 60 seconds). Runs in `spawn_blocking` to avoid blocking the async runtime.
-3. Graceful shutdown — bounded by `shutdown_timeout_secs` (default 30 seconds).
+While the tiers disagree (between the `DELETE` and the rename) queries are held
+off by the tier lock, so a report never counts a row twice or misses it.
 
----
+**Failure behaviour.** If the insert fails, the events go back to the front of
+the buffer (nothing is lost). If the insert succeeds and the Parquet write
+fails, the rows stay in the hot table, are still visible, and the next flush
+retries even when no new event arrives. A failure after an event was accepted
+does not fail the request that triggered the flush; it is counted in
+`mallard_buffer_flush_failures_total` / `mallard_flush_failures_total` and
+logged. If flushes keep failing, the buffer fills to `max_buffered_events` and
+new events get `503` (`mallard_events_dropped_total`).
 
-## Data Retention
+**Triggers.** Buffer size (`flush_event_count`, default 1000), a timer
+(`flush_interval_secs`, default 60), and shutdown. **Visibility lag:** a new
+event appears in reports after the next flush, up to `flush_interval_secs`
+later (verified: three events posted with a 300 s interval returned zero events
+from `/api/stats/main` until shutdown flushed them). `/health/detailed` shows the
+pending count as `buffered_events`.
 
-When `retention_days` is set to a non-zero value, a background task runs daily and removes Parquet partition directories older than the configured threshold.
+**Shutdown.** On `SIGTERM`/`SIGINT` the server first stops accepting
+connections and drains in-flight requests (bounded by `shutdown_timeout_secs`),
+then closes the buffer (late requests get `503`) and performs a final flush,
+bounded by the same timeout again. Allow for both: the compose files use a 45 s
+grace period. `SIGKILL` skips all of it and loses the buffer.
 
-```toml
-# Delete partitions older than 90 days
-retention_days = 90
-```
+## Compaction
 
-**What is deleted:** the entire `date=YYYY-MM-DD/` directory and all Parquet files within it.
+A 60-second interval writes about 1,440 files per site per day, and DuckDB reads
+every file's footer on every query. After a flush, each partition that received
+a file is checked: once it holds `compact_after_files` (default 24) files of one
+level, they are merged into one file of the next level (`NNNN.mK.parquet`),
+sorted by `timestamp`. Files only merge with files of their own level, so a large
+merged file is not rewritten until enough large files exist.
 
-**What is not deleted:** the `site_id=*/` parent directory (it remains even if all date partitions have been removed).
+The expensive part (reading and writing) runs **without** the tier lock; sources
+are immutable. Only the swap takes it, and it is a few renames: move each source
+to `.del`, rename the merged file in, fsync, unlink the sources. Any failure
+undoes the earlier steps, and a crash is resolved at startup (staging file plus
+`.del` files means "restore the sources"; `.del` files alone means "finished,
+delete them"). One compaction runs at a time. `compact_after_files = 0` turns it
+off.
 
-To keep data indefinitely, set `retention_days = 0` (the default).
+## Data retention
 
-### GDPR Right to Erasure
+`retention_days > 0` removes `date=YYYY-MM-DD/` directories older than the
+threshold. The task runs at startup and every 24 hours. It takes the exclusive
+tier lock, refreshes `events_all` (a view over a pattern that matches nothing
+would fail every query), clears the query cache, and removes `site_id=*`
+directories that no longer hold any partition. Hot-table rows are not affected
+by retention; they leave when flushed and the resulting partition ages out.
 
-Mallard Metrics provides an admin-authenticated `DELETE /api/gdpr/erase` endpoint to permanently delete analytics data for a given `site_id` within a date range. Because visitor IDs are pseudonymous HMAC hashes under a rotating salt and cannot be reverse-mapped to individuals, erasure operates at the **site + date-range** granularity — the finest granularity available without the original IP address and User-Agent. See [PRIVACY.md](https://github.com/tomtom215/mallardmetrics/blob/main/PRIVACY.md) for the full analysis and operator obligations.
+`retention_days = 0` (default) keeps everything. Retention deletes whole days by
+the **partition date**, so it cannot be used for per-visitor deletion.
 
----
+## Erasure
 
-## Backup and Restore
+`DELETE /api/gdpr/erase` removes a site's events for an inclusive date range from
+both tiers. Semantics, partial failure and the limits of site-and-date
+granularity are on [Privacy and GDPR](privacy-gdpr.md#erasure) and in the
+[API reference](api-reference/stats.md#delete-apigdprerase).
 
-Parquet files are self-describing and portable. To back up:
+## Importing and exporting
 
-```bash
-# Sync data directory to a backup location
-rsync -a --checksum /data/events/ /backup/mallard-events/
+- [Importing Data](importing-data.md): `mallard-metrics import` loads a Google
+  Analytics 4 BigQuery export (the one event-level export whose schema is
+  documented) with the server stopped, and says why the other products' exports
+  cannot be imported.
+- [Exporting to Parquet](exporting-parquet.md): one site and date range as a
+  single Parquet file for a warehouse, without `visitor_id`.
 
-# Or with rclone to S3
-rclone sync /data/events s3:my-bucket/mallard-events
-```
+Imported rows are ordinary rows whose `visitor_id` starts with `imp:`.
 
-To restore:
+## Backup and restore
 
-```bash
-rsync -a /backup/mallard-events/ /data/events/
-```
-
-After restore, restart Mallard Metrics. The `events_all` VIEW automatically picks up all Parquet files on startup.
-
-> **Tip:** Include `data/mallard.duckdb` and `data/mallard.duckdb.wal` in your backups to preserve any hot (not yet flushed) events.
+Do not copy `mallard.duckdb` while the server runs: the database file and its
+write-ahead log can be captured inconsistently, and such a copy often fails to
+open. See [Backup and Restore](backup-restore.md) for what `deploy/backup.sh`
+does and what each restore needs.
 
 ---
 
@@ -147,7 +203,7 @@ The events table schema (also the Parquet file schema):
 | `timestamp` | TIMESTAMP | No | UTC event timestamp |
 | `event_name` | VARCHAR | No | Event type (e.g. `pageview`, `signup`) |
 | `pathname` | VARCHAR | No | URL path |
-| `hostname` | VARCHAR | Yes | URL hostname |
+| `hostname` | VARCHAR | Yes | The site ID again (ingest stores the validated `d` value, not the URL host) |
 | `referrer` | VARCHAR | Yes | Referrer URL |
 | `referrer_source` | VARCHAR | Yes | Parsed referrer source name |
 | `utm_source` | VARCHAR | Yes | UTM source parameter |
@@ -160,7 +216,7 @@ The events table schema (also the Parquet file schema):
 | `os` | VARCHAR | Yes | Operating system name |
 | `os_version` | VARCHAR | Yes | OS version string |
 | `device_type` | VARCHAR | Yes | `desktop`, `mobile`, or `tablet` |
-| `screen_size` | VARCHAR | Yes | Screen viewport width in pixels (e.g. `1920`) |
+| `screen_size` | VARCHAR | Yes | Viewport width in CSS pixels (e.g. `1920`) |
 | `country_code` | VARCHAR(2) | Yes | ISO 3166-1 alpha-2 country code |
 | `region` | VARCHAR | Yes | Region/state name |
 | `city` | VARCHAR | Yes | City name |

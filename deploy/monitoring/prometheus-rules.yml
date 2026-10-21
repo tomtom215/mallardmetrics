@@ -1,0 +1,235 @@
+# Prometheus alerting rules for Mallard Metrics.
+#
+# Every metric name below is exported by GET /metrics (src/server.rs:
+# write_gauges, write_counters, write_http_metrics). Nothing here depends on a
+# metric Mallard does not emit; what we would like to alert on but cannot yet is
+# listed in the "Not alertable yet" note at the end.
+#
+# Load it from prometheus.yml:
+#   rule_files:
+#     - /etc/prometheus/mallard-rules.yml
+# and scrape the job named `mallard-metrics` (see prometheus-scrape.example.yml).
+# Validate with:  promtool check rules deploy/monitoring/prometheus-rules.yml
+#
+# Counters reset when the process restarts. increase() and rate() handle that,
+# so the counter rules below are safe across restarts.
+
+groups:
+  - name: mallard-availability
+    rules:
+      - alert: MallardDown
+        expr: up{job="mallard-metrics"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Mallard Metrics is not answering scrapes"
+          description: >-
+            Prometheus has not scraped {{ $labels.instance }} for 5 minutes.
+            Visitors are being counted by nobody: the tracker does not retry.
+            Check `docker compose ps`, the container's logs, and that the
+            bearer token for /metrics still matches MALLARD_METRICS_TOKEN.
+
+      - alert: MallardAdminNotConfigured
+        expr: mallard_auth_configured == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No admin password is set on {{ $labels.instance }}"
+          description: >-
+            Until a password exists, whoever reaches /api/auth/setup first can
+            claim the instance and mint API keys. Set MALLARD_ADMIN_PASSWORD or
+            complete the setup yourself.
+
+      - alert: MallardBehavioralExtensionMissing
+        expr: mallard_behavioral_extension == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The behavioral extension is not loaded on {{ $labels.instance }}"
+          description: >-
+            Funnels, retention, sessions, sequences and flow answer 503, and the
+            main stats silently omit bounce rate and visit duration. The
+            usual causes are a musl-based image (the extension is not published
+            for musl), an unwritable extension directory, or an isolated network
+            that was never seeded: run `--install-extension` against the data
+            volume (deploy/docker-compose.production.yml explains how).
+
+  - name: mallard-ingest
+    rules:
+      - alert: MallardFlushFailing
+        expr: increase(mallard_flush_failures_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Mallard is failing to write events to disk"
+          description: >-
+            {{ $value | printf "%.0f" }} Parquet flush failure(s) in the last 15
+            minutes on {{ $labels.instance }}. Events stay in memory and are lost
+            on restart. Check free space and ownership of the data directory
+            (it must be writable by uid 65532).
+
+      - alert: MallardFlushStalled
+        # The gauge is 0 until the first flush completes, so a fresh process does
+        # not alert before its loop has had one interval to run.
+        expr: >-
+          (time() - mallard_last_flush_success_timestamp_seconds) > 600
+          and mallard_last_flush_success_timestamp_seconds > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Mallard has not completed a flush in over 10 minutes"
+          description: >-
+            The periodic flush on {{ $labels.instance }} last succeeded more
+            than 10 minutes ago. A flush that finds nothing to write counts as
+            success, so this means the flush loop is failing or stuck, not that
+            traffic stopped. Buffered events are not yet durable.
+
+      - alert: MallardBufferFlushFailing
+        expr: increase(mallard_buffer_flush_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Threshold flushes are failing on {{ $labels.instance }}"
+          description: >-
+            Flushes triggered by the buffer filling up failed
+            {{ $value | printf "%.0f" }} time(s) in 15 minutes. The events are
+            safe in the hot table and the requests succeeded, but the Parquet
+            stage is not keeping up: check free space and the logs.
+
+      - alert: MallardEventsDropped
+        expr: increase(mallard_events_dropped_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Mallard is discarding events"
+          description: >-
+            {{ $value | printf "%.0f" }} event(s) were dropped in the last 15
+            minutes because the in-memory buffer was full. Flushing is not
+            keeping up with ingestion (see MallardFlushFailing) or
+            MALLARD_MAX_BUFFERED_EVENTS is too low for the traffic.
+
+      - alert: MallardBufferBacklog
+        # The default cap is MALLARD_MAX_BUFFERED_EVENTS = 100000. Half of it,
+        # sustained, means flushes are falling behind. Adjust if you changed it.
+        expr: mallard_buffered_events > 50000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mallard's event buffer is more than half full"
+          description: >-
+            {{ $value | printf "%.0f" }} events are waiting to be flushed on
+            {{ $labels.instance }}. Events are dropped once the buffer reaches
+            MALLARD_MAX_BUFFERED_EVENTS.
+
+      - alert: MallardNoEventsReceived
+        expr: >-
+          increase(mallard_events_ingested_total[6h]) == 0
+          and on(instance) up{job="mallard-metrics"} == 1
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "No events ingested for 6 hours"
+          description: >-
+            {{ $labels.instance }} is up but has accepted no events in the last 6
+            hours (or since it last restarted, if that was more recent). If the
+            site has steady traffic, the tracking snippet, an ad-blocker rule, the allowed
+            site_ids list or the reverse proxy is the likely culprit. Quiet sites
+            will trip this overnight; silence or drop it for them.
+
+  - name: mallard-http
+    rules:
+      - alert: MallardServerErrors
+        expr: >-
+          (
+            sum by (instance) (increase(mallard_http_requests_total{status="5xx"}[10m]))
+              / sum by (instance) (increase(mallard_http_requests_total[10m]))
+          ) > 0.05
+          and sum by (instance) (increase(mallard_http_requests_total{status="5xx"}[10m])) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 5% of Mallard responses are 5xx"
+          description: >-
+            {{ $value | humanizePercentage }} of responses on {{ $labels.instance }}
+            were server errors over the last 10 minutes. Look at the container
+            logs (`docker compose logs mallard`).
+
+      - alert: MallardSlowResponses
+        expr: >-
+          histogram_quantile(0.95,
+            sum by (instance, le) (rate(mallard_http_request_duration_seconds_bucket[5m]))) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mallard's 95th percentile response time is above 2 s"
+          description: >-
+            p95 latency on {{ $labels.instance }} is {{ $value | humanizeDuration }}.
+            Expensive analytics queries compete with ingestion; consider
+            MALLARD_MAX_CONCURRENT_QUERIES, a longer MALLARD_CACHE_TTL, or more
+            memory for DuckDB.
+
+  - name: mallard-abuse
+    rules:
+      - alert: MallardLoginFailuresSpike
+        expr: increase(mallard_login_failures_total[10m]) > 20
+        labels:
+          severity: warning
+        annotations:
+          summary: "Many failed dashboard logins"
+          description: >-
+            {{ $value | printf "%.0f" }} failed logins in 10 minutes on
+            {{ $labels.instance }}: a password-guessing attempt, or users locked
+            out together because the proxy's address is being used as the client
+            address (check MALLARD_TRUST_PROXY_HEADERS behind a reverse proxy).
+
+      - alert: MallardRateLimiting
+        expr: increase(mallard_rate_limit_rejections_total[10m]) > 100
+        labels:
+          severity: info
+        annotations:
+          summary: "Mallard is rejecting ingest requests"
+          description: >-
+            {{ $value | printf "%.0f" }} requests were rejected by a rate limiter
+            in 10 minutes on {{ $labels.instance }}. Either one client is
+            misbehaving or MALLARD_RATE_LIMIT is below your real traffic.
+
+  - name: mallard-notifications
+    rules:
+      # The webhook cannot report its own failure, so Prometheus watches it. The
+      # counters are 0 and flat when webhook alerts are not configured.
+      - alert: MallardNotificationsFailing
+        expr: increase(mallard_notifications_failed_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mallard cannot deliver its webhook notifications"
+          description: >-
+            {{ $value | printf "%.0f" }} webhook notification(s) were abandoned
+            after their retries in the last hour on {{ $labels.instance }}
+            (kind {{ $labels.kind }}). Run `mallard-metrics --test-webhook` with
+            the same environment, and check the receiver, the egress route and
+            docs/src/alerts-and-reports.md.
+
+      - alert: MallardNotificationsDropped
+        expr: increase(mallard_notifications_dropped_total{kind!=""}[1h]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "Mallard discarded webhook notifications unsent"
+          description: >-
+            The notification queue overflowed on {{ $labels.instance }}: the
+            receiver has been unreachable long enough for 64 messages to pile up.
+
+# Not alertable yet (no such metric): free disk space on the data volume, size
+# and file count of the Parquet store, last retention/compaction success and
+# DuckDB query errors. Use node_exporter for disk space in the meantime, e.g.
+# node_filesystem_avail_bytes{mountpoint="/srv/mallard/data"}. Version drift is
+# visible through mallard_build_info{version, behavioral_version}.

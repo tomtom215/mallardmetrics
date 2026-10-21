@@ -2,13 +2,17 @@
 
 ## `POST /api/event`
 
-Records a single analytics event. This endpoint is called by the tracking script automatically and can also be called directly for server-side event recording.
+Records one analytics event. The tracking script calls it automatically; it can
+also be called directly for server-side events.
 
-**Authentication:** None required. The `Origin` header is validated against `site_ids` if that config option is set.
+**Authentication:** none. When `site_ids` is configured, the `Origin` header
+**and** the payload's `d` field are checked against it (see below).
 
-**CORS:** Fully permissive (`Access-Control-Allow-Origin: *`) to allow cross-origin calls from the tracking script.
+**CORS:** `Access-Control-Allow-Origin: *`, methods `POST, GET`, header
+`Content-Type`, and preflight responses are cached for 24 hours
+(`Access-Control-Max-Age: 86400`) so a `sendBeacon` costs one request, not two.
 
-### Request Body
+### Request body
 
 ```json
 {
@@ -25,91 +29,108 @@ Records a single analytics event. This endpoint is called by the tracking script
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `d` | string | Yes | Domain / site identifier. Max 256 chars; alphanumeric plus `.`, `-`, `_`, `:` only. |
-| `n` | string | Yes | Event name (e.g. `"pageview"`, `"signup"`, `"purchase"`). |
-| `u` | string | Yes | Full URL of the page where the event occurred. |
-| `r` | string | No | Referrer URL. |
-| `w` | number | No | Screen width in pixels (for device-type detection). |
-| `p` | string | No | Custom properties as a JSON-encoded string. Stored in the `props` column and queryable via `json_extract`. |
-| `ra` | number | No | Revenue amount (stored as `DECIMAL(12,2)`). |
-| `rc` | string | No | ISO 4217 currency code (e.g. `"USD"`, `"EUR"`). Maximum 3 characters. |
+| `d` | string | yes | Site ID. 1–256 characters from `A-Z a-z 0-9 . - _ :`. |
+| `n` | string | yes | Event name, 1–256 characters (`pageview`, `signup`, ...). |
+| `u` | string | yes | Page URL, at most 2048 characters. Only the path is stored; query string and fragment are dropped, but `utm_*` parameters are extracted first. |
+| `r` | string | no | Referrer URL, at most 2048 characters. The source name (`Google`, ...) is derived from its host. |
+| `w` | integer | no | Viewport width in CSS pixels (the tracker sends `window.innerWidth`). Stored as `screen_size`; also gives `device_type` when the browser sends no Client Hints. A non-integer is a `422`. |
+| `p` | string | no | Custom properties as a **JSON-encoded object in a string**, at most 4096 characters. Anything that is not a JSON object is dropped (the event is still recorded). |
+| `ra` | number | no | Revenue amount. Dropped if not finite or outside ±9,999,999,999.99. |
+| `rc` | string | no | ISO 4217 code. Validated and upper-cased; an invalid code is dropped. |
 
 ### Response
 
 ```
 HTTP/1.1 202 Accepted
+Content-Length: 0
 ```
 
-The response body is empty. `202` means the event was accepted into the buffer. It will be flushed to Parquet on the next flush cycle or when the buffer threshold is reached.
+`202` means the event is in the in-memory buffer. **It is not queryable yet**:
+the buffer is flushed every `flush_interval_secs` (default 60) or when it holds
+`flush_event_count` (default 1000) events, whichever comes first. See
+[Data Management](../data-management.md#buffer-and-flush-lifecycle).
 
-### Validation Errors
+### Errors
+
+Checked in this order; the body is empty unless stated.
 
 | Condition | Status |
 |---|---|
-| Missing required field (`d`, `n`, or `u`) | 422 Unprocessable Entity |
-| Empty `d`, `n`, or `u` | 400 Bad Request |
-| `d` contains invalid characters or exceeds 256 chars | 400 Bad Request |
-| Field exceeds length limit (`n` > 256, `u` > 2048, `r` > 2048, `p` > 4096) | 400 Bad Request |
-| Request body exceeds 64 KB | 413 Payload Too Large |
-| `Origin` header does not match `site_ids` | 403 Forbidden |
-| Rate limit exceeded for this `site_id` | 429 Too Many Requests |
+| Body over 64 KB | 413 (plain text) |
+| Not valid JSON | 400 (plain text) |
+| `Content-Type` is not `application/json` | 415 (plain text) |
+| A required field missing, or a field of the wrong type | 422 (plain text naming the field) |
+| `Origin` present and not in `site_ids` | 403 |
+| `d`, `n` or `u` empty; `n` > 256, `u` > 2048, `r` > 2048 or `p` > 4096 characters | 400 |
+| `d` has invalid characters | 400 |
+| `site_ids` set and `d` not in it | 403 |
+| Per-site (`rate_limit_per_site`) or per-IP (`rate_limit_per_ip`) limit exceeded | 429 with `Retry-After: 1` |
+| Bot User-Agent while `filter_bots = true` | **202**, event discarded, not counted |
+| Client address in a listed hosting ASN while `asn_db_path` is set | **202**, event discarded, counted in `mallard_datacenter_filtered_total` ([configuration](../configuration.md#datacenter-traffic-filter)) |
+| Buffer at `max_buffered_events` (flushes are failing) or server shutting down | 503 |
+
+Note the order: bot filtering runs **after** rate limiting, so bot traffic
+consumes rate-limit budget. An unlisted `Origin` is checked before the payload
+is validated; a request with **no** `Origin` (curl, server-side code) passes the
+Origin check and is held to the `d` allowlist instead.
+
+Origin matching is by host: `https://example.com` and `http://example.com:8080`
+match the entry `example.com`; `https://example.com.evil.com` does not.
+
+### Privacy processing
+
+Before storage the server:
+
+1. Resolves the client address — the peer socket, or `X-Forwarded-For` entry
+   `trusted_proxy_hops` from the right when `trust_proxy_headers` is on.
+2. Computes `visitor_id = HMAC-SHA256(salt, site_id | IP | User-Agent)`, where
+   the salt is derived from `MALLARD_SECRET` and the current salt period
+   (`visitor_salt_rotation_days`, 1 by default). See
+   [Privacy and GDPR](../privacy-gdpr.md).
+3. Looks the address up in GeoIP if a database is loaded.
+4. Discards the address. It is never written anywhere.
+
+### Server-side example
+
+```bash
+curl -X POST https://your-instance.com/api/event \
+  -H 'Content-Type: application/json' \
+  -H 'User-Agent: Mozilla/5.0 (X11; Linux x86_64) Chrome/131.0 Safari/537.36' \
+  -d '{"d":"example.com","n":"server_signup","u":"https://example.com/signup"}'
+```
+
+Send a browser-like `User-Agent`: curl's default is classed as a bot and the
+event would be accepted (`202`) and silently dropped.
 
 ---
 
 ## `GET /api/event`
 
-Pixel-tracking endpoint for environments where JavaScript is unavailable (email, AMP pages, RSS readers). Returns a 1x1 transparent GIF (43 bytes, `Content-Type: image/gif`).
+A 1×1 transparent GIF tracker for places without JavaScript (HTML email, RSS).
 
-**Authentication:** None required.
+| Query parameter | Required | Description |
+|---|---|---|
+| `d` | yes | Site ID. |
+| `u` | yes | Page URL. |
+| `n` | no | Event name, default `pageview`. |
+| `r` | no | Referrer. |
+| `w` | no | Viewport width. A non-number is ignored. |
 
-### Query Parameters
+Revenue and custom properties are not available on this route.
 
-| Parameter | Type | Required | Description |
-|---|---|---|---|
-| `d` | string | Yes | Domain / site identifier. |
-| `n` | string | No | Event name (defaults to `"pageview"`). |
-| `u` | string | Yes | Full URL of the page. |
-| `r` | string | No | Referrer URL. |
-| `w` | number | No | Screen width in pixels. |
-
-Revenue (`ra`, `rc`) and custom properties (`p`) are not supported on the GET endpoint.
-
-### Response
-
-```
-HTTP/1.1 200 OK
-Content-Type: image/gif
-Content-Length: 43
-```
-
-### Usage
+**The response is always the GIF**, `200 OK`, `Content-Type: image/gif`,
+`Content-Length: 43`, `Cache-Control: no-store, no-cache, must-revalidate`,
+whatever the query says: a missing `d` or `u`, a disallowed site, a rate-limited
+or bot request all return the GIF and simply record nothing (rate-limit
+rejections still count in `mallard_rate_limit_rejections_total`). An error
+status would render as a broken image in a mail client.
 
 ```html
-<img src="https://analytics.example.com/api/event?d=example.com&u=https://example.com/page" width="1" height="1" alt="">
+<img src="https://analytics.example.com/api/event?d=example.com&u=https%3A%2F%2Fexample.com%2Fpage" width="1" height="1" alt="">
 ```
 
----
+## `HEAD /api/event`
 
-### Bot Filtering
-
-When `filter_bots = true` (default), the server inspects the `User-Agent` header and discards the event if it matches known bot patterns. A `202` is still returned — the event is silently dropped rather than returning an error.
-
-### Privacy Processing
-
-Before the event is stored:
-
-1. The client IP address is extracted from the request.
-2. A `visitor_id` is computed as `HMAC-SHA256(salt, site_id | IP | User-Agent)`, where the salt is derived from `MALLARD_SECRET` and the current salt period (`visitor_salt_rotation_days`, one day by default). The site ID is part of the input, so a visitor is not correlatable across two sites on one instance.
-3. The IP address is discarded. It is never written to disk or the database.
-
-### Server-Side Example
-
-```bash
-curl -X POST https://your-instance.com/api/event \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "d": "example.com",
-    "n": "server_signup",
-    "u": "https://example.com/signup"
-  }'
-```
+Answers `200` with `Content-Type: image/gif` and records nothing, so link
+checkers and mail-client prefetchers do not register pageviews. (Without this
+route HEAD would reach the GET handler.)

@@ -102,6 +102,8 @@ fn flush(state: &Arc<AppState>) {
 #[tokio::test]
 async fn test_full_ingest_pipeline() {
     let (state, _dir) = plain_state();
+    // `7d` is the last seven calendar days including today. It used to be
+    // eight (today and the seven before it) under a seven-day label.
     assert_eq!(
         post_event(&state, pageview("example.com", "https://example.com/")).await,
         StatusCode::ACCEPTED
@@ -342,6 +344,42 @@ async fn test_pixel_endpoint_records_an_event() {
 }
 
 #[tokio::test]
+async fn test_pixel_always_answers_with_a_gif() {
+    // SI-21: a missing or malformed parameter failed the Query extractor with a
+    // text 400 before the handler ran, a broken-image icon in an email client.
+    let (state, _dir) = plain_state();
+    for uri in [
+        "/api/event",
+        "/api/event?d=example.com",
+        "/api/event?u=https%3A%2F%2Fexample.com%2F",
+        "/api/event?d=example.com&u=%2F&w=wide",
+        "/api/event?d=bad%20domain&u=%2F",
+    ] {
+        let response = get(&state, uri).await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("image/gif"),
+            "{uri}"
+        );
+    }
+    // Only the request that named a site and page (and merely mangled `w`) counts.
+    assert_eq!(state.buffer.len(), 1);
+    flush(&state);
+    let width: Option<String> = {
+        let conn = state.buffer.conn().lock();
+        conn.query_row("SELECT screen_size FROM events_all LIMIT 1", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!(width, None, "a non-numeric width is no width");
+}
+
+#[tokio::test]
 async fn test_rate_limiting() {
     let (state, _dir) = state_builder().rate_limit_per_site(2).build();
     let payload = pageview("example.com", "https://example.com/");
@@ -508,8 +546,8 @@ async fn test_timeseries_has_no_gaps() {
     let buckets = json.as_array().unwrap();
     assert_eq!(
         buckets.len(),
-        8,
-        "7d spans eight daily buckets, gaps filled"
+        7,
+        "7d spans seven daily buckets, gaps filled"
     );
     assert!(buckets.iter().all(|b| b.get("date").is_some()));
 }
@@ -526,7 +564,7 @@ async fn test_breakdowns_across_every_dimension() {
             &format!("/api/stats/breakdown/{slug}?site_id=example.com&period=30d"),
         )
         .await;
-        let expected = if dim.requires_behavioral() && !state.behavioral_extension_loaded {
+        let expected = if dim.requires_behavioral() && !state.behavioral.is_loaded() {
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::OK
@@ -1066,7 +1104,7 @@ async fn test_sessions_endpoint_reports_a_missing_extension() {
     // Without the extension the route must say so rather than returning zeros,
     // which are indistinguishable from a site where everyone bounced.
     let (state, _dir) = plain_state();
-    if state.behavioral_extension_loaded {
+    if state.behavioral.is_loaded() {
         return;
     }
     let response = get(&state, "/api/stats/sessions?site_id=example.com&period=30d").await;
@@ -1169,6 +1207,9 @@ async fn test_retention_reports_counts_and_the_identity_caveat() {
     // The default one-day salt rotation cannot support week-over-week cohorts,
     // and the response has to say so rather than presenting zeros as a finding.
     assert_eq!(json["identity_supports_cohorts"], false);
+    // The value behind the caveat travels with it, so a client does not have to
+    // parse prose to tell an operator what to raise.
+    assert_eq!(json["visitor_salt_rotation_days"], 1);
     assert!(
         json["caveat"]
             .as_str()
@@ -1202,6 +1243,7 @@ async fn test_retention_caveat_absent_with_a_long_rotation() {
         body_json(get(&state, "/api/stats/retention?site_id=example.com&weeks=4").await).await;
     assert_eq!(json["identity_supports_cohorts"], true);
     assert!(json["caveat"].is_null());
+    assert_eq!(json["visitor_salt_rotation_days"], 60);
 }
 
 #[tokio::test]
@@ -1259,7 +1301,7 @@ async fn test_flow_rejects_bad_direction_and_page() {
 #[tokio::test]
 async fn test_behavioral_endpoints_report_unavailability_clearly() {
     let (state, _dir) = plain_state();
-    if state.behavioral_extension_loaded {
+    if state.behavioral.is_loaded() {
         return;
     }
     // A 200 with an empty body was indistinguishable from a site with no data.
@@ -1553,6 +1595,45 @@ async fn test_login_lockout_after_repeated_failures() {
     assert!(locked.headers().contains_key("retry-after"));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_login_guesses_cannot_exceed_the_attempt_limit() {
+    // SI-06 regression: attempts were counted after verification, so a burst of
+    // parallel requests all passed the lockout check before any failure was
+    // recorded, and every one of them got its own password guess.
+    let (state, _dir) = state_builder()
+        .admin_password("correct-horse-battery")
+        .login_limits(3, 300)
+        .build();
+
+    let mut set = tokio::task::JoinSet::new();
+    for _ in 0..12 {
+        let state = Arc::clone(&state);
+        set.spawn(async move {
+            post_json(
+                &state,
+                "/api/auth/login",
+                serde_json::json!({"password": "wrong"}),
+            )
+            .await
+            .status()
+        });
+    }
+    let mut verified = 0;
+    let mut refused = 0;
+    while let Some(status) = set.join_next().await {
+        match status.unwrap() {
+            StatusCode::UNAUTHORIZED => verified += 1,
+            StatusCode::TOO_MANY_REQUESTS => refused += 1,
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(
+        verified, 3,
+        "exactly the allowed number of guesses is checked"
+    );
+    assert_eq!(refused, 9);
+}
+
 #[tokio::test]
 async fn test_setup_is_rate_limited_too() {
     // Setup is unauthenticated; without a limit it could be probed freely
@@ -1573,6 +1654,135 @@ async fn test_setup_is_rate_limited_too() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_login_body_does_not_repeat_the_session_token() {
+    // SI-23: the token is a bearer-equivalent credential. It belongs in the
+    // HttpOnly cookie only; echoing it in the body defeats HttpOnly.
+    let (state, _dir) = state_builder()
+        .admin_password("correct-horse-battery")
+        .build();
+    let response = post_json(
+        &state,
+        "/api/auth/login",
+        serde_json::json!({"password": "correct-horse-battery"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let cookie = session_cookie(&response).expect("a session cookie is set");
+    let body = body_text(response).await;
+    assert!(
+        !body.contains(&cookie),
+        "the token must not appear in the body: {body}"
+    );
+    assert!(!body.contains("token"));
+}
+
+async fn post_json_from(
+    state: &Arc<AppState>,
+    uri: &str,
+    payload: serde_json::Value,
+    peer: &str,
+    origin: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json");
+    if let Some(origin) = origin {
+        builder = builder.header("origin", origin);
+    }
+    let mut request = builder.body(Body::from(payload.to_string())).unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        peer.parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    send(state, request).await
+}
+
+#[tokio::test]
+async fn test_login_lockout_cannot_be_dodged_by_rotating_ipv6_addresses() {
+    // SI-04 end to end: every guess comes from a different /128 of one /64.
+    let (state, _dir) = state_builder()
+        .admin_password("correct-horse-battery")
+        .login_limits(3, 300)
+        .build();
+    for i in 1..=3 {
+        let response = post_json_from(
+            &state,
+            "/api/auth/login",
+            serde_json::json!({"password": "wrong"}),
+            &format!("[2001:db8:7:7::{i}]:4000"),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let fourth = post_json_from(
+        &state,
+        "/api/auth/login",
+        serde_json::json!({"password": "correct-horse-battery"}),
+        "[2001:db8:7:7:aaaa::9]:4000",
+        None,
+    )
+    .await;
+    assert_eq!(fourth.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let neighbour = post_json_from(
+        &state,
+        "/api/auth/login",
+        serde_json::json!({"password": "correct-horse-battery"}),
+        "[2001:db8:7:8::1]:4000",
+        None,
+    )
+    .await;
+    assert_eq!(
+        neighbour.status(),
+        StatusCode::OK,
+        "another /64 is another client"
+    );
+}
+
+#[tokio::test]
+async fn test_auth_endpoints_refuse_a_foreign_origin() {
+    // SI-29: login, setup and logout were outside the CSRF check that guards
+    // the other state-changing routes.
+    let (state, _dir) = state_builder()
+        .admin_password("correct-horse-battery")
+        .dashboard_origin(Some("https://stats.example.com".to_string()))
+        .build();
+    let body = serde_json::json!({"password": "correct-horse-battery"});
+
+    let foreign = post_json_from(
+        &state,
+        "/api/auth/login",
+        body.clone(),
+        "203.0.113.5:1",
+        Some("https://evil.example"),
+    )
+    .await;
+    assert_eq!(foreign.status(), StatusCode::FORBIDDEN);
+    assert!(session_cookie(&foreign).is_none());
+
+    let logout = post_json_from(
+        &state,
+        "/api/auth/logout",
+        serde_json::json!({}),
+        "203.0.113.5:1",
+        Some("https://evil.example"),
+    )
+    .await;
+    assert_eq!(logout.status(), StatusCode::FORBIDDEN);
+
+    let own = post_json_from(
+        &state,
+        "/api/auth/login",
+        body,
+        "203.0.113.5:1",
+        Some("https://stats.example.com"),
+    )
+    .await;
+    assert_eq!(own.status(), StatusCode::OK);
 }
 
 // ── API keys ─────────────────────────────────────────────────────────────
@@ -1812,6 +2022,21 @@ async fn test_tracking_script_is_served() {
 }
 
 #[tokio::test]
+async fn test_extras_script_is_served() {
+    let (state, _dir) = plain_state();
+    let response = get(&state, "/mallard-extras.js").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("*")
+    );
+    assert!(body_text(response).await.contains("window.mallard"));
+}
+
+#[tokio::test]
 async fn test_metrics_endpoint_is_open_without_a_token() {
     let (state, _dir) = plain_state();
     let response = get(&state, "/metrics").await;
@@ -1843,4 +2068,964 @@ async fn test_metrics_endpoint_honours_its_token() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+// ── Tracking script ──────────────────────────────────────────────────────
+
+/// Drives `tracking/script.js` against a minimal fake browser (no dependencies,
+/// plain Node) and checks what it would send.
+const TRACKER_HARNESS: &str = r"// Drives tracking/script.js against a minimal fake browser and checks what it
+// would send. Usage: node harness.js <path-to-script.js>
+'use strict';
+const fs = require('fs');
+const vm = require('vm');
+const assert = require('assert');
+
+const source = fs.readFileSync(process.argv[2], 'utf8');
+
+/** A fake page: returns { sent, win, doc, fire(target, type, ev) }. */
+function page(opts) {
+  const attrs = Object.assign({ 'data-domain': 'site.test' }, opts.attrs || {});
+  const sent = [];
+  const listeners = { window: {}, document: {} };
+  const add = (who) => (type, fn) => {
+    (listeners[who][type] = listeners[who][type] || []).push(fn);
+  };
+  const remove = (who) => (type, fn) => {
+    listeners[who][type] = (listeners[who][type] || []).filter((f) => f !== fn);
+  };
+  let url = new URL(opts.url);
+  const location = {};
+  const syncLocation = () => {
+    location.href = url.href;
+    location.origin = url.origin;
+    location.protocol = url.protocol;
+    location.host = url.host;
+    location.hostname = url.hostname;
+    location.pathname = url.pathname;
+    location.search = url.search;
+    location.hash = url.hash;
+  };
+  syncLocation();
+  const history = {
+    pushState(_s, _t, to) { url = new URL(to, url); syncLocation(); },
+    replaceState(_s, _t, to) { url = new URL(to, url); syncLocation(); },
+  };
+  class FakeBlob { constructor(parts) { this.text = parts.join(''); } }
+  const doc = {
+    currentScript: { getAttribute: (n) => (n in attrs ? attrs[n] : null), src: 'https://stats.test/mallard.js' },
+    baseURI: url.href,
+    referrer: opts.referrer || '',
+    visibilityState: opts.visibility || 'visible',
+    prerendering: !!opts.prerendering,
+    addEventListener: add('document'),
+    removeEventListener: remove('document'),
+    querySelector: () => null,
+  };
+  const win = {
+    location,
+    history,
+    document: doc,
+    navigator: {
+      sendBeacon(endpoint, blob) { sent.push(JSON.parse(blob.text)); return true; },
+    },
+    innerWidth: 1280,
+    localStorage: { getItem: () => null },
+    addEventListener: add('window'),
+    removeEventListener: remove('window'),
+  };
+  win.window = win;
+  const ctx = vm.createContext({
+    window: win, document: doc, navigator: win.navigator, URL, Blob: FakeBlob, JSON,
+    XMLHttpRequest: function () { throw new Error('XHR not expected'); }, RegExp,
+  });
+  vm.runInContext(source, ctx);
+  const fire = (who, type, ev) => (listeners[who][type] || []).slice().forEach((f) => f(ev || {}));
+  return {
+    sent, win, doc, fire,
+    go(to) { history.pushState(null, '', to); },
+    click(link) { fire('document', 'click', { target: { closest: () => link } }); },
+  };
+}
+
+const tests = [];
+const test = (name, fn) => tests.push([name, fn]);
+
+test('SI-10: the external referrer is sent once, not on every SPA route', () => {
+  const p = page({ url: 'https://site.test/', referrer: 'https://www.google.com/search?q=x' });
+  assert.strictEqual(p.sent.length, 1);
+  assert.strictEqual(p.sent[0].r, 'https://www.google.com/search?q=x');
+  p.go('/b');
+  p.go('/c');
+  assert.strictEqual(p.sent.length, 3);
+  assert.strictEqual(p.sent[1].r, null, 'second route');
+  assert.strictEqual(p.sent[2].r, null, 'third route');
+  p.win.mallard('signup');
+  assert.strictEqual(p.sent[3].r, null, 'custom events after navigation');
+});
+
+test('SI-10: a custom event before any navigation still carries the referrer', () => {
+  const p = page({ url: 'https://site.test/', referrer: 'https://www.google.com/' });
+  p.win.mallard('signup');
+  assert.strictEqual(p.sent[1].r, 'https://www.google.com/');
+});
+
+test('SI-11: a hash route is reported as the path', () => {
+  const p = page({ url: 'https://site.test/app/#/pricing', attrs: { 'data-hash': 'true' } });
+  assert.strictEqual(p.sent[0].u, 'https://site.test/app/pricing');
+  p.win.location.hash = '#/docs';
+  p.win.history.pushState(null, '', '#/docs');
+  p.fire('window', 'hashchange');
+  p.fire('window', 'popstate');
+  assert.strictEqual(p.sent.length, 2, 'one pageview for one navigation');
+  assert.strictEqual(p.sent[1].u, 'https://site.test/app/docs');
+});
+
+test('SI-11: the search string survives on a hash route, and a bare fragment is not a route', () => {
+  const p = page({ url: 'https://site.test/?utm_source=x#/pricing', attrs: { 'data-hash': 'true' } });
+  assert.strictEqual(p.sent[0].u, 'https://site.test/pricing?utm_source=x');
+  const q = page({ url: 'https://site.test/page#section', attrs: { 'data-hash': 'true' } });
+  assert.strictEqual(q.sent[0].u, 'https://site.test/page#section');
+});
+
+test('SI-11: hashchange counts a route change once even with popstate', () => {
+  const p = page({ url: 'https://site.test/#/a', attrs: { 'data-hash': 'true' } });
+  p.win.history.pushState(null, '', '#/b');
+  p.fire('window', 'hashchange');
+  p.fire('window', 'hashchange');
+  assert.strictEqual(p.sent.length, 2);
+});
+
+test('SI-17: a page restored from the back/forward cache is counted', () => {
+  const p = page({ url: 'https://site.test/' });
+  assert.strictEqual(p.sent.length, 1);
+  p.fire('window', 'pageshow', { persisted: false });
+  assert.strictEqual(p.sent.length, 1, 'the initial pageshow is not a restore');
+  p.fire('window', 'pageshow', { persisted: true });
+  assert.strictEqual(p.sent.length, 2);
+  assert.strictEqual(p.sent[1].r, null, 'a restore is not a new acquisition');
+});
+
+test('SI-18: a document.prerendering page is counted only when activated', () => {
+  const p = page({ url: 'https://site.test/', prerendering: true });
+  assert.strictEqual(p.sent.length, 0, 'not counted while prerendering');
+  p.doc.prerendering = false;
+  p.fire('document', 'prerenderingchange');
+  p.fire('document', 'visibilitychange');
+  assert.strictEqual(p.sent.length, 1, 'counted exactly once on activation');
+});
+
+test('SI-18: the legacy prerender visibility state still defers the pageview', () => {
+  const p = page({ url: 'https://site.test/', visibility: 'prerender' });
+  assert.strictEqual(p.sent.length, 0, 'not counted while prerendering');
+  p.doc.visibilityState = 'visible';
+  p.fire('document', 'visibilitychange');
+  assert.strictEqual(p.sent.length, 1);
+});
+
+const link = (href, abs) => ({
+  getAttribute: (n) => (n === 'href' ? href : null),
+  href: abs === undefined ? new URL(href, 'https://site.test/').href : abs,
+});
+
+test('SI-19: outbound and download URLs lose their query and fragment', () => {
+  const p = page({ url: 'https://site.test/', attrs: { 'data-outbound': 'true', 'data-downloads': 'true' } });
+  p.click(link('https://other.test/path?email=a@b.c&token=s3cret#frag'));
+  p.click(link('/files/report.pdf?session=abc#page=2'));
+  assert.strictEqual(JSON.parse(p.sent[1].p).url, 'https://other.test/path');
+  assert.strictEqual(JSON.parse(p.sent[2].p).url, 'https://site.test/files/report.pdf');
+});
+
+test('SI-19: data-link-query opts back in', () => {
+  const p = page({
+    url: 'https://site.test/',
+    attrs: { 'data-outbound': 'true', 'data-link-query': 'true' },
+  });
+  p.click(link('https://other.test/path?a=1'));
+  assert.strictEqual(JSON.parse(p.sent[1].p).url, 'https://other.test/path?a=1');
+});
+
+test('SI-19: an SVG link (href is an SVGAnimatedString) is classified by its attribute', () => {
+  const p = page({ url: 'https://site.test/', attrs: { 'data-outbound': 'true' } });
+  p.click(link('https://other.test/x', { baseVal: 'https://other.test/x', animVal: 'https://other.test/x' }));
+  assert.strictEqual(p.sent.length, 2, 'the outbound click was recognised');
+  assert.strictEqual(JSON.parse(p.sent[1].p).url, 'https://other.test/x');
+});
+
+let failed = 0;
+for (const [name, fn] of tests) {
+  try { fn(); console.log('ok   ' + name); }
+  catch (e) { failed++; console.log('FAIL ' + name + '\n     ' + String(e.message).split('\n')[0]); }
+}
+process.exit(failed ? 1 : 0);
+";
+
+/// Run the tracker harness, skipping where Node is not installed unless the
+/// environment says it must be (CI, or `MALLARD_REQUIRE_NODE=1`).
+#[test]
+fn test_tracking_script_behaviour() {
+    let required =
+        std::env::var_os("MALLARD_REQUIRE_NODE").is_some() || std::env::var_os("CI").is_some();
+    let dir = tempfile::tempdir().unwrap();
+    let harness = dir.path().join("tracker_harness.js");
+    std::fs::write(&harness, TRACKER_HARNESS).unwrap();
+
+    let output = match std::process::Command::new("node")
+        .arg(&harness)
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tracking/script.js"))
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) if !required => {
+            eprintln!("skipping the tracker harness: node is not available ({e})");
+            return;
+        }
+        Err(e) => panic!("node is required for the tracker harness: {e}"),
+    };
+    assert!(
+        output.status.success(),
+        "tracker harness failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ── Query execution and metric definitions ───────────────────────────────
+
+#[tokio::test]
+async fn test_a_cold_dashboard_load_gets_no_429() {
+    // Regression (S-01): a dashboard refresh fires about 31 requests at once
+    // (ten summary panels, twenty breakdowns) against a default cap of ten
+    // concurrent queries, and every request past the tenth was answered 429 on
+    // a cold cache. The cache is disabled here so every request runs a query.
+    let (state, _dir) = state_builder().cache_ttl_secs(0).build();
+    seed(&state).await;
+
+    let mut uris: Vec<String> = [
+        "main?site_id=example.com&period=30d",
+        "main?site_id=example.com&period=30d&compare=previous_period",
+        "sessions?site_id=example.com&period=30d",
+        "timeseries?site_id=example.com&period=30d",
+        "goals?site_id=example.com&period=30d",
+        "revenue?site_id=example.com&period=30d",
+        "properties?site_id=example.com&period=30d",
+        "realtime?site_id=example.com",
+        "funnel?site_id=example.com&period=30d&steps=page:/,page:/about",
+        "retention?site_id=example.com&period=30d&weeks=4",
+    ]
+    .iter()
+    .map(|tail| format!("/api/stats/{tail}"))
+    .collect();
+    for slug in [
+        "pages",
+        "referrers",
+        "sources",
+        "countries",
+        "regions",
+        "cities",
+        "browsers",
+        "browser-versions",
+        "os",
+        "os-versions",
+        "devices",
+        "screen-sizes",
+        "utm-sources",
+        "utm-mediums",
+        "utm-campaigns",
+        "utm-contents",
+        "utm-terms",
+        "events",
+        "entry-pages",
+        "exit-pages",
+    ] {
+        uris.push(format!(
+            "/api/stats/breakdown/{slug}?site_id=example.com&period=30d"
+        ));
+    }
+    assert_eq!(uris.len(), 30);
+
+    let mut tasks = Vec::new();
+    for uri in uris {
+        let state = Arc::clone(&state);
+        tasks.push(tokio::spawn(async move {
+            let status = get(&state, &uri).await.status();
+            (uri, status)
+        }));
+    }
+    for task in tasks {
+        let (uri, status) = task.await.unwrap();
+        assert_ne!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "{uri} was rejected by the concurrency cap during a dashboard load"
+        );
+        assert!(
+            status == StatusCode::OK || status == StatusCode::SERVICE_UNAVAILABLE,
+            "{uri} answered {status}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_session_analyses_are_refused_when_timestamps_are_rounded() {
+    // Regression (S-05): gdpr_mode rounds every timestamp to the hour. Sessions,
+    // funnels, sequences and flows then compute from events that can no longer
+    // be ordered, and used to return confident, meaningless numbers. They must
+    // say so instead; analyses that do not depend on intra-hour order must keep
+    // working.
+    let (state, _dir) = state_builder().round_timestamps(true).build();
+    seed(&state).await;
+
+    for uri in [
+        "/api/stats/sessions?site_id=example.com&period=30d",
+        "/api/stats/funnel?site_id=example.com&period=30d&steps=page:/,page:/about",
+        "/api/stats/sequences?site_id=example.com&period=30d&steps=page:/,page:/about",
+        "/api/stats/flow?site_id=example.com&period=30d&page=/",
+        "/api/stats/breakdown/entry-pages?site_id=example.com&period=30d",
+        "/api/stats/breakdown/exit-pages?site_id=example.com&period=30d",
+    ] {
+        let response = get(&state, uri).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{uri} must be refused, not computed from rounded timestamps"
+        );
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rounded"),
+            "{uri}: {body}"
+        );
+        // A privacy setting, not a missing install: clients must be able to
+        // tell, without parsing the message, because the remedies differ.
+        assert_eq!(body["code"], "session_data_unavailable", "{uri}: {body}");
+    }
+
+    // Headline metrics still answer; only the session-derived fields drop out.
+    let main = body_json(get(&state, "/api/stats/main?site_id=example.com&period=30d").await).await;
+    assert_eq!(main["total_pageviews"], 3);
+    assert_eq!(main["behavioral_available"], false);
+    assert_eq!(main["sessions_unavailable_reason"], "timestamps_rounded");
+    assert!(main["bounce_rate"].is_null(), "{main}");
+    assert!(main["total_sessions"].is_null(), "{main}");
+
+    // Unaffected analyses.
+    for uri in [
+        "/api/stats/breakdown/pages?site_id=example.com&period=30d",
+        "/api/stats/timeseries?site_id=example.com&period=30d",
+        "/api/stats/goals?site_id=example.com&period=30d",
+    ] {
+        assert_eq!(get(&state, uri).await.status(), StatusCode::OK, "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn test_a_lone_start_date_is_a_bad_request() {
+    // Regression (S-09): it used to be ignored and the 30-day default answered.
+    let (state, _dir) = plain_state();
+    let response = get(
+        &state,
+        "/api/stats/main?site_id=example.com&start_date=2024-01-01",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── Streaming raw export ─────────────────────────────────────────────────
+//
+// The raw export used to build the whole file in memory (several copies of it,
+// S-12). It now streams: a blocking thread runs the query and feeds a bounded
+// channel that the response body drains. These tests pin the properties that
+// make that worth having.
+
+const EXPORT_DAY: &str = "2024-01-15";
+
+/// Insert `count` pageviews for `site` on `day`, one second apart so that
+/// `ORDER BY timestamp` has no ties. Straight into the hot table: building this
+/// many rows through the ingest endpoint would take far longer than the test.
+fn insert_rows(state: &Arc<AppState>, site: &str, day: &str, count: usize) {
+    assert!(count <= 86_000, "one row per second of a single day");
+    state
+        .buffer
+        .conn()
+        .lock()
+        .execute_batch(&format!(
+            "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname, browser) \
+             SELECT '{site}', 'v' || (i % 100), \
+                    TIMESTAMP '{day} 00:00:00' + INTERVAL (i) SECOND, \
+                    'pageview', '/p' || (i % 7), \
+                    CASE WHEN i % 3 = 0 THEN NULL ELSE 'Chrome' END \
+             FROM range({count}) t(i)"
+        ))
+        .expect("insert rows");
+}
+
+fn raw_export_uri(site: &str, format: &str) -> String {
+    format!(
+        "/api/stats/export?site_id={site}&start_date={EXPORT_DAY}&end_date={EXPORT_DAY}\
+         &kind=raw&format={format}"
+    )
+}
+
+#[tokio::test]
+async fn test_streamed_raw_export_is_byte_identical_to_the_buffered_one() {
+    use mallard_metrics::query::{QueryScope, export};
+    let (state, _dir) = plain_state();
+    // Two and a half chunks, so chunk joins are exercised.
+    insert_rows(&state, "stream.test", EXPORT_DAY, 25_000);
+    let scope = QueryScope::new("stream.test", EXPORT_DAY, "2024-01-16", "30 minutes");
+    let rows = {
+        let conn = state.buffer.conn();
+        let guard = conn.lock();
+        export::query_raw_export(&guard, &scope, 100_000).unwrap()
+    };
+    assert_eq!(rows.len(), 25_000);
+
+    for (format, want, content_type) in [
+        (
+            "csv",
+            export::to_csv(export::RAW_COLUMNS, &rows),
+            "text/csv; charset=utf-8",
+        ),
+        ("json", export::raw_to_json(&rows), "application/json"),
+    ] {
+        let response = get(&state, &raw_export_uri("stream.test", format)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{format}");
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            content_type
+        );
+        let disposition = response
+            .headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            disposition.starts_with("attachment; filename=\"mallard-events-"),
+            "{disposition}"
+        );
+        assert!(
+            response.headers().get("content-length").is_none(),
+            "a streamed body has no length up front"
+        );
+        let text = body_text(response).await;
+        assert!(
+            text == want,
+            "{format}: the streamed export differs from the buffered one ({} vs {} bytes)",
+            text.len(),
+            want.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_streamed_raw_export_keeps_its_row_limit() {
+    let (state, _dir) = plain_state();
+    insert_rows(&state, "stream.test", EXPORT_DAY, 25_000);
+    let uri = format!("{}&limit=12345", raw_export_uri("stream.test", "csv"));
+    let text = body_text(get(&state, &uri).await).await;
+    assert_eq!(text.lines().count(), 12_345 + 1, "header plus the limit");
+
+    let too_many = format!("{}&limit=1000001", raw_export_uri("stream.test", "csv"));
+    assert_eq!(
+        get(&state, &too_many).await.status(),
+        StatusCode::BAD_REQUEST,
+        "the cap is unchanged"
+    );
+}
+
+#[tokio::test]
+async fn test_raw_export_with_nothing_to_export_is_still_a_valid_file() {
+    let (state, _dir) = plain_state();
+    let csv = body_text(get(&state, &raw_export_uri("nobody.test", "csv")).await).await;
+    assert_eq!(csv.lines().count(), 1, "just the header: {csv:?}");
+    assert!(csv.contains("pathname"));
+    let json = body_text(get(&state, &raw_export_uri("nobody.test", "json")).await).await;
+    assert_eq!(json, "[]");
+}
+
+#[tokio::test]
+async fn test_raw_export_streams_with_back_pressure_and_stops_when_the_client_leaves() {
+    use std::time::Duration;
+    let (state, _dir) = plain_state();
+    // Many more chunks (10,000 rows each) than the channel and the socket can
+    // hold, so a producer that ignored back-pressure would run to the end.
+    insert_rows(&state, "stream.test", EXPORT_DAY, 80_000);
+
+    let response = get(&state, &raw_export_uri("stream.test", "csv")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+
+    // Let the producer fill the channel and block on it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The export still holds the shared tier lock, so an exclusive request (a
+    // flush or compaction) cannot get it: the query has not run to completion,
+    // which it would have, in milliseconds, if the rows were being collected.
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+    let tier = state.tier_lock.clone();
+    let writer = std::thread::spawn(move || {
+        let _exclusive = tier.write();
+        let _ = acquired_tx.send(());
+    });
+    assert!(
+        acquired_rx
+            .recv_timeout(Duration::from_millis(400))
+            .is_err(),
+        "the export finished without anyone reading it: it is not streaming"
+    );
+    assert!(
+        state.query_semaphore.available_permits() < 10,
+        "the export should still hold its query slot"
+    );
+
+    // Reading makes progress...
+    let frame = body.frame().await.expect("a frame").expect("no error");
+    assert!(frame.is_data());
+
+    // ...and walking away releases everything promptly.
+    drop(body);
+    acquired_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the producer kept the tier lock after the client left");
+    writer.join().unwrap();
+    for _ in 0..100 {
+        if state.query_semaphore.available_permits() == 10 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the query slot was not returned after the client left");
+}
+
+// A multi-thread runtime: the producer's stall timeout is a tokio timer, and on
+// the default single-thread test runtime it is only driven when the test thread
+// itself wakes. The test thread then drains the channel in the same moment, so
+// under load the producer lost the race and the export "ended cleanly". With
+// worker threads the timer fires while the test is still stalled, as it does in
+// the server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_a_client_that_stops_reading_gets_a_truncated_body_not_a_clean_end() {
+    use mallard_metrics::api::stats::QueryLimits;
+    use std::time::Duration;
+    // The deadline bounds DuckDB's own work (a debug build sorting 50,000 rows
+    // on a busy machine needs a good fraction of a second) and is also the
+    // longest the producer waits for the client to take a chunk, so it is
+    // generous and the stall below is longer still.
+    let (state, _dir) = state_builder()
+        .query_limits(QueryLimits {
+            queue_wait: Duration::from_secs(5),
+            deadline: Duration::from_secs(2),
+        })
+        .build();
+    // More than the first chunk, the two the channel holds, and the one the
+    // producer is blocked sending.
+    insert_rows(&state, "stream.test", EXPORT_DAY, 50_000);
+
+    let response = get(&state, &raw_export_uri("stream.test", "csv")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+
+    // Stall well past the deadline (and past scheduling delay under load), then
+    // read what is left.
+    tokio::time::sleep(Duration::from_millis(6000)).await;
+    let mut aborted = false;
+    let mut bytes = 0usize;
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else {
+            aborted = true;
+            break;
+        };
+        bytes += frame.into_data().map_or(0, |d| d.len());
+    }
+    assert!(
+        aborted,
+        "the body ended cleanly after {bytes} bytes: a truncated export would look complete"
+    );
+}
+
+#[tokio::test]
+async fn test_raw_export_answers_busy_before_it_starts_streaming() {
+    use mallard_metrics::api::stats::QueryLimits;
+    use std::time::Duration;
+    let (state, _dir) = state_builder()
+        .query_permits(0)
+        .query_limits(QueryLimits {
+            queue_wait: Duration::from_millis(50),
+            deadline: Duration::from_secs(1),
+        })
+        .build();
+    let response = get(&state, &raw_export_uri("stream.test", "csv")).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "an export that cannot get a slot is refused with a status, not a broken body"
+    );
+}
+
+// ── Site listing ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_sites_are_listed_most_active_first_with_30_day_counts() {
+    // The allowlist applies to ingestion too, so it has to name the sites that
+    // post events; "configured.test" is listed without ever having any.
+    let (state, _dir) = state_builder()
+        .allowed_sites(vec![
+            "busy.test".to_string(),
+            "quiet.test".to_string(),
+            "configured.test".to_string(),
+        ])
+        .build();
+    // Today's events, some flushed to Parquet and some still hot.
+    for _ in 0..4 {
+        post_event(&state, pageview("busy.test", "https://busy.test/")).await;
+    }
+    post_event(&state, pageview("quiet.test", "https://quiet.test/")).await;
+    flush(&state);
+    post_event(&state, pageview("busy.test", "https://busy.test/more")).await;
+    post_event(&state, pageview("quiet.test", "https://quiet.test/more")).await;
+    // A site whose only events are far outside the 30-day window.
+    state
+        .buffer
+        .conn()
+        .lock()
+        .execute_batch(
+            "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname) \
+             SELECT 'old.test', 'v' || i, TIMESTAMP '2024-01-15 10:00:00' + INTERVAL (i) MINUTE, \
+                    'pageview', '/' FROM range(3) t(i)",
+        )
+        .unwrap();
+    flush(&state);
+
+    let json = body_json(get(&state, "/api/sites").await).await;
+    let ids: Vec<&str> = json["sites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(
+        ids,
+        ["busy.test", "quiet.test", "configured.test", "old.test"],
+        "most active first, then the quiet ones alphabetically"
+    );
+    let counts: Vec<(&str, u64)> = json["details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["site_id"].as_str().unwrap(),
+                d["events_30d"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        counts,
+        [
+            ("busy.test", 5),
+            ("quiet.test", 2),
+            ("configured.test", 0),
+            ("old.test", 0)
+        ]
+    );
+}
+
+// ── Export memory measurement (not part of the normal run) ───────────────
+//
+// `cargo test --test ingest_test -- --ignored --nocapture --test-threads=1 \
+//     measure_export_memory` prints the peak extra resident memory of exporting
+// a million rows the old way (collect every row, then build the CSV) and the
+// new way (stream it to a client that discards it as it arrives). Run each in
+// its own process (`--exact`) so one cannot inflate the other's baseline.
+
+/// Resident set size in KiB, from `/proc/self/statm` (Linux).
+fn rss_kib() -> u64 {
+    let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    let pages: u64 = statm
+        .split_whitespace()
+        .nth(1)
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+    pages * 4
+}
+
+/// Samples this process's resident memory until finished.
+struct RssSampler {
+    done: Arc<std::sync::atomic::AtomicBool>,
+    peak: Arc<std::sync::atomic::AtomicU64>,
+    before: u64,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl RssSampler {
+    fn start() -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let done = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU64::new(0));
+        let before = rss_kib();
+        let thread = {
+            let (done, peak) = (Arc::clone(&done), Arc::clone(&peak));
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    peak.fetch_max(rss_kib(), Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        };
+        Self {
+            done,
+            peak,
+            before,
+            thread,
+        }
+    }
+
+    /// The largest increase over the starting size, in KiB.
+    fn finish(self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.done.store(true, Ordering::Relaxed);
+        self.thread.join().unwrap();
+        self.peak
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.before)
+    }
+}
+
+fn million_row_state() -> (Arc<AppState>, tempfile::TempDir) {
+    let (state, dir) = plain_state();
+    for day in 1..=12 {
+        insert_rows(&state, "big.test", &format!("2024-01-{day:02}"), 84_000);
+    }
+    (state, dir)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "memory measurement; see the comment above"]
+async fn measure_export_memory_streamed() {
+    let (state, _dir) = million_row_state();
+    let uri = "/api/stats/export?site_id=big.test&start_date=2024-01-01&end_date=2024-01-12\
+               &kind=raw&format=csv&limit=1000000";
+    let started = std::time::Instant::now();
+    let sampler = RssSampler::start();
+    let response = get(&state, uri).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let mut bytes = 0usize;
+    while let Some(frame) = body.frame().await {
+        bytes += frame.unwrap().into_data().map_or(0, |d| d.len());
+    }
+    let growth = sampler.finish();
+    println!(
+        "STREAMED: {bytes} bytes in {:?}; peak RSS growth {} MiB",
+        started.elapsed(),
+        growth / 1024
+    );
+}
+
+#[test]
+#[ignore = "memory measurement; see the comment above"]
+fn measure_export_memory_buffered() {
+    use mallard_metrics::query::{QueryScope, export};
+    let (state, _dir) = million_row_state();
+    let scope = QueryScope::new("big.test", "2024-01-01", "2024-01-13", "30 minutes");
+    let started = std::time::Instant::now();
+    let conn = state.buffer.conn();
+    let sampler = RssSampler::start();
+    let rows = {
+        let guard = conn.lock();
+        export::query_raw_export(&guard, &scope, 1_000_000).unwrap()
+    };
+    let text = export::to_csv(export::RAW_COLUMNS, &rows);
+    let (rows, bytes) = (rows.len(), text.len());
+    let growth = sampler.finish();
+    println!(
+        "BUFFERED: {rows} rows, {bytes} bytes in {:?}; peak RSS growth {} MiB",
+        started.elapsed(),
+        growth / 1024
+    );
+}
+
+// ── Online backup ────────────────────────────────────────────────────────
+
+fn backup_request(token: &str, query: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/api/admin/backup{query}"))
+        .header("cookie", format!("mm_session={token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_backup_endpoint_writes_a_snapshot_that_opens_on_its_own() {
+    let password = "correct-horse-battery";
+    let (state, _dir) = state_builder().admin_password(password).build();
+    let token = admin_session(&state, password).await;
+
+    post_event(&state, pageview("example.com", "https://example.com/a")).await;
+    flush(&state);
+    post_event(&state, pageview("example.com", "https://example.com/b")).await;
+    // One event is in Parquet, one is buffered; the backup must hold the flushed
+    // one and report the hot table honestly.
+
+    let response = send(&state, backup_request(&token, "?name=b1")).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let json = body_json(response).await;
+    assert_eq!(json["status"], "created");
+    assert_eq!(json["name"], "b1");
+    assert_eq!(json["parquet_files"], 1);
+
+    let path = std::path::PathBuf::from(json["path"].as_str().unwrap());
+    assert!(path.join("MANIFEST.json").exists());
+    let restored = duckdb::Connection::open(path.join("mallard.duckdb")).unwrap();
+    let cold: i64 = restored
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM read_parquet('{}/**/*.parquet')",
+                path.join("events").display()
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cold, 1, "the flushed event must be in the backup's Parquet");
+}
+
+#[tokio::test]
+async fn test_backup_endpoint_never_overwrites_and_validates_the_name() {
+    let password = "correct-horse-battery";
+    let (state, _dir) = state_builder().admin_password(password).build();
+    let token = admin_session(&state, password).await;
+
+    let first = send(&state, backup_request(&token, "?name=b1")).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let again = send(&state, backup_request(&token, "?name=b1")).await;
+    assert_eq!(again.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(again).await["code"], "conflict");
+
+    for bad in ["..", "a%2Fb", ".hidden", "a%20b"] {
+        let response = send(&state, backup_request(&token, &format!("?name={bad}"))).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{bad:?} must be refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_backup_endpoint_needs_admin() {
+    let password = "correct-horse-battery";
+    let (state, _dir) = state_builder().admin_password(password).build();
+    let anonymous = send(
+        &state,
+        Request::builder()
+            .method("POST")
+            .uri("/api/admin/backup")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_a_default_backup_name_is_a_timestamp() {
+    let password = "correct-horse-battery";
+    let (state, _dir) = state_builder().admin_password(password).build();
+    let token = admin_session(&state, password).await;
+    let response = send(&state, backup_request(&token, "")).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let name = body_json(response).await["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(name.starts_with("mallard-20"), "{name}");
+}
+
+#[tokio::test]
+async fn test_a_funnel_mode_combination_error_names_the_real_problem() {
+    let (state, _dir) = state_builder().build();
+    if !require_behavioral(&state, "funnel modes") {
+        return;
+    }
+    let combo = get(
+        &state,
+        "/api/stats/funnel?site_id=example.com&period=30d&steps=page:/,page:/about&modes=allow_reentry",
+    )
+    .await;
+    assert_eq!(combo.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(combo).await;
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(message.contains("requires 'strict_order'"), "{body}");
+    assert!(!message.contains("Unknown"), "{body}");
+
+    let typo = get(
+        &state,
+        "/api/stats/funnel?site_id=example.com&period=30d&steps=page:/,page:/about&modes=strict_ordr",
+    )
+    .await;
+    assert_eq!(typo.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(typo).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Unknown funnel mode")
+    );
+}
+
+// ── Extractor rejections are JSON like every other API error ─────────────
+
+#[tokio::test]
+async fn test_a_missing_query_parameter_is_a_json_bad_request() {
+    // axum's own Query extractor answers this with a plain-text 400, which was
+    // the one error response a client could not parse like the rest.
+    let (state, _dir) = state_builder().build();
+    let response = get(&state, "/api/stats/main?period=30d").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(body["code"], "bad_request", "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("site_id"),
+        "the message must name the missing parameter: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_a_malformed_json_body_is_a_json_bad_request() {
+    let (state, _dir) = state_builder().build();
+    for (body, content_type) in [
+        ("{not json", "application/json"),
+        (r#"{"password": 12}"#, "application/json"),
+        (r#"{"password":"x"}"#, "text/plain"),
+    ] {
+        let response = send(
+            &state,
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            response.status().is_client_error(),
+            "{body:?} as {content_type}: {}",
+            response.status()
+        );
+        let json = body_json(response).await;
+        assert_eq!(
+            json["code"], "bad_request",
+            "{body:?} as {content_type}: {json}"
+        );
+    }
 }

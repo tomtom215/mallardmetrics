@@ -2,16 +2,33 @@ pub mod breakdowns;
 pub mod cache;
 pub mod events;
 pub mod export;
+pub mod extension;
 pub mod flow;
 pub mod funnel;
 pub mod metrics;
+pub mod parquet_export;
 pub mod realtime;
 pub mod retention;
 pub mod revenue;
 pub mod sequences;
+pub mod sessions;
 pub mod timeseries;
 
 use breakdowns::Dimension;
+use chrono::{Days, NaiveDate, NaiveDateTime};
+
+pub mod scoped;
+
+/// The view over both storage tiers. See `storage::schema::setup_query_view`.
+pub const EVENTS_ALL: &str = "events_all";
+
+/// A date (`YYYY-MM-DD`) or timestamp (`YYYY-MM-DD HH:MM:SS`) as a timestamp.
+pub fn parse_bound(raw: &str) -> Option<NaiveDateTime> {
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .or_else(|| NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").ok())
+}
 
 #[cfg(any(test, feature = "testing"))]
 pub mod test_support;
@@ -21,6 +38,45 @@ pub mod test_support;
 /// Breakdowns render a NULL as `(unknown)`, so a dashboard that turns a
 /// breakdown row into a filter sends back exactly what it displayed.
 pub const UNKNOWN_VALUE: &str = "(unknown)";
+
+/// Whether the `behavioral` extension's functions exist on this connection.
+///
+/// Asked of the function catalog, not inferred from an error message: DuckDB
+/// rewords its errors between releases (1.5.5 began quoting identifiers in them),
+/// and a string match that stops matching turns "extension missing" back into
+/// "every failure". The extension arms the connection that ran `LOAD`, so this
+/// must be asked of the connection that will run the query.
+///
+/// If the catalog itself cannot be read the answer is `true`, which makes the
+/// caller surface the original error rather than hide it.
+pub fn behavioral_loaded(conn: &duckdb::Connection) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM duckdb_functions() WHERE function_name = 'sessionize'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map_or(true, |n| n > 0)
+}
+
+tokio::task_local! {
+    /// Set to `true` around a request that must not see outside its segment.
+    ///
+    /// A filter normally *selects sessions*: a visit with one matching event is
+    /// measured whole, so a segment `pages==/pricing` still reports where those
+    /// visits went next. That is the right reading for the person who built the
+    /// segment, and the wrong one for a share link, whose segment is a
+    /// confidentiality boundary. The share middleware runs the request inside
+    /// this scope and [`AppState::scope`](crate::ingest::handler::AppState::scope)
+    /// reads it, so every report built for that request cuts events instead,
+    /// without any handler having to know.
+    pub static SEGMENT_CUTS_EVENTS: bool;
+}
+
+/// Whether the current request's segment cuts events (see [`SEGMENT_CUTS_EVENTS`]).
+#[must_use]
+pub fn segment_cuts_events() -> bool {
+    SEGMENT_CUTS_EVENTS.try_with(|v| *v).unwrap_or(false)
+}
 
 /// One condition narrowing a report to a subset of events.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +143,13 @@ pub struct QueryScope {
     pub session_window: String,
     /// Conditions narrowing the report; empty means the whole site.
     pub filters: Vec<Filter>,
+    /// The relation every query reads events from: the `events_all` view, or a
+    /// parenthesised subquery over just the files this scope can touch.
+    /// See [`scoped::ColdReads`].
+    source: String,
+    /// Whether the filters remove events before sessions are formed, rather than
+    /// choosing which whole sessions to keep. See [`SEGMENT_CUTS_EVENTS`].
+    cut_events: bool,
 }
 
 impl QueryScope {
@@ -102,7 +165,60 @@ impl QueryScope {
             end: end.into(),
             session_window: session_window.into(),
             filters: Vec::new(),
+            source: EVENTS_ALL.to_string(),
+            cut_events: false,
         }
+    }
+
+    /// The relation to put after `FROM`: [`EVENTS_ALL`] unless the scope was
+    /// narrowed with [`QueryScope::with_source`].
+    ///
+    /// Interpolated into SQL, which is safe because the only way to set it is
+    /// `with_source`, whose callers get the text from
+    /// [`scoped_events_sql`](crate::storage::schema::scoped_events_sql) (file
+    /// names this crate built, quote-escaped) and never from request input.
+    pub fn events(&self) -> &str {
+        &self.source
+    }
+
+    /// The same scope reading events from `source` instead of `events_all`.
+    #[must_use]
+    pub fn with_source(mut self, source: String) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// The days of the cold tier a query over this scope can read, inclusive,
+    /// or `None` when the bounds cannot be parsed (the caller then reads
+    /// everything, which is slower but never wrong).
+    ///
+    /// Every statement in this module restricts `timestamp` to `[start, end)`
+    /// and `site_id` to the scope's site, and partitions are keyed by site and
+    /// event date, so those are the only files that can hold a row it reads.
+    /// A session, funnel or flow never reaches outside that window either: the
+    /// SQL builds them from the rows its own range predicate returned, so there
+    /// is nothing to widen for. `lookback_days` is the one exception, for a
+    /// query whose SQL deliberately scans earlier than `start` (retention's
+    /// first-seen lookback). The end day is included although `end` is
+    /// exclusive: one extra directory listing, and no off-by-one at midnight.
+    pub fn scan_days(&self, lookback_days: u32) -> Option<(NaiveDate, NaiveDate)> {
+        let start = parse_bound(&self.start)?.date();
+        let end = parse_bound(&self.end)?.date();
+        let from = start.checked_sub_days(Days::new(u64::from(lookback_days)))?;
+        Some((from, end))
+    }
+
+    /// The same scope with filters that cut events before sessionising.
+    #[must_use]
+    pub const fn with_cut_events(mut self, cut: bool) -> Self {
+        self.cut_events = cut;
+        self
+    }
+
+    /// Whether the filters cut events before sessionising.
+    #[must_use]
+    pub const fn cuts_events(&self) -> bool {
+        self.cut_events
     }
 
     /// The same scope narrowed by `filters`.
@@ -135,6 +251,37 @@ impl QueryScope {
     /// are interpolated, and those come from the [`Dimension`] enum.
     pub fn where_clause(&self) -> String {
         format!("{}{}", Self::SCOPE_CLAUSE, self.filter_clause())
+    }
+
+    /// The `WHERE` fragment for the site and range alone, ignoring filters.
+    ///
+    /// Session metrics need this: a session is defined by *all* of a visitor's
+    /// events, so it must be reconstructed before a filter picks which
+    /// sessions to keep. Bind it with [`QueryScope::range_params`].
+    pub const fn range_clause() -> &'static str {
+        Self::SCOPE_CLAUSE
+    }
+
+    /// Site, start and end: the parameters of [`QueryScope::range_clause`].
+    pub const fn range_params(&self) -> [&str; 3] {
+        [
+            self.site_id.as_str(),
+            self.start.as_str(),
+            self.end.as_str(),
+        ]
+    }
+
+    /// A boolean expression that is true for an event matching *every* filter.
+    ///
+    /// `TRUE` when there are no filters. Bind its values with
+    /// [`QueryScope::filter_params`]; it contains one `?` per value-bearing
+    /// filter and nothing else request-derived.
+    pub fn filter_expr(&self) -> String {
+        if self.filters.is_empty() {
+            return "TRUE".to_string();
+        }
+        let preds: Vec<String> = self.filters.iter().map(Filter::predicate).collect();
+        format!("({})", preds.join(" AND "))
     }
 
     /// The site-and-range half of [`QueryScope::where_clause`].
@@ -181,6 +328,41 @@ mod tests {
             dimension: Dimension::from_slug(slug).unwrap(),
             negated,
             value: value.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_no_query_module_swallows_row_errors() {
+        // Regression (S-06): every row mapper ended in `.filter_map(Result::ok)`,
+        // so a row that failed to decode vanished and the endpoint answered 200
+        // with a plausible, shorter report. `export.rs` is checked by its own
+        // owner; this guards the modules that feed the dashboard.
+        let swallow = [
+            "filter_map(Result::ok)",
+            ".flatten()",
+            "filter_map(|r| r.ok())",
+        ];
+        for (name, source) in [
+            ("breakdowns", include_str!("breakdowns.rs")),
+            ("events", include_str!("events.rs")),
+            ("flow", include_str!("flow.rs")),
+            ("funnel", include_str!("funnel.rs")),
+            ("realtime", include_str!("realtime.rs")),
+            ("retention", include_str!("retention.rs")),
+            ("revenue", include_str!("revenue.rs")),
+            ("sequences", include_str!("sequences.rs")),
+            ("sessions", include_str!("sessions.rs")),
+            ("metrics", include_str!("metrics.rs")),
+            ("timeseries", include_str!("timeseries.rs")),
+        ] {
+            // Code only: the tests below legitimately mention the pattern.
+            let code = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for pattern in swallow {
+                assert!(
+                    !code.contains(pattern),
+                    "src/query/{name}.rs drops row errors with `{pattern}`; collect into a Result"
+                );
+            }
         }
     }
 

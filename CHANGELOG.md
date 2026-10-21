@@ -17,6 +17,336 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Changes since 0.2.0 (`6944e68`). Several reported figures change meaning, and a
+few startup conditions that used to be accepted are now refused; read
+**Breaking** before upgrading.
+
+### Breaking
+
+- **`MALLARD_SECRET` shorter than 16 characters stops startup.** Use a random
+  value such as `openssl rand -hex 32`. A secret that is only whitespace is
+  treated as unset. Changing the secret still changes every visitor ID.
+- **Other startup refusals.** A `MALLARD_ADMIN_PASSWORD` that fails the setup
+  policy (12 characters minimum, obvious values refused); an unreadable
+  `data_dir/.secret` (it used to be silently replaced, which changed every
+  visitor ID); `login_lockout_secs = 0`; a `data_dir` containing `*`, `?`, `[`
+  or `]`; and, when `trust_proxy_headers` is on, a `trusted_proxy_hops` outside
+  1 to 8. An empty `MALLARD_GEOIP_DB` now means "not set".
+- **Client address behind a proxy is counted from the right.** With
+  `MALLARD_TRUST_PROXY_HEADERS=true` Mallard used the leftmost
+  `X-Forwarded-For` entry, which the client controls behind an appending proxy.
+  It now uses entry `MALLARD_TRUSTED_PROXY_HOPS` (new, default 1) from the
+  right. One proxy needs no change; a CDN in front of your proxy needs `2`.
+  Visitor IDs, GeoIP and rate-limit buckets of deployments that relied on the
+  leftmost entry will change.
+- **`/health/detailed` fields.** `auth_configured`, `active_sessions` and
+  `trust_proxy_headers` are gone. `cold_tier` is added, and the endpoint answers
+  `503` with `"status": "degraded"` when Parquet files exist that the
+  `events_all` view does not read. Monitors that parse the old fields or expect
+  `200` need updating.
+- **`Nd` periods are N days.** `7d` now spans seven daily buckets including
+  today (it spanned eight; `30d` spanned 31). `12mo` is the twelve months ending
+  today. Figures for the same label are therefore lower than before, and
+  period comparison shifts by the new length. A `start_date` without an
+  `end_date` (or the reverse) is a `400` instead of being ignored.
+- **Session, bounce and filter definitions changed**, so the numbers change.
+  A session is a run of one visitor's events of any kind; only sessions with a
+  pageview count; a bounce is a counted session of exactly one event, a
+  pageview (a custom event ends the bounce); filters select whole sessions
+  instead of cutting them; entry/exit pages use the same sessions as
+  `/api/stats/sessions`. Entry/exit rows now report the pageviews and events of
+  their sessions, with a new `sessions` field for entrances (they previously
+  reported the entrance count as `pageviews` and `events`). See
+  [README](README.md#how-metrics-are-defined).
+- **Flow counts pageviews only** and collapses consecutive repeats. A custom
+  event no longer appears as a destination, and a reload is not a transition.
+- **Funnels default to `strict_once`** (one event fills one step) unless the
+  caller passes `strict_once` or `strict_increase`. `allow_reentry` without
+  `strict_order` is a `400`. Cause: DuckDB 1.5.6 / `behavioral` 0.10.0 follows
+  ClickHouse, where one event can satisfy several steps.
+- **DuckDB 1.5.6 and `behavioral` >= 0.10.0.** Startup refuses an older cached
+  extension build on the data volume, because `INSTALL` is a no-op when a file
+  is already present. Remove the extension directory (`data_dir/extensions` by
+  default) and restart, or run `mallard-metrics --install-extension` after
+  removing it, so a current build is installed.
+- **`gdpr_mode` / `round_timestamps` disable session analyses.** Sessions,
+  funnel, sequences, flow and entry/exit pages answer `503` and the session
+  fields of `/api/stats/main` are `null`, because order within an hour is lost.
+- **The musl build is gone.** The `behavioral` extension is not published for
+  musl (`linux_*_musl` requests return 404), so that image answered `503` on
+  funnels, retention, sessions, sequences and flow. The image is now a glibc
+  binary on distroless `cc-debian12:nonroot` (UID 65532); release archives are
+  `*-unknown-linux-gnu` for x86_64 and aarch64. It is no longer `FROM scratch`
+  or statically linked. Any process that copied the old binary out of the image
+  must use the new one.
+- **Errors carry a stable `code`.** Handler errors are
+  `{"code": ..., "error": ...}` with `bad_request`, `unauthorized`,
+  `not_found`, `internal_error`, `too_many_requests`,
+  `behavioral_unavailable` or `query_timeout`. A query that passes its deadline
+  is `504` (it was `400`). Clients that matched on message text should switch to
+  `code`. (Query-string rejections by the web framework, such as a missing
+  `site_id`, are still plain text.)
+- **GDPR erasure that cannot remove a partition answers `500`** with
+  `"status": "partial"` and `failed_dates`, instead of `200 "erased"`.
+- **Backups.** `deploy/backup.sh` (graceful stop, hard-linked snapshot, verify,
+  always restart, prune) replaces the cron job that copied the live data
+  directory, which could produce a copy DuckDB could not open.
+
+### Added
+
+- **Optional extras script** `/mallard-extras.js` (`tracking/extras.js`, 1.8 KB
+  gzipped, own 2,048-byte budget). Opt-in by attribute: scroll depth
+  (`data-scroll`), engagement time (`data-engagement`), 404 detection
+  (`data-404-selector` / `data-404-title`) and form submits (`data-forms`).
+  It sends through the main tracker, so every opt-out and server limit applies
+  unchanged. Its background events (`Scroll Depth`, `Engagement`) do not end a
+  bounce, so enabling it leaves bounce rate meaning what it did; see
+  [Tracker extras](docs/src/extras.md).
+- **Datacenter traffic filter**, off by default. `MALLARD_ASN_DB` / `asn_db_path`
+  (GeoLite2-ASN or DB-IP ASN lite) turns it on: events from a hosting ASN are
+  dropped like bots (`202`, not stored) and counted in
+  `mallard_datacenter_filtered_total`. `MALLARD_DATACENTER_ASNS` /
+  `datacenter_asns` replaces the built-in list of 11 verified hosting ASNs.
+- **Webhook alerts and scheduled reports** ([docs](docs/src/alerts-and-reports.md)).
+  Off until `MALLARD_ALERTS_WEBHOOK_URL` (or `[alerts] webhook_url`) is set.
+  Mallard then POSTs HMAC-SHA256-signed JSON to that one webhook: operational
+  alerts (flush stalled, events failing to reach disk, behavioral extension
+  missing, cold tier degraded, rate-limiter evictions spiking), traffic alerts
+  (an hour's pageviews at least X% below, or Y% above, the same hour of the
+  previous N weeks, with a minimum-volume floor), and daily and/or weekly
+  per-site reports (visitors, pageviews, top pages and sources, change against
+  the previous period). Alerts have stable ids, a cooldown, and a `resolved`
+  message; the payload carries `text` and `content` fields for Slack and Discord
+  (`payload_format` can narrow it to one). Settings are the `[alerts]` table and
+  `MALLARD_ALERTS_*` variables, documented in `mallard-metrics.toml.example`;
+  `mallard-metrics --test-webhook` sends one test message.
+  - **Outbound-request safety.** URL and secret come from configuration only.
+    `https://` is required (`allow_http_webhook` to relax it); loopback, private,
+    link-local (cloud metadata), CGNAT, multicast, unspecified and reserved
+    addresses are refused at connect time, including names that resolve to them,
+    unless `allow_private_webhook_targets` is set; the connection goes to the
+    address that was checked (DNS rebinding); redirects are never followed;
+    timeouts, a response-size cap, bounded retries with jittered backoff and a
+    bounded queue apply; the secret and URL are never logged. An insecure
+    combination stops startup with a message naming the setting.
+  - **New dependencies:** `rustls` (ring provider), `tokio-rustls`, `webpki-roots`
+    and `httparse` (already in the tree through hyper); dev-only `rcgen`. The HTTP
+    client is about 400 lines in `src/alerts/client.rs`; see the page above for
+    why `reqwest`, `ureq` and `hyper-rustls` were not used.
+  - **New metrics:** `mallard_notifications_{sent,failed,dropped}_total{kind}`,
+    `mallard_notification_last_success_timestamp_seconds`,
+    `mallard_notification_queue_depth`, `mallard_alerts_active`; Prometheus rules
+    `MallardNotificationsFailing` and `MallardNotificationsDropped`.
+  - Alert state is in memory: a restart forgets which alerts were firing.
+- **Share links.** An admin can create a revocable, read-only public link to one
+  site's dashboard, optionally limited to a saved segment and an expiry, and
+  revoke it at any time (`POST/GET /api/share-links`, `DELETE
+  /api/share-links/{id}`, and a **Share links** panel). The token is 256 bits
+  from the OS CSPRNG, shown once, stored only as a SHA-256 hash in
+  `data_dir/share_links.json` (mode 0600, atomic writes, a corrupt file is moved
+  aside and authorises nothing). It travels in the URL fragment
+  (`/#share=<token>`) and an `X-Share-Token` header, so it never appears in a URL
+  the server sees; share responses carry `Referrer-Policy: no-referrer` and
+  `Cache-Control: no-store`, and request logging redacts anything shaped like a
+  token. A token opens only the read-only report routes under `/api/shared/`,
+  forced to the link's site (another site is `403`) with the link's segment
+  AND-ed into every query; there are no exports, no site list and nothing
+  administrative. Per-link and global rate limits, and 100 active links per
+  instance. A viewer sees a **Shared view** banner and none of the admin
+  controls. The design and threat model are in `docs/src/share-links.md`.
+- **Saved segments.** Named filter sets per site (`GET/POST /api/segments`,
+  `POST/DELETE /api/segments/{id}`, in `data_dir/segments.json`), validated by
+  the same parser as the `filters` parameter and capped at 50 per site, 500 per
+  instance, 8 filters each. The dashboard has a **Segment** menu that applies one
+  and a **Segments** panel to manage them. A share link copies its segment's
+  filters when it is made, so a later edit never widens an existing link.
+- `share_links.json` and `segments.json` are part of an online backup. Restoring
+  a backup taken before a link was revoked makes that link valid again.
+- **`mallard-metrics import ga4-bigquery`** loads a Google Analytics 4 BigQuery
+  export (newline-delimited JSON) into a stopped instance: offline, streamed,
+  validated with line-numbered errors, `--dry-run`, `--skip-invalid`, site id
+  supplied by you, idempotent (key: site, visitor id, timestamp, event name,
+  path, as a multiset), written through the server's own flush and recovery.
+  Imported rows carry a `visitor_id` starting `imp:` (a keyed hash of GA4's
+  session, never the user id) and follow the instance's privacy settings. They
+  count in pageviews, events and every breakdown; unique visitors are GA4
+  *sessions*, and imported dates never form retention cohorts. Plausible,
+  Fathom, Umami and Matomo are **not** importable: Plausible and Fathom export
+  aggregates only, and Umami's and Matomo's event-level formats have no
+  published schema to build against. See [Importing Data](docs/src/importing-data.md).
+- **`GET /api/admin/export/parquet`** (admin scope): one site and date range as a
+  single Parquet file with a documented schema, no `visitor_id`, an `is_imported`
+  flag, `Content-Length`, a 1,000,000-row cap that refuses rather than truncates,
+  and the same tier-lock and scoped-read rules as the reports. The file is
+  written under `<data_dir>/exports` and deleted after the download. See
+  [Exporting to Parquet](docs/src/exporting-parquet.md).
+
+- `MALLARD_QUERY_QUEUE_WAIT_SECS` (default 5) and `MALLARD_QUERY_DEADLINE_SECS`
+  (default 20), TOML `query_queue_wait_secs` and `query_deadline_secs`: how long
+  a request waits for a query slot (then `429`) and how long a statement may run
+  (then it is interrupted and the request gets `504`). Together they must not
+  exceed the 30 s request timeout.
+- A missing or mistyped query parameter, and a malformed, mistyped or
+  wrongly-typed JSON body, now answer `400` with `{"error", "code": "bad_request"}`
+  on every route except `POST /api/event`. They used to be plain-text `400`,
+  `415` or `422`.
+- API errors: `session_data_unavailable` (503) is now distinct from
+  `behavioral_unavailable` for analyses refused under `gdpr_mode`; `/api/stats/main`
+  gains `sessions_unavailable_reason` (`"timestamps_rounded"` or
+  `"extension_missing"`) when session figures are `null`; the retention response
+  gains `visitor_salt_rotation_days`; `conflict` (409) is a new code. A funnel
+  `modes=allow_reentry` 400 now says it requires `strict_order` instead of
+  "Unknown funnel mode".
+- `GET /api/sites` is ordered by events in the last 30 days and gains a
+  `details` array of `{site_id, events_30d}`; `sites` keeps its shape.
+- **Online backup:** `POST /api/admin/backup` (admin) snapshots the database and
+  the Parquet files consistently while serving, plus `.secret`, `admin.json` and
+  `api_keys.json`, into `<data_dir>/backups/<name>/` (owner-only, never
+  overwritten). Parquet files are hard-linked, so it costs almost no disk or time.
+  `deploy/backup.sh` remains for the stop-and-copy layout.
+- The raw export (`kind=raw`) streams: no `Content-Length`, memory does not grow
+  with `limit` (about 170 MiB against about 1 GiB at 1,000,000 rows, debug
+  build, 3 runs). A failure after the first byte aborts the connection.
+- `MALLARD_TRUSTED_PROXY_HOPS` (TOML `trusted_proxy_hops`).
+- `/metrics`: `mallard_build_info{version,behavioral_version}`,
+  `mallard_last_flush_success_timestamp_seconds`,
+  `mallard_process_start_time_seconds`, `mallard_rate_limiter_evictions_total`,
+  `mallard_buffer_flush_failures_total`.
+- Startup advisories for `max_login_attempts = 0` and for an instance with
+  neither `site_ids` nor a per-IP rate limit.
+- `HEAD /api/event` answers like the pixel and records nothing; the ingest CORS
+  preflight is cacheable for 24 hours.
+- Retention reports `complete_weeks` and `partial_first_week` per cohort, so
+  weeks that have not happened yet are not shown as zero retention. The
+  retention scan starts `visitor_salt_rotation_days` before the report instead
+  of at the beginning of history.
+- Analytics queries wait up to 10 s for a slot instead of failing at once, and
+  are interrupted after 20 s. `429` (genuine overload) carries `Retry-After: 1`.
+- Tracking script: `data-link-query="true"` keeps query and fragment on
+  outbound and download URLs (now stripped by default); `data-hash` reports
+  `#/pricing` as the path `/pricing`; the referrer is sent only until the first
+  in-page navigation; back/forward-cache restores and prerendered pages are
+  handled. The script is 4,013 bytes gzipped (budget 4,096).
+- Dashboard rebuilt: state in the URL, lazy panels, a request queue with `429`
+  back-off, accessible tabs, a chart table view, a copy-snippet button.
+- Operations: `deploy/monitoring/` (eleven Prometheus alert rules with tests, a
+  Grafana dashboard, a scrape example), `deploy/systemd/` unit, `Makefile`,
+  pre-commit hooks, devcontainer, `scripts/docker-smoke.sh`,
+  `scripts/check-binary-abi.sh`, `scripts/shutdown-race-test.py`,
+  `scripts/check-seed-schema.py`, and `.github/workflows/security.yml`
+  (RustSec advisories weekly and on dependency changes).
+- Recognised iOS browser wrappers (Chrome, Edge, Opera on iOS) and more bots
+  (`Storebot-Google`, `GoogleOther`, `BingPreview`, `meta-external*`,
+  `PostmanRuntime`, `Bytespider`, `ChatGPT-User`).
+- `maxminddb` 0.32, with tests that decode a real MMDB.
+- Benchmark `query_scale` (see [PERF.md](PERF.md)); `files_for_range` and
+  `scoped_events_sql`, a site-and-date-scoped Parquet read, and `stream_raw_export`,
+  a chunked raw export. Neither is used by a request yet.
+
+### Changed
+
+- Reports read only the Parquet files a request can touch (the site and the
+  date range, widened for the retention lookback) instead of every file. One
+  site and one week on 100 sites x 90 days: main 4.2 ms against 618-659 ms,
+  breakdown 5.1-5.5 ms against 608-645 ms, timeseries 6.3-7.5 ms against
+  574-630 ms (release Criterion, 4-core 2.1 GHz Xeon, 3 runs). A differential
+  test demands identical results from both paths.
+- The listener closes a connection that sends no complete request head within
+  30 s, and idle keep-alive connections close at the same limit (HTTP/1 only).
+  A proxy's upstream keep-alive timeout must be shorter than 30 s.
+- The `behavioral` extension is retried every 60 s if the first install failed,
+  so `behavioral_extension_loaded` can turn true after boot.
+- The `events_all` view reads hive keys as explicit types and enables the
+  Parquet metadata cache; a site-and-week query over 9,000 files measured 1.36 s
+  to 0.6 s in that change's informal benchmark.
+- The cumulative funnel is summed in Rust instead of cross-joining steps with
+  visitors.
+- Flush stages `NNNN.parquet.pending`, fsyncs it, deletes the hot rows, then
+  renames; startup recovers interrupted flushes by comparing rows. Compaction
+  merges within levels without holding the tier lock for the whole merge. A
+  flush writes at most a bounded number of partitions, largest first.
+- `push` returns success when the event is safely buffered even if the flush it
+  triggered failed (the failure is counted); a retrying client no longer
+  duplicates the event.
+- Rate-limit keys for IPv6 clients are the /64. At the key cap the limiters
+  evict in batches instead of refusing new keys.
+- Login attempts are counted when admitted, before password verification, and at
+  most 4 Argon2 operations run at once (`503` beyond that).
+- The production compose file sets `MALLARD_TRUST_PROXY_HEADERS=true` and
+  `MALLARD_TRUSTED_PROXY_HOPS=1`; Caddy logs no IP, headers or query string;
+  `setup.sh` makes the data directory owned by UID 65532.
+- macOS `os_version` is no longer stored (every browser reports a frozen
+  10.15.7). Client-hint brand, version and platform are restricted to known values.
+- Toolchain and CI: Rust 1.98.0; the musl target removed; the smoke job and
+  release binaries require the extension; dependency updates for `duckdb` are
+  grouped apart with a cooldown.
+
+### Fixed
+
+- **Shutdown lost late events.** The final flush ran before the server drained,
+  so a request accepted during shutdown was lost. The server now drains first
+  (bounded by `shutdown_timeout_secs`), then flushes and closes the buffer.
+- **Compaction could lose rows** when a later source file could not be removed;
+  **a crash between publishing a flush and deleting the hot rows counted every
+  row twice**; a power loss could leave a short Parquet file in the read glob.
+- **A corrupt Parquet file silently hid the whole cold tier**; the view now
+  falls back to the hot table only when there are no files, and `cold_tier`
+  reports the degraded state.
+- **Retention left the view reading an empty glob** after removing the last
+  partition, and did not clear the query cache. Erasure and retention reported
+  success when removal failed, and left empty site directories.
+- **Reports hid decode errors.** Rows that failed to decode were dropped, so an
+  endpoint answered `200` with a shorter report; errors now propagate. A
+  transient session-query failure is no longer cached as "no session data".
+- A cold dashboard load (about 30 requests) was answered `429` past the tenth;
+  readers could deadlock against a flush when the pool shared the writer
+  connection; a pre-erasure result could be cached after an erasure.
+- Custom property keys containing `.` can be queried; one malformed `props`
+  value no longer fails a report for the whole range.
+- The pixel endpoint always answers a GIF, even for a missing site or a bad width.
+- API-key and secret-file writes are durable, serialised and honest about
+  failure (a failed write was reported as success, and a revoked key could be
+  live again after a restart).
+- The login and setup responses no longer repeat the session token; login,
+  setup and logout apply the dashboard-origin check, case-insensitively and
+  ignoring a default port.
+- Huge `login_lockout_secs` / `session_ttl_secs` no longer panic.
+
+### Security
+
+Fixes from an independent adversarial review of the share-link, webhook, backup
+and datacenter-filter code (no critical or high findings; each below was
+reproduced against the running server before it was fixed):
+
+- **A share link's segment now cuts events instead of selecting visits.** With
+  the segment `pages==/p1`, a viewer could read views per visit, entry and exit
+  pages and session figures computed from the *whole* visit, which exposed pages
+  the segment excludes. For a link, events outside the segment are removed before
+  visits are formed. The same filter in the admin dashboard is unchanged.
+- **Webhook report text is inert.** Page paths and referrer sources are
+  visitor-controlled; `<!channel>`, `@everyone` and markdown links reached Slack and
+  Discord messages unchanged. They are now reduced to a safe alphabet and
+  length-capped in the chat text (the structured fields keep the real values),
+  and Discord bodies carry `allowed_mentions: {parse: []}`.
+- Webhook targets in `fec0::/10` and the SIIT range `::ffff:0:0/96` are refused.
+- Backup names may not end in `.partial` (a finished backup with that name was
+  deleted by the next request for the name without it).
+- Share-token redaction in debug logs now matches any case and percent-escapes.
+- A link holder asking for another site no longer writes a warning per request.
+
+- Client-IP trust (see Breaking), IPv6 /64 keying, batch eviction instead of
+  refusal in the limiters, and attempt counting before verification.
+- Query-string and fragment removed from outbound/download event URLs by
+  default; path parsing no longer reads a `/` from the query string; invisible
+  format characters are dropped from stored strings; the User-Agent is bounded
+  before hashing.
+- Advisories in `rustls`, `rustls-webpki` and `webpki-roots` cleared
+  (RUSTSEC-2026-0285 and five others).
+- `/health/detailed` no longer discloses whether an admin password is set, the
+  live session count or the proxy setting. (`/metrics` still exposes
+  `mallard_auth_configured` and `mallard_active_sessions`; set
+  `MALLARD_METRICS_TOKEN` or keep it off the public network.)
+
 ## [0.2.0] - 2026-08-31
 
 A broad modernisation pass. The toolchain, edition and every dependency are

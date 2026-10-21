@@ -1,125 +1,113 @@
 # Roadmap
 
-This document describes the current state of Mallard Metrics and future directions. For a detailed history of what has shipped, see [CHANGELOG.md](CHANGELOG.md).
+Where Mallard Metrics stands, what it cannot do, and what is missing for wider
+use. For what has shipped, see [CHANGELOG.md](CHANGELOG.md). Nothing below is
+scheduled; items are ordered by evidence of need, not by commitment.
 
 ---
 
-## Current Status
+## Status
 
-Core functionality is complete and production-ready:
+Implemented and covered by the test suite (counts in
+[DEVELOPMENT.md](DEVELOPMENT.md#current-metrics)):
 
-**Ingestion**
-- `POST /api/event` plus a `GET` pixel endpoint for JavaScript-free contexts
-- Per-site HMAC-SHA256 visitor IDs with configurable salt rotation
-- User-Agent and Client Hints parsing, bot filtering, GeoIP resolution
-- Per-site and per-IP rate limiting, bounded buffering, atomic Parquet writes
-
-**Storage**
-- Two-tier DuckDB hot table plus Parquet cold tier, unioned by `events_all`
-- Date-partitioned layout with automatic compaction and retention cleanup
-- A read-connection pool so queries do not block ingestion
-
-**Analytics**
-- Visitors, pageviews, events, visits, bounce rate, visit duration
-- Twenty breakdown dimensions, covering every column the ingest path populates
-- Gap-filled time series, realtime activity, goals, custom properties, revenue
-- Segment filters on every report, over any of the twenty dimensions
-- Behavioral analytics: cumulative funnels with ordering modes, per-visitor
-  retention cohorts, session metrics, sequence matching, forward/backward flow
-- Daily and raw event exports as CSV or JSON
-
-**Operations**
-- Embedded dashboard SPA (Preact + HTM, no build step) with dark mode
-- Period comparison against the previous period or the same period last year
-- Argon2id authentication with a persisted credential, scoped API keys managed
-  from the dashboard, per-IP brute-force protection
-- GDPR mode, configurable privacy flags, Art. 17 erasure endpoint
-- Prometheus metrics — internal counters plus HTTP request counts and a latency
-  histogram — structured logging, readiness probes, graceful shutdown
-- Configurable DuckDB memory limit, thread count and extension directory
-- OWASP security headers, CSRF protection, non-root container image
+- **Ingestion**: `POST /api/event`, a pixel `GET`, per-site and per-client-IP rate limits, bounded buffering, bot filtering, GeoIP, User-Agent and Client Hints parsing.
+- **Storage**: DuckDB hot table plus date-partitioned Parquet, unioned by `events_all`; crash-safe flush and compaction; retention; consistent reads.
+- **Analytics**: core and session metrics, twenty breakdown dimensions, segment filters on every report, period comparison on `/api/stats/main`, goals, custom properties, per-currency revenue, realtime, and (with the `behavioral` extension) funnels, retention, sequences and flow; CSV/JSON export.
+- **Sharing and segments**: revocable read-only share links per site (optionally limited to a saved segment, which cuts events rather than selecting visits), and named saved segments.
+- **Data in and out**: an offline importer for the GA4 BigQuery export, streamed raw export, a Parquet export for warehouses, and an online backup endpoint.
+- **Tracker**: an optional extras script (scroll depth, engagement time, 404, form submit) with its own size budget.
+- **Notifications**: signed webhook alerts (flush stalled, extension missing, cold tier degraded, traffic drop or spike against the same hour of previous weeks) and scheduled daily or weekly reports, with address checks that refuse internal targets.
+- **Operations**: embedded dashboard, Argon2id auth with persisted credential, API keys (`ReadOnly`/`Admin`), GDPR mode and erasure endpoint, Prometheus `/metrics`, health probes, alert rules and a Grafana dashboard (`deploy/monitoring/`), a backup script, a systemd unit, a hardened production compose stack, glibc release binaries and image.
 
 ---
 
 ## Known limitations
 
-Stated plainly, because each is a property of the design rather than a bug:
+Each is a property of the design today, not a bug.
 
-- **Cross-period visitor analysis depends on salt rotation.** With the default
-  daily rotation, "unique visitors" over a longer range counts visitor-days, and
-  weekly retention cohorts cannot work. `visitor_salt_rotation_days` trades
-  privacy for that capability, and the retention endpoint reports which side of
-  the trade the current configuration sits on.
-- **Behavioral analytics need a community extension** downloaded at startup.
-  Without network access on first run, those endpoints return 503.
-- **Single-node.** There is no clustering, replication or read-replica story.
-  DuckDB handles a great deal on one box, but the ceiling is one box.
-- **Revenue is not converted between currencies.** There is no exchange-rate
-  source, so totals are reported per currency and never summed.
-- **Erasure is site plus date range.** Visitor IDs are pseudonymous hashes, so a
-  named individual's rows cannot be singled out.
-- **Exports are built in memory, not streamed.** `limit` therefore bounds memory
-  as well as row count. Slice by date range rather than raising the ceiling on a
-  small host.
+- **Behavioral analytics need a runtime download.** Funnels, retention, sessions, sequences, flow and entry/exit pages come from a DuckDB community extension (written by this project's author) fetched on first start. Offline, those endpoints answer `503`; `mallard-metrics --install-extension` seeds it ahead of time. Startup refuses a cached build older than 0.10.0.
+- **Cross-day visitor analysis depends on salt rotation.** With the default daily rotation, "unique visitors" over a range counts visitor-days and weekly retention cannot work. Raising `visitor_salt_rotation_days` trades privacy for that capability; `/api/stats/retention` says which side the configuration is on.
+- **Single node.** No clustering, replication or read replicas.
+- **No published capacity figures.** [PERF.md](PERF.md) has micro-benchmarks only; the scoped read path is measured on 100 sites by 90 days, not at 10M or 100M rows.
+- **One admin credential.** No users, roles, per-site access or SSO; API keys have two scopes and see every site.
+- **Revenue is never converted between currencies**; totals are per currency.
+- **Erasure is site plus date range**; a named individual's rows cannot be singled out because visitor IDs are hashes.
+- **Raw exports are capped** at 1,000,000 rows (default 100,000) and stream, so a failure after the first byte aborts the connection instead of returning a status.
+- **Bot filtering is a User-Agent substring list**, plus an opt-in datacenter-ASN filter that needs a database you supply. No referrer-spam or flood detection.
+- **Imports cover one product.** Only the GA4 BigQuery event export is importable. Plausible and Fathom export daily aggregates, and Umami and Matomo publish no field-level export schema we could verify; see [Importing data](docs/src/importing-data.md).
+- **Webhook notifications are one URL**, with state in memory: a restart forgets which alerts were firing. There is no email delivery.
+- **Share links expose drill-down.** A viewer can combine filters until a count reaches one visitor; a link is not an aggregates-only view (see the [share links](docs/src/share-links.md) threat model).
+- **Session analyses are unavailable under hour-rounded timestamps** (`gdpr_mode`).
+- **`site_ids` comes from configuration**, not a UI; there is no site-management screen.
 
 ---
 
-## Future Considerations
+## Gaps for production use
 
-Potential directions, not committed work. Each depends on demonstrated need.
+Ranked from an ecosystem comparison done on 2026-10-20 that read competitors'
+repositories and documentation pages. Its competitor figures were partly
+unverified, so none are repeated here; "who ships it" cites only what the report
+read on a named page. Effort: S under a week, M one to three weeks, L longer
+(estimates for the current architecture).
 
-### Performance and scale
+| # | Gap | Evidence others ship it | Effort |
+|---|---|---|---|
+| 1 | Multiple users, roles and per-site access | Umami (Teams), Rybbit (organisations), HitKeep (members) | L |
+| 2 | OIDC single sign-on | Plausible has it outside Community Edition; HitKeep lists it on a paid plan | M, after 1 |
+| 3 | More importers: Plausible and Fathom need an aggregates table (their exports are not events); Umami and Matomo need a documented event schema first | Plausible (GA4 + CSV), Rybbit (Umami, Simple Analytics) | M |
+| 4 | Email delivery of reports; per-site webhooks; persisted alert state | Plausible, Swetrix, HitKeep, OpenPanel | S to M |
+| 5 | Comparison for breakdowns and the time series | Rybbit, Umami | S to M |
+| 6 | Referrer-spam list and flood detection (the ASN filter is done) | Rybbit, Plausible Cloud | M |
+| 7 | Site-management UI (add/remove sites, copy snippet) | Rybbit, Umami | M |
+| 8 | Documented first-party proxy recipe for ad-blocker resilience (`/js/script.js` and `data-api` already exist; the recipe is missing) | Plausible, Umami | S |
+| 9 | Search Console integration | Plausible, OpenPanel, HitKeep | M to L |
+| 10 | A published scale envelope (events per second, query latency at 10M and 100M rows, memory) and pre-aggregated rollups | Matomo publishes sizing tiers | M to L |
+| 11 | Server-side and mobile SDKs, a client library | Rybbit, OpenPanel, Pirsch | S to M |
+| 12 | MCP/AI-assistant endpoint over the existing API | Umami, Rybbit, OpenPanel, HitKeep | S to M |
 
-- **Time-partitioned Parquet statistics** — record per-file min/max timestamps so
-  a narrow date range can skip files without opening their footers.
-- **Incremental pre-aggregation** — materialise daily rollups for ranges where
-  exact per-event detail is not needed.
-- **Multi-node deployment** — only if a single process demonstrably cannot cope.
+Already done since the report's matrix was drawn, and therefore **not** gaps:
+segment filters on every report, saved segments, read-only share links, period
+comparison on the headline figures, Prometheus metrics with alert rules, webhook
+alerts and scheduled reports, a GA4 importer, an online backup endpoint, streamed
+and Parquet exports, scroll-depth, engagement, 404 and form events, a datacenter
+ASN filter, scoped Parquet reads, a supported backup script, glibc images with
+the extension verified at build, per-IP login lockout, a persisted admin
+credential.
 
-### Features
+### Engineering work that follows from this repository
 
-- **Alerting** — thresholds and anomaly detection on traffic or conversions.
-- **Scheduled reports** — periodic summaries by email or webhook.
-- **Saved segments** — naming and storing a filter set, so it can be recalled
-  rather than rebuilt. The filters themselves now exist; what is missing is
-  persistence and a name.
-- **Comparison beyond the headline figures** — `compare` currently applies to
-  `/api/stats/main`. Extending it to breakdowns and the time series means
-  deciding how to align two rankings that do not share their rows, which is a
-  design question rather than a mechanical one.
-- **UTM-aware attribution models** — first-touch and last-touch, rather than the
-  per-event attribution available today.
-- **Alternative auth backends** — OIDC or SAML for organisations that need it.
+- Replace hand-rolled pieces with maintained data or crates only after benchmarking: a bot-UA list (data, not a crate), the Matomo referrer lists, the `url` crate for URL parsing. `moka` for the query cache was evaluated and not adopted: inserting into a full cache measured 40-44 µs at 1,000 entries and about 0.4 ms at the default 10,000, which does not justify the code ([PERF.md](PERF.md)). The ecosystem report flags each of the others as a candidate, not a recommendation.
+- Evaluate DuckLake for the hot/cold tiering as a branch prototype; its maintenance functions and extension-download story were not verified.
 
-### Ecosystem
+### Positioning
 
-- **Additional GeoIP providers** — IP2Location and other MMDB-compatible databases.
-- **Additional export formats** — Parquet and Arrow IPC for warehouse ingestion.
-- **Streaming exports** — a chunked response body, removing the memory bound
-  that `limit` currently doubles as.
-- **A client library** — a thin wrapper over the ingest endpoint for server-side
-  events in common languages.
+Funnels, journeys and retention are absent from Plausible Community Edition
+according to Plausible's documentation; Umami, Rybbit, OpenPanel and HitKeep list
+funnels, so they are not a differentiator against those. What Mallard offers that
+the same search did not find elsewhere is the combination of a single Rust
+binary, embedded DuckDB, an open Parquet cold tier and documented salt-rotation
+trade-offs. HitKeep (Go, embedded DuckDB, MIT) overlaps this architecture and
+ships more product features today; Mallard is currently a capable engine with a
+thin product around it.
 
 ---
 
-## Verification Protocol
+## Verification protocol
 
-Every release must pass the full validation suite before tagging:
+Every release must pass the validation suite before tagging; the release
+workflow (`.github/workflows/release.yml`) enforces it on every version tag.
 
 ```bash
-cargo test --all-targets   # all 602 tests pass
-cargo clippy --all-targets --all-features -- -D warnings   # zero warnings
-cargo fmt -- --check       # zero format violations
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps   # docs build cleanly
+cargo test --all-targets
+cargo clippy --all-targets --all-features -- -D warnings
+cargo fmt -- --check
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
-# Behavioral-extension tests skip when the extension cannot be downloaded.
-# CI sets this so a skip becomes a failure.
+# Behavioral tests skip when the extension cannot be downloaded; CI turns a skip
+# into a failure with this variable.
 MALLARD_REQUIRE_BEHAVIORAL=1 cargo test --all-targets
 
-# End-to-end against the real binary: every route, on a socket, with real
-# storage. The in-process tests cannot see a route that only breaks once the
-# server is assembled.
+# End-to-end against the real binary: every route, on a socket, with real storage.
 cargo build && scripts/smoke-test.sh
 ```
-
-The release workflow (`.github/workflows/release.yml`) enforces these gates automatically on every tag push.

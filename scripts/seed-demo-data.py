@@ -35,7 +35,7 @@ Note: The DuckDB behavioral extension must be installed for sessions,
 funnel, retention, sequences, and flow endpoints to return data.
 Install it with: INSTALL behavioral FROM community; LOAD behavioral;
 """
-import duckdb, random, sys, hashlib
+import duckdb, os, random, sys, hashlib
 from datetime import datetime, timedelta, timezone
 
 DB_PATH = sys.argv[1] if len(sys.argv) > 1 else "/tmp/mallard-demo-data/mallard.duckdb"
@@ -136,7 +136,8 @@ for i in range(500):
         "visit_days": chosen_days,
     })
 
-# Connect and create table
+# Connect and create table. DuckDB will not create the parent directory.
+os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
 conn = duckdb.connect(DB_PATH)
 conn.execute("""
 CREATE TABLE IF NOT EXISTS events (

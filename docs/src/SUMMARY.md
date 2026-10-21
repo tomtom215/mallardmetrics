@@ -8,6 +8,8 @@
 
 - [Quick Start](getting-started.md)
 - [Tracking Script](tracking-script.md)
+  - [Tracker Extras](extras.md)
+- [Upgrading](upgrading.md)
 
 # Reference
 
@@ -17,11 +19,14 @@
   - [Analytics Stats](api-reference/stats.md)
   - [Authentication](api-reference/auth.md)
   - [Health & Metrics](api-reference/health.md)
+- [Metric Definitions](metric-definitions.md)
 
 # Concepts
 
 - [Architecture](architecture.md)
-- [Security & Privacy](security.md)
+- [Security](security.md)
+- [Share Links and Segments](share-links.md)
+- [Privacy and GDPR](privacy-gdpr.md)
 - [Behavioral Analytics](behavioral-analytics.md)
 
 # Operations
@@ -30,4 +35,9 @@
   - [VPS Deployment Guide](deploy-vps.md)
   - [Fly.io Deployment](deploy-flyio.md)
 - [Monitoring](monitoring.md)
+- [Webhook Alerts and Reports](alerts-and-reports.md)
 - [Data Management](data-management.md)
+  - [Importing Data](importing-data.md)
+  - [Exporting to Parquet](exporting-parquet.md)
+- [Backup and Restore](backup-restore.md)
+- [Troubleshooting](troubleshooting.md)

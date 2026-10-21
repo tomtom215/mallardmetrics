@@ -26,6 +26,14 @@ pub struct PropertyValue {
 /// Rows kept per property breakdown.
 const TOP_N: usize = 50;
 
+/// `props` as JSON, or NULL when the stored text is not valid JSON.
+///
+/// Ingest validates props, but `json_keys` and `json_extract_string` raise on
+/// malformed input, so one bad row in a restored or hand-edited store would
+/// fail the report for the whole range. `CASE` is evaluated per row, unlike a
+/// `WHERE json_valid(props)` that the planner may reorder after the call.
+const PROPS_JSON: &str = "CASE WHEN json_valid(props) THEN props END";
+
 /// Maximum length of a property key accepted from a request.
 const MAX_PROP_KEY_LEN: usize = 128;
 
@@ -55,9 +63,10 @@ pub fn query_goals(
     scope: &QueryScope,
 ) -> Result<Vec<GoalConversion>, duckdb::Error> {
     let where_clause = scope.where_clause();
+    let events = scope.events();
     let sql = format!(
         "WITH scoped AS (
-             SELECT visitor_id, event_name FROM events_all WHERE {where_clause}
+             SELECT visitor_id, event_name FROM {events} WHERE {where_clause}
          ),
          total AS (SELECT COUNT(DISTINCT visitor_id) AS visitors FROM scoped)
          SELECT event_name,
@@ -80,8 +89,7 @@ pub fn query_goals(
                 conversion_rate: row.get(3)?,
             })
         })?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
@@ -94,9 +102,10 @@ pub fn query_property_keys(
     conn: &Connection,
     scope: &QueryScope,
 ) -> Result<Vec<String>, duckdb::Error> {
+    let events = scope.events();
     let sql = format!(
-        "SELECT DISTINCT UNNEST(json_keys(props)) AS key
-         FROM events_all
+        "SELECT DISTINCT UNNEST(json_keys({PROPS_JSON})) AS key
+         FROM {events}
          WHERE {} AND props IS NOT NULL
          ORDER BY key
          LIMIT {TOP_N}",
@@ -107,8 +116,7 @@ pub fn query_property_keys(
         .query_map(duckdb::params_from_iter(scope.params()), |row| {
             row.get::<_, String>(0)
         })?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
@@ -134,11 +142,23 @@ pub fn query_property_values(
     } else {
         ""
     };
+    // A key containing `.` is looked up as a flat key first ({"a.b": ..}) and
+    // only then as a nested path ({"a": {"b": ..}}). The key is limited to
+    // characters that cannot close the quotes around it.
+    let extract = if key.contains('.') {
+        format!(
+            "COALESCE(json_extract_string({PROPS_JSON}, '$.\"{key}\"'),
+                      json_extract_string({PROPS_JSON}, '$.{key}'))"
+        )
+    } else {
+        format!("json_extract_string({PROPS_JSON}, '$.{key}')")
+    };
+    let events = scope.events();
     let sql = format!(
-        "SELECT json_extract_string(props, '$.{key}') AS value,
+        "SELECT {extract} AS value,
                 COUNT(DISTINCT visitor_id) AS visitors,
                 COUNT(*) AS events
-         FROM events_all
+         FROM {events}
          WHERE {where_clause} AND props IS NOT NULL{event_filter}
          GROUP BY value
          HAVING value IS NOT NULL
@@ -156,19 +176,15 @@ pub fn query_property_values(
         })
     };
 
-    let rows: Vec<PropertyValue> = match event_name {
-        Some(name) => stmt
-            .query_map(
-                duckdb::params![scope.site_id, scope.start, scope.end, name],
-                map_row,
-            )?
-            .filter_map(Result::ok)
-            .collect(),
-        None => stmt
-            .query_map(duckdb::params_from_iter(scope.params()), map_row)?
-            .filter_map(Result::ok)
-            .collect(),
-    };
+    // The event name is the last placeholder, after the scope's own, which
+    // include one per segment filter. It used to be bound after only site, start
+    // and end, so a request that named an event *and* a segment failed with a
+    // parameter-count error.
+    let mut bound: Vec<&str> = scope.params();
+    bound.extend(event_name);
+    let rows: Vec<PropertyValue> = stmt
+        .query_map(duckdb::params_from_iter(bound), map_row)?
+        .collect::<Result<_, _>>()?;
     Ok(rows)
 }
 
@@ -281,6 +297,40 @@ mod tests {
     }
 
     #[test]
+    fn test_property_values_for_one_event_honour_the_segment() {
+        // Regression: naming an event *and* a segment bound one parameter too
+        // few ("Wrong number of parameters passed to query") because the event
+        // name was bound right after the date range, ahead of the filter values.
+        let db = TestDb::new();
+        for (visitor, browser, plan) in [
+            ("v1", "Chrome", "pro"),
+            ("v2", "Firefox", "free"),
+            ("v3", "Chrome", "pro"),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname, browser, props)
+                     VALUES ('test.com', ?, CAST('2024-01-15 10:00:00' AS TIMESTAMP), 'signup', '/', ?, ?)",
+                    duckdb::params![visitor, browser, format!(r#"{{"plan":"{plan}"}}"#)],
+                )
+                .unwrap();
+        }
+        let chrome = crate::query::test_support::filtered_scope(
+            "2024-01-01",
+            "2024-02-01",
+            "browsers==Chrome",
+        );
+        let values = query_property_values(&db.conn, &chrome, "plan", Some("signup")).unwrap();
+        assert_eq!(values.len(), 1, "{values:?}");
+        assert_eq!(values[0].value, "pro");
+        assert_eq!(values[0].visitors, 2);
+
+        // And without an event name the segment still applies.
+        let all = query_property_values(&db.conn, &chrome, "plan", None).unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
     fn test_missing_property_key_yields_nothing() {
         let db = TestDb::new();
         db.insert_with_props("v1", "2024-01-15 10:00:00", "signup", r#"{"plan":"pro"}"#);
@@ -288,6 +338,44 @@ mod tests {
             query_property_values(&db.conn, &scope("2024-01-01", "2024-02-01"), "absent", None)
                 .unwrap();
         assert!(values.is_empty());
+    }
+
+    #[test]
+    fn test_a_flat_key_containing_a_dot_can_be_queried() {
+        // Regression (S-13): `.` was allowed in keys but became a nested JSON
+        // path, so the flat key "a.b" that `/properties/keys` lists could never
+        // be queried. A flat match now wins; the nested reading still works for
+        // objects like {"user":{"tier":"gold"}}.
+        let db = TestDb::new();
+        db.insert_with_props("v1", "2024-01-15 10:00:00", "e", r#"{"a.b":"flat"}"#);
+        db.insert_with_props("v2", "2024-01-15 10:01:00", "e", r#"{"a":{"b":"nested"}}"#);
+        let s = scope("2024-01-01", "2024-02-01");
+
+        let values = query_property_values(&db.conn, &s, "a.b", None).unwrap();
+        let found: Vec<&str> = values.iter().map(|v| v.value.as_str()).collect();
+        assert!(found.contains(&"flat"), "{found:?}");
+        assert!(found.contains(&"nested"), "{found:?}");
+
+        let keys = query_property_keys(&db.conn, &s).unwrap();
+        assert!(keys.contains(&"a.b".to_string()), "{keys:?}");
+    }
+
+    #[test]
+    fn test_one_malformed_props_value_does_not_fail_the_whole_report() {
+        // Regression (S-13): json_keys / json_extract_string raise on invalid
+        // JSON, so a single tampered row made both property endpoints 500 for
+        // the entire range. Ingest validates props; this protects against a
+        // store that was edited or restored from somewhere else.
+        let db = TestDb::new();
+        db.insert_with_props("v1", "2024-01-15 10:00:00", "e", r#"{"plan":"pro"}"#);
+        db.insert_with_props("v2", "2024-01-15 10:01:00", "e", "this is not json");
+        let s = scope("2024-01-01", "2024-02-01");
+
+        let keys = query_property_keys(&db.conn, &s).unwrap();
+        assert_eq!(keys, ["plan"]);
+        let values = query_property_values(&db.conn, &s, "plan", None).unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].value, "pro");
     }
 
     #[test]

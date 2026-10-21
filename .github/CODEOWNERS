@@ -18,9 +18,15 @@ SECURITY.md                           @tomtom215
 deny.toml                             @tomtom215
 
 # CI / deployment changes affect reproducibility and supply-chain security
-.github/workflows/                    @tomtom215
+.github/                              @tomtom215
 Dockerfile                            @tomtom215
+.dockerignore                         @tomtom215
+docker-compose.yml                    @tomtom215
 deploy/                               @tomtom215
+scripts/                              @tomtom215
+Cargo.toml                            @tomtom215
+Cargo.lock                            @tomtom215
+rust-toolchain.toml                   @tomtom215
 
 # Storage layer — data integrity and durability
 src/storage/                          @tomtom215

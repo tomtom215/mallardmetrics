@@ -79,8 +79,7 @@ pub fn query_timeseries(
                 pageviews: row.get(2)?,
             })
         })?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
@@ -91,6 +90,7 @@ fn timeseries_sql(granularity: Granularity, scope: &QueryScope) -> String {
     let fmt = granularity.format_str();
     let step = granularity.step_interval();
     let max_buckets = granularity.max_buckets();
+    let events = scope.events();
 
     // The spine is generated from the requested bounds so that empty buckets
     // still appear. `end` is exclusive, so one microsecond is subtracted before
@@ -112,7 +112,7 @@ fn timeseries_sql(granularity: Granularity, scope: &QueryScope) -> String {
              SELECT DATE_TRUNC('{trunc}', timestamp) AS bucket_ts,
                     COUNT(DISTINCT visitor_id) AS visitors,
                     COUNT(*) FILTER (WHERE event_name = 'pageview') AS pageviews
-             FROM events_all
+             FROM {events}
              WHERE site_id = ?
                AND timestamp >= (SELECT lo FROM bounds)
                AND timestamp <  (SELECT hi FROM bounds){filters}

@@ -2,6 +2,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_ma
 use duckdb::Connection;
 use mallard_metrics::ingest::buffer::{Event, EventBuffer};
 use mallard_metrics::query::QueryScope;
+use mallard_metrics::query::scoped::ColdReads;
 use mallard_metrics::query::{breakdowns, metrics, timeseries};
 use mallard_metrics::storage::TierLock;
 use mallard_metrics::storage::parquet::ParquetStorage;
@@ -241,11 +242,324 @@ fn bench_visitor_id(c: &mut Criterion) {
     });
 }
 
+/// Number of sites and days in the synthetic cold tier. The headline case in
+/// the audit (F-06) is 100 sites x 90 days = 9,000 one-file partitions, which
+/// is what compaction leaves behind. Overridable so a laptop can try a smaller
+/// shape: `MALLARD_BENCH_SITES=20 MALLARD_BENCH_DAYS=30`.
+///
+/// `cargo test --all-targets` also runs this binary, without `--bench`. Writing
+/// 18,000 files there would add minutes to every test run, so that mode uses a
+/// token shape that still exercises the code.
+fn scale_shape() -> (usize, usize) {
+    let measuring = std::env::args().any(|a| a == "--bench");
+    let (default_sites, default_days) = if measuring { (100, 90) } else { (5, 4) };
+    let read = |key: &str, default: usize| {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    };
+    (
+        read("MALLARD_BENCH_SITES", default_sites),
+        read("MALLARD_BENCH_DAYS", default_days),
+    )
+}
+
+/// Write one compacted-looking partition file per (site, day).
+///
+/// `with_site_id` selects the on-disk layout: the legacy one carries `site_id`
+/// as a column inside the file, the current one leaves it to the directory name.
+fn write_scale_dataset(root: &std::path::Path, with_site_id: bool) {
+    let (sites, days) = scale_shape();
+    let conn = Connection::open_in_memory().unwrap();
+    let projection = if with_site_id {
+        "*"
+    } else {
+        "* EXCLUDE (site_id)"
+    };
+    let start = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+    for s in 0..sites {
+        let site = format!("site{s:03}.example.com");
+        for d in 0..days {
+            let date = start + chrono::Duration::days(i64::try_from(d).unwrap());
+            let dir = root
+                .join(format!("site_id={site}"))
+                .join(format!("date={date}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("0001.parquet");
+            conn.execute_batch(&format!(
+                "COPY (SELECT {projection} FROM (\
+                   SELECT '{site}' AS site_id, 'v' || (i % 17) AS visitor_id, \
+                          TIMESTAMP '{date} 00:00:00' + INTERVAL (i * 17) MINUTE AS timestamp, \
+                          'pageview' AS event_name, '/p' || (i % 5) AS pathname, \
+                          CAST(NULL AS VARCHAR) AS hostname, CAST(NULL AS VARCHAR) AS referrer, \
+                          CAST(NULL AS VARCHAR) AS referrer_source, CAST(NULL AS VARCHAR) AS utm_source, \
+                          CAST(NULL AS VARCHAR) AS utm_medium, CAST(NULL AS VARCHAR) AS utm_campaign, \
+                          CAST(NULL AS VARCHAR) AS utm_content, CAST(NULL AS VARCHAR) AS utm_term, \
+                          'Chrome' AS browser, CAST(NULL AS VARCHAR) AS browser_version, \
+                          'Linux' AS os, CAST(NULL AS VARCHAR) AS os_version, \
+                          'desktop' AS device_type, CAST(NULL AS VARCHAR) AS screen_size, \
+                          'US' AS country_code, CAST(NULL AS VARCHAR) AS region, \
+                          CAST(NULL AS VARCHAR) AS city, CAST(NULL AS VARCHAR) AS props, \
+                          CAST(NULL AS DECIMAL(12,2)) AS revenue_amount, \
+                          CAST(NULL AS VARCHAR) AS revenue_currency \
+                   FROM range(60) t(i))) \
+                 TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
+                file.to_string_lossy()
+            ))
+            .unwrap();
+        }
+    }
+}
+
+/// Per-request cost of the cold tier as it grows (audit F-06).
+///
+/// Every dashboard request is `WHERE site_id = ? AND timestamp BETWEEN ..` over
+/// `events_all`. This builds the same logical dataset in the legacy file layout
+/// and in the layout without a `site_id` column, and times that query through
+/// each view definition, so the claim about what pruning buys is a measurement.
+/// Setup is outside `b.iter()` (L21).
+fn bench_query_scale(c: &mut Criterion) {
+    // A site in the middle of the dataset and a week from the middle of its
+    // history (2026-08-15..22 at the default 90 days).
+    let (sites, days) = scale_shape();
+    let target_site = format!("site{:03}.example.com", sites / 2);
+    let first_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()
+        + chrono::Duration::days(i64::try_from(days.saturating_sub(7) / 2).unwrap());
+    let last_day = first_day + chrono::Duration::days(6);
+    let range = (
+        first_day.format("%Y-%m-%d").to_string(),
+        (last_day + chrono::Duration::days(1))
+            .format("%Y-%m-%d")
+            .to_string(),
+    );
+    let legacy = tempfile::tempdir().unwrap();
+    let lean = tempfile::tempdir().unwrap();
+    write_scale_dataset(legacy.path(), true);
+    write_scale_dataset(lean.path(), false);
+
+    let columns = schema::EVENT_COLUMNS.join(", ");
+    let hive = "hive_partitioning=true, hive_types={'site_id': VARCHAR, 'date': DATE}";
+    // (label, files, read_parquet options, per-connection setup)
+    let cache = "SET GLOBAL parquet_metadata_cache = true";
+    let variants: Vec<(&str, &std::path::Path, String, &str)> = vec![
+        (
+            "current_union_by_name",
+            legacy.path(),
+            "union_by_name=true, hive_partitioning=false".to_string(),
+            "",
+        ),
+        (
+            "current_plus_metadata_cache",
+            legacy.path(),
+            "union_by_name=true, hive_partitioning=false".to_string(),
+            cache,
+        ),
+        (
+            "legacy_hive_union_by_name",
+            legacy.path(),
+            format!("union_by_name=true, {hive}"),
+            "",
+        ),
+        (
+            "legacy_hive_plus_metadata_cache",
+            legacy.path(),
+            format!("union_by_name=true, {hive}"),
+            cache,
+        ),
+        (
+            "lean_hive_union_by_name",
+            lean.path(),
+            format!("union_by_name=true, {hive}"),
+            "",
+        ),
+        (
+            "legacy_no_union_by_name",
+            legacy.path(),
+            "hive_partitioning=false".to_string(),
+            "",
+        ),
+        ("lean_hive", lean.path(), hive.to_string(), ""),
+        (
+            "lean_hive_plus_metadata_cache",
+            lean.path(),
+            hive.to_string(),
+            cache,
+        ),
+    ];
+
+    let mut group = c.benchmark_group("query_scale");
+    group.sample_size(10);
+    for (label, root, options, setup) in variants {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_schema(&conn).unwrap();
+        if !setup.is_empty() {
+            conn.execute_batch(setup).unwrap();
+        }
+        conn.execute_batch(&format!(
+            "CREATE VIEW events_all AS SELECT {columns} FROM events UNION ALL \
+             SELECT {columns} FROM read_parquet('{}/site_id=*/date=*/*.parquet', {options})",
+            root.to_string_lossy()
+        ))
+        .unwrap();
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                let n: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM events_all WHERE site_id = ? \
+                         AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)",
+                        duckdb::params![target_site, range.0, range.1],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(n > 0);
+            });
+        });
+    }
+    // The scoped read the query layer can use: the same question answered from
+    // the files of one site and week only.
+    {
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_schema(&conn).unwrap();
+        let storage = ParquetStorage::new(legacy.path(), 0);
+        group.bench_function("scoped_file_list", |b| {
+            b.iter(|| {
+                // The file list is rebuilt per request, as a handler would.
+                let source = schema::scoped_events_sql(&storage.files_for_range(
+                    &target_site,
+                    first_day,
+                    last_day,
+                ));
+                let sql = format!(
+                    "SELECT COUNT(*) FROM {source} WHERE site_id = ? \
+                     AND timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP)"
+                );
+                let n: i64 = conn
+                    .query_row(
+                        &sql,
+                        duckdb::params![target_site, range.0, range.1],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(n > 0);
+            });
+        });
+    }
+    group.finish();
+}
+
+/// The reports a dashboard load runs, through `events_all` and through the
+/// scoped read the API now uses (task: scoped queries, audit F-06).
+///
+/// Same dataset as `query_scale` (current file layout, one week of one site in
+/// the middle of it). Each pair answers the same question and the benchmark
+/// asserts the answers match before timing them, so a speed-up cannot come from
+/// reading less than the report needs. The scoped variants include the per-request
+/// file listing, as the handler pays it. Setup is outside `b.iter()` (L21).
+fn bench_report_scale(c: &mut Criterion) {
+    type Report = fn(&Connection, &QueryScope) -> usize;
+    let (sites, days) = scale_shape();
+    let site = format!("site{:03}.example.com", sites / 2);
+    let first_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()
+        + chrono::Duration::days(i64::try_from(days.saturating_sub(7) / 2).unwrap());
+    let end_day = first_day + chrono::Duration::days(7);
+    let scope = QueryScope::new(
+        site.as_str(),
+        first_day.format("%Y-%m-%d").to_string(),
+        end_day.format("%Y-%m-%d").to_string(),
+        "30 minutes",
+    );
+
+    // The layout the writer produces today: `site_id` is a column in the file
+    // as well as a directory name, which the scoped read depends on.
+    let root = tempfile::tempdir().unwrap();
+    write_scale_dataset(root.path(), true);
+    let conn = Connection::open_in_memory().unwrap();
+    schema::init_schema(&conn).unwrap();
+    schema::setup_query_view(&conn, root.path()).unwrap();
+    let storage = ParquetStorage::new(root.path(), 0);
+    let cold = ColdReads::new(&storage);
+
+    let main_all = metrics::query_event_metrics(&conn, &scope).unwrap();
+    let main_scoped = metrics::query_event_metrics(&conn, &cold.scope(scope.clone(), 0)).unwrap();
+    assert_eq!(
+        serde_json::to_string(&main_all).unwrap(),
+        serde_json::to_string(&main_scoped).unwrap()
+    );
+    assert!(main_all.total_pageviews > 0);
+
+    let mut group = c.benchmark_group("report_scale");
+    group.sample_size(10);
+    let reports: [(&str, Report); 3] = [
+        ("main", |conn, scope| {
+            usize::try_from(
+                metrics::query_event_metrics(conn, scope)
+                    .unwrap()
+                    .total_pageviews,
+            )
+            .unwrap()
+        }),
+        ("breakdown_pages", |conn, scope| {
+            breakdowns::query_breakdown(conn, scope, breakdowns::Dimension::Page, 10)
+                .unwrap()
+                .len()
+        }),
+        ("timeseries_day", |conn, scope| {
+            timeseries::query_timeseries(conn, scope, timeseries::Granularity::Day)
+                .unwrap()
+                .len()
+        }),
+    ];
+    for (name, report) in reports {
+        assert_eq!(
+            report(&conn, &scope),
+            report(&conn, &cold.scope(scope.clone(), 0)),
+            "{name}: the scoped read must answer the same"
+        );
+        group.bench_function(format!("{name}/events_all"), |b| {
+            b.iter(|| report(&conn, &scope));
+        });
+        group.bench_function(format!("{name}/scoped"), |b| {
+            b.iter(|| report(&conn, &cold.scope(scope.clone(), 0)));
+        });
+    }
+    group.finish();
+}
+
+/// Cost of inserting into a full query cache (audit S-10).
+///
+/// At capacity every insert evicts the least recently used entry by scanning
+/// them all under the cache mutex. This measures that at the default size, to
+/// decide whether replacing the cache is worth anything. Setup is outside
+/// `b.iter()` (L21); each iteration inserts a key the cache has not seen, so it
+/// always has to evict.
+fn bench_cache_insert_full(c: &mut Criterion) {
+    use mallard_metrics::query::cache::{QueryCache, cache_key};
+    let mut group = c.benchmark_group("cache_insert_full");
+    for capacity in [1_000usize, 10_000, 100_000] {
+        let cache = QueryCache::new(60, capacity);
+        for i in 0..capacity {
+            cache.insert(cache_key("main", "site", &[&i.to_string()]), "{}");
+        }
+        let mut next = capacity;
+        group.bench_function(BenchmarkId::from_parameter(capacity), |b| {
+            b.iter(|| {
+                next += 1;
+                cache.insert(cache_key("main", "site", &[&next.to_string()]), "{}");
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_buffer_push,
     bench_flush,
     bench_queries,
+    bench_query_scale,
+    bench_report_scale,
+    bench_cache_insert_full,
     bench_user_agent,
     bench_visitor_id
 );

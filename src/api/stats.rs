@@ -1,17 +1,23 @@
-use crate::api::errors::ApiError;
+use crate::api::errors::{ApiError, ApiQuery};
 use crate::ingest::handler::AppState;
+use crate::query::QueryScope;
 use crate::query::cache::{CacheKey, cache_key};
+use crate::query::scoped::ColdReads;
 use crate::query::{
-    Filter, UNKNOWN_VALUE, breakdowns, events, export, flow, funnel, metrics, realtime, retention,
-    revenue, sequences, timeseries,
+    Filter, UNKNOWN_VALUE, breakdowns, events, export, flow, funnel, metrics, parquet_export,
+    realtime, retention, revenue, sequences, timeseries,
 };
-use axum::extract::{Path, Query, State};
-use axum::http::header;
+use crate::storage::parquet::ErasureReport;
+use axum::body::{Body, Bytes};
+use axum::extract::{Path, State};
+use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::{Json, http::HeaderValue};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 // ── Shared parameter handling ────────────────────────────────────────────
 
@@ -99,7 +105,14 @@ pub fn filters_cache_key(filters: &[Filter]) -> String {
         .collect();
     parts.sort_unstable();
     parts.dedup();
-    parts.join(";")
+    let key = parts.join(";");
+    // The same filters give different numbers when they cut events instead of
+    // choosing sessions, so the two must never share a cache entry.
+    if crate::query::segment_cuts_events() {
+        format!("cut|{key}")
+    } else {
+        key
+    }
 }
 
 /// Maximum filters accepted on one request.
@@ -241,58 +254,92 @@ impl StatsParams {
     ///
     /// An explicit `start_date`/`end_date` pair wins over `period`; both are
     /// parsed as `YYYY-MM-DD` and capped at [`MAX_RANGE_DAYS`] so a request
-    /// cannot ask for an unbounded partition scan.
+    /// cannot ask for an unbounded partition scan. Giving only one of the two is
+    /// an error: it used to be ignored and the default 30-day period answered
+    /// instead, so a client that mistyped one parameter silently got a report
+    /// for a different range.
+    ///
+    /// # Periods
+    ///
+    /// `Nd` is the last N calendar days **including today**, so `7d` is seven
+    /// daily buckets (as in Plausible and Matomo), not eight. It used to start N
+    /// days back and so spanned N+1 days under an N-day label. `12mo` is the
+    /// twelve months ending today, inclusive. All dates are UTC; sites have no
+    /// time zone of their own, so a day boundary is a UTC boundary.
     ///
     /// # Errors
     ///
     /// Returns a `BadRequest` for a malformed date, an inverted range, an
-    /// over-long range, or an unknown period.
+    /// over-long range, an unpaired date, or an unknown period.
     pub fn date_range(&self) -> Result<DateRange, ApiError> {
-        if let (Some(start_str), Some(end_str)) = (&self.start_date, &self.end_date) {
-            let start = parse_date(start_str, "start_date")?;
-            let end = parse_date(end_str, "end_date")?;
-            let days = (end - start).num_days();
-            if days < 0 {
+        self.date_range_on(chrono::Utc::now().date_naive())
+    }
+
+    /// [`StatsParams::date_range`] with today's date supplied, so the period
+    /// arithmetic can be tested exactly (LESSONS L23).
+    ///
+    /// # Errors
+    ///
+    /// As [`StatsParams::date_range`].
+    pub fn date_range_on(&self, today: NaiveDate) -> Result<DateRange, ApiError> {
+        match (&self.start_date, &self.end_date) {
+            (Some(start_str), Some(end_str)) => {
+                let start = parse_date(start_str, "start_date")?;
+                let end = parse_date(end_str, "end_date")?;
+                let days = (end - start).num_days();
+                if days < 0 {
+                    return Err(ApiError::BadRequest(
+                        "end_date must be on or after start_date".to_string(),
+                    ));
+                }
+                if days > MAX_RANGE_DAYS {
+                    return Err(ApiError::BadRequest(format!(
+                        "Date range must not exceed {MAX_RANGE_DAYS} days"
+                    )));
+                }
+                // The stored end bound is exclusive, so an inclusive end_date of
+                // 2024-01-31 must query up to 2024-02-01. Without this the final
+                // day of every explicit range was silently omitted.
+                let exclusive_end = end
+                    .succ_opt()
+                    .ok_or_else(|| ApiError::BadRequest("end_date is out of range".to_string()))?;
+                return Ok(DateRange {
+                    start: start.to_string(),
+                    end: exclusive_end.to_string(),
+                    days: days + 1,
+                });
+            }
+            (Some(_), None) | (None, Some(_)) => {
                 return Err(ApiError::BadRequest(
-                    "end_date must be on or after start_date".to_string(),
+                    "start_date and end_date must be given together".to_string(),
                 ));
             }
-            if days > MAX_RANGE_DAYS {
-                return Err(ApiError::BadRequest(format!(
-                    "Date range must not exceed {MAX_RANGE_DAYS} days"
-                )));
-            }
-            // The stored end bound is exclusive, so an inclusive end_date of
-            // 2024-01-31 must query up to 2024-02-01. Without this the final
-            // day of every explicit range was silently omitted.
-            let exclusive_end = end
-                .succ_opt()
-                .ok_or_else(|| ApiError::BadRequest("end_date is out of range".to_string()))?;
-            return Ok(DateRange {
-                start: start.to_string(),
-                end: exclusive_end.to_string(),
-                days: days + 1,
-            });
+            (None, None) => {}
         }
 
-        let now = chrono::Utc::now().date_naive();
-        let (start, days) = match self.period.as_str() {
-            "day" | "today" => (now, 1),
-            "7d" => (now - chrono::Days::new(7), 8),
-            "30d" => (now - chrono::Days::new(30), 31),
-            "90d" => (now - chrono::Days::new(90), 91),
-            "12mo" => (now - chrono::Days::new(365), 366),
+        let out_of_range = || ApiError::BadRequest("The period is out of range".to_string());
+        let tomorrow = today.succ_opt().ok_or_else(out_of_range)?;
+        let start = match self.period.as_str() {
+            "day" | "today" => Some(today),
+            "7d" => today.checked_sub_days(chrono::Days::new(6)),
+            "30d" => today.checked_sub_days(chrono::Days::new(29)),
+            "90d" => today.checked_sub_days(chrono::Days::new(89)),
+            // Twelve months ending today: from the day after this date last year.
+            "12mo" => today
+                .checked_sub_months(chrono::Months::new(12))
+                .and_then(|d| d.succ_opt()),
             other => {
                 return Err(ApiError::BadRequest(format!(
                     "Invalid period: {other}. Use 'day', '7d', '30d', '90d', '12mo', \
                      or supply start_date and end_date."
                 )));
             }
-        };
+        }
+        .ok_or_else(out_of_range)?;
         Ok(DateRange {
             start: start.to_string(),
-            end: (now + chrono::Days::new(1)).to_string(),
-            days,
+            end: tomorrow.to_string(),
+            days: (tomorrow - start).num_days(),
         })
     }
 
@@ -377,6 +424,138 @@ fn parse_date(raw: &str, field: &str) -> Result<NaiveDate, ApiError> {
 
 // ── Query execution helpers ──────────────────────────────────────────────
 
+/// How long a request may wait for a query slot, and how long a statement may run.
+///
+/// The two budgets must not add up to more than the 30 s request timeout in
+/// `server.rs` (`Config::validate` enforces it; the defaults use all of it), so
+/// a query that overruns is interrupted here, with a message, rather than being
+/// abandoned by the timeout layer while its blocking thread keeps going. They
+/// come from `query_queue_wait_secs` and `query_deadline_secs` and travel in
+/// `AppState::query_limits`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryLimits {
+    /// Longest a request waits for one of `max_concurrent_queries` slots.
+    pub queue_wait: Duration,
+    /// Longest a statement may execute once it holds a reader connection.
+    pub deadline: Duration,
+}
+
+impl QueryLimits {
+    /// The defaults: 5 s in the queue plus 20 s of execution, which leaves a 5 s
+    /// margin under the 30 s request timeout.
+    pub const DEFAULT: Self = Self {
+        queue_wait: Duration::from_secs(5),
+        deadline: Duration::from_secs(20),
+    };
+}
+
+impl Default for QueryLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// How often the watchdog repeats an interrupt after the deadline has passed.
+///
+/// DuckDB drops an interrupt that arrives while no statement is running, and
+/// some handlers run several statements in a row, so one interrupt fired in the
+/// gap between two of them would be lost and the next would run to completion.
+const INTERRUPT_REPEAT: Duration = Duration::from_millis(50);
+
+/// Shared between the blocking query and its watchdog.
+#[derive(Default)]
+struct Deadline {
+    /// Present only while a statement can be running on the reader.
+    handle: parking_lot::Mutex<Option<Arc<duckdb::InterruptHandle>>>,
+    /// Set by the watchdog before its first interrupt.
+    fired: AtomicBool,
+    /// Milliseconds the query spent waiting on something other than DuckDB, added
+    /// to the allowance. Only a streaming export has any: time spent handing a
+    /// chunk to a slow client is not the statement running long.
+    credit_ms: std::sync::atomic::AtomicU64,
+}
+
+impl Deadline {
+    fn arm(&self, handle: Arc<duckdb::InterruptHandle>) {
+        *self.handle.lock() = Some(handle);
+    }
+
+    /// Called under the connection lock, so an interrupt can never reach the
+    /// connection's next user.
+    fn disarm(&self) {
+        *self.handle.lock() = None;
+    }
+
+    fn interrupt(&self) {
+        self.fired.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.lock().as_ref() {
+            handle.interrupt();
+        }
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::SeqCst)
+    }
+
+    /// Give back time spent not executing the statement.
+    fn credit(&self, waited: Duration) {
+        let ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+        self.credit_ms.fetch_add(ms, Ordering::SeqCst);
+    }
+
+    fn credited(&self) -> Duration {
+        Duration::from_millis(self.credit_ms.load(Ordering::SeqCst))
+    }
+}
+
+/// Run `f` on a reader connection, inside the tier read lock.
+///
+/// # Lock order
+///
+/// Flushes take the exclusive tier lock and then the connection lock
+/// (LESSONS L28), so a reader that waited for the tier lock *while holding its
+/// connection* could deadlock against one when the pool shares the writer
+/// connection (size 1, and every in-memory test database). Readers therefore
+/// never block on the tier lock holding a connection: they take the connection,
+/// try the tier lock, and if a writer has it, release the connection, wait for
+/// the writer to finish, and start again.
+///
+/// The shared side of the tier lock is held only while `f` runs, not while
+/// queued for a connection. It used to be taken first, so every request parked
+/// behind the four reader connections was also holding up the next flush
+/// (finding F-08), and ingest latency was tied to the slowest dashboard query.
+///
+/// `f` also receives a [`ColdReads`], which builds the per-request file list
+/// that replaces the all-files `events_all` view. It is created here, after the
+/// shared tier lock is held, because a list made earlier can name files a
+/// compaction has since moved (see `query::scoped`).
+fn execute_on_reader<T>(
+    readers: &crate::storage::ReaderPool,
+    tier_lock: &crate::storage::TierLock,
+    storage: &crate::storage::parquet::ParquetStorage,
+    deadline: &Deadline,
+    started: tokio::sync::oneshot::Sender<()>,
+    f: impl FnOnce(&duckdb::Connection, ColdReads<'_>, &Deadline) -> Result<T, duckdb::Error>,
+) -> Result<T, duckdb::Error> {
+    let conn = readers.acquire();
+    let (guard, _tier) = loop {
+        let guard = conn.lock();
+        if let Some(tier) = tier_lock.try_read() {
+            break (guard, tier);
+        }
+        drop(guard);
+        drop(tier_lock.read());
+    };
+
+    deadline.arm(guard.interrupt_handle());
+    // The deadline runs from here, not from when the request arrived. The
+    // receiver is gone only if the watchdog was never started, which is fine.
+    let _ = started.send(());
+    let result = f(&guard, ColdReads::new(storage), deadline);
+    deadline.disarm();
+    result
+}
+
 /// Run a blocking DuckDB query on a reader connection, under the concurrency cap.
 ///
 /// Every analytics endpoint goes through here, so the concurrency limit and the
@@ -384,36 +563,239 @@ fn parse_date(raw: &str, field: &str) -> Result<NaiveDate, ApiError> {
 /// four of the thirteen endpoints, which meant it could not actually bound
 /// concurrent load.
 ///
+/// The closure also gets a [`ColdReads`] to narrow its scope (or build a source)
+/// with. It is valid only inside the closure, which runs under the tier read
+/// lock; see `query::scoped` for why the file list must be made there.
+///
 /// # Errors
 ///
-/// Returns `TooManyRequests` when the cap is reached, or the query's own error.
-async fn run_query<T, F>(state: &Arc<AppState>, f: F) -> Result<T, ApiError>
+/// Returns `TooManyRequests` if no slot frees up within the queue wait,
+/// `QueryTimeout` if the statement overruns its deadline, or the query's own
+/// error.
+pub(crate) async fn run_scoped<T, F>(state: &Arc<AppState>, f: F) -> Result<T, ApiError>
 where
     T: Send + 'static,
-    F: FnOnce(&duckdb::Connection) -> Result<T, duckdb::Error> + Send + 'static,
+    F: FnOnce(&duckdb::Connection, ColdReads<'_>) -> Result<T, duckdb::Error> + Send + 'static,
 {
-    let semaphore = Arc::clone(&state.query_semaphore);
-    let _permit = semaphore.try_acquire().map_err(|_| {
+    run_scoped_with(state, state.query_limits, f).await
+}
+
+/// [`run_scoped`] with explicit limits.
+///
+/// # Waiting for a slot
+///
+/// A dashboard load fires about 31 requests at once (ten summary panels and
+/// twenty breakdowns) against a cap of ten. The cap used to be enforced with
+/// `try_acquire`, so every request past the tenth answered `429` and its panel
+/// rendered an error on a cold cache. A request now waits for a slot for up to
+/// [`QueryLimits::queue_wait`]: waiting is cheap (an async task, no thread),
+/// the cap still bounds the work in flight, and `429` is reserved for genuine
+/// overload.
+///
+/// # Deadline
+///
+/// DuckDB cannot be cancelled by dropping the future, and a blocking thread
+/// runs to completion once started. A watchdog task interrupts the statement
+/// through DuckDB's interrupt handle when [`QueryLimits::deadline`] passes, so
+/// one pathological query cannot hold a reader connection, a concurrency slot
+/// and the tier read lock (which blocks the next flush) indefinitely. The slot
+/// is released by the blocking task itself, not by the request future, so a
+/// client that disconnects cannot free a slot whose query is still running.
+async fn run_scoped_with<T, F>(
+    state: &Arc<AppState>,
+    limits: QueryLimits,
+    f: F,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&duckdb::Connection, ColdReads<'_>) -> Result<T, duckdb::Error> + Send + 'static,
+{
+    let RunningQuery {
+        deadline,
+        limits,
+        task,
+    } = start_query(state, limits, move |conn, cold, _| f(conn, cold)).await?;
+    let result = task
+        .await
+        .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))?;
+    result.map_err(|e| {
+        if deadline.fired() {
+            deadline_error(limits.deadline)
+        } else {
+            classify_error(e)
+        }
+    })
+}
+
+/// A query that holds a slot and is running, or about to run, on the blocking pool.
+struct RunningQuery<T> {
+    deadline: Arc<Deadline>,
+    limits: QueryLimits,
+    task: tokio::task::JoinHandle<Result<T, duckdb::Error>>,
+}
+
+/// Wait for a slot, then start `f` on a reader connection under the tier lock,
+/// with the deadline watchdog running.
+///
+/// The slot is released by the blocking task when `f` returns, so a caller that
+/// drops the [`RunningQuery`] (a client that disconnected) does not free a slot
+/// whose query is still running.
+async fn start_query<T, F>(
+    state: &Arc<AppState>,
+    limits: QueryLimits,
+    f: F,
+) -> Result<RunningQuery<T>, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&duckdb::Connection, ColdReads<'_>, &Deadline) -> Result<T, duckdb::Error>
+        + Send
+        + 'static,
+{
+    let permit = tokio::time::timeout(
+        limits.queue_wait,
+        Arc::clone(&state.query_semaphore).acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
         ApiError::TooManyRequests(
-            "Too many concurrent queries. Please retry in a moment.".to_string(),
+            "The server is busy running other queries. Please retry in a moment.".to_string(),
         )
-    })?;
+    })?
+    .map_err(|_| ApiError::Internal("The query semaphore was closed".to_string()))?;
+
+    let deadline = Arc::new(Deadline::default());
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let watchdog = Arc::clone(&deadline);
+    tokio::spawn(async move {
+        // Never started (the task panicked or was refused): nothing to watch.
+        if started_rx.await.is_err() {
+            return;
+        }
+        // `finished_tx` is dropped when the blocking task ends, which resolves
+        // this receiver with an error; only a timeout means the query overran.
+        // The allowance is re-read after each wait: a streaming export credits
+        // the time it spent handing chunks to the client.
+        let began = tokio::time::Instant::now();
+        loop {
+            let allowed = limits.deadline + watchdog.credited();
+            let elapsed = began.elapsed();
+            if elapsed >= allowed {
+                break;
+            }
+            if tokio::time::timeout(allowed.saturating_sub(elapsed), &mut finished_rx)
+                .await
+                .is_ok()
+            {
+                return;
+            }
+        }
+        tracing::warn!(
+            deadline_secs = limits.deadline.as_secs_f32(),
+            "Analytics query exceeded its deadline; interrupting"
+        );
+        loop {
+            watchdog.interrupt();
+            if tokio::time::timeout(INTERRUPT_REPEAT, &mut finished_rx)
+                .await
+                .is_ok()
+            {
+                return;
+            }
+        }
+    });
 
     let readers = state.readers.clone();
     let tier_lock = state.tier_lock.clone();
-    tokio::task::spawn_blocking(move || {
-        // Taken before the connection lock — the same order flushes use, so the
-        // two cannot deadlock. It keeps this query from landing in the middle
-        // of a flush or a compaction, when the same rows are momentarily
-        // visible in both the hot table and Parquet.
-        let _tier = tier_lock.read();
-        let conn = readers.acquire();
-        let guard = conn.lock();
-        f(&guard)
+    let storage = state.buffer.storage().clone();
+    let task_deadline = Arc::clone(&deadline);
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _finished = finished_tx;
+        execute_on_reader(
+            &readers,
+            &tier_lock,
+            &storage,
+            &task_deadline,
+            started_tx,
+            f,
+        )
+    });
+    Ok(RunningQuery {
+        deadline,
+        limits,
+        task,
+    })
+}
+
+/// The error for a statement that overran its deadline.
+///
+/// A `400` because the request as posed is too expensive and the remedy is the
+/// caller's (a shorter range, fewer filters), and the status says so: 504.
+fn deadline_error(deadline: Duration) -> ApiError {
+    ApiError::QueryTimeout(format!(
+        "The query did not finish within {} seconds. Try a shorter date range or fewer filters.",
+        deadline.as_secs()
+    ))
+}
+
+/// The `behavioral` functions whose argument errors are the caller's doing.
+const BEHAVIORAL_FUNCTIONS: &[&str] = &[
+    "window_funnel",
+    "retention",
+    "sequence_match",
+    "sequence_count",
+    "sequence_next_node",
+    "sessionize",
+];
+
+/// Map a DuckDB error to the right HTTP error.
+///
+/// The extension rejects a bad argument (a mode combination it does not allow,
+/// a window it cannot use) with an `Invalid Input Error` that names the
+/// function, e.g. `window_funnel: mode 'allow_reentry' requires 'strict_order'`.
+/// That is the caller's input, so it is a `400` carrying the extension's own
+/// message, not a `500` that hides it. The match is deliberately narrow — the
+/// class *and* a behavioral function name — because `Invalid Input Error` also
+/// covers things that are not the caller's fault, such as a stored timestamp
+/// that cannot be subtracted.
+fn classify_error(err: duckdb::Error) -> ApiError {
+    if let duckdb::Error::DuckDBFailure(_, Some(message)) = &err
+        && let Some(detail) = message.strip_prefix("Invalid Input Error: ")
+        && BEHAVIORAL_FUNCTIONS.iter().any(|name| {
+            detail
+                .strip_prefix(name)
+                .is_some_and(|r| r.starts_with(':'))
+        })
+    {
+        return ApiError::BadRequest(detail.to_string());
+    }
+    ApiError::DatabaseError(err)
+}
+
+/// Like [`cached_with`], for a report over a [`QueryScope`], reading only the
+/// files that scope can touch (F-06).
+///
+/// The scope is narrowed inside the query, under the tier read lock, so the
+/// file list and the statement see the same set of files. `lookback_days` widens
+/// the read for a query that scans before the scope's start (retention); pass 0
+/// otherwise. See `query::scoped` for why no other widening is needed.
+async fn cached_scoped<T, F>(
+    state: &Arc<AppState>,
+    key: CacheKey,
+    scope: QueryScope,
+    lookback_days: u32,
+    f: F,
+) -> Result<Json<T>, ApiError>
+where
+    T: Serialize + serde::de::DeserializeOwned + Send + 'static,
+    F: FnOnce(&duckdb::Connection, &QueryScope) -> Result<T, duckdb::Error> + Send + 'static,
+{
+    cached_with(state, key, move |conn, cold| {
+        f(conn, &cold.scope(scope, lookback_days))
     })
     .await
-    .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))?
-    .map_err(ApiError::DatabaseError)
 }
 
 /// Run a cached, JSON-serialisable query.
@@ -421,67 +803,177 @@ where
 /// Caching now covers every read endpoint. It previously applied to two of
 /// them, so a dashboard load re-ran eleven uncached queries against the
 /// database on every refresh.
-async fn cached_query<T, F>(state: &Arc<AppState>, key: CacheKey, f: F) -> Result<Json<T>, ApiError>
+///
+/// The cache epoch is read before the query runs and checked on insert, so a
+/// result computed before a GDPR erasure cannot be cached after it.
+async fn cached_with<T, F>(state: &Arc<AppState>, key: CacheKey, f: F) -> Result<Json<T>, ApiError>
 where
     T: Serialize + serde::de::DeserializeOwned + Send + 'static,
-    F: FnOnce(&duckdb::Connection) -> Result<T, duckdb::Error> + Send + 'static,
+    F: FnOnce(&duckdb::Connection, ColdReads<'_>) -> Result<T, duckdb::Error> + Send + 'static,
 {
     if let Some(cached) = state.query_cache.get(key.as_str())
         && let Ok(value) = serde_json::from_str::<T>(&cached)
     {
         return Ok(Json(value));
     }
-    let result = run_query(state, f).await?;
+    let epoch = state.query_cache.epoch();
+    let result = run_scoped(state, f).await?;
     if let Ok(serialized) = serde_json::to_string(&result) {
-        state.query_cache.insert(key, serialized);
+        state.query_cache.insert_at(epoch, key, serialized);
     }
     Ok(Json(result))
 }
 
 /// Map a behavioral-extension query failure to a 503 rather than a 500.
 fn behavioral_error(state: &AppState, feature: &str, err: ApiError) -> ApiError {
-    if state.behavioral_extension_loaded {
+    if state.behavioral.is_loaded() {
         err
     } else {
         ApiError::behavioral_required(feature)
     }
 }
 
+/// Refuse an analysis that is meaningless on hour-rounded timestamps.
+///
+/// With `round_timestamps` (enabled by `gdpr_mode`) every event is stored at
+/// the top of its hour. Sessions, funnels, sequences and flows depend on the
+/// order and spacing of events *inside* an hour, which that rounding destroys:
+/// every event in an hour is one tie, so no session can last more than zero
+/// seconds, a visit at 10:59 and one at 11:01 become two sessions, and the order
+/// of funnel steps is decided by tie-breaking rather than by what happened.
+/// The result is not a coarse version of the right answer but an unrelated
+/// number, and it used to be served with nothing to say so.
+///
+/// Counts, breakdowns, time series and weekly retention are unaffected.
+fn require_exact_timestamps(state: &AppState, feature: &str) -> Result<(), ApiError> {
+    if state.round_timestamps {
+        return Err(ApiError::SessionDataUnavailable(format!(
+            "{feature} is not available while timestamps are rounded to the hour \
+             (round_timestamps, enabled by gdpr_mode): events within an hour can no \
+             longer be put in order."
+        )));
+    }
+    Ok(())
+}
+
 // ── Endpoints ────────────────────────────────────────────────────────────
 
-/// GET /api/sites — site IDs that have data.
+/// One site in the `/api/sites` listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteActivity {
+    pub site_id: String,
+    /// Events recorded in the last 30 days, today included (UTC). 0 for a site
+    /// that is known but quiet.
+    pub events_30d: u64,
+}
+
+/// Days of activity the site listing counts.
+pub const SITE_ACTIVITY_DAYS: u64 = 30;
+
+/// GET /api/sites — the sites that have data, most active first.
 ///
-/// The dashboard previously had no way to discover them, so an operator had to
-/// remember and retype each site ID.
+/// ```json
+/// {
+///   "sites": ["busy.example", "quiet.example"],
+///   "details": [
+///     {"site_id": "busy.example", "events_30d": 18423},
+///     {"site_id": "quiet.example", "events_30d": 0}
+///   ]
+/// }
+/// ```
+///
+/// `sites` is what the endpoint always returned, the IDs, and `details` carries
+/// the same IDs in the same order with their event counts over the last 30 days.
+/// The order is `events_30d` descending, then `site_id`, so a dashboard that
+/// opens the first site opens the one with traffic rather than the first
+/// alphabetically; it used to be alphabetical.
+///
+/// A site is listed if it has hot-tier rows, a Parquet partition on disk, or is
+/// in the configured allowlist. Sites are no longer discovered with a
+/// `SELECT DISTINCT` over `events_all`, which opened every Parquet file: the
+/// partition directories name the same sites, and the 30-day counts read only
+/// the files of the last 30 days.
 pub async fn list_sites(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     let configured = state.allowed_sites.clone();
     let storage = state.buffer.storage().clone();
 
-    let mut sites = run_query(&state, move |conn| {
-        let mut stmt = conn.prepare("SELECT DISTINCT site_id FROM events_all ORDER BY site_id")?;
-        let rows: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .filter_map(Result::ok)
-            .collect();
-        Ok(rows)
+    let today = chrono::Utc::now().date_naive();
+    let first_day = today
+        .checked_sub_days(chrono::Days::new(SITE_ACTIVITY_DAYS - 1))
+        .unwrap_or(today);
+    let since = first_day.to_string();
+    let until = today.succ_opt().unwrap_or(today).to_string();
+
+    let counted = run_scoped(&state, move |conn, cold| {
+        let source = cold.all_sites_source(first_day, today);
+        let mut counts = std::collections::BTreeMap::<String, u64>::new();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT site_id, COUNT(*) FROM {source} \
+             WHERE timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP) \
+             GROUP BY site_id"
+        ))?;
+        let rows = stmt.query_map(duckdb::params![since, until], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })?;
+        for row in rows {
+            let (site, n) = row?;
+            counts.insert(site, n);
+        }
+        // Unflushed rows older than the window still make a site known.
+        let mut stmt = conn.prepare("SELECT DISTINCT site_id FROM events")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            counts.entry(row?).or_insert(0);
+        }
+        Ok(counts)
     })
     .await
-    // A site whose data lives only in Parquet is still discoverable from disk,
-    // and disk is also the fallback if the view cannot be queried.
-    .unwrap_or_default();
+    // Disk is also the fallback if the files cannot be queried.
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "Could not count recent events per site; listing sites without counts");
+        std::collections::BTreeMap::new()
+    });
 
-    sites.extend(storage.known_site_ids());
-    sites.extend(configured);
-    sites.sort_unstable();
-    sites.dedup();
+    let mut counts = counted;
+    for site in storage.known_site_ids().into_iter().chain(configured) {
+        counts.entry(site).or_insert(0);
+    }
+    let mut details: Vec<SiteActivity> = counts
+        .into_iter()
+        .map(|(site_id, events_30d)| SiteActivity {
+            site_id,
+            events_30d,
+        })
+        .collect();
+    details.sort_by(|a, b| {
+        b.events_30d
+            .cmp(&a.events_30d)
+            .then_with(|| a.site_id.cmp(&b.site_id))
+    });
+    let sites: Vec<&str> = details.iter().map(|d| d.site_id.as_str()).collect();
 
-    Ok(Json(serde_json::json!({ "sites": sites })))
+    Ok(Json(
+        serde_json::json!({ "sites": sites, "details": details }),
+    ))
+}
+
+/// The headline metrics, with or without the session pass.
+fn main_metrics(
+    conn: &duckdb::Connection,
+    scope: &crate::query::QueryScope,
+    with_sessions: bool,
+) -> Result<metrics::CoreMetrics, duckdb::Error> {
+    if with_sessions {
+        metrics::query_core_metrics(conn, scope)
+    } else {
+        metrics::query_event_metrics(conn, scope)
+    }
 }
 
 /// GET /api/stats/main — headline metrics.
 pub async fn get_main_stats(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<metrics::CoreMetrics>, ApiError> {
     let range = params.validated()?;
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
@@ -514,10 +1006,23 @@ pub async fn get_main_stats(
             compare.map_or("none", Compare::slug),
         ],
     );
-    let Json(mut current) = cached_query(&state, key, move |conn| {
-        metrics::query_core_metrics(conn, &scope)
+    // Session figures computed from hour-rounded timestamps are artefacts of the
+    // rounding; they are reported as unavailable instead.
+    let with_sessions = !state.round_timestamps;
+    let Json(mut current) = cached_scoped(&state, key, scope, 0, move |conn, scope| {
+        main_metrics(conn, scope, with_sessions)
     })
     .await?;
+    if !current.behavioral_available {
+        current.sessions_unavailable_reason = Some(
+            if state.round_timestamps {
+                "timestamps_rounded"
+            } else {
+                "extension_missing"
+            }
+            .to_string(),
+        );
+    }
 
     if let Some(mode) = compare {
         let previous = range.compared_with(mode)?;
@@ -532,9 +1037,13 @@ pub async fn get_main_stats(
             &params.site_id,
             &[&previous.start, &previous.end, &filter_key, "none"],
         );
-        let Json(baseline) = cached_query(&state, previous_key, move |conn| {
-            metrics::query_core_metrics(conn, &previous_scope)
-        })
+        let Json(baseline) = cached_scoped(
+            &state,
+            previous_key,
+            previous_scope,
+            0,
+            move |conn, scope| main_metrics(conn, scope, with_sessions),
+        )
         .await?;
 
         current.comparison = Some(metrics::ComparisonWindow::from_metrics(
@@ -550,9 +1059,10 @@ pub async fn get_main_stats(
 /// GET /api/stats/sessions — session-level metrics.
 pub async fn get_sessions(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<metrics::SessionMetrics>, ApiError> {
     let range = params.validated()?;
+    require_exact_timestamps(&state, "Session metrics")?;
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
     let filter_key = filters_cache_key(&filters);
     let scope = state
@@ -563,8 +1073,8 @@ pub async fn get_sessions(
         &params.site_id,
         &[&range.start, &range.end, &filter_key],
     );
-    cached_query(&state, key, move |conn| {
-        metrics::query_session_metrics(conn, &scope)
+    cached_scoped(&state, key, scope, 0, |conn, scope| {
+        metrics::query_session_metrics(conn, scope)
     })
     .await
     .map_err(|e| behavioral_error(&state, "Session metrics", e))
@@ -573,7 +1083,7 @@ pub async fn get_sessions(
 /// GET /api/stats/timeseries — bucketed visitor and pageview counts.
 pub async fn get_timeseries(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<Vec<timeseries::TimeBucket>>, ApiError> {
     let range = params.validated()?;
     let granularity = timeseries::Granularity::for_span_days(range.days);
@@ -592,8 +1102,8 @@ pub async fn get_timeseries(
             &filter_key,
         ],
     );
-    cached_query(&state, key, move |conn| {
-        timeseries::query_timeseries(conn, &scope, granularity)
+    cached_scoped(&state, key, scope, 0, move |conn, scope| {
+        timeseries::query_timeseries(conn, scope, granularity)
     })
     .await
 }
@@ -607,7 +1117,7 @@ pub async fn get_timeseries(
 pub async fn get_breakdown(
     State(state): State<Arc<AppState>>,
     Path(dimension): Path<String>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<Vec<breakdowns::BreakdownRow>>, ApiError> {
     let range = params.validated()?;
     let limit = params.limit_or(DEFAULT_LIMIT, MAX_BREAKDOWN_LIMIT)?;
@@ -619,10 +1129,11 @@ pub async fn get_breakdown(
         ))
     })?;
 
-    if dim.requires_behavioral() && !state.behavioral_extension_loaded {
-        return Err(ApiError::behavioral_required(
-            "Entry and exit page breakdowns",
-        ));
+    if dim.requires_behavioral() {
+        require_exact_timestamps(&state, "Entry and exit page reports")?;
+        if !state.behavioral.is_loaded() {
+            return Err(ApiError::behavioral_required("Entry and exit page reports"));
+        }
     }
 
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
@@ -641,8 +1152,8 @@ pub async fn get_breakdown(
             &filter_key,
         ],
     );
-    cached_query(&state, key, move |conn| {
-        breakdowns::query_breakdown(conn, &scope, dim, limit)
+    cached_scoped(&state, key, scope, 0, move |conn, scope| {
+        breakdowns::query_breakdown(conn, scope, dim, limit)
     })
     .await
 }
@@ -650,15 +1161,20 @@ pub async fn get_breakdown(
 /// GET /api/stats/realtime — activity in the last few minutes.
 pub async fn get_realtime(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<realtime::RealtimeSnapshot>, ApiError> {
     validate_site_id(&params.site_id)?;
     let site_id = params.site_id.clone();
     let window = state.realtime_window_minutes;
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
     // Deliberately uncached: a cached "realtime" figure is not realtime.
-    let snapshot = run_query(&state, move |conn| {
-        realtime::query_realtime(conn, &site_id, window, &filters)
+    let snapshot = run_scoped(&state, move |conn, cold| {
+        // The instant is taken here, inside the query, as before: a request
+        // that queued must still report "the last N minutes" as of when it ran.
+        let now = chrono::Utc::now().naive_utc();
+        let (from, to) = realtime::window_days(window, now);
+        let source = cold.source(&site_id, from, to);
+        realtime::query_realtime_from(conn, &source, &site_id, window, &filters, now)
     })
     .await?;
     Ok(Json(snapshot))
@@ -667,7 +1183,7 @@ pub async fn get_realtime(
 /// GET /api/stats/revenue — revenue totals, per currency and dimension.
 pub async fn get_revenue(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<revenue::RevenueReport>, ApiError> {
     let range = params.validated()?;
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
@@ -680,8 +1196,8 @@ pub async fn get_revenue(
         &params.site_id,
         &[&range.start, &range.end, &filter_key],
     );
-    cached_query(&state, key, move |conn| {
-        revenue::query_revenue(conn, &scope)
+    cached_scoped(&state, key, scope, 0, |conn, scope| {
+        revenue::query_revenue(conn, scope)
     })
     .await
 }
@@ -689,7 +1205,7 @@ pub async fn get_revenue(
 /// GET /api/stats/goals — conversions for every custom event.
 pub async fn get_goals(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<Vec<events::GoalConversion>>, ApiError> {
     let range = params.validated()?;
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
@@ -702,13 +1218,16 @@ pub async fn get_goals(
         &params.site_id,
         &[&range.start, &range.end, &filter_key],
     );
-    cached_query(&state, key, move |conn| events::query_goals(conn, &scope)).await
+    cached_scoped(&state, key, scope, 0, |conn, scope| {
+        events::query_goals(conn, scope)
+    })
+    .await
 }
 
 /// GET /api/stats/properties — custom property keys seen in range.
 pub async fn get_property_keys(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<Vec<String>>, ApiError> {
     let range = params.validated()?;
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
@@ -721,8 +1240,8 @@ pub async fn get_property_keys(
         &params.site_id,
         &[&range.start, &range.end, &filter_key],
     );
-    cached_query(&state, key, move |conn| {
-        events::query_property_keys(conn, &scope)
+    cached_scoped(&state, key, scope, 0, |conn, scope| {
+        events::query_property_keys(conn, scope)
     })
     .await
 }
@@ -746,7 +1265,7 @@ pub struct PropertyParams {
 /// GET /api/stats/property-values — one custom property, broken down by value.
 pub async fn get_property_values(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<PropertyParams>,
+    ApiQuery(params): ApiQuery<PropertyParams>,
 ) -> Result<Json<Vec<events::PropertyValue>>, ApiError> {
     let common = StatsParams {
         site_id: params.site_id.clone(),
@@ -790,8 +1309,8 @@ pub async fn get_property_values(
             &filter_key,
         ],
     );
-    cached_query(&state, cache, move |conn| {
-        events::query_property_values(conn, &scope, &key_name, event.as_deref())
+    cached_scoped(&state, cache, scope, 0, move |conn, scope| {
+        events::query_property_values(conn, scope, &key_name, event.as_deref())
     })
     .await
 }
@@ -890,7 +1409,7 @@ fn parse_steps(raw: &str, min: usize, max: usize) -> Result<Vec<String>, ApiErro
 /// GET /api/stats/funnel — cumulative funnel analysis.
 pub async fn get_funnel(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<FunnelParams>,
+    ApiQuery(params): ApiQuery<FunnelParams>,
 ) -> Result<Json<Vec<funnel::FunnelStep>>, ApiError> {
     let common = StatsParams {
         site_id: params.site_id.clone(),
@@ -910,16 +1429,13 @@ pub async fn get_funnel(
         ));
     }
 
-    let modes = funnel::normalize_modes(&params.modes).ok_or_else(|| {
-        ApiError::BadRequest(format!(
-            "Unknown funnel mode. Available: {}",
-            funnel::VALID_MODES.join(", ")
-        ))
-    })?;
+    let modes = funnel::normalize_modes(&params.modes)
+        .ok_or_else(|| ApiError::BadRequest(funnel::modes_error(&params.modes)))?;
 
     let steps = parse_steps(&params.steps, funnel::MIN_STEPS, funnel::MAX_STEPS)?;
 
-    if !state.behavioral_extension_loaded {
+    require_exact_timestamps(&state, "Funnel analysis")?;
+    if !state.behavioral.is_loaded() {
         return Err(ApiError::behavioral_required("Funnel analysis"));
     }
 
@@ -940,9 +1456,9 @@ pub async fn get_funnel(
             &filter_key,
         ],
     );
-    cached_query(&state, key, move |conn| {
+    cached_scoped(&state, key, scope, 0, move |conn, scope| {
         let refs: Vec<&str> = steps.iter().map(String::as_str).collect();
-        funnel::query_funnel(conn, &scope, &window, &modes, &refs)
+        funnel::query_funnel(conn, scope, &window, &modes, &refs)
     })
     .await
     .map_err(|e| behavioral_error(&state, "Funnel analysis", e))
@@ -974,12 +1490,15 @@ pub struct RetentionResponse {
     pub identity_supports_cohorts: bool,
     /// Explanation shown when it cannot.
     pub caveat: Option<String>,
+    /// The configured visitor-ID rotation, in days, so a client can say the
+    /// real value (and what to raise it to) instead of parsing `caveat`.
+    pub visitor_salt_rotation_days: u32,
 }
 
 /// GET /api/stats/retention — weekly retention cohorts.
 pub async fn get_retention(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<RetentionParams>,
+    ApiQuery(params): ApiQuery<RetentionParams>,
 ) -> Result<Json<RetentionResponse>, ApiError> {
     let common = StatsParams {
         site_id: params.site_id.clone(),
@@ -1001,7 +1520,7 @@ pub async fn get_retention(
         )));
     }
 
-    if !state.behavioral_extension_loaded {
+    if !state.behavioral.is_loaded() {
         return Err(ApiError::behavioral_required("Retention cohorts"));
     }
 
@@ -1028,14 +1547,27 @@ pub async fn get_retention(
         .scope(&params.site_id, &range.start, &range.end)
         .with_filters(filters);
     let weeks = params.weeks;
+    // A visitor ID cannot outlive the salt rotation, which bounds how far back
+    // "first seen" has to look.
+    let lookback_days = state.visitor_salt_rotation_days;
     let key = cache_key(
         "retention",
         &params.site_id,
-        &[&range.start, &range.end, &weeks.to_string(), &filter_key],
+        &[
+            &range.start,
+            &range.end,
+            &weeks.to_string(),
+            &lookback_days.to_string(),
+            &filter_key,
+        ],
     );
-    let cohorts: Json<Vec<retention::RetentionCohort>> = cached_query(&state, key, move |conn| {
-        retention::query_retention(conn, &scope, weeks)
-    })
+    let cohorts: Json<Vec<retention::RetentionCohort>> = cached_scoped(
+        &state,
+        key,
+        scope,
+        retention::scan_lookback_days(lookback_days),
+        move |conn, scope| retention::query_retention(conn, scope, weeks, lookback_days),
+    )
     .await
     .map_err(|e| behavioral_error(&state, "Retention cohorts", e))?;
 
@@ -1043,6 +1575,7 @@ pub async fn get_retention(
         cohorts: cohorts.0,
         identity_supports_cohorts,
         caveat,
+        visitor_salt_rotation_days: state.visitor_salt_rotation_days,
     }))
 }
 
@@ -1063,7 +1596,7 @@ pub struct SequenceParams {
 /// GET /api/stats/sequences — ordered pattern matching over event streams.
 pub async fn get_sequences(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<SequenceParams>,
+    ApiQuery(params): ApiQuery<SequenceParams>,
 ) -> Result<Json<sequences::SequenceMatchResult>, ApiError> {
     let common = StatsParams {
         site_id: params.site_id.clone(),
@@ -1082,7 +1615,8 @@ pub async fn get_sequences(
         sequences::MAX_CONDITIONS,
     )?;
 
-    if !state.behavioral_extension_loaded {
+    require_exact_timestamps(&state, "Sequence analysis")?;
+    if !state.behavioral.is_loaded() {
         return Err(ApiError::behavioral_required("Sequence analysis"));
     }
 
@@ -1096,9 +1630,9 @@ pub async fn get_sequences(
         &params.site_id,
         &[&range.start, &range.end, &params.steps, &filter_key],
     );
-    cached_query(&state, key, move |conn| {
+    cached_scoped(&state, key, scope, 0, move |conn, scope| {
         let refs: Vec<&str> = steps.iter().map(String::as_str).collect();
-        sequences::execute_sequence_match(conn, &scope, &refs)
+        sequences::execute_sequence_match(conn, scope, &refs)
     })
     .await
     .map_err(|e| behavioral_error(&state, "Sequence analysis", e))
@@ -1129,7 +1663,7 @@ fn default_direction() -> String {
 /// GET /api/stats/flow — the pages around a given page.
 pub async fn get_flow(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<FlowParams>,
+    ApiQuery(params): ApiQuery<FlowParams>,
 ) -> Result<Json<Vec<flow::FlowNode>>, ApiError> {
     let common = StatsParams {
         site_id: params.site_id.clone(),
@@ -1152,7 +1686,8 @@ pub async fn get_flow(
         ApiError::BadRequest("direction must be 'forward' or 'backward'".to_string())
     })?;
 
-    if !state.behavioral_extension_loaded {
+    require_exact_timestamps(&state, "Flow analysis")?;
+    if !state.behavioral.is_loaded() {
         return Err(ApiError::behavioral_required("Flow analysis"));
     }
 
@@ -1174,8 +1709,8 @@ pub async fn get_flow(
             &filter_key,
         ],
     );
-    cached_query(&state, key, move |conn| {
-        flow::query_flow(conn, &scope, &page, direction, limit)
+    cached_scoped(&state, key, scope, 0, move |conn, scope| {
+        flow::query_flow(conn, scope, &page, direction, limit)
     })
     .await
     .map_err(|e| behavioral_error(&state, "Flow analysis", e))
@@ -1213,7 +1748,7 @@ fn default_export_kind() -> String {
 /// GET /api/stats/export — download analytics data.
 pub async fn get_export(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<ExportParams>,
+    ApiQuery(params): ApiQuery<ExportParams>,
 ) -> Result<impl IntoResponse, ApiError> {
     let common = StatsParams {
         site_id: params.site_id.clone(),
@@ -1246,28 +1781,26 @@ pub async fn get_export(
         .with_filters(filters);
 
     let (body, filename) = match kind {
+        // The only export that can be large, so the only one that streams.
+        export::ExportKind::Raw => {
+            let limit = common.limit_or(DEFAULT_EXPORT_LIMIT, export::MAX_RAW_ROWS)?;
+            (
+                stream_raw_export(&state, scope, limit, format).await?,
+                "mallard-events",
+            )
+        }
         export::ExportKind::Daily => {
-            let rows =
-                run_query(&state, move |conn| export::query_daily_export(conn, &scope)).await?;
-            let body = match format {
+            let rows = run_scoped(&state, move |conn, cold| {
+                export::query_daily_export(conn, &cold.scope(scope, 0))
+            })
+            .await?;
+            let text = match format {
                 export::ExportFormat::Csv => export::daily_to_csv(&rows),
                 export::ExportFormat::Json => {
                     serde_json::to_string(&rows).unwrap_or_else(|_| "[]".to_string())
                 }
             };
-            (body, "mallard-daily")
-        }
-        export::ExportKind::Raw => {
-            let limit = common.limit_or(DEFAULT_EXPORT_LIMIT, export::MAX_RAW_ROWS)?;
-            let rows = run_query(&state, move |conn| {
-                export::query_raw_export(conn, &scope, limit)
-            })
-            .await?;
-            let body = match format {
-                export::ExportFormat::Csv => export::to_csv(export::RAW_COLUMNS, &rows),
-                export::ExportFormat::Json => export::raw_to_json(&rows),
-            };
-            (body, "mallard-events")
+            (Body::from(text), "mallard-daily")
         }
     };
 
@@ -1291,6 +1824,446 @@ pub async fn get_export(
     ))
 }
 
+// ── Streaming raw export ─────────────────────────────────────────────────
+
+/// Chunks queued between the query thread and the socket.
+///
+/// Two lets the thread produce the next chunk while the previous one is being
+/// written, and no more: the point of the channel is back-pressure, so memory
+/// stays at a few chunks however many rows match (S-12).
+const EXPORT_CHANNEL_DEPTH: usize = 2;
+
+/// Longest a raw export may hold its reader connection and the tier read lock.
+///
+/// A streaming export keeps its statement open for as long as the client takes
+/// to read. A flush or compaction needs the exclusive tier lock and, while one
+/// waits, every new query waits behind it, so a slow download stalls the whole
+/// dashboard for as long as it lasts. A fast client finishes a million rows in
+/// well under a minute; one that trickles must not hold the lock indefinitely, so
+/// the export is cut off, as a truncated body and not a clean end, after this
+/// long. Two minutes bounds the stall; a client that needs more can ask for
+/// fewer rows (`limit`) or a shorter range.
+const EXPORT_MAX_DURATION: Duration = Duration::from_secs(120);
+
+/// The response body of a streaming export.
+///
+/// Chunks arrive from the query thread through a bounded channel. The channel
+/// closing normally is the end of the file; it closing with `failed` set is an
+/// error, and has to be reported as one: a body that simply ends looks complete
+/// to the client, which would save a truncated export as if it were whole.
+struct ExportStream {
+    first: Option<Bytes>,
+    rx: tokio::sync::mpsc::Receiver<Result<Bytes, ApiError>>,
+    failed: Arc<AtomicBool>,
+}
+
+impl futures_core::Stream for ExportStream {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        if let Some(first) = this.first.take() {
+            return Poll::Ready(Some(Ok(first)));
+        }
+        match this.rx.poll_recv(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(chunk))),
+            Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Some(Err(std::io::Error::other(e.to_string()))))
+            }
+            Poll::Ready(None) => {
+                if this.failed.swap(false, Ordering::SeqCst) {
+                    Poll::Ready(Some(Err(std::io::Error::other(
+                        "the export was aborted before it finished",
+                    ))))
+                } else {
+                    Poll::Ready(None)
+                }
+            }
+        }
+    }
+}
+
+/// Marks the export failed unless it is told it finished.
+///
+/// Every way out of the producer other than success (a query error, a stalled
+/// client, the time cap, a panic) leaves the flag set, so none can end the body
+/// as if it were complete.
+struct ExportCompletion {
+    failed: Arc<AtomicBool>,
+    finished: bool,
+}
+
+impl Drop for ExportCompletion {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.failed.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+/// The query thread's half of a streaming export.
+struct ExportProducer {
+    tx: tokio::sync::mpsc::Sender<Result<Bytes, ApiError>>,
+    runtime: tokio::runtime::Handle,
+    limits: QueryLimits,
+    format: export::ExportFormat,
+    began: std::time::Instant,
+    /// Whether any output has been handed over, i.e. whether a status is still
+    /// possible.
+    sent_any: bool,
+    /// Set when the client left, stalled, or the time cap passed.
+    stopped: bool,
+}
+
+impl ExportProducer {
+    /// Hand one piece of the file to the response. False means stop.
+    fn send(&mut self, deadline: &Deadline, text: String) -> bool {
+        if text.is_empty() {
+            return true;
+        }
+        let waited = std::time::Instant::now();
+        let delivery = self.runtime.block_on(tokio::time::timeout(
+            self.limits.deadline,
+            self.tx.send(Ok(Bytes::from(text))),
+        ));
+        // Waiting for the client is not DuckDB running long.
+        deadline.credit(waited.elapsed());
+        match delivery {
+            Ok(Ok(())) => {
+                self.sent_any = true;
+                if self.began.elapsed() > EXPORT_MAX_DURATION {
+                    tracing::warn!(
+                        max_secs = EXPORT_MAX_DURATION.as_secs(),
+                        "Raw export exceeded its time cap; aborting"
+                    );
+                    self.stopped = true;
+                }
+            }
+            // The body was dropped: the client went away.
+            Ok(Err(_)) => self.stopped = true,
+            Err(_) => {
+                tracing::warn!(
+                    stall_secs = self.limits.deadline.as_secs(),
+                    "A raw export client stopped reading; aborting"
+                );
+                self.stopped = true;
+            }
+        }
+        !self.stopped
+    }
+
+    /// The text for one chunk of rows, with the file's opening on the first.
+    fn chunk(&self, rows: &[Vec<Option<String>>], first: bool) -> String {
+        let mut out = String::new();
+        match self.format {
+            export::ExportFormat::Csv => {
+                if first {
+                    out.push_str(&export::csv_header_line(export::RAW_COLUMNS));
+                }
+                out.push_str(&export::csv_rows(rows));
+            }
+            export::ExportFormat::Json => {
+                if first {
+                    out.push_str(export::JSON_STREAM_OPEN);
+                }
+                out.push_str(&export::raw_json_chunk(rows, first));
+            }
+        }
+        out
+    }
+
+    /// What closes the file after `delivered` rows. A file with no rows is still
+    /// a valid one: a header, or an empty array.
+    fn tail(&self, delivered: usize) -> String {
+        match (self.format, delivered) {
+            (export::ExportFormat::Csv, 0) => export::csv_header_line(export::RAW_COLUMNS),
+            (export::ExportFormat::Csv, _) => String::new(),
+            (export::ExportFormat::Json, 0) => {
+                format!("{}{}", export::JSON_STREAM_OPEN, export::JSON_STREAM_CLOSE)
+            }
+            (export::ExportFormat::Json, _) => export::JSON_STREAM_CLOSE.to_string(),
+        }
+    }
+
+    /// Run the export to the end, the client's departure, or a failure.
+    /// Returns whether the file was delivered whole.
+    fn run(
+        &mut self,
+        conn: &duckdb::Connection,
+        scope: &QueryScope,
+        limit: usize,
+        deadline: &Deadline,
+    ) -> bool {
+        let mut first = true;
+        let outcome =
+            export::stream_raw_export(conn, scope, limit, export::EXPORT_CHUNK_ROWS, |rows| {
+                let text = self.chunk(rows, first);
+                first = false;
+                self.send(deadline, text)
+            });
+        match outcome {
+            Ok(delivered) if !self.stopped => {
+                let tail = self.tail(delivered);
+                self.send(deadline, tail)
+            }
+            Ok(_) => false,
+            Err(err) => {
+                let api = if deadline.fired() {
+                    deadline_error(self.limits.deadline)
+                } else {
+                    classify_error(err)
+                };
+                if self.sent_any {
+                    tracing::error!(error = %api, "Raw export failed after it started; truncating");
+                    false
+                } else {
+                    // Nothing has been sent yet, so the failure can still be a
+                    // status instead of a broken body.
+                    let _ = self.runtime.block_on(self.tx.send(Err(api)));
+                    true
+                }
+            }
+        }
+    }
+}
+
+/// Stream a raw export: the query runs on a blocking thread and pushes chunks
+/// into a bounded channel that the response body drains.
+///
+/// - **Back-pressure.** The thread blocks when the channel is full, so a slow
+///   client slows the query instead of buffering the file in memory.
+/// - **Client disconnects.** hyper drops the body, which drops the receiver; the
+///   thread's next send fails, it stops, and its reader connection, the tier
+///   read lock and the concurrency slot are released with it. A thread blocked
+///   in a send is woken by the receiver closing.
+/// - **Errors.** The first chunk is awaited before any response is built, so a
+///   statement that fails to start (bad filter, deadline, no slot) still gets
+///   its proper status. After that the status is gone, and a failure ends the
+///   body with an error so the connection is aborted rather than finished.
+/// - **Limits.** The row cap is the caller's `limit`, as before. The query
+///   deadline bounds the time DuckDB spends executing; time spent waiting for
+///   the client is credited back, but a chunk the client will not take within
+///   the deadline aborts the export, and [`EXPORT_MAX_DURATION`] caps the whole.
+async fn stream_raw_export(
+    state: &Arc<AppState>,
+    scope: QueryScope,
+    limit: usize,
+    format: export::ExportFormat,
+) -> Result<Body, ApiError> {
+    let limits = state.query_limits;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, ApiError>>(EXPORT_CHANNEL_DEPTH);
+    let failed = Arc::new(AtomicBool::new(false));
+
+    let mut producer = ExportProducer {
+        tx,
+        runtime: tokio::runtime::Handle::current(),
+        limits,
+        format,
+        began: std::time::Instant::now(),
+        sent_any: false,
+        stopped: false,
+    };
+    let producer_failed = Arc::clone(&failed);
+    let running = start_query(state, limits, move |conn, cold, deadline| {
+        let mut completion = ExportCompletion {
+            failed: producer_failed,
+            finished: false,
+        };
+        let scope = cold.scope(scope, 0);
+        completion.finished = producer.run(conn, &scope, limit, deadline);
+        Ok(())
+    })
+    .await?;
+    // The thread owns everything it needs; the body is the only way to cancel it.
+    drop(running);
+
+    match rx.recv().await {
+        Some(Ok(first)) => Ok(Body::from_stream(ExportStream {
+            first: Some(first),
+            rx,
+            failed,
+        })),
+        Some(Err(e)) => Err(e),
+        None => Err(ApiError::Internal(
+            "The export ended before producing any output".to_string(),
+        )),
+    }
+}
+
+// ── Parquet export ───────────────────────────────────────────────────────
+
+/// Parameters for the Parquet export endpoint.
+#[derive(Debug, Deserialize)]
+pub struct ParquetExportParams {
+    pub site_id: String,
+    #[serde(default = "default_period")]
+    pub period: String,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+}
+
+/// The response body of a Parquet export: the file, read in chunks.
+struct FileBody {
+    rx: tokio::sync::mpsc::Receiver<Result<Bytes, std::io::Error>>,
+}
+
+impl futures_core::Stream for FileBody {
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
+    }
+}
+
+/// Stream `file` to the client, then delete it and free the export slot.
+///
+/// The reader is a task, so a client that stalls holds only the task and the
+/// slot, and [`EXPORT_MAX_DURATION`] ends it. `guard` and `busy` are released
+/// *before* the body can end (`tx` is dropped last), so a client that has read
+/// to the end can immediately ask for another export.
+fn stream_export_file(
+    mut file: tokio::fs::File,
+    guard: parquet_export::TempFile,
+    busy: parquet_export::ExportSlot,
+) -> FileBody {
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(EXPORT_CHANNEL_DEPTH);
+    tokio::spawn(async move {
+        let copy = async {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                match file.read(&mut buf).await {
+                    Ok(0) => return,
+                    Ok(n) => {
+                        if tx
+                            .send(Ok(Bytes::copy_from_slice(&buf[..n])))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e)).await;
+                        return;
+                    }
+                }
+            }
+        };
+        let finished = tokio::time::timeout(EXPORT_MAX_DURATION, copy).await;
+        // The file is deleted and the slot freed *before* the body can end:
+        // `tx` is dropped last, so a client that has read to the end can
+        // immediately ask for another export.
+        drop(guard);
+        drop(busy);
+        if finished.is_err() {
+            tracing::warn!("A Parquet export download exceeded its time cap; aborting");
+            let _ = tx
+                .send(Err(std::io::Error::other("the export download timed out")))
+                .await;
+        }
+    });
+    FileBody { rx }
+}
+
+/// GET /api/admin/export/parquet — one site and date range as a Parquet file.
+///
+/// Admin scope. `visitor_id` is not in the file (see
+/// [`parquet_export`]); the schema is documented in
+/// `docs/src/exporting-parquet.md`. The file is written to
+/// `<data_dir>/exports` under the shared tier read lock, which is released
+/// before the download starts, then streamed and deleted. A range with more
+/// than [`parquet_export::MAX_ROWS`] rows is a `400`, not a truncated file.
+pub async fn export_parquet(
+    State(state): State<Arc<AppState>>,
+    ApiQuery(params): ApiQuery<ParquetExportParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    let range = StatsParams {
+        site_id: params.site_id.clone(),
+        period: params.period.clone(),
+        start_date: params.start_date.clone(),
+        end_date: params.end_date.clone(),
+        limit: None,
+        filters: None,
+        compare: None,
+    }
+    .validated()?;
+
+    let busy = parquet_export::ExportSlot::try_claim(&state.data_dir).ok_or_else(|| {
+        ApiError::TooManyRequests(
+            "Another Parquet export is running. Please retry when it has finished.".to_string(),
+        )
+    })?;
+
+    let data_dir = state.data_dir.clone();
+    let path = tokio::task::spawn_blocking(move || parquet_export::new_export_path(&data_dir))
+        .await
+        .map_err(|e| ApiError::Internal(format!("Export task panicked: {e}")))?
+        .map_err(|e| ApiError::Internal(format!("Could not prepare the exports directory: {e}")))?;
+    // From here the file is removed however this request ends.
+    let guard = parquet_export::TempFile(path.clone());
+
+    let scope = state.scope(&params.site_id, &range.start, &range.end);
+    let dest = path.clone();
+    let outcome = run_scoped(&state, move |conn, cold| {
+        parquet_export::write_parquet(conn, &cold.scope(scope, 0), &dest, parquet_export::MAX_ROWS)
+    })
+    .await?;
+    let rows = match outcome {
+        parquet_export::Outcome::Written { rows } => rows,
+        parquet_export::Outcome::TooManyRows => {
+            return Err(ApiError::BadRequest(format!(
+                "More than {} events match; choose a shorter date range.",
+                parquet_export::MAX_ROWS
+            )));
+        }
+    };
+
+    let file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Could not open the export file: {e}")))?;
+    let length = file
+        .metadata()
+        .await
+        .map_err(|e| ApiError::Internal(format!("Could not size the export file: {e}")))?
+        .len();
+
+    let body = stream_export_file(file, guard, busy);
+
+    let filename = format!(
+        "mallard-events-{}-{}.parquet",
+        params.site_id,
+        range.start.split(' ').next().unwrap_or(&range.start)
+    );
+    let disposition = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
+    Ok((
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(parquet_export::CONTENT_TYPE),
+            ),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::CONTENT_LENGTH, HeaderValue::from(length)),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            (
+                axum::http::HeaderName::from_static("x-mallard-rows"),
+                HeaderValue::from(rows),
+            ),
+        ],
+        Body::from_stream(body),
+    ))
+}
+
 // ── GDPR erasure ─────────────────────────────────────────────────────────
 
 /// Parameters for the erasure endpoint.
@@ -1301,6 +2274,65 @@ pub struct GdprEraseParams {
     pub start_date: String,
     /// Inclusive end date, `YYYY-MM-DD`.
     pub end_date: String,
+}
+
+/// Remove one site's data for a date range from both tiers.
+///
+/// Blocking: takes the tier write lock and the writer connection. Returns the
+/// number of hot-table rows deleted and what happened to the Parquet partitions.
+fn erase_site_range(
+    state: &AppState,
+    site_id: &str,
+    start_date: NaiveDate,
+    end_date: NaiveDate,
+) -> Result<(i64, ErasureReport), ApiError> {
+    let start_str = start_date.format("%Y-%m-%d").to_string();
+    let end_str = end_date.format("%Y-%m-%d").to_string();
+    let writer = state.buffer.conn();
+
+    // Between the hot-table delete and the partition removal the two tiers
+    // disagree; no query may observe that.
+    let _tier = state.tier_lock.write();
+
+    // Delete from the hot table first, holding the writer lock only for the two
+    // statements.
+    let db_count: i64 = {
+        let guard = writer.lock();
+        let count: i64 = guard
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE site_id = ? \
+                 AND STRFTIME(CAST(timestamp AS DATE), '%Y-%m-%d') BETWEEN ? AND ?",
+                duckdb::params![site_id, start_str, end_str],
+                |row| row.get(0),
+            )
+            .map_err(ApiError::DatabaseError)?;
+        guard
+            .execute(
+                "DELETE FROM events WHERE site_id = ? \
+                 AND STRFTIME(CAST(timestamp AS DATE), '%Y-%m-%d') BETWEEN ? AND ?",
+                duckdb::params![site_id, start_str, end_str],
+            )
+            .map_err(ApiError::DatabaseError)?;
+        count
+    };
+
+    // A directory that could not be removed is personal data still on disk, so
+    // it is reported rather than counted as zero.
+    let report = state
+        .buffer
+        .storage()
+        .erase_partitions_report(site_id, start_date, end_date)
+        .map_err(|e| ApiError::Internal(format!("Could not erase Parquet partitions: {e}")))?;
+
+    // Rebuild the union view so the deleted partitions leave the read glob.
+    // Connections opened against one database share its catalog, so refreshing
+    // on the writer covers the whole reader pool — see
+    // `storage::tests::test_readers_see_the_view_refreshed_after_a_flush`, which
+    // is what the post-flush refresh in `parquet.rs` relies on too.
+    crate::storage::schema::setup_query_view(&writer.lock(), &state.events_dir)
+        .map_err(ApiError::DatabaseError)?;
+
+    Ok((db_count, report))
 }
 
 /// DELETE /api/gdpr/erase — permanently delete data for a site and date range.
@@ -1319,7 +2351,7 @@ pub struct GdprEraseParams {
 /// your privacy notice.
 pub async fn gdpr_erase(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<GdprEraseParams>,
+    ApiQuery(params): ApiQuery<GdprEraseParams>,
 ) -> Result<impl IntoResponse, ApiError> {
     validate_site_id(&params.site_id)?;
 
@@ -1355,58 +2387,44 @@ pub async fn gdpr_erase(
         }
     }
 
-    let site_id = params.site_id.clone();
-    let start_str = params.start_date.clone();
-    let end_str = params.end_date.clone();
-    let events_dir = state.events_dir.clone();
-    let storage = state.buffer.storage().clone();
-    let writer = state.buffer.conn().clone();
-    let tier_lock = state.tier_lock.clone();
-
-    let (db_records_deleted, parquet_partitions_deleted) =
-        tokio::task::spawn_blocking(move || -> Result<(i64, u64), duckdb::Error> {
-            // Between the hot-table delete and the partition removal the two
-            // tiers disagree; no query may observe that.
-            let _tier = tier_lock.write();
-            // Delete from the hot table first, holding the writer lock only for
-            // the two statements.
-            let db_count: i64 = {
-                let guard = writer.lock();
-                let count: i64 = guard
-                    .query_row(
-                        "SELECT COUNT(*) FROM events WHERE site_id = ? \
-                         AND STRFTIME(CAST(timestamp AS DATE), '%Y-%m-%d') BETWEEN ? AND ?",
-                        duckdb::params![site_id, start_str, end_str],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
-                guard.execute(
-                    "DELETE FROM events WHERE site_id = ? \
-                     AND STRFTIME(CAST(timestamp AS DATE), '%Y-%m-%d') BETWEEN ? AND ?",
-                    duckdb::params![site_id, start_str, end_str],
-                )?;
-                count
-            };
-
-            let parquet_removed = storage
-                .erase_partitions(&site_id, start_date, end_date)
-                .unwrap_or(0);
-
-            // Rebuild the union view so the deleted partitions leave the read
-            // glob. Connections opened against one database share its catalog,
-            // so refreshing on the writer covers the whole reader pool — see
-            // `storage::tests::test_readers_see_the_view_refreshed_after_a_flush`,
-            // which is what the post-flush refresh in `parquet.rs` relies on too.
-            crate::storage::schema::setup_query_view(&writer.lock(), &events_dir)?;
-
-            Ok((db_count, parquet_removed))
+    let (db_records_deleted, report) = {
+        let state = Arc::clone(&state);
+        let site_id = params.site_id.clone();
+        tokio::task::spawn_blocking(move || {
+            erase_site_range(&state, &site_id, start_date, end_date)
         })
         .await
-        .map_err(|e| ApiError::Internal(format!("Erasure task panicked: {e}")))?
-        .map_err(ApiError::DatabaseError)?;
+        .map_err(|e| ApiError::Internal(format!("Erasure task panicked: {e}")))??
+    };
 
     // Without this the dashboard would keep serving erased data from cache.
     state.query_cache.invalidate_site(&params.site_id);
+
+    let parquet_partitions_deleted = report.removed;
+    if !report.failed.is_empty() {
+        let failed: Vec<&str> = report
+            .failed
+            .iter()
+            .map(|(date, _)| date.as_str())
+            .collect();
+        for (date, error) in &report.failed {
+            tracing::error!(site_id = %params.site_id, date = %date, error = %error, "GDPR erasure could not remove a partition");
+        }
+        // 500, not 200: the request asked for the data to be gone and some of it
+        // is not. The caller must retry; the body says which dates remain.
+        return Ok((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "status": "partial",
+                "site_id": params.site_id,
+                "start_date": params.start_date,
+                "end_date": params.end_date,
+                "db_records_deleted": db_records_deleted,
+                "parquet_partitions_deleted": parquet_partitions_deleted,
+                "failed_dates": failed,
+            })),
+        ));
+    }
 
     tracing::warn!(
         site_id = %params.site_id,
@@ -1417,14 +2435,17 @@ pub async fn gdpr_erase(
         "GDPR erasure completed"
     );
 
-    Ok(Json(serde_json::json!({
-        "status": "erased",
-        "site_id": params.site_id,
-        "start_date": params.start_date,
-        "end_date": params.end_date,
-        "db_records_deleted": db_records_deleted,
-        "parquet_partitions_deleted": parquet_partitions_deleted,
-    })))
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "erased",
+            "site_id": params.site_id,
+            "start_date": params.start_date,
+            "end_date": params.end_date,
+            "db_records_deleted": db_records_deleted,
+            "parquet_partitions_deleted": parquet_partitions_deleted,
+        })),
+    ))
 }
 
 #[cfg(test)]
@@ -1694,6 +2715,75 @@ mod tests {
         assert!(p.date_range().is_err());
     }
 
+    fn on(period: &str, today: &str) -> DateRange {
+        let today = NaiveDate::parse_from_str(today, "%Y-%m-%d").unwrap();
+        params(period).date_range_on(today).unwrap()
+    }
+
+    #[test]
+    fn test_n_day_periods_span_exactly_n_days_including_today() {
+        // Regression (S-09): `7d` started seven days back and so covered eight
+        // calendar days (30d: 31, 12mo: 366) under an N-day label.
+        let r = on("7d", "2024-03-10");
+        assert_eq!(
+            (r.start.as_str(), r.end.as_str(), r.days),
+            ("2024-03-04", "2024-03-11", 7)
+        );
+        let r = on("30d", "2024-03-10");
+        assert_eq!((r.start.as_str(), r.days), ("2024-02-10", 30));
+        let r = on("90d", "2024-03-10");
+        assert_eq!((r.start.as_str(), r.days), ("2023-12-12", 90));
+        let r = on("day", "2024-03-10");
+        assert_eq!(
+            (r.start.as_str(), r.end.as_str(), r.days),
+            ("2024-03-10", "2024-03-11", 1)
+        );
+        assert_eq!(on("today", "2024-03-10"), r);
+    }
+
+    #[test]
+    fn test_twelve_months_ends_today_inclusive() {
+        let r = on("12mo", "2026-10-20");
+        assert_eq!(
+            (r.start.as_str(), r.end.as_str(), r.days),
+            ("2025-10-21", "2026-10-21", 365)
+        );
+        // Across a leap day the span is a day longer, never over the cap.
+        let r = on("12mo", "2024-10-20");
+        assert_eq!((r.start.as_str(), r.days), ("2023-10-21", 366));
+        assert!(r.days <= MAX_RANGE_DAYS);
+        // A 29 February today clamps its month arithmetic to 28 February.
+        assert_eq!(on("12mo", "2024-02-29").start, "2023-03-01");
+    }
+
+    #[test]
+    fn test_period_ranges_always_fit_the_explicit_range_cap() {
+        for today in ["2024-02-29", "2023-12-31", "2026-10-20"] {
+            for period in ["day", "7d", "30d", "90d", "12mo"] {
+                assert!(
+                    on(period, today).days <= MAX_RANGE_DAYS,
+                    "{period} on {today}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_a_lone_start_or_end_date_is_rejected_not_ignored() {
+        // Regression (S-09): with only one bound the range silently fell back to
+        // the default period.
+        for (start, end) in [(Some("2024-01-01"), None), (None, Some("2024-01-31"))] {
+            let p = StatsParams {
+                start_date: start.map(str::to_string),
+                end_date: end.map(str::to_string),
+                ..params("30d")
+            };
+            let err = p.date_range().unwrap_err();
+            assert!(matches!(err, ApiError::BadRequest(_)), "{err}");
+            assert!(err.to_string().contains("together"), "{err}");
+        }
+    }
+
     #[test]
     fn test_period_span_drives_granularity() {
         assert_eq!(
@@ -1816,5 +2906,292 @@ mod tests {
         ] {
             assert!(!is_safe_interval(bad), "{bad} must be rejected");
         }
+    }
+
+    // ── Query execution: queueing, deadline, lock scope ──────────────────
+
+    use std::time::Instant;
+
+    fn state_with_permits(permits: usize) -> Arc<AppState> {
+        crate::test_support::state_builder()
+            .query_permits(permits)
+            .build_state()
+    }
+
+    fn short_limits(queue_wait_ms: u64, deadline_ms: u64) -> QueryLimits {
+        QueryLimits {
+            queue_wait: Duration::from_millis(queue_wait_ms),
+            deadline: Duration::from_millis(deadline_ms),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_cold_dashboard_load_is_queued_not_rejected() {
+        // Regression (S-01): the dashboard fires ~31 requests at once against a
+        // default cap of 10, and `try_acquire` answered 429 to everything past
+        // the tenth. With default settings and default limits all of them must
+        // be served.
+        let state = state_with_permits(10);
+        let mut tasks = Vec::new();
+        for i in 0..31u64 {
+            let state = Arc::clone(&state);
+            tasks.push(tokio::spawn(async move {
+                run_scoped(&state, move |conn, _| {
+                    std::thread::sleep(Duration::from_millis(15));
+                    conn.query_row("SELECT ?::BIGINT", [i], |row| row.get::<_, u64>(0))
+                })
+                .await
+            }));
+        }
+        for (i, task) in tasks.into_iter().enumerate() {
+            let value = task.await.expect("task").unwrap_or_else(|e| {
+                panic!("request {i} of the dashboard load was rejected: {e}");
+            });
+            assert_eq!(value, i as u64);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_request_that_cannot_get_a_slot_in_time_is_told_to_retry() {
+        let state = state_with_permits(1);
+        let slow_state = Arc::clone(&state);
+        let slow = tokio::spawn(async move {
+            run_scoped(&slow_state, |_, _| {
+                std::thread::sleep(Duration::from_millis(600));
+                Ok(())
+            })
+            .await
+        });
+        // Let the slow query take the only slot.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let err = run_scoped_with(&state, short_limits(50, 5_000), |_, _| Ok(()))
+            .await
+            .expect_err("no slot frees up inside 50 ms");
+        assert!(matches!(err, ApiError::TooManyRequests(_)), "{err}");
+        assert_eq!(err.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        slow.await.expect("task").expect("the slow query finishes");
+    }
+
+    #[tokio::test]
+    async fn test_a_runaway_statement_is_interrupted_and_the_reader_survives() {
+        // F-08, reader side: no deadline existed, so one pathological query held
+        // a reader, a concurrency slot and the tier read lock indefinitely.
+        let state = state_with_permits(2);
+        let started = Instant::now();
+        let err = run_scoped_with(&state, short_limits(1_000, 300), |conn, _| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM range(100000000000) a, range(1000) b",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+        })
+        .await
+        .expect_err("a query this size cannot finish in 300 ms");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the interrupt did not stop the statement: {:?}",
+            started.elapsed()
+        );
+        assert!(matches!(err, ApiError::QueryTimeout(_)), "{err}");
+        assert_eq!(err.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(err.to_string().contains("did not finish"), "{err}");
+
+        // The interrupt must not leak into the connection's next user.
+        let ok = run_scoped(&state, |conn, _| {
+            conn.query_row("SELECT 42", [], |row| row.get::<_, i64>(0))
+        })
+        .await
+        .expect("the reader must still be usable");
+        assert_eq!(ok, 42);
+        // ...and the slot came back.
+        assert_eq!(state.query_semaphore.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_a_fast_query_is_not_interrupted() {
+        let state = state_with_permits(2);
+        let v = run_scoped_with(&state, short_limits(1_000, 2_000), |conn, _| {
+            conn.query_row("SELECT 7", [], |row| row.get::<_, i64>(0))
+        })
+        .await
+        .unwrap();
+        assert_eq!(v, 7);
+    }
+
+    #[tokio::test]
+    async fn test_a_request_waiting_for_a_connection_does_not_block_a_flush() {
+        // Regression (F-08): the tier read lock was taken before the wait for a
+        // reader connection, so every request parked behind a busy pool held a
+        // read lock, and the writer-fair lock then queued the next flush behind
+        // all of them. Here the only connection is busy; a request parks on it;
+        // the exclusive lock must still be available immediately.
+        let state = state_with_permits(4);
+        let conn = state.readers.acquire();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _guard = conn.lock();
+            held_tx.send(()).expect("test channel");
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        });
+        held_rx.recv().expect("connection held");
+
+        let waiting_state = Arc::clone(&state);
+        let waiting = tokio::spawn(async move {
+            run_scoped(&waiting_state, |conn, _| {
+                conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+            })
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let tier = state.tier_lock.clone();
+        let (got_tx, got_rx) = std::sync::mpsc::channel::<()>();
+        let flusher = std::thread::spawn(move || {
+            let _write = tier.write();
+            let _ = got_tx.send(());
+        });
+        let acquired = got_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+
+        release_tx.send(()).expect("test channel");
+        holder.join().expect("holder thread");
+        flusher.join().expect("flusher thread");
+        assert!(
+            acquired,
+            "a query queued for a connection held the tier read lock and starved the writer"
+        );
+        assert_eq!(waiting.await.expect("task").expect("query"), 1);
+    }
+
+    #[tokio::test]
+    async fn test_readers_sharing_the_writer_connection_cannot_deadlock_with_a_flush() {
+        // A flush takes the tier lock and then the connection (L28). When the
+        // pool shares the writer connection, a reader that took the connection
+        // first and then blocked on the tier lock would deadlock with it.
+        let state = state_with_permits(8);
+        let tier = state.tier_lock.clone();
+        let writer = state.buffer.conn().clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flusher = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    let _write = tier.write();
+                    let guard = writer.lock();
+                    std::thread::sleep(Duration::from_millis(5));
+                    drop(guard);
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        let mut tasks = Vec::new();
+        for _ in 0..24 {
+            let state = Arc::clone(&state);
+            tasks.push(tokio::spawn(async move {
+                run_scoped(&state, |conn, _| {
+                    conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                })
+                .await
+            }));
+        }
+        let all = async {
+            for task in tasks {
+                task.await.expect("task").expect("query");
+            }
+        };
+        let finished = tokio::time::timeout(Duration::from_secs(20), all)
+            .await
+            .is_ok();
+        stop.store(true, Ordering::SeqCst);
+        flusher.join().expect("flusher thread");
+        assert!(finished, "readers and the flusher deadlocked");
+    }
+
+    #[tokio::test]
+    async fn test_a_result_computed_before_an_erasure_is_not_cached_after_it() {
+        // Regression (S-10), end to end through `cached_with`.
+        let state = crate::test_support::state_builder()
+            .cache_ttl_secs(60)
+            .build_state();
+        let key = cache_key("t", "a.com", &[]);
+        let key_str = key.as_str().to_string();
+
+        let slow = cached_with(&state, key, |conn, _| {
+            let v = conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))?;
+            std::thread::sleep(Duration::from_millis(300));
+            Ok(v)
+        });
+        let erase = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            state.query_cache.invalidate_site("a.com");
+        };
+        let (result, ()) = tokio::join!(slow, erase);
+        assert_eq!(result.expect("query").0, 1);
+        assert!(
+            state.query_cache.get(&key_str).is_none(),
+            "pre-erasure data was cached after the invalidation"
+        );
+
+        // Without an erasure in between, the result is cached as before.
+        let key = cache_key("t", "a.com", &[]);
+        let Json(second) = cached_with(&state, key, |_, _| Ok(2i64))
+            .await
+            .expect("query");
+        assert_eq!(second, 2);
+        assert!(state.query_cache.get(&key_str).is_some());
+    }
+
+    // ── Error classification ─────────────────────────────────────────────
+
+    #[test]
+    fn test_a_behavioral_argument_error_is_a_bad_request() {
+        // The extension rejects `allow_reentry` without `strict_order` at query
+        // time. `normalize_modes` catches it first today; this is the net for the
+        // next rule the extension adds that the whitelist does not know about.
+        let db = crate::query::test_support::TestDb::new();
+        if !db.require_behavioral("behavioral error classification") {
+            return;
+        }
+        // The mode is validated when the aggregate binds, which needs a group.
+        crate::query::test_support::insert_pageview(&db.conn, "v", "2024-01-01 10:00:00", "/");
+        let err = db
+            .conn
+            .query_row(
+                "SELECT window_funnel(INTERVAL '1 day', 'allow_reentry', timestamp,
+                                      pathname = '/', pathname = '/x')
+                 FROM events GROUP BY visitor_id",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect_err("allow_reentry alone is rejected by the extension");
+        match classify_error(err) {
+            ApiError::BadRequest(message) => {
+                assert!(message.starts_with("window_funnel:"), "{message}");
+                assert!(message.contains("strict_order"), "{message}");
+            }
+            other => panic!("expected a 400, got {other}"),
+        }
+    }
+
+    #[test]
+    fn test_an_invalid_input_error_that_is_not_the_callers_fault_stays_a_500() {
+        // Same error class, different cause: a stored infinite timestamp cannot
+        // be subtracted. Blaming the caller for that would be wrong.
+        let conn = duckdb::Connection::open_in_memory().expect("open");
+        let err = conn
+            .query_row(
+                "SELECT CAST('infinity' AS TIMESTAMP) - CAST('2024-01-01' AS TIMESTAMP)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect_err("infinite timestamps cannot be subtracted");
+        assert!(matches!(classify_error(err), ApiError::DatabaseError(_)));
+
+        let plain = conn
+            .execute_batch("SELECT * FROM no_such_table")
+            .expect_err("missing table");
+        assert!(matches!(classify_error(plain), ApiError::DatabaseError(_)));
     }
 }

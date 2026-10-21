@@ -1,0 +1,145 @@
+# Unit tests for prometheus-rules.yml.
+# Run:  promtool test rules deploy/monitoring/prometheus-rules.test.yml
+rule_files:
+  - prometheus-rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  - name: healthy instance raises nothing
+    interval: 1m
+    input_series:
+      - series: 'up{job="mallard-metrics", instance="m:8000"}'
+        values: '1+0x30'
+      - series: 'mallard_behavioral_extension{job="mallard-metrics", instance="m:8000"}'
+        values: '1+0x30'
+      - series: 'mallard_auth_configured{job="mallard-metrics", instance="m:8000"}'
+        values: '1+0x30'
+      - series: 'mallard_flush_failures_total{job="mallard-metrics", instance="m:8000"}'
+        values: '0+0x30'
+      - series: 'mallard_events_ingested_total{job="mallard-metrics", instance="m:8000"}'
+        values: '0+5x30'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: MallardDown
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: MallardFlushFailing
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: MallardBehavioralExtensionMissing
+        exp_alerts: []
+
+  - name: missing extension and flush failures
+    interval: 1m
+    input_series:
+      - series: 'mallard_behavioral_extension{job="mallard-metrics", instance="m:8000"}'
+        values: '0+0x30'
+      - series: 'mallard_flush_failures_total{job="mallard-metrics", instance="m:8000"}'
+        values: '0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: MallardBehavioralExtensionMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: mallard-metrics
+              instance: "m:8000"
+            exp_annotations:
+              summary: "The behavioral extension is not loaded on m:8000"
+              description: >-
+                Funnels, retention, sessions, sequences and flow answer 503, and the
+                main stats silently omit bounce rate and visit duration. The
+                usual causes are a musl-based image (the extension is not published
+                for musl), an unwritable extension directory, or an isolated network
+                that was never seeded: run `--install-extension` against the data
+                volume (deploy/docker-compose.production.yml explains how).
+      - eval_time: 10m
+        alertname: MallardFlushFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: mallard-metrics
+              instance: "m:8000"
+            exp_annotations:
+              summary: "Mallard is failing to write events to disk"
+              description: >-
+                1 Parquet flush failure(s) in the last 15
+                minutes on m:8000. Events stay in memory and are lost
+                on restart. Check free space and ownership of the data directory
+                (it must be writable by uid 65532).
+
+  - name: five-xx ratio needs both a share and a count
+    interval: 1m
+    input_series:
+      # 20 requests per minute, 4 of them 5xx: 20 % errors and plenty of them.
+      - series: 'mallard_http_requests_total{status="2xx", job="mallard-metrics", instance="m:8000"}'
+        values: '0+16x30'
+      - series: 'mallard_http_requests_total{status="5xx", job="mallard-metrics", instance="m:8000"}'
+        values: '0+4x30'
+      # A second instance with a tiny error count must not alert.
+      - series: 'mallard_http_requests_total{status="2xx", job="mallard-metrics", instance="quiet:8000"}'
+        values: '0+0x30'
+      - series: 'mallard_http_requests_total{status="5xx", job="mallard-metrics", instance="quiet:8000"}'
+        values: '0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: MallardServerErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: "m:8000"
+            exp_annotations:
+              summary: "More than 5% of Mallard responses are 5xx"
+              description: >-
+                20% of responses on m:8000
+                were server errors over the last 10 minutes. Look at the container
+                logs (`docker compose logs mallard`).
+
+  - name: a stalled flush alerts, a fresh process does not
+    interval: 1m
+    input_series:
+      # Last success at t=100 s; by 30 m the age is far over ten minutes.
+      - series: 'mallard_last_flush_success_timestamp_seconds{job="mallard-metrics", instance="stalled:8000"}'
+        values: '100+0x30'
+      # Never flushed yet: the gauge is 0 and must not alert.
+      - series: 'mallard_last_flush_success_timestamp_seconds{job="mallard-metrics", instance="fresh:8000"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: MallardFlushStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: mallard-metrics
+              instance: "stalled:8000"
+            exp_annotations:
+              summary: "Mallard has not completed a flush in over 10 minutes"
+              description: >-
+                The periodic flush on stalled:8000 last succeeded more
+                than 10 minutes ago. A flush that finds nothing to write counts as
+                success, so this means the flush loop is failing or stuck, not that
+                traffic stopped. Buffered events are not yet durable.
+
+  - name: webhook notifications failing
+    interval: 1m
+    input_series:
+      - series: 'mallard_notifications_failed_total{job="mallard-metrics", instance="m:8000", kind="alert"}'
+        values: '0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+      - series: 'mallard_notifications_dropped_total{job="mallard-metrics", instance="m:8000", kind="alert"}'
+        values: '0+0x19'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MallardNotificationsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: mallard-metrics
+              instance: "m:8000"
+              kind: alert
+            exp_annotations:
+              summary: "Mallard cannot deliver its webhook notifications"
+              description: "1 webhook notification(s) were abandoned after their retries in the last hour on m:8000 (kind alert). Run `mallard-metrics --test-webhook` with the same environment, and check the receiver, the egress route and docs/src/alerts-and-reports.md."
+      - eval_time: 19m
+        alertname: MallardNotificationsDropped
+        exp_alerts: []
