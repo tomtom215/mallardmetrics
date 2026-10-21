@@ -71,6 +71,35 @@ groups:
             on restart. Check free space and ownership of the data directory
             (it must be writable by uid 65532).
 
+      - alert: MallardFlushStalled
+        # The gauge is 0 until the first flush completes, so a fresh process does
+        # not alert before its loop has had one interval to run.
+        expr: >-
+          (time() - mallard_last_flush_success_timestamp_seconds) > 600
+          and mallard_last_flush_success_timestamp_seconds > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Mallard has not completed a flush in over 10 minutes"
+          description: >-
+            The periodic flush on {{ $labels.instance }} last succeeded more
+            than 10 minutes ago. A flush that finds nothing to write counts as
+            success, so this means the flush loop is failing or stuck, not that
+            traffic stopped. Buffered events are not yet durable.
+
+      - alert: MallardBufferFlushFailing
+        expr: increase(mallard_buffer_flush_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Threshold flushes are failing on {{ $labels.instance }}"
+          description: >-
+            Flushes triggered by the buffer filling up failed
+            {{ $value | printf "%.0f" }} time(s) in 15 minutes. The events are
+            safe in the hot table and the requests succeeded, but the Parquet
+            stage is not keeping up: check free space and the logs.
+
       - alert: MallardEventsDropped
         expr: increase(mallard_events_dropped_total[15m]) > 0
         labels:
@@ -172,8 +201,8 @@ groups:
             in 10 minutes on {{ $labels.instance }}. Either one client is
             misbehaving or MALLARD_RATE_LIMIT is below your real traffic.
 
-# Not alertable yet (no such metric): free disk space on the data volume,
-# seconds since the last successful flush, size and file count of the Parquet
-# store, last retention/compaction success, DuckDB query errors, process start
-# time and build/behavioral version labels. Use node_exporter for disk space in
-# the meantime, e.g. node_filesystem_avail_bytes{mountpoint="/srv/mallard/data"}.
+# Not alertable yet (no such metric): free disk space on the data volume, size
+# and file count of the Parquet store, last retention/compaction success and
+# DuckDB query errors. Use node_exporter for disk space in the meantime, e.g.
+# node_filesystem_avail_bytes{mountpoint="/srv/mallard/data"}. Version drift is
+# visible through mallard_build_info{version, behavioral_version}.

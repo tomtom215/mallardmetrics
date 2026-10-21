@@ -95,3 +95,28 @@ tests:
                 20% of responses on m:8000
                 were server errors over the last 10 minutes. Look at the container
                 logs (`docker compose logs mallard`).
+
+  - name: a stalled flush alerts, a fresh process does not
+    interval: 1m
+    input_series:
+      # Last success at t=100 s; by 30 m the age is far over ten minutes.
+      - series: 'mallard_last_flush_success_timestamp_seconds{job="mallard-metrics", instance="stalled:8000"}'
+        values: '100+0x30'
+      # Never flushed yet: the gauge is 0 and must not alert.
+      - series: 'mallard_last_flush_success_timestamp_seconds{job="mallard-metrics", instance="fresh:8000"}'
+        values: '0+0x30'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: MallardFlushStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: mallard-metrics
+              instance: "stalled:8000"
+            exp_annotations:
+              summary: "Mallard has not completed a flush in over 10 minutes"
+              description: >-
+                The periodic flush on stalled:8000 last succeeded more
+                than 10 minutes ago. A flush that finds nothing to write counts as
+                success, so this means the flush loop is failing or stuck, not that
+                traffic stopped. Buffered events are not yet durable.
