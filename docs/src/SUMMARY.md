@@ -8,6 +8,7 @@
 
 - [Quick Start](getting-started.md)
 - [Tracking Script](tracking-script.md)
+  - [Tracker Extras](extras.md)
 - [Upgrading](upgrading.md)
 
 # Reference

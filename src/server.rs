@@ -173,6 +173,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // `/js/script.js` is an alias for people migrating from Plausible.
         .route("/mallard.js", get(dashboard::serve_tracking_script))
         .route("/js/script.js", get(dashboard::serve_tracking_script))
+        .route("/mallard-extras.js", get(crate::ingest::extras::serve_extras_script))
         .nest("/api", api_routes)
         .route("/", get(dashboard::serve_index))
         .route("/{*path}", get(dashboard::serve_asset))
