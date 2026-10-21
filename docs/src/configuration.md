@@ -45,7 +45,7 @@ into an image.
 |---|---|---|---|---|
 | `MALLARD_HOST` / `host` | string | `0.0.0.0` | bind must succeed | Listen address. Use `127.0.0.1` behind a proxy on the same host. |
 | `MALLARD_PORT` / `port` | u16 | `8000` | | Listen port. |
-| `MALLARD_DATA_DIR` / `data_dir` | path | `data` | must not contain `* ? [ ]` | Holds `mallard.duckdb`, `events/`, `extensions/`, `.secret`, `admin.json`, `api_keys.json`. The characters are refused because DuckDB would treat them as a glob. |
+| `MALLARD_DATA_DIR` / `data_dir` | path | `data` | must not contain `* ? [ ]` | Holds `mallard.duckdb`, `events/`, `extensions/`, `.secret`, `admin.json`, `api_keys.json`, `share_links.json`, `segments.json`. The characters are refused because DuckDB would treat them as a glob. |
 | `MALLARD_EXTENSION_DIR` / `extension_directory` | path | `data_dir/extensions` | empty = unset | Where `INSTALL behavioral` writes and loads from. The image sets it to `/data/extensions`. DuckDB's `home_directory` is set to `data_dir` too. |
 | `MALLARD_RETENTION_DAYS` / `retention_days` | u32 | `0` | | Delete `date=` partitions older than N days; `0` keeps everything. Runs at startup and every 24 hours, clears the query cache and refreshes the view. |
 | `MALLARD_COMPACT_AFTER_FILES` / `compact_after_files` | usize | `24` | `0` disables; values below 2 act as 2 | Merge a partition's files of one level once it holds at least this many. |

@@ -12,10 +12,16 @@ image, `/srv/mallard/data` on the production VPS layout):
 | `.secret` | Visitor-ID secret, when `MALLARD_SECRET` is unset | every visitor gets a new ID (see [Privacy and GDPR](privacy-gdpr.md#salt-rotation)) |
 | `admin.json` | Admin password hash set through setup | the instance is **unconfigured and claimable** until setup is run again |
 | `api_keys.json` | API key hashes | every API key stops working |
+| `share_links.json` | Share link hashes, labels, segments, expiry | every [share link](share-links.md) stops working |
+| `segments.json` | Saved segments | the saved segments are gone (share links keep their own copy) |
 | `extensions/` | The `behavioral` extension | re-downloaded on start, or seed it again on an isolated network |
 
-A backup therefore contains password and key hashes and the secret: protect it
-like the live directory.
+A backup therefore contains password, key and share-link hashes and the secret:
+protect it like the live directory.
+
+**Restoring an old backup brings back revoked share links**, because the file it
+restores predates the revocation. After any restore, list the links
+(`GET /api/share-links`) and revoke what should be dead.
 
 ## Do not copy a live data directory
 
@@ -42,11 +48,11 @@ curl -X POST -H "Authorization: Bearer $ADMIN_KEY" \
 ```
 
 (The figures are an illustration; `state_files` is how many of `.secret`,
-`admin.json` and `api_keys.json` existed.)
+`admin.json`, `api_keys.json`, `share_links.json` and `segments.json` existed.)
 
 It writes `<data_dir>/backups/<name>/` (default name `mallard-<UTC timestamp>`)
-holding `mallard.duckdb`, `events/`, whichever of `.secret`, `admin.json` and
-`api_keys.json` exist, and a `MANIFEST.json`. The directory and the secrets in it
+holding `mallard.duckdb`, `events/`, whichever of `.secret`, `admin.json`,
+`api_keys.json`, `share_links.json` and `segments.json` exist, and a `MANIFEST.json`. The directory and the secrets in it
 are owner-only. `extensions/` is left out because it is downloaded again on start.
 
 How it stays consistent: the server takes the lock that a flush takes, so no

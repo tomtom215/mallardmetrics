@@ -39,8 +39,8 @@ We will acknowledge receipt within 48 hours and provide a timeline for a fix.
 ### Data Protection
 
 - **Storage format** -- Event data is stored in Parquet files with ZSTD compression, organized by `site_id` and `date` for partition pruning
-- **Atomic writes** -- Parquet files, `api_keys.json` and the visitor-ID secret are written to a temporary file and renamed into place, so an interrupted write leaves either the old content or the new, never a truncated file
-- **File permissions** -- `api_keys.json`, `admin.json` and `.secret` are created mode 0600. Anyone able to read the secret can re-derive every visitor ID from an IP and User-Agent, which is the whole pseudonymisation guarantee
+- **Atomic writes** -- Parquet files, `api_keys.json`, `share_links.json`, `segments.json` and the visitor-ID secret are written to a temporary file and renamed into place, so an interrupted write leaves either the old content or the new, never a truncated file
+- **File permissions** -- `api_keys.json`, `admin.json`, `share_links.json`, `segments.json` and `.secret` are created mode 0600. Anyone able to read the secret can re-derive every visitor ID from an IP and User-Agent, which is the whole pseudonymisation guarantee
 - **Encryption at rest** -- Not provided by Mallard Metrics itself. Use filesystem-level encryption (e.g., LUKS, dm-crypt) if required
 - **Data retention** -- Configurable automatic deletion of old partitions via `MALLARD_RETENTION_DAYS`
 - **Container hardening** -- The image is a distroless glibc image (no shell or package manager) running as uid 65532 and writing only to `/data`; the bundled compose files add `read_only`, `cap_drop: ALL` and `no-new-privileges`. The production compose file also puts Mallard on an `internal` network with no route to the internet, which is why the extension must be seeded with `--install-extension` there
@@ -79,6 +79,9 @@ We will acknowledge receipt within 48 hours and provide a timeline for a fix.
 | `GET /api/stats/*` | Yes — session cookie or any API key (ReadOnly or Admin) |
 | `GET /api/stats/export` | Yes — session cookie or any API key (ReadOnly or Admin) |
 | `GET /api/keys`, `POST /api/keys`, `DELETE /api/keys/*`, `DELETE /api/gdpr/erase` | Yes — session cookie or Admin-scoped API key; refused (`401`) until an admin password exists |
+| `POST/GET /api/share-links`, `DELETE /api/share-links/*`, `POST /api/segments`, `POST/DELETE /api/segments/*` | Yes — session cookie or Admin-scoped API key; refused (`401`) until an admin password exists |
+| `GET /api/segments` | Yes — session cookie or any API key (ReadOnly or Admin) |
+| `GET /api/shared/session`, `GET /api/shared/stats/*` | A share token in `X-Share-Token` (and nothing else): read-only reports for the link's one site. See [docs/src/share-links.md](docs/src/share-links.md) |
 
 Before an admin password exists, the read routes are open. That is a deliberate mode for a public dashboard; the dashboard warns about it on every load.
 
@@ -176,6 +179,7 @@ no data-centre/ASN filtering or referrer-spam list.
 | Instance takeover after a restart | The Argon2id hash of a password set through the setup endpoint is persisted to `data_dir/admin.json` (mode 0600), so a restart does not reopen first-run setup for whoever reaches the instance first |
 | Dashboard lockout as denial of service | Brute-force records are keyed by the resolved client address rather than a shared placeholder, so one attacker's failures cannot lock out every other operator |
 | Privilege escalation before setup | Key management and GDPR erasure return `401` until an admin password exists, so an unconfigured instance cannot be used to mint an admin key that would outlive setup |
+| Leaked, guessed or over-reaching share link | 256-bit OS-CSPRNG token shown once and stored only as a hash; read from a URL fragment and sent in a header, so it is in no URL, log or `Referer`; confined to the read-only `/api/shared/` routes with `site_id` forced and the link's segment AND-ed in; revocation and expiry on the next request; per-link, global and per-client rate limits. A leaked link stays valid until revoked, and restoring an old backup revives revoked links. See [docs/src/share-links.md](docs/src/share-links.md) |
 | Session hijacking | HttpOnly cookies, Secure flag with TLS, SameSite=Strict, 256-bit random tokens |
 | CSRF | `SameSite=Strict` cookies, plus Origin/Referer validation when `dashboard_origin` is set (see CSRF Protection for its limits) |
 | Clickjacking | `X-Frame-Options: DENY` and `Content-Security-Policy` headers |

@@ -94,6 +94,30 @@ few startup conditions that used to be accepted are now refused; read
 
 ### Added
 
+- **Share links.** An admin can create a revocable, read-only public link to one
+  site's dashboard, optionally limited to a saved segment and an expiry, and
+  revoke it at any time (`POST/GET /api/share-links`, `DELETE
+  /api/share-links/{id}`, and a **Share links** panel). The token is 256 bits
+  from the OS CSPRNG, shown once, stored only as a SHA-256 hash in
+  `data_dir/share_links.json` (mode 0600, atomic writes, a corrupt file is moved
+  aside and authorises nothing). It travels in the URL fragment
+  (`/#share=<token>`) and an `X-Share-Token` header, so it never appears in a URL
+  the server sees; share responses carry `Referrer-Policy: no-referrer` and
+  `Cache-Control: no-store`, and request logging redacts anything shaped like a
+  token. A token opens only the read-only report routes under `/api/shared/`,
+  forced to the link's site (another site is `403`) with the link's segment
+  AND-ed into every query; there are no exports, no site list and nothing
+  administrative. Per-link and global rate limits, and 100 active links per
+  instance. A viewer sees a **Shared view** banner and none of the admin
+  controls. The design and threat model are in `docs/src/share-links.md`.
+- **Saved segments.** Named filter sets per site (`GET/POST /api/segments`,
+  `POST/DELETE /api/segments/{id}`, in `data_dir/segments.json`), validated by
+  the same parser as the `filters` parameter and capped at 50 per site, 500 per
+  instance, 8 filters each. The dashboard has a **Segment** menu that applies one
+  and a **Segments** panel to manage them. A share link copies its segment's
+  filters when it is made, so a later edit never widens an existing link.
+- `share_links.json` and `segments.json` are part of an online backup. Restoring
+  a backup taken before a link was revoked makes that link valid again.
 - `MALLARD_QUERY_QUEUE_WAIT_SECS` (default 5) and `MALLARD_QUERY_DEADLINE_SECS`
   (default 20), TOML `query_queue_wait_secs` and `query_deadline_secs`: how long
   a request waits for a query slot (then `429`) and how long a statement may run
