@@ -232,6 +232,7 @@ impl AppStateBuilder {
             started_at_unix: 0,
             rate_limit_rejections_total: Arc::new(AtomicU64::new(0)),
             login_failures_total: Arc::new(AtomicU64::new(0)),
+            alert_metrics: Arc::default(),
             metrics_token: self.metrics_token,
             query_semaphore: Arc::new(tokio::sync::Semaphore::new(self.query_permits)),
             query_limits: self.query_limits,

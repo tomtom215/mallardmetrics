@@ -565,7 +565,7 @@ fn execute_on_reader<T>(
 /// Returns `TooManyRequests` if no slot frees up within the queue wait,
 /// `QueryTimeout` if the statement overruns its deadline, or the query's own
 /// error.
-async fn run_scoped<T, F>(state: &Arc<AppState>, f: F) -> Result<T, ApiError>
+pub(crate) async fn run_scoped<T, F>(state: &Arc<AppState>, f: F) -> Result<T, ApiError>
 where
     T: Send + 'static,
     F: FnOnce(&duckdb::Connection, ColdReads<'_>) -> Result<T, duckdb::Error> + Send + 'static,

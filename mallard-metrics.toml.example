@@ -203,6 +203,65 @@ geoip_precision = "city"       # MALLARD_GEOIP_PRECISION
 # for the ingest path on a small box.
 # duckdb_threads = 2             # MALLARD_DUCKDB_THREADS
 
+# ─── Webhook alerts and scheduled reports ────────────────────────────────────
+#
+# Mallard can POST signed JSON notifications to one webhook: operational alerts
+# (flush stalled, events failing to reach disk, behavioral extension missing,
+# cold tier degraded, rate-limiter evictions spiking), traffic alerts (a site's
+# pageviews far below or above the same hour of previous weeks) and daily or
+# weekly reports. Nothing is sent until webhook_url is set. Payloads hold
+# aggregate counts only: no visitor IDs, no IP addresses.
+#
+# The destination comes from this file or the environment and can never be set
+# through the HTTP API. Treat the URL as a secret (Slack and Discord URLs are
+# bearer tokens); prefer the environment variable. The signing secret is
+# environment-only, like the other secrets below.
+#
+# Full reference: docs/src/alerts-and-reports.md
+[alerts]
+# webhook_url = "https://hooks.example.com/mallard"   # MALLARD_ALERTS_WEBHOOK_URL
+#   https:// is required. The host is resolved at delivery time and refused if
+#   any address is loopback, private, link-local (cloud metadata), CGNAT,
+#   multicast, unspecified or reserved. Redirects are never followed.
+# allow_http_webhook = false                  # MALLARD_ALERTS_ALLOW_HTTP_WEBHOOK
+#   Permit http://. Notifications then travel unencrypted.
+# allow_private_webhook_targets = false       # MALLARD_ALERTS_ALLOW_PRIVATE_WEBHOOK_TARGETS
+#   Permit internal destinations, for a receiver on your own network. This
+#   removes the SSRF protection: only set it when the configuration is trusted.
+# webhook_ca_file = "/etc/mallard/ca.pem"     # MALLARD_ALERTS_WEBHOOK_CA_FILE
+#   PEM bundle of extra CA certificates to trust (a private CA), added to the
+#   built-in Mozilla roots.
+# payload_format = "generic"                  # MALLARD_ALERTS_PAYLOAD_FORMAT
+#   "generic" (JSON with `text` and `content` fields), "slack" ({"text"}) or
+#   "discord" ({"content"}).
+# timeout_secs = 10                           # MALLARD_ALERTS_TIMEOUT_SECS (1-60)
+#   Total time for one delivery attempt, DNS and TLS included.
+# max_attempts = 4                            # MALLARD_ALERTS_MAX_ATTEMPTS (1-10)
+#   Attempts per notification, with exponential backoff and jitter between.
+# sites = ["example.com"]                     # MALLARD_ALERTS_SITES (comma list)
+#   Sites that traffic alerts and reports cover. Default: site_ids.
+# check_interval_secs = 60                    # MALLARD_ALERTS_CHECK_INTERVAL_SECS (10-3600)
+# renotify_secs = 14400                       # MALLARD_ALERTS_RENOTIFY_SECS (>= 60)
+#   An alert that stays firing is repeated at most this often.
+# operational = true                          # MALLARD_ALERTS_OPERATIONAL
+# flush_stalled_secs = 600                    # MALLARD_ALERTS_FLUSH_STALLED_SECS
+# failure_window_secs = 300                   # MALLARD_ALERTS_FAILURE_WINDOW_SECS
+#   Window for "events failing to reach disk" and "evictions spiking".
+# evictions_spike_threshold = 100             # MALLARD_ALERTS_EVICTIONS_SPIKE_THRESHOLD
+#   Rate-limiter evictions inside the window that count as a spike; 0 disables.
+# behavioral_grace_secs = 600                 # MALLARD_ALERTS_BEHAVIORAL_GRACE_SECS
+#   How long after start a missing behavioral extension is tolerated.
+# traffic_drop_percent = 50                   # MALLARD_ALERTS_TRAFFIC_DROP_PERCENT (0 = off)
+# traffic_rise_percent = 0                    # MALLARD_ALERTS_TRAFFIC_RISE_PERCENT (0 = off)
+# traffic_baseline_weeks = 4                  # MALLARD_ALERTS_TRAFFIC_BASELINE_WEEKS (1-12)
+# traffic_min_pageviews = 50                  # MALLARD_ALERTS_TRAFFIC_MIN_PAGEVIEWS
+#   A site whose baseline hour averages fewer pageviews than this is never
+#   judged, so quiet sites do not flap.
+# daily_report = false                        # MALLARD_ALERTS_DAILY_REPORT
+# weekly_report = false                       # MALLARD_ALERTS_WEEKLY_REPORT
+# report_hour_utc = 8                         # MALLARD_ALERTS_REPORT_HOUR_UTC (0-23)
+# weekly_report_day = "monday"                # MALLARD_ALERTS_WEEKLY_REPORT_DAY
+
 # ─── Secrets (environment only) ──────────────────────────────────────────────
 #
 # These are never read from this file, so a configuration file can be committed
@@ -218,4 +277,8 @@ geoip_precision = "city"       # MALLARD_GEOIP_PRECISION
 #                            and survives a restart. Unset, and with no stored
 #                            hash, reads are open until someone completes setup.
 #   MALLARD_METRICS_TOKEN    Bearer token required by GET /metrics.
+#   MALLARD_ALERTS_WEBHOOK_SECRET
+#                            Key for the HMAC-SHA256 signature on webhook
+#                            notifications (at least 16 characters). Unset, they
+#                            are sent unsigned. Never read from this file.
 #   RUST_LOG                 Log filter, e.g. "mallard_metrics=debug,tower_http=info".

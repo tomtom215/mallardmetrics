@@ -265,6 +265,12 @@ pub struct Config {
     /// a single query would otherwise saturate every core.
     #[serde(default)]
     pub duckdb_threads: Option<u32>,
+
+    // ── Webhook alerts and reports ───────────────────────────────────────
+    /// The `[alerts]` table: outbound webhook notifications. Disabled until a
+    /// webhook URL is set. See `docs/src/alerts-and-reports.md`.
+    #[serde(default)]
+    pub alerts: crate::alerts::AlertSettings,
 }
 
 fn default_host() -> String {
@@ -422,6 +428,7 @@ impl Default for Config {
             extension_directory: None,
             duckdb_memory_limit: None,
             duckdb_threads: None,
+            alerts: crate::alerts::AlertSettings::default(),
         }
     }
 }
@@ -716,6 +723,8 @@ impl Config {
             }
         }
 
+        config.alerts.apply_env(&mut warnings);
+
         config.apply_gdpr_mode();
 
         Ok(LoadedConfig { config, warnings })
@@ -819,6 +828,7 @@ impl Config {
             );
         }
         self.validate_query_budgets()?;
+        self.alerts.validate()?;
         if self.max_buffered_events > 0 && self.max_buffered_events < self.flush_event_count {
             return Err(format!(
                 "max_buffered_events ({}) must be >= flush_event_count ({}), \
@@ -998,6 +1008,7 @@ impl Config {
                     .to_string(),
             );
         }
+        out.extend(self.alerts.advisories(&self.site_ids));
         if self.suppress_visitor_id {
             out.push(
                 "suppress_visitor_id is enabled: unique-visitor counts degrade to page-load \
