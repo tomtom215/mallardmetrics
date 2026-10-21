@@ -8,6 +8,7 @@
 
 - [Quick Start](getting-started.md)
 - [Tracking Script](tracking-script.md)
+- [Upgrading](upgrading.md)
 
 # Reference
 
@@ -17,11 +18,13 @@
   - [Analytics Stats](api-reference/stats.md)
   - [Authentication](api-reference/auth.md)
   - [Health & Metrics](api-reference/health.md)
+- [Metric Definitions](metric-definitions.md)
 
 # Concepts
 
 - [Architecture](architecture.md)
-- [Security & Privacy](security.md)
+- [Security](security.md)
+- [Privacy and GDPR](privacy-gdpr.md)
 - [Behavioral Analytics](behavioral-analytics.md)
 
 # Operations
@@ -31,3 +34,5 @@
   - [Fly.io Deployment](deploy-flyio.md)
 - [Monitoring](monitoring.md)
 - [Data Management](data-management.md)
+- [Backup and Restore](backup-restore.md)
+- [Troubleshooting](troubleshooting.md)
