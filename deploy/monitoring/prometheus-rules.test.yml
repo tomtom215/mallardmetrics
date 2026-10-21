@@ -120,3 +120,26 @@ tests:
                 than 10 minutes ago. A flush that finds nothing to write counts as
                 success, so this means the flush loop is failing or stuck, not that
                 traffic stopped. Buffered events are not yet durable.
+
+  - name: webhook notifications failing
+    interval: 1m
+    input_series:
+      - series: 'mallard_notifications_failed_total{job="mallard-metrics", instance="m:8000", kind="alert"}'
+        values: '0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+      - series: 'mallard_notifications_dropped_total{job="mallard-metrics", instance="m:8000", kind="alert"}'
+        values: '0+0x19'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MallardNotificationsFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: mallard-metrics
+              instance: "m:8000"
+              kind: alert
+            exp_annotations:
+              summary: "Mallard cannot deliver its webhook notifications"
+              description: "1 webhook notification(s) were abandoned after their retries in the last hour on m:8000 (kind alert). Run `mallard-metrics --test-webhook` with the same environment, and check the receiver, the egress route and docs/src/alerts-and-reports.md."
+      - eval_time: 19m
+        alertname: MallardNotificationsDropped
+        exp_alerts: []

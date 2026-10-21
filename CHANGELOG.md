@@ -94,6 +94,37 @@ few startup conditions that used to be accepted are now refused; read
 
 ### Added
 
+- **Webhook alerts and scheduled reports** ([docs](docs/src/alerts-and-reports.md)).
+  Off until `MALLARD_ALERTS_WEBHOOK_URL` (or `[alerts] webhook_url`) is set.
+  Mallard then POSTs HMAC-SHA256-signed JSON to that one webhook: operational
+  alerts (flush stalled, events failing to reach disk, behavioral extension
+  missing, cold tier degraded, rate-limiter evictions spiking), traffic alerts
+  (an hour's pageviews at least X% below, or Y% above, the same hour of the
+  previous N weeks, with a minimum-volume floor), and daily and/or weekly
+  per-site reports (visitors, pageviews, top pages and sources, change against
+  the previous period). Alerts have stable ids, a cooldown, and a `resolved`
+  message; the payload carries `text` and `content` fields for Slack and Discord
+  (`payload_format` can narrow it to one). Settings are the `[alerts]` table and
+  `MALLARD_ALERTS_*` variables, documented in `mallard-metrics.toml.example`;
+  `mallard-metrics --test-webhook` sends one test message.
+  - **Outbound-request safety.** URL and secret come from configuration only.
+    `https://` is required (`allow_http_webhook` to relax it); loopback, private,
+    link-local (cloud metadata), CGNAT, multicast, unspecified and reserved
+    addresses are refused at connect time, including names that resolve to them,
+    unless `allow_private_webhook_targets` is set; the connection goes to the
+    address that was checked (DNS rebinding); redirects are never followed;
+    timeouts, a response-size cap, bounded retries with jittered backoff and a
+    bounded queue apply; the secret and URL are never logged. An insecure
+    combination stops startup with a message naming the setting.
+  - **New dependencies:** `rustls` (ring provider), `tokio-rustls`, `webpki-roots`
+    and `httparse` (already in the tree through hyper); dev-only `rcgen`. The HTTP
+    client is about 400 lines in `src/alerts/client.rs`; see the page above for
+    why `reqwest`, `ureq` and `hyper-rustls` were not used.
+  - **New metrics:** `mallard_notifications_{sent,failed,dropped}_total{kind}`,
+    `mallard_notification_last_success_timestamp_seconds`,
+    `mallard_notification_queue_depth`, `mallard_alerts_active`; Prometheus rules
+    `MallardNotificationsFailing` and `MallardNotificationsDropped`.
+  - Alert state is in memory: a restart forgets which alerts were firing.
 - `MALLARD_QUERY_QUEUE_WAIT_SECS` (default 5) and `MALLARD_QUERY_DEADLINE_SECS`
   (default 20), TOML `query_queue_wait_secs` and `query_deadline_secs`: how long
   a request waits for a query slot (then `429`) and how long a statement may run

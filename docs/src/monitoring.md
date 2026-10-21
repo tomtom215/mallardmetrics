@@ -66,6 +66,12 @@ text are exact.
 | `mallard_cache_hits_total` | counter | Query cache hits since startup |
 | `mallard_cache_misses_total` | counter | Query cache misses since startup |
 | `mallard_cache_evictions_total` | counter | Cache entries evicted to stay within the entry cap |
+| `mallard_notifications_sent_total{kind}` | counter | Webhook notifications the receiver accepted, by kind (`alert`, `resolved`, `report`) |
+| `mallard_notifications_failed_total{kind}` | counter | Webhook notifications abandoned after their retries, by kind |
+| `mallard_notifications_dropped_total{kind}` | counter | Webhook notifications discarded unsent (queue full or shutdown), by kind |
+| `mallard_notification_last_success_timestamp_seconds` | gauge | Unix time of the last webhook delivery the receiver accepted (0 before the first) |
+| `mallard_notification_queue_depth` | gauge | Webhook notifications waiting to be delivered |
+| `mallard_alerts_active` | gauge | Alerts currently firing, as seen by the alert evaluator |
 | `mallard_http_requests_total{status}` | counter | HTTP responses served, by status class (`1xx`..`5xx`) |
 | `mallard_http_request_duration_seconds` | histogram | Time to produce a response. Buckets (`le`): 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, `+Inf`, plus `_sum` and `_count` |
 
@@ -113,7 +119,7 @@ The repository ships `deploy/monitoring/`:
 | File | Content |
 |---|---|
 | `prometheus-scrape.example.yml` | Scrape job with the bearer token read from a file |
-| `prometheus-rules.yml` | Alerts: `MallardDown`, `MallardAdminNotConfigured`, `MallardBehavioralExtensionMissing`, `MallardFlushFailing`, `MallardEventsDropped`, `MallardBufferBacklog`, `MallardNoEventsReceived`, `MallardServerErrors`, `MallardSlowResponses`, `MallardLoginFailuresSpike`, `MallardRateLimiting` |
+| `prometheus-rules.yml` | Alerts: `MallardDown`, `MallardAdminNotConfigured`, `MallardBehavioralExtensionMissing`, `MallardFlushFailing`, `MallardEventsDropped`, `MallardBufferBacklog`, `MallardNoEventsReceived`, `MallardServerErrors`, `MallardSlowResponses`, `MallardLoginFailuresSpike`, `MallardRateLimiting`, `MallardNotificationsFailing`, `MallardNotificationsDropped` |
 | `prometheus-rules.test.yml` | `promtool test rules` unit tests for the alerts |
 | `grafana-dashboard.json` | Dashboard: up, extension, admin password, GeoIP, ingest rate, buffer, flush failures, HTTP classes, latency, cache, failed logins, sessions |
 
@@ -155,6 +161,18 @@ Lines emitted while serving a request carry a `request_id` matching the
 
 See [Troubleshooting](troubleshooting.md#reading-the-logs) for which messages
 matter.
+
+---
+
+## Webhook alerts and reports
+
+Prometheus is the right tool when you run one. When you do not, Mallard can push
+its own alerts (flush stalled, events failing to reach disk, extension missing,
+cold tier degraded, rate-limiter evictions spiking, abnormal traffic) and daily
+or weekly reports to a signed webhook, including Slack and Discord. It is off by
+default and has its own page: [Webhook Alerts and Reports](alerts-and-reports.md).
+The notifier's own health is on `/metrics` (the `mallard_notification*` family
+above) and `MallardNotificationsFailing` fires when deliveries are abandoned.
 
 ---
 
