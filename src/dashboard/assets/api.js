@@ -12,11 +12,23 @@
  *     JSON each become a short sentence a person can act on, never raw JSON and
  *     never "undefined".
  *
+ * Failures are told apart by the `code` the server puts in every error body
+ * (`bad_request`, `unauthorized`, `not_found`, `internal_error`,
+ * `too_many_requests`, `behavioral_unavailable`, `query_timeout`), never by
+ * matching the wording of its message, which is written for people and free to
+ * change. A response with no code at all (a proxy's HTML page, an older server)
+ * is classified by its status alone.
+ *
  * Every call resolves; none rejects. Callers switch on `result.kind`:
  *   ok           - `data` holds the parsed body
  *   unauthorized - the session ended (401)
- *   unavailable  - 503 because the `behavioral` extension is not loaded
- *   error        - anything the server refused or failed; `message` is displayable
+ *   unavailable  - `behavioral_unavailable` (503): the report needs data this
+ *                  server cannot provide, either because the `behavioral`
+ *                  extension is not loaded or because gdpr_mode rounds
+ *                  timestamps to the hour. A state of the deployment, not a fault.
+ *   timeout      - `query_timeout` (504): valid request, too much work
+ *   busy         - 429 that outlasted the retries
+ *   error        - anything else the server refused or failed; `message` is displayable
  *   network      - the server could not be reached at all
  *   aborted      - the caller cancelled it; ignore the result
  */
@@ -40,6 +52,33 @@ export function backoffMs(attempt, retryAfter, random = Math.random) {
   return Math.min(MAX_DELAY_MS, Math.max(exponential, asked)) + Math.floor(random() * 250);
 }
 
+/** The stable error code from a response body, or null when it has none the dashboard knows. */
+export const ERROR_CODES = [
+  'bad_request',
+  'unauthorized',
+  'not_found',
+  'internal_error',
+  'too_many_requests',
+  'behavioral_unavailable',
+  'query_timeout',
+];
+
+export function errorCode(body) {
+  return body && typeof body.code === 'string' && ERROR_CODES.includes(body.code) ? body.code : null;
+}
+
+/**
+ * What kind of failure a non-OK response is, from its `code` and, only when
+ * there is no code, its status.
+ */
+export function classifyFailure(status, body) {
+  const code = errorCode(body);
+  if (code === 'behavioral_unavailable') return 'unavailable';
+  if (code === 'query_timeout' || (code === null && status === 504)) return 'timeout';
+  if (code === 'too_many_requests' || (code === null && status === 429)) return 'busy';
+  return 'error';
+}
+
 /** A sentence for a failed response. Prefers the server's own message when it is short and plain. */
 export function describeFailure(status, body) {
   const said = body && typeof body.error === 'string' ? body.error.trim() : '';
@@ -49,6 +88,13 @@ export function describeFailure(status, body) {
   if (status === 404) return 'This report is not available on this server.';
   if (status >= 500) return `The server reported an error (HTTP ${status}).`;
   return `The server rejected the request (HTTP ${status}).`;
+}
+
+/** The sentence for a failure of a given kind. Timeouts and a busy server get the dashboard's own wording. */
+export function failureMessage(kind, status, body) {
+  if (kind === 'timeout') return 'This report took too long to compute.';
+  if (kind === 'busy') return 'The server is busy right now.';
+  return describeFailure(status, body);
 }
 
 const sleep = (ms, signal) =>
@@ -138,13 +184,11 @@ export class Api {
             ? { kind: 'ok', data: body }
             : { kind: 'error', status: res.status, message: 'The server sent a response the dashboard cannot read.' };
         }
-        const message = describeFailure(res.status, parsed ? body : null);
-        // 503 is overloaded in two ways. The extension being absent is a state of
-        // the deployment, so it gets its own explanation; anything else is a fault.
-        if (res.status === 503 && /behavioral/i.test(message)) {
-          return { kind: 'unavailable', status: 503, message };
-        }
-        return { kind: 'error', status: res.status, message, retryable: res.status === 429 || res.status >= 500 };
+        const failure = parsed ? body : null;
+        const kind = classifyFailure(res.status, failure);
+        const code = errorCode(failure);
+        const message = failureMessage(kind, res.status, failure);
+        return { kind, status: res.status, code, message, retryable: kind !== 'unavailable' && (res.status === 429 || res.status >= 500) };
       }, signal);
     } catch (e) {
       if (e && e.name === 'AbortError') return { kind: 'aborted' };
@@ -168,7 +212,7 @@ export class Api {
       }
       if (res.ok) return { kind: 'ok', data: body };
       if (res.status === 401) return { kind: 'unauthorized' };
-      return { kind: 'error', status: res.status, message: describeFailure(res.status, body) };
+      return { kind: 'error', status: res.status, message: failureMessage(classifyFailure(res.status, body), res.status, body) };
     } catch (e) {
       return { kind: 'network', message: 'Cannot reach the server. Check that it is running, then retry.' };
     }
@@ -187,7 +231,7 @@ export class Api {
           } catch (e) {
             /* keep the status-based sentence */
           }
-          return { kind: 'error', status: res.status, message: describeFailure(res.status, body) };
+          return { kind: 'error', status: res.status, message: failureMessage(classifyFailure(res.status, body), res.status, body) };
         }
         const disposition = res.headers.get('content-disposition') || '';
         const name = /filename="?([^";]+)"?/i.exec(disposition)?.[1] ?? null;

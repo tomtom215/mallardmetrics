@@ -169,6 +169,34 @@ check('URL state round-trips, defaults are omitted, junk is ignored', () => {
   assert.deepEqual(F.readViewState('start=2026-09-30&end=2026-09-01', allowed), {});
 });
 
+check('periods match the server: Nd is N days including today', () => {
+  const now = new Date(Date.UTC(2026, 9, 21, 15, 30));
+  assert.deepEqual(F.periodRange('day', now), { start: '2026-10-21', end: '2026-10-21' });
+  assert.deepEqual(F.periodRange('7d', now), { start: '2026-10-15', end: '2026-10-21' });
+  assert.deepEqual(F.periodRange('30d', now), { start: '2026-09-22', end: '2026-10-21' });
+  assert.deepEqual(F.periodRange('90d', now), { start: '2026-07-24', end: '2026-10-21' });
+  assert.deepEqual(F.periodRange('12mo', now), { start: '2025-10-22', end: '2026-10-21' });
+  // 29 February has no counterpart a year earlier.
+  assert.deepEqual(F.periodRange('12mo', new Date(Date.UTC(2028, 1, 29))), { start: '2027-03-01', end: '2028-02-29' });
+  for (const p of ['7d', '30d', '90d']) {
+    const r = F.periodRange(p, now);
+    assert.equal(Math.round((F.parseDate(r.end) - F.parseDate(r.start)) / 86400000) + 1, F.periodDays(p));
+  }
+});
+
+check('retention cells are never a false zero', () => {
+  const row = { complete_weeks: 2, retention_rates: [1, 0.4, 0, 0] };
+  assert.equal(F.retentionCellState(row, 0, true), 'value');
+  assert.equal(F.retentionCellState(row, 1, true), 'value');
+  assert.equal(F.retentionCellState(row, 2, true), 'pending', 'the first unfinished week is not a measurement');
+  assert.equal(F.retentionCellState(row, 3, true), 'pending');
+  assert.equal(F.retentionCellState({ complete_weeks: 0 }, 0, true), 'value', 'the cohort week is always everyone');
+  assert.equal(F.retentionCellState({ complete_weeks: 0 }, 1, true), 'pending');
+  assert.equal(F.retentionCellState(row, 1, false), 'unmeasurable');
+  assert.equal(F.retentionCellState(row, 0, false), 'value');
+  assert.equal(F.retentionCellState({}, 3, true), 'value', 'a server that sends no complete_weeks is trusted');
+});
+
 check('chart axes use whole, de-duplicated ticks', () => {
   assert.equal(F.niceMax(0), 1);
   assert.equal(F.niceMax(47), 50);
@@ -212,10 +240,32 @@ check('the client retries 429, caps concurrency and classifies results', async (
     const r = await new A.Api({ wait: async () => {}, fetchImpl: async () => res(Number(status), { error: 'e' }) }).get('/x');
     assert.equal(r.kind, kind, `status ${status}`);
   }
-  const behavioral = await new A.Api({ fetchImpl: async () => res(503, { error: 'Funnel analysis requires the DuckDB `behavioral` community extension' }) }).get('/x');
+  // Failures are told apart by the server's `code`, never by its wording.
+  const coded = async (status, body) => new A.Api({ wait: async () => {}, fetchImpl: async () => res(status, body) }).get('/x');
+  const behavioral = await coded(503, { error: 'any wording at all', code: 'behavioral_unavailable' });
   assert.equal(behavioral.kind, 'unavailable');
-  const other503 = await new A.Api({ fetchImpl: async () => res(503, { error: 'shutting down' }) }).get('/x');
-  assert.equal(other503.kind, 'error');
+  assert.equal(behavioral.code, 'behavioral_unavailable');
+  assert.equal((await coded(503, { error: 'Funnel analysis requires the DuckDB `behavioral` community extension' })).kind, 'error', 'the word "behavioral" in a message is not a code');
+  assert.equal((await coded(503, { error: 'shutting down', code: 'internal_error' })).kind, 'error');
+  const timeout = await coded(504, { error: 'The query did not finish within 30 seconds.', code: 'query_timeout' });
+  assert.equal(timeout.kind, 'timeout');
+  assert.equal(timeout.retryable, true);
+  assert.doesNotMatch(timeout.message, /30 seconds/, 'the dashboard words timeouts itself');
+  assert.equal((await coded(504, undefined)).kind, 'timeout', 'a proxy 504 with no body is still a timeout');
+  assert.equal((await coded(400, { error: 'bad', code: 'bad_request' })).kind, 'error');
+  assert.equal((await coded(400, { error: 'bad', code: 'bad_request' })).message, 'bad');
+  assert.equal((await coded(500, { error: 'Internal server error', code: 'internal_error' })).retryable, true);
+  assert.equal((await coded(400, { error: 'bad', code: 'bad_request' })).retryable, false);
+  assert.equal((await coded(404, { error: 'No such thing', code: 'not_found' })).kind, 'error');
+  // A 429 that outlasts the retries surfaces as `busy`, not as a raw error.
+  const busy = await coded(429, { error: 'too many', code: 'too_many_requests' });
+  assert.equal(busy.kind, 'busy');
+  assert.match(busy.message, /busy/);
+  assert.equal(A.classifyFailure(504, { code: 'query_timeout' }), 'timeout');
+  assert.equal(A.classifyFailure(503, { code: 'behavioral_unavailable' }), 'unavailable');
+  assert.equal(A.classifyFailure(503, { code: 'made_up_code' }), 'error', 'an unknown code is not trusted');
+  assert.equal(A.errorCode({ code: 'bad_request' }), 'bad_request');
+  assert.equal(A.errorCode(null), null);
   const html = await new A.Api({ fetchImpl: async () => res(502, undefined) }).get('/x');
   assert.equal(html.kind, 'error');
   assert.match(html.message, /HTTP 502/);

@@ -2,8 +2,8 @@ import { h, render, Component, createRef } from '/preact.js';
 import htm from '/htm.js';
 import {
   DASH, num, compact, tick, pct, fixed, duration, money, fmtDate, fmtDay, fmtMonth, fmtHour, hasTime,
-  todayUTC, shiftDay, rangePreset, periodDays, validateRange, serializeFilters, readViewState,
-  writeViewState, niceMax, axisTicks, MAX_RANGE_DAYS,
+  todayUTC, shiftDay, rangePreset, periodRange, validateRange, serializeFilters, readViewState,
+  writeViewState, niceMax, axisTicks, retentionCellState, MAX_RANGE_DAYS,
 } from '/format.js';
 import { Api } from '/api.js';
 
@@ -47,6 +47,18 @@ function SkelRows({ rows = 5 }) {
   return html`
     <div class="skel-rows" role="status" aria-label="Loading">
       ${Array.from({ length: rows }, (_, i) => html`<${Skel} className="skel-row" width=${`${95 - (i % 3) * 12}%`} />`)}
+    </div>
+  `;
+}
+
+/**
+ * Placeholder for a ten-row table, sized to the real thing (a header plus ten
+ * rows), so the panels below do not jump down when a breakdown arrives.
+ */
+function SkelTable({ rows = 11 }) {
+  return html`
+    <div class="skel-rows skel-table" role="status" aria-label="Loading">
+      ${Array.from({ length: rows }, (_, i) => html`<${Skel} className="skel-row" width=${`${96 - (i % 3) * 10}%`} />`)}
     </div>
   `;
 }
@@ -98,15 +110,15 @@ function Render({ fn, data }) {
   return fn(data);
 }
 
-/** The explanation shown wherever a behavioral report cannot be produced. */
+/** The explanation shown wherever the `behavioral` extension is missing. */
 function BehavioralHelp({ detail, compactView }) {
   return html`
     <div class="placeholder placeholder-unavailable behavioral-help">
       <strong>Behavioral analytics is unavailable on this server</strong>
       <p>
-        Visits, bounce rate, funnels, retention, sequences and flow depend on DuckDB's${' '}
-        <code>behavioral</code> community extension, and it is not loaded. Page views, events,
-        breakdowns, goals and revenue are unaffected.
+        Visits, bounce rate, funnels, retention, sequences, flow and entry and exit pages depend on
+        DuckDB's${' '}<code>behavioral</code> community extension, and it is not loaded. Page views,
+        events, breakdowns, goals and revenue are unaffected.
       </p>
       ${!compactView &&
       html`
@@ -134,6 +146,44 @@ function BehavioralHelp({ detail, compactView }) {
 }
 
 /**
+ * The explanation shown wherever a report needs exact timestamps.
+ *
+ * `gdpr_mode` rounds every event to the top of its hour, which destroys the
+ * order and spacing of events inside the hour that sessions, funnels, sequences
+ * and flow are built from. That is a deliberate privacy setting, not a failure,
+ * so it is presented as information in the accent colour, with no error styling.
+ */
+function RoundedHelp({ compactView }) {
+  return html`
+    <div class="placeholder placeholder-info rounded-help">
+      <strong>This report needs session data that gdpr_mode rounds away</strong>
+      <p>
+        ${compactView
+          ? 'Timestamps are rounded to the hour, so visits cannot be reconstructed.'
+          : html`With <code>gdpr_mode</code> every timestamp is rounded to the hour. The server then
+              cannot tell which events belong to one visit or in what order they happened, so it does
+              not report visits, bounce rate, visit duration, funnels, sequences, flow or entry and
+              exit pages. Visitors, pageviews, breakdowns, goals, revenue and weekly retention are
+              unaffected.`}
+      </p>
+      ${!compactView &&
+      html`<p class="muted">
+        This is the privacy setting working as designed. To get these reports, turn off${' '}
+        <code>gdpr_mode</code> (or <code>round_timestamps</code>) and restart; the data collected
+        from then on keeps its exact times.
+      </p>`}
+    </div>
+  `;
+}
+
+/** Why a report is unavailable: the extension is missing, or timestamps are rounded. */
+function Unavailable({ reason, detail, compactView }) {
+  return reason === 'rounded'
+    ? html`<${RoundedHelp} compactView=${compactView} />`
+    : html`<${BehavioralHelp} detail=${detail} compactView=${compactView} />`;
+}
+
+/**
  * Renders whichever of loading, unavailable, failed or loaded applies, then
  * hands loaded data to `render`. While a refresh is under way the previous
  * data stays on screen, dimmed, so the layout does not jump.
@@ -142,9 +192,36 @@ function Async({ state, onRetry, skeleton, render: renderData, behavioral }) {
   const first = !state || (state.loading && state.kind !== 'ok');
   if (first) return skeleton || html`<${SkelRows} />`;
   if (state.kind === 'unavailable') {
-    return html`<${BehavioralHelp} detail=${state.message} compactView=${behavioral === 'compact'} />`;
+    return html`<${Unavailable} reason=${state.reason} detail=${state.message} compactView=${behavioral === 'compact'} />`;
   }
-  if (state.kind === 'error' || state.kind === 'network') {
+  if (state.kind === 'network') {
+    // A lost connection hits every panel at once. The banner at the top says so
+    // and offers the one Retry; repeating the sentence and button in all twenty
+    // panels buried the page in identical errors.
+    return html`<div class="placeholder placeholder-offline" role="status">Waiting for the server…</div>`;
+  }
+  if (state.kind === 'timeout') {
+    return html`
+      <div class="placeholder placeholder-notice">
+        <strong>${state.message}</strong>
+        <p>
+          The server stopped it at its time limit. Choose a shorter date range or remove a filter, then
+          try again.
+        </p>
+        ${onRetry && html`<button type="button" class="btn-secondary" onClick=${onRetry}>Try again</button>`}
+      </div>
+    `;
+  }
+  if (state.kind === 'busy') {
+    return html`
+      <div class="placeholder placeholder-notice">
+        <strong>${state.message}</strong>
+        <p>It is answering other requests. Try again in a moment.</p>
+        ${onRetry && html`<button type="button" class="btn-secondary" onClick=${onRetry}>Try again</button>`}
+      </div>
+    `;
+  }
+  if (state.kind === 'error') {
     return html`
       <div class="placeholder placeholder-error">
         <p>${state.message}</p>
@@ -236,9 +313,34 @@ function Delta({ before, after, invert }) {
   `;
 }
 
-function MetricCard({ label, value, full, hint, muted, delta }) {
+// What each headline figure means, in the server's own terms. The same words
+// are the hover text on a card and the list under the cards, so a reader who
+// never opens the list still gets the one-line version.
+const HELP = {
+  visitors: 'Distinct visitor IDs. IDs are replaced on a schedule the server sets (visitor_salt_rotation_days), so over a long range one person can be counted more than once.',
+  pageviews: 'Page loads, including navigation inside single-page apps.',
+  events: 'Every recorded event: pageviews plus custom events such as sign-ups.',
+  viewsPerVisitor: 'Pageviews divided by unique visitors.',
+  visits: 'A run of one visitor’s events with no gap longer than the session window (30 minutes by default). Only visits containing at least one pageview count.',
+  bounce: 'The share of visits that were exactly one event, and that event a pageview. A visit with one pageview and a click or other custom event is not a bounce.',
+  duration: 'Time from a visit’s first event to its last, averaged over visits. A one-event visit lasts 0 seconds, so a high bounce rate pulls this down.',
+  viewsPerVisit: 'Pageviews divided by visits.',
+};
+const DEFINITIONS = [
+  ['Unique visitors', HELP.visitors],
+  ['Pageviews and events', 'A pageview is a page load. Total events add custom events (sign-ups, clicks you track, purchases) to that.'],
+  ['Visit', HELP.visits + ' Custom events keep a visit alive, so a visitor who watches a video between two pageviews stays in one visit.'],
+  ['Bounce rate', HELP.bounce],
+  ['Visit duration', HELP.duration],
+  ['Views per visit', 'Pageviews divided by visits. Views per visitor divides by people instead, so it is higher whenever people come back.'],
+  ['Entry and exit pages', 'The entry page is the first pageview of a visit and the exit page is the last. Each counts visits, not pageviews.'],
+  ['Filters', 'A filter keeps every visit that contains at least one matching event, and measures that visit in full. Filtering to one page therefore does not turn two-page visits into bounces.'],
+  ['Date ranges', 'All dates are UTC. “Today” is midnight UTC until now. “7D” is the last seven days including today, and likewise 30D and 90D; 12M is the twelve months ending today.'],
+];
+
+function MetricCard({ label, value, full, hint, muted, delta, help }) {
   return html`
-    <div class=${`metric-card${muted ? ' metric-muted' : ''}`}>
+    <div class=${`metric-card${muted ? ' metric-muted' : ''}`} title=${help}>
       <dt class="metric-label">${label}</dt>
       <dd class="metric-value" title=${full}>${value}</dd>
       ${delta && html`<dd class="metric-extra">${delta}</dd>`}
@@ -435,8 +537,8 @@ class TimeseriesChart extends Component {
 }
 
 /** A ranked list with an inline bar for relative magnitude. */
-function BreakdownList({ rows, label = 'Value', columns, onFilter, caption }) {
-  if (!rows || rows.length === 0) return html`<${Empty}>No data for this period</${Empty}>`;
+function BreakdownList({ rows, label = 'Value', columns, onFilter, caption, empty = 'No data for this period' }) {
+  if (!rows || rows.length === 0) return html`<${Empty}>${empty}</${Empty}>`;
   const cols = columns || [['Visitors', 'visitors'], ['Pageviews', 'pageviews']];
   const max = Math.max(...rows.map((r) => r[cols[0][1]] || 0), 1);
   return html`
@@ -511,12 +613,30 @@ function Segmented({ label, options, value, onChange, pressedOverride }) {
   `;
 }
 
+// Rows a breakdown asks for, in the order "Show more" steps through them. The
+// server caps a request at 1000; 250 is already more than a person scans, and
+// the list scrolls inside its panel instead of lengthening the page.
+const LIMIT_STEPS = [10, 50, 250];
+
+// Entry and exit pages are counted per visit, so their figure is a count of
+// visits that began or ended there. The server reports it as `sessions`, and
+// the other numbers are totals over those visits.
+const SESSION_COLUMNS = {
+  'entry-pages': [['Entrances', 'sessions'], ['Visitors', 'visitors']],
+  'exit-pages': [['Exits', 'sessions'], ['Visitors', 'visitors']],
+};
+const TAB_HELP = {
+  'entry-pages': 'Entrances: visits that began on this page, that is, whose first pageview was this one.',
+  'exit-pages': 'Exits: visits that ended on this page, that is, whose last pageview was this one.',
+};
+
 /** Tabbed group of breakdowns sharing one panel. Fully keyboard operable. */
-function BreakdownGroup({ group, active, data, onTab, onFilter, onRetry }) {
+function BreakdownGroup({ group, active, data, limits, onTab, onFilter, onRetry, onLimit }) {
   const current = data[`bd:${active}`];
   const filterable = FILTERABLE_SLUGS.has(active);
   const tabLabel = group.tabs.find((t) => t.slug === active).label;
   const slugs = group.tabs.map((t) => t.slug);
+  const limit = limits[active] || LIMIT_STEPS[0];
   const onKey = (event) => {
     const i = slugs.indexOf(active);
     const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: slugs.length - 1 }[event.key];
@@ -527,6 +647,28 @@ function BreakdownGroup({ group, active, data, onTab, onFilter, onRetry }) {
     requestAnimationFrame(() => document.getElementById(`tab-${slug}`)?.focus());
   };
   const panelId = `bd-${group.id}`;
+  const render = (rows) => {
+    const sessionCols = SESSION_COLUMNS[active];
+    // Older servers do not send `sessions`; fall back to the plain columns.
+    const columns = sessionCols && rows.length > 0 && rows.every((r) => typeof r.sessions === 'number') ? sessionCols : undefined;
+    const more = rows.length >= limit && limit < LIMIT_STEPS[LIMIT_STEPS.length - 1];
+    const nextLimit = LIMIT_STEPS[LIMIT_STEPS.indexOf(limit) + 1];
+    const scrolls = limit > LIMIT_STEPS[0] && rows.length > LIMIT_STEPS[0];
+    return html`
+      ${TAB_HELP[active] && html`<p class="table-note muted">${TAB_HELP[active]}</p>`}
+      <div class=${scrolls ? 'breakdown-scroll' : ''} tabindex=${scrolls ? '0' : undefined} role=${scrolls ? 'region' : undefined} aria-label=${scrolls ? `${tabLabel}, ${rows.length} rows` : undefined}>
+        <${BreakdownList} rows=${rows} label=${FILTER_LABELS[active] || tabLabel} columns=${columns} caption=${`${group.title}: ${tabLabel}`} onFilter=${filterable ? (value) => onFilter(active, value) : null} />
+      </div>
+      ${(more || limit > LIMIT_STEPS[0]) &&
+      html`
+        <div class="list-more">
+          ${more && html`<button type="button" class="btn-link" onClick=${() => onLimit(active, nextLimit)}>Show more (up to ${nextLimit})</button>`}
+          ${limit > LIMIT_STEPS[0] && html`<button type="button" class="btn-link" onClick=${() => onLimit(active, LIMIT_STEPS[0])}>Show top ${LIMIT_STEPS[0]}</button>`}
+          <span class="muted" aria-live="polite">Showing ${num(rows.length)} ${rows.length === 1 ? 'row' : 'rows'}</span>
+        </div>
+      `}
+    `;
+  };
   return html`
     <${Panel} id=${panelId} title=${group.title}>
       <${Sentinel} onVisible=${() => onTab(group, active, true)} />
@@ -549,24 +691,38 @@ function BreakdownGroup({ group, active, data, onTab, onFilter, onRetry }) {
       <div class="tab-panel" id=${`${panelId}-body`} role="tabpanel" aria-labelledby=${`tab-${active}`}>
         <${Async}
           state=${current}
+          behavioral="compact"
+          skeleton=${html`<${SkelTable} />`}
           onRetry=${() => onRetry(`bd:${active}`)}
-          render=${(rows) => html`<${BreakdownList} rows=${rows} label=${FILTER_LABELS[active] || tabLabel} caption=${`${group.title}: ${tabLabel}`} onFilter=${filterable ? (value) => onFilter(active, value) : null} />`}
+          render=${render}
         />
       </div>
     </${Panel}>
   `;
 }
 
-function RealtimePanel({ state, onRetry, onVisible }) {
+function RealtimePanel({ state, onRetry, onVisible, filtered }) {
   return html`
     <${Panel} id="realtime" title="Right now" subtitle=${state && state.kind === 'ok' ? `Last ${state.data.window_minutes} minutes` : undefined}>
       <${Sentinel} onVisible=${onVisible} />
       <${Async}
         state=${state}
         onRetry=${onRetry}
+        skeleton=${html`<${SkelTable} rows=${8} />`}
         render=${(data) => {
           const max = Math.max(...data.per_minute, 1);
           const total = data.per_minute.reduce((a, b) => a + b, 0);
+          if (data.current_visitors === 0 && total === 0) {
+            return html`
+              <div class="placeholder realtime-empty">
+                <strong>No one is on ${filtered ? 'the filtered part of ' : ''}the site right now</strong>
+                <p>
+                  No pageviews in the last ${data.window_minutes} minutes${filtered ? ' that match the active filters' : ''}.
+                  This panel checks again every ${REALTIME_REFRESH_MS / 1000} seconds${state.offline ? html` <span class="offline-tag">(offline, retrying)</span>` : ''}.
+                </p>
+              </div>
+            `;
+          }
           return html`
             <div class="realtime">
               <div class="realtime-headline">
@@ -580,11 +736,11 @@ function RealtimePanel({ state, onRetry, onVisible }) {
             <div class="realtime-lists">
               <div>
                 <h3>Top pages</h3>
-                <${BreakdownList} rows=${data.top_pages} label="Page" columns=${[['Visitors', 'visitors']]} caption="Top pages right now" />
+                <${BreakdownList} rows=${data.top_pages} label="Page" columns=${[['Visitors', 'visitors']]} caption="Top pages right now" empty="No pageviews in this window" />
               </div>
               <div>
                 <h3>Top sources</h3>
-                <${BreakdownList} rows=${data.top_sources} label="Source" columns=${[['Visitors', 'visitors']]} caption="Top sources right now" />
+                <${BreakdownList} rows=${data.top_sources} label="Source" columns=${[['Visitors', 'visitors']]} caption="Top sources right now" empty="No sources in this window" />
               </div>
             </div>
           `;
@@ -619,35 +775,69 @@ function FunnelChart({ steps, specs }) {
   `;
 }
 
+// Weeks requested from the retention report, and so how long a visitor ID has
+// to survive for the later columns to mean anything: week N needs 7 x N days.
+const RETENTION_WEEKS = 4;
+const RETENTION_MIN_ROTATION_DAYS = (RETENTION_WEEKS - 1) * 7;
+
+/**
+ * Weekly cohorts.
+ *
+ * A cell is only a percentage when its week is over. Weeks that have not
+ * finished (`complete_weeks`) are not yet a measurement, and printing them as 0%
+ * told people nobody came back when the week had simply not happened. A cohort
+ * whose first week began before the report's start (`partial_first_week`) is
+ * missing the visitors first seen earlier that week, so it is labelled.
+ */
 function RetentionGrid({ data }) {
-  const { cohorts, caveat } = data;
-  const notice = caveat && html`<div class="notice">${caveat}</div>`;
+  const { cohorts, identity_supports_cohorts: supported } = data;
+  // An informational note, not an error: nothing is broken, the server is set up
+  // to forget visitors faster than this report needs it to remember them.
+  const notice =
+    supported === false &&
+    html`
+      <div class="notice notice-info" role="note">
+        <strong>Weeks after the first cannot be measured with the current setting.</strong>
+        Retention follows the same visitor from one week to the next, but this server replaces visitor
+        IDs sooner than that, so a returning visitor looks like a new one. To measure ${RETENTION_WEEKS}-week
+        cohorts, set <code>visitor_salt_rotation_days</code> (environment variable${' '}
+        <code>MALLARD_VISITOR_SALT_ROTATION_DAYS</code>) to at least ${RETENTION_MIN_ROTATION_DAYS} and
+        restart. It applies to events collected from then on, and a longer setting lets a visitor be
+        recognised for longer.
+      </div>
+    `;
   if (!cohorts || cohorts.length === 0) {
     return html`${notice}<${Empty}>No cohorts in this period</${Empty}>`;
   }
   const width = Math.max(...cohorts.map((c) => c.retained.length));
+  const stateOf = (row, i) => retentionCellState(row, i, supported);
+  const anyPending = cohorts.some((row) => row.retention_rates.some((_, i) => stateOf(row, i) === 'pending'));
+  const anyPartial = cohorts.some((row) => row.partial_first_week);
   return html`
     ${notice}
-    <div class="table-scroll" tabindex="0" role="region" aria-label="Retention cohort table">
+    <div class="table-scroll retention-scroll" tabindex="0" role="region" aria-label="Retention cohort table. Scroll sideways to see later weeks.">
       <table class="data-table retention-table">
         <caption class="sr-only">Share of each weekly cohort that returned in each following week</caption>
         <thead>
           <tr>
-            <th scope="col">Cohort</th>
+            <th scope="col">Cohort (week of)</th>
             <th scope="col" class="numeric">Size</th>
-            ${Array.from({ length: width }, (_, i) => html`<th scope="col" class="numeric" title=${`Week ${i}`}>W${i}</th>`)}
+            ${Array.from({ length: width }, (_, i) => html`<th scope="col" class="numeric" title=${i === 0 ? 'The cohort week itself' : `${i} week${i === 1 ? '' : 's'} later`}>${i === 0 ? 'Week 0' : `Week ${i}`}</th>`)}
           </tr>
         </thead>
         <tbody>
           ${cohorts.map(
             (row) => html`
               <tr>
-                <th scope="row">${fmtDate(row.cohort_date)}</th>
+                <th scope="row">
+                  ${fmtDate(row.cohort_date)}
+                  ${row.partial_first_week && html` <span class="tag" title="This cohort's first week began before the report's start date, so visitors first seen earlier that week are not counted.">partial week</span>`}
+                </th>
                 <td class="numeric">${num(row.cohort_size)}</td>
-                ${row.retention_rates.map(
-                  (rate, i) => html`
-                    <td class="numeric retention-cell" style=${{ '--r': Math.min(1, Math.max(0, rate)) }} title=${`${num(row.retained[i])} of ${num(row.cohort_size)}`}>${pct(rate, 0)}</td>
-                  `,
+                ${row.retention_rates.map((rate, i) =>
+                  stateOf(row, i) === 'value'
+                    ? html`<td class="numeric retention-cell" style=${{ '--r': Math.min(1, Math.max(0, rate)) }} title=${`${num(row.retained[i])} of ${num(row.cohort_size)}`}>${pct(rate, 0)}</td>`
+                    : html`<td class="numeric retention-pending" title=${stateOf(row, i) === 'unmeasurable' ? 'Not measurable: visitor IDs do not last this long' : 'This week has not finished yet'}><span aria-hidden="true">–</span><span class="sr-only">${stateOf(row, i) === 'unmeasurable' ? 'not measurable' : 'not finished yet'}</span></td>`,
                 )}
               </tr>
             `,
@@ -655,6 +845,11 @@ function RetentionGrid({ data }) {
         </tbody>
       </table>
     </div>
+    ${(anyPending || anyPartial) &&
+    html`<p class="table-note muted">
+      ${anyPending ? html`A dash means that week has not finished yet, so there is nothing to compare. ` : ''}
+      ${anyPartial ? html`A partial-week cohort began before the start of the report, so it leaves out visitors first seen earlier that week.` : ''}
+    </p>`}
   `;
 }
 
@@ -1067,20 +1262,23 @@ const FILTER_LABELS = {
 // an event, so the server has no per-event predicate for them and answers 400.
 const FILTERABLE_SLUGS = new Set(ALL_BREAKDOWN_SLUGS.filter((slug) => slug !== 'entry-pages' && slug !== 'exit-pages'));
 
+// Reports computed from sessions or ordered events. `retention` is separate: it
+// needs the extension but not exact timestamps, so gdpr_mode leaves it working.
 const BEHAVIORAL_KEYS = new Set(['funnel', 'retention', 'sequences', 'flow']);
+const NEEDS_EXACT_TIME = (key) => key === 'bd:entry-pages' || key === 'bd:exit-pages' || (BEHAVIORAL_KEYS.has(key) && key !== 'retention');
 const REALTIME_REFRESH_MS = 15000;
 const RANGE_OPTIONS = [
-  { value: 'day', label: 'Today', title: 'Today so far (UTC)' },
-  { value: '7d', label: '7D', title: 'Last 7 days' },
-  { value: '30d', label: '30D', title: 'Last 30 days' },
-  { value: '90d', label: '90D', title: 'Last 90 days' },
-  { value: '12mo', label: '12M', title: 'Last 12 months' },
+  { value: 'day', label: 'Today', title: 'Today so far: midnight UTC until now' },
+  { value: '7d', label: '7D', title: 'The last 7 days, including today' },
+  { value: '30d', label: '30D', title: 'The last 30 days, including today' },
+  { value: '90d', label: '90D', title: 'The last 90 days, including today' },
+  { value: '12mo', label: '12M', title: 'The last 12 months, ending today' },
   { value: 'custom', label: 'Custom', title: 'Pick exact dates' },
 ];
 const COMPARE_OPTIONS = [
   { value: 'none', label: 'Off', title: 'Do not compare' },
-  { value: 'previous_period', label: 'Previous period', title: 'Compare with the equally long period before this one' },
-  { value: 'year_over_year', label: 'Last year', title: 'Compare with the same dates 365 days earlier' },
+  { value: 'previous_period', label: 'Previous period', title: 'Compare with the equally long period immediately before this one' },
+  { value: 'year_over_year', label: 'Last year', title: 'Compare with the same dates 365 days earlier, the same length' },
 ];
 
 class Dashboard extends Component {
@@ -1102,6 +1300,8 @@ class Dashboard extends Component {
       filters: url.filters || [],
       theme: prefs.theme || 'auto',
       res: {},
+      reason: null,
+      limits: {},
       tabs: Object.fromEntries(BREAKDOWN_GROUPS.map((g) => [g.id, prefs.tabs?.[g.id] && g.tabs.some((t) => t.slug === prefs.tabs[g.id]) ? prefs.tabs[g.id] : g.tabs[0].slug])),
       funnelSteps: prefs.funnelSteps || 'page:/,page:/pricing,event:signup',
       funnelModes: prefs.funnelModes || '',
@@ -1187,10 +1387,10 @@ class Dashboard extends Component {
       case 'properties': return `/api/stats/properties?${q}`;
       case 'funnel':
         return `/api/stats/funnel?${q}&steps=${encodeURIComponent(s.funnelSteps)}&window=${encodeURIComponent('1 day')}${s.funnelModes ? `&modes=${encodeURIComponent(s.funnelModes)}` : ''}`;
-      case 'retention': return `/api/stats/retention?${q}&weeks=4`;
+      case 'retention': return `/api/stats/retention?${q}&weeks=${RETENTION_WEEKS}`;
       case 'sequences': return `/api/stats/sequences?${q}&steps=${encodeURIComponent(s.sequenceSteps)}`;
       case 'flow': return `/api/stats/flow?${q}&page=${encodeURIComponent(s.flowPage)}&direction=${s.flowDirection}`;
-      default: return `/api/stats/breakdown/${key.slice(3)}?${q}&limit=10`;
+      default: return `/api/stats/breakdown/${key.slice(3)}?${q}&limit=${s.limits[key.slice(3)] || LIMIT_STEPS[0]}`;
     }
   }
 
@@ -1203,6 +1403,32 @@ class Dashboard extends Component {
     return this.mainSettled ? Promise.resolve() : new Promise((resolve) => this.mainWaiters.push(resolve));
   }
 
+  /**
+   * Why session data is missing: 'extension' (the behavioral extension is not
+   * loaded), 'rounded' (it is, but gdpr_mode rounds timestamps to the hour, so
+   * sessions cannot be built) or 'unknown'. `/stats/main` reports only that it
+   * could not compute sessions, so the public health endpoint names the cause.
+   */
+  whyUnavailable(gen) {
+    if (!this.reasonPromise || this.reasonGen !== gen) {
+      this.reasonGen = gen;
+      this.reasonPromise = (async () => {
+        let reason = 'unknown';
+        try {
+          const res = await fetch('/health/detailed', { headers: { Accept: 'application/json' } });
+          const body = await res.json();
+          if (body.behavioral_extension_loaded === true) reason = 'rounded';
+          else if (body.behavioral_extension_loaded === false) reason = 'extension';
+        } catch (e) {
+          /* the health endpoint is a hint; without it the generic explanation is used */
+        }
+        if (gen === this.gen) this.setState({ reason });
+        return reason;
+      })();
+    }
+    return this.reasonPromise;
+  }
+
   /** Fetch one report. Stale results from an earlier view are dropped. */
   async load(key, { quiet = false } = {}) {
     const gen = this.gen;
@@ -1210,15 +1436,22 @@ class Dashboard extends Component {
     const prev = this.res[key];
     this.fetched.add(key);
 
-    // The behavioral reports answer 503 when the extension is missing. `main`
-    // already says whether it is, so ask it first rather than provoke an
-    // error (and a console message) per panel.
-    if (BEHAVIORAL_KEYS.has(key)) {
+    // Reports built from sessions answer 503 (`behavioral_unavailable`) when the
+    // extension is missing or gdpr_mode has rounded the timestamps. `main`
+    // already says whether session data exists, so ask it first rather than
+    // provoke an error (and a console message) per panel.
+    if (BEHAVIORAL_KEYS.has(key) || NEEDS_EXACT_TIME(key)) {
       await this.whenMain();
       if (gen !== this.gen) return;
       if (this.behavioral === false) {
-        this.setRes(key, { kind: 'unavailable', message: '' });
-        return;
+        const reason = await this.whyUnavailable(gen);
+        if (gen !== this.gen) return;
+        // Weekly retention does not depend on the order of events inside an
+        // hour, so a rounded-timestamp server can still answer it.
+        if (!(key === 'retention' && reason === 'rounded')) {
+          this.setRes(key, { kind: 'unavailable', reason, message: '' });
+          return;
+        }
       }
     }
     if (!quiet) this.setRes(key, prev && prev.kind === 'ok' ? { ...prev, loading: true } : { loading: true });
@@ -1233,6 +1466,11 @@ class Dashboard extends Component {
       this.behavioral = result.kind === 'ok' ? result.data.behavioral_available !== false : null;
       this.mainSettled = true;
       this.mainWaiters.splice(0).forEach((resolve) => resolve());
+    }
+    if (result.kind === 'unavailable') {
+      // Name the cause; the code alone cannot tell a missing extension from rounded timestamps.
+      result.reason = await this.whyUnavailable(gen);
+      if (gen !== this.gen) return;
     }
     if (quiet && result.kind !== 'ok' && prev && prev.kind === 'ok') {
       this.setRes(key, { ...prev, loading: false, offline: true });
@@ -1355,8 +1593,7 @@ class Dashboard extends Component {
   effectiveRange() {
     const { period, startDate, endDate } = this.state;
     if (period === 'custom' && startDate && endDate) return { start: startDate, end: endDate };
-    const today = todayUTC();
-    return { start: shiftDay(today, (periodDays(period) || 30) - 1), end: today };
+    return periodRange(period);
   }
 
   pickRange(value) {
@@ -1389,7 +1626,8 @@ class Dashboard extends Component {
     const res = await api.download(`/api/stats/export?${this.query()}&kind=${kind}&format=${format}`);
     if (res.kind === 'unauthorized') return this.props.onAuthExpired();
     if (res.kind !== 'ok') {
-      this.setState({ notice: { tone: 'error', text: `The ${label} export failed: ${res.message}` } });
+      const hint = res.status === 504 ? ' Try a shorter date range or fewer filters.' : '';
+      this.setState({ notice: { tone: 'error', text: `The ${label} export failed: ${res.message}${hint}` } });
       return;
     }
     const name = res.filename || `mallard-${this.state.siteId}-${kind}.${format}`;
@@ -1427,6 +1665,11 @@ class Dashboard extends Component {
       this.persist();
       this.want(`bd:${slug}`);
     });
+  }
+
+  /** "Show more" / "Show top 10" on a breakdown: refetch just that list with its new row count. */
+  setLimit(slug, limit) {
+    this.setState((s) => ({ limits: { ...s.limits, [slug]: limit } }), () => this.load(`bd:${slug}`));
   }
 
   applyFunnel(event) {
@@ -1510,8 +1753,17 @@ class Dashboard extends Component {
           <p id="range-error" class="field-error" role="alert">${rangeError}</p>
         </form>
       `}
-      ${period === 'custom' && !rangeOpen && startDate && html`<p class="range-summary muted">Showing ${fmtDate(startDate)} – ${fmtDate(endDate)} (UTC)</p>`}
+      ${!rangeOpen && html`<p class="range-summary muted">${this.rangeSummary()}</p>`}
     `;
+  }
+
+  /** The exact dates on screen, so "7D" is never ambiguous about whether it includes today. */
+  rangeSummary() {
+    const { period } = this.state;
+    const { start, end } = this.effectiveRange();
+    if (period === 'day') return `Today, ${fmtDate(end)}, so far (UTC). The chart shows hours.`;
+    const label = { '7d': 'Last 7 days', '30d': 'Last 30 days', '90d': 'Last 90 days', '12mo': 'Last 12 months' }[period];
+    return `${label ? `${label}, including today: ` : 'Showing '}${fmtDate(start)} – ${fmtDate(end)} (UTC)`;
   }
 
   renderOverview() {
@@ -1547,24 +1799,31 @@ class Dashboard extends Component {
   renderHeadline(m) {
     const prev = m.comparison || null;
     const unavailable = m.behavioral_available === false;
-    const hint = unavailable ? 'Unavailable' : null;
+    const rounded = unavailable && this.state.reason === 'rounded';
+    const hint = unavailable ? (rounded ? 'Needs exact times' : 'Unavailable') : null;
     const delta = (key, invert) => (prev ? html`<${Delta} before=${prev[key]} after=${m[key]} invert=${invert} />` : null);
     // A baseline of zero produces no percentages (see `Delta`), so the note has
     // to say why, or it reads as a comparison that silently failed.
     const baselineEmpty = prev && prev.total_pageviews === 0 && prev.unique_visitors === 0;
     return html`
       ${prev && html`<p class="comparison-note">Compared with ${fmtDate(prev.start_date)} – ${fmtDate(prev.end_date)}${baselineEmpty ? ' — no data in that period, so there is nothing to compare against' : ''}</p>`}
-      ${unavailable && html`<${BehavioralHelp} />`}
+      ${unavailable && html`<${Unavailable} reason=${this.state.reason} />`}
       <dl class="metrics-grid">
-        <${MetricCard} label="Unique visitors" value=${compact(m.unique_visitors)} full=${num(m.unique_visitors)} delta=${delta('unique_visitors')} />
-        <${MetricCard} label="Pageviews" value=${compact(m.total_pageviews)} full=${num(m.total_pageviews)} delta=${delta('total_pageviews')} />
-        <${MetricCard} label="Total events" value=${compact(m.total_events)} full=${num(m.total_events)} delta=${delta('total_events')} />
-        <${MetricCard} label="Views per visitor" value=${fixed(m.views_per_visitor)} />
-        <${MetricCard} label="Visits" value=${compact(m.total_sessions)} full=${num(m.total_sessions)} hint=${hint} muted=${unavailable} delta=${delta('total_sessions')} />
-        <${MetricCard} label="Bounce rate" value=${pct(m.bounce_rate)} hint=${hint} muted=${unavailable} delta=${delta('bounce_rate', true)} />
-        <${MetricCard} label="Visit duration" value=${duration(m.avg_visit_duration_secs)} hint=${hint} muted=${unavailable} delta=${delta('avg_visit_duration_secs')} />
-        <${MetricCard} label="Views per visit" value=${fixed(m.views_per_visit)} hint=${hint} muted=${unavailable} />
+        <${MetricCard} label="Unique visitors" help=${HELP.visitors} value=${compact(m.unique_visitors)} full=${num(m.unique_visitors)} delta=${delta('unique_visitors')} />
+        <${MetricCard} label="Pageviews" help=${HELP.pageviews} value=${compact(m.total_pageviews)} full=${num(m.total_pageviews)} delta=${delta('total_pageviews')} />
+        <${MetricCard} label="Total events" help=${HELP.events} value=${compact(m.total_events)} full=${num(m.total_events)} delta=${delta('total_events')} />
+        <${MetricCard} label="Views per visitor" help=${HELP.viewsPerVisitor} value=${fixed(m.views_per_visitor)} />
+        <${MetricCard} label="Visits" help=${HELP.visits} value=${compact(m.total_sessions)} full=${num(m.total_sessions)} hint=${hint} muted=${unavailable} delta=${delta('total_sessions')} />
+        <${MetricCard} label="Bounce rate" help=${HELP.bounce} value=${pct(m.bounce_rate)} hint=${hint} muted=${unavailable} delta=${delta('bounce_rate', true)} />
+        <${MetricCard} label="Visit duration" help=${HELP.duration} value=${duration(m.avg_visit_duration_secs)} hint=${hint} muted=${unavailable} delta=${delta('avg_visit_duration_secs')} />
+        <${MetricCard} label="Views per visit" help=${HELP.viewsPerVisit} value=${fixed(m.views_per_visit)} hint=${hint} muted=${unavailable} />
       </dl>
+      <details class="definitions">
+        <summary>How these figures are measured</summary>
+        <dl>
+          ${DEFINITIONS.map(([term, text]) => html`<div><dt>${term}</dt><dd>${text}</dd></div>`)}
+        </dl>
+      </details>
     `;
   }
 
@@ -1584,7 +1843,7 @@ class Dashboard extends Component {
           <button type="submit">Apply</button>
         </form>
         ${funnelError && html`<p class="field-error" role="alert">${funnelError}</p>`}
-        <${Async} state=${res.funnel} onRetry=${() => this.load('funnel')} render=${(steps) => html`<${FunnelChart} steps=${steps} specs=${specs} />`} />
+        <${Async} behavioral="compact" state=${res.funnel} onRetry=${() => this.load('funnel')} render=${(steps) => html`<${FunnelChart} steps=${steps} specs=${specs} />`} />
       </${Panel}>
     `;
   }
@@ -1596,7 +1855,7 @@ class Dashboard extends Component {
 
       <${Panel} id="retention" title="Retention cohorts" subtitle="Weekly cohorts by first visit">
         <${Sentinel} onVisible=${() => this.want('retention')} />
-        <${Async} state=${res.retention} onRetry=${() => this.load('retention')} render=${(data) => html`<${RetentionGrid} data=${data} />`} />
+        <${Async} behavioral="compact" state=${res.retention} onRetry=${() => this.load('retention')} render=${(data) => html`<${RetentionGrid} data=${data} />`} />
       </${Panel}>
 
       <${Panel} id="sequence" title="Sequence" subtitle="Visitors whose events matched this ordered pattern">
@@ -1607,7 +1866,7 @@ class Dashboard extends Component {
           </label>
           <button type="submit">Apply</button>
         </form>
-        <${Async} state=${res.sequences} onRetry=${() => this.load('sequences')} skeleton=${html`<${SkelCards} count=${4} />`}
+        <${Async} behavioral="compact" state=${res.sequences} onRetry=${() => this.load('sequences')} skeleton=${html`<${SkelCards} count=${4} />`}
           render=${(d) => html`
             <dl class="metrics-grid">
               <${MetricCard} label="Converting visitors" value=${compact(d.converting_visitors)} full=${num(d.converting_visitors)} />
@@ -1631,7 +1890,7 @@ class Dashboard extends Component {
           </label>
           <button type="submit">Apply</button>
         </form>
-        <${Async} state=${res.flow} onRetry=${() => this.load('flow')}
+        <${Async} behavioral="compact" state=${res.flow} onRetry=${() => this.load('flow')}
           render=${(rows) => rows.length === 0
             ? html`<${Empty}>No flow data for this page</${Empty}>`
             : html`<${BreakdownList} rows=${rows.map((r) => ({ value: r.next_page, visitors: r.visitors, share: r.share }))} label=${flowDirection === 'forward' ? 'Next page' : 'Previous page'} columns=${[['Visitors', 'visitors'], ['Share', 'share', pct]]} />`} />
@@ -1672,8 +1931,8 @@ class Dashboard extends Component {
             <button type="button" class="btn-secondary" onClick=${() => this.setState({ notice: null })}>Dismiss</button>
           </div>`}
 
-          ${offline && html`<div class="banner banner-error" role="alert">
-            <span>Cannot reach the server. The dashboard will retry on its own.</span>
+          ${offline && html`<div class="banner banner-error banner-offline" role="alert">
+            <span><strong>Cannot reach the server.</strong> Nothing on this page is being refreshed. The dashboard retries on its own, or you can try now.</span>
             <button type="button" class="btn-secondary" onClick=${() => this.refresh({ push: false })}>Retry now</button>
           </div>`}
 
@@ -1693,11 +1952,11 @@ class Dashboard extends Component {
             <${FilterBar} filters=${filters} onRemove=${(i) => this.removeFilter(i)} onToggle=${(i) => this.toggleFilter(i)} onClear=${() => this.clearFilters()} />
             ${this.renderOverview()}
 
-            <${RealtimePanel} state=${res.realtime} onRetry=${() => this.load('realtime')} onVisible=${() => this.want('realtime')} />
+            <${RealtimePanel} state=${res.realtime} filtered=${filters.length > 0} onRetry=${() => this.load('realtime')} onVisible=${() => this.want('realtime')} />
 
             <div class="panel-grid">
               ${BREAKDOWN_GROUPS.map((group) => html`
-                <${BreakdownGroup} group=${group} active=${tabs[group.id]} data=${res} onTab=${(g, slug, visible) => this.setTab(g, slug, visible)}
+                <${BreakdownGroup} group=${group} active=${tabs[group.id]} data=${res} limits=${this.state.limits} onLimit=${(slug, limit) => this.setLimit(slug, limit)} onTab=${(g, slug, visible) => this.setTab(g, slug, visible)}
                   onFilter=${(dimension, value) => this.addFilter(dimension, value)} onRetry=${(key) => this.load(key)} />`)}
             </div>
 
