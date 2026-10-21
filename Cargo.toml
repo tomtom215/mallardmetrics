@@ -25,6 +25,16 @@ sha2 = "0.11"
 subtle = "2.6.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# The `Stream` trait that `axum::body::Body::from_stream` takes; already in the
+# tree through tokio and axum.
+futures-core = "0.3.34"
+# The listener (`server::serve`) is hyper's HTTP/1 connection builder instead of
+# `axum::serve`, which has no way to set a header-read timeout (SI-14). HTTP/1
+# only, as axum's default features give today (no `http2`, so no `h2` crate).
+# hyper-util supplies the graceful-shutdown helper, the Tokio timer and the
+# tower adapter.
+hyper = { version = "1.11.1", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["server-graceful", "service", "tokio"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["cors", "compression-gzip", "trace", "timeout"] }

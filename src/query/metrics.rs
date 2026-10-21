@@ -177,11 +177,12 @@ fn assemble(base: &BaseCounts, sessions: Option<&SessionAggregates>) -> CoreMetr
 
 /// Visitor, pageview and event counts in one scan.
 fn query_base_counts(conn: &Connection, scope: &QueryScope) -> Result<BaseCounts, duckdb::Error> {
+    let events = scope.events();
     let sql = format!(
         "SELECT COUNT(DISTINCT visitor_id),
                 COUNT(*) FILTER (WHERE event_name = 'pageview'),
                 COUNT(*)
-         FROM events_all WHERE {}",
+         FROM {events} WHERE {}",
         scope.where_clause()
     );
     let mut stmt = conn.prepare(&sql)?;

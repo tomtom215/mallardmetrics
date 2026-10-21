@@ -2,6 +2,7 @@ use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_ma
 use duckdb::Connection;
 use mallard_metrics::ingest::buffer::{Event, EventBuffer};
 use mallard_metrics::query::QueryScope;
+use mallard_metrics::query::scoped::ColdReads;
 use mallard_metrics::query::{breakdowns, metrics, timeseries};
 use mallard_metrics::storage::TierLock;
 use mallard_metrics::storage::parquet::ParquetStorage;
@@ -447,12 +448,118 @@ fn bench_query_scale(c: &mut Criterion) {
     group.finish();
 }
 
+/// The reports a dashboard load runs, through `events_all` and through the
+/// scoped read the API now uses (task: scoped queries, audit F-06).
+///
+/// Same dataset as `query_scale` (current file layout, one week of one site in
+/// the middle of it). Each pair answers the same question and the benchmark
+/// asserts the answers match before timing them, so a speed-up cannot come from
+/// reading less than the report needs. The scoped variants include the per-request
+/// file listing, as the handler pays it. Setup is outside `b.iter()` (L21).
+fn bench_report_scale(c: &mut Criterion) {
+    type Report = fn(&Connection, &QueryScope) -> usize;
+    let (sites, days) = scale_shape();
+    let site = format!("site{:03}.example.com", sites / 2);
+    let first_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()
+        + chrono::Duration::days(i64::try_from(days.saturating_sub(7) / 2).unwrap());
+    let end_day = first_day + chrono::Duration::days(7);
+    let scope = QueryScope::new(
+        site.as_str(),
+        first_day.format("%Y-%m-%d").to_string(),
+        end_day.format("%Y-%m-%d").to_string(),
+        "30 minutes",
+    );
+
+    // The layout the writer produces today: `site_id` is a column in the file
+    // as well as a directory name, which the scoped read depends on.
+    let root = tempfile::tempdir().unwrap();
+    write_scale_dataset(root.path(), true);
+    let conn = Connection::open_in_memory().unwrap();
+    schema::init_schema(&conn).unwrap();
+    schema::setup_query_view(&conn, root.path()).unwrap();
+    let storage = ParquetStorage::new(root.path(), 0);
+    let cold = ColdReads::new(&storage);
+
+    let main_all = metrics::query_event_metrics(&conn, &scope).unwrap();
+    let main_scoped = metrics::query_event_metrics(&conn, &cold.scope(scope.clone(), 0)).unwrap();
+    assert_eq!(
+        serde_json::to_string(&main_all).unwrap(),
+        serde_json::to_string(&main_scoped).unwrap()
+    );
+    assert!(main_all.total_pageviews > 0);
+
+    let mut group = c.benchmark_group("report_scale");
+    group.sample_size(10);
+    let reports: [(&str, Report); 3] = [
+        ("main", |conn, scope| {
+            usize::try_from(
+                metrics::query_event_metrics(conn, scope)
+                    .unwrap()
+                    .total_pageviews,
+            )
+            .unwrap()
+        }),
+        ("breakdown_pages", |conn, scope| {
+            breakdowns::query_breakdown(conn, scope, breakdowns::Dimension::Page, 10)
+                .unwrap()
+                .len()
+        }),
+        ("timeseries_day", |conn, scope| {
+            timeseries::query_timeseries(conn, scope, timeseries::Granularity::Day)
+                .unwrap()
+                .len()
+        }),
+    ];
+    for (name, report) in reports {
+        assert_eq!(
+            report(&conn, &scope),
+            report(&conn, &cold.scope(scope.clone(), 0)),
+            "{name}: the scoped read must answer the same"
+        );
+        group.bench_function(format!("{name}/events_all"), |b| {
+            b.iter(|| report(&conn, &scope));
+        });
+        group.bench_function(format!("{name}/scoped"), |b| {
+            b.iter(|| report(&conn, &cold.scope(scope.clone(), 0)));
+        });
+    }
+    group.finish();
+}
+
+/// Cost of inserting into a full query cache (audit S-10).
+///
+/// At capacity every insert evicts the least recently used entry by scanning
+/// them all under the cache mutex. This measures that at the default size, to
+/// decide whether replacing the cache is worth anything. Setup is outside
+/// `b.iter()` (L21); each iteration inserts a key the cache has not seen, so it
+/// always has to evict.
+fn bench_cache_insert_full(c: &mut Criterion) {
+    use mallard_metrics::query::cache::{QueryCache, cache_key};
+    let mut group = c.benchmark_group("cache_insert_full");
+    for capacity in [1_000usize, 10_000, 100_000] {
+        let cache = QueryCache::new(60, capacity);
+        for i in 0..capacity {
+            cache.insert(cache_key("main", "site", &[&i.to_string()]), "{}");
+        }
+        let mut next = capacity;
+        group.bench_function(BenchmarkId::from_parameter(capacity), |b| {
+            b.iter(|| {
+                next += 1;
+                cache.insert(cache_key("main", "site", &[&next.to_string()]), "{}");
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_buffer_push,
     bench_flush,
     bench_queries,
     bench_query_scale,
+    bench_report_scale,
+    bench_cache_insert_full,
     bench_user_agent,
     bench_visitor_id
 );

@@ -1,4 +1,4 @@
-use super::QueryScope;
+use super::{QueryScope, parse_bound};
 use chrono::{Days, NaiveDate, NaiveDateTime};
 use duckdb::Connection;
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,15 @@ pub struct RetentionCohort {
 pub const fn rotation_supports_weeks(rotation_days: u32, weeks: u32) -> bool {
     // Week N needs identities to survive at least 7*N days.
     rotation_days as u64 >= (weeks.saturating_sub(1) as u64) * 7
+}
+
+/// How many days before the report's start the cohort query reads.
+///
+/// At least one: a lookback of zero would make "first seen" meaningless. Shared
+/// with the caller that picks which Parquet files to open, so the two cannot
+/// disagree about the window.
+pub const fn scan_lookback_days(lookback_days: u32) -> u32 {
+    if lookback_days == 0 { 1 } else { lookback_days }
 }
 
 /// Query weekly retention cohorts.
@@ -110,7 +119,7 @@ pub fn query_retention_at(
     // `first_seen` reads from `start - lookback_days`; an unparsable start
     // falls back to the whole history, which is slower but never wrong.
     let scan_from = parse_bound(&scope.start)
-        .and_then(|t| t.checked_sub_days(Days::new(u64::from(lookback_days.max(1)))))
+        .and_then(|t| t.checked_sub_days(Days::new(u64::from(scan_lookback_days(lookback_days)))))
         .map_or_else(|| "-infinity".to_string(), |t| t.to_string());
 
     // Bind order follows the statement text: the cohort CTE takes site, scan
@@ -173,14 +182,6 @@ pub fn query_retention_at(
         .collect())
 }
 
-/// A date (`YYYY-MM-DD`) or timestamp (`YYYY-MM-DD HH:MM:SS`) as a timestamp.
-fn parse_bound(raw: &str) -> Option<NaiveDateTime> {
-    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
-        .ok()
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .or_else(|| NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").ok())
-}
-
 /// How many of a cohort's `weeks` weeks ended on or before `observed_until`.
 fn complete_weeks(cohort_week: NaiveDateTime, weeks: u32, observed_until: NaiveDateTime) -> u32 {
     (0..weeks)
@@ -197,6 +198,7 @@ fn complete_weeks(cohort_week: NaiveDateTime, weeks: u32, observed_until: NaiveD
 /// SQL for the per-visitor retention report. Split out so it can be unit-tested.
 fn retention_sql(weeks: u32, scope: &QueryScope) -> String {
     let filters = scope.filter_clause();
+    let events = scope.events();
     let conditions: Vec<String> = (0..weeks)
         .map(|i| {
             format!(
@@ -223,7 +225,7 @@ fn retention_sql(weeks: u32, scope: &QueryScope) -> String {
     format!(
         "WITH first_seen AS (
              SELECT visitor_id, MIN(timestamp) AS first_ts
-             FROM events_all
+             FROM {events}
              WHERE site_id = ?
                AND timestamp >= CAST(? AS TIMESTAMP)
                AND timestamp <  CAST(? AS TIMESTAMP){filters}
@@ -236,7 +238,7 @@ fn retention_sql(weeks: u32, scope: &QueryScope) -> String {
                     retention(
                  {retention_args}
                     ) AS r
-             FROM events_all e
+             FROM {events} e
              JOIN first_seen f ON e.visitor_id = f.visitor_id
              WHERE e.site_id = ?
                AND e.timestamp >= CAST(? AS TIMESTAMP)

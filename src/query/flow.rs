@@ -79,6 +79,7 @@ pub fn query_flow(
     let escaped_page = target_page.replace('\'', "''");
     let dir = direction.as_arg();
 
+    let events = scope.events();
     let sql = format!(
         "WITH moves AS (
              SELECT visitor_id, timestamp, pathname
@@ -86,7 +87,7 @@ pub fn query_flow(
                  SELECT visitor_id, timestamp, pathname,
                         LAG(pathname) OVER (
                             PARTITION BY visitor_id ORDER BY timestamp) AS previous
-                 FROM events_all
+                 FROM {events}
                  WHERE {where_clause} AND event_name = 'pageview'
              )
              WHERE previous IS DISTINCT FROM pathname

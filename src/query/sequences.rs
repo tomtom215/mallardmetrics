@@ -37,6 +37,7 @@ fn build_pattern(num_conditions: usize) -> String {
 fn build_sequence_match_sql(scope: &QueryScope, conditions: &[&str]) -> String {
     let pattern = build_pattern(conditions.len());
     let conds = conditions.join(", ");
+    let events = scope.events();
     format!(
         "SELECT
             COUNT(*) FILTER (WHERE matched) AS converting_visitors,
@@ -48,7 +49,7 @@ fn build_sequence_match_sql(scope: &QueryScope, conditions: &[&str]) -> String {
              SELECT visitor_id,
                  sequence_match('{pattern}', timestamp, {conds}) AS matched,
                  sequence_count('{pattern}', timestamp, {conds}) AS match_count
-             FROM events_all
+             FROM {events}
              WHERE {where_clause}
              GROUP BY visitor_id
          )",

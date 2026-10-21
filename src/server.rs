@@ -26,8 +26,9 @@ const MAX_BODY_BYTES: usize = 65_536;
 const LATENCY_BUCKETS_SECS: [f64; 11] = [
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];
-/// Per-request timeout.
-const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Per-request timeout. The query queue wait plus the query deadline must fit
+/// inside it; `Config::validate` enforces that.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Request counts and latency, recorded for every HTTP request.
 ///
@@ -428,8 +429,8 @@ async fn detailed_health_check(State(state): State<Arc<AppState>>) -> Response {
         "buffer_empty": state.buffer.is_empty(),
         "dropped_events": state.buffer.dropped_events.load(Ordering::Relaxed),
         "geoip_loaded": state.geoip.is_loaded(),
-        "behavioral_extension_loaded": state.behavioral_extension_loaded,
-        "behavioral_version": state.behavioral_version,
+        "behavioral_extension_loaded": state.behavioral.is_loaded(),
+        "behavioral_version": state.behavioral.version(),
         "read_connections": state.readers.len(),
         "filter_bots": state.filter_bots,
         "session_window": state.session_window,
@@ -547,7 +548,7 @@ fn write_gauges(out: &mut String, state: &AppState) {
         "mallard_behavioral_extension",
         "Whether the DuckDB behavioral extension is loaded",
         "gauge",
-        u64::from(state.behavioral_extension_loaded),
+        u64::from(state.behavioral.is_loaded()),
     );
     metric(
         out,
@@ -677,6 +678,7 @@ fn escape_label(value: &str) -> String {
 /// decides what funnel results mean, so it belongs next to the binary's own.
 fn write_build_info(out: &mut String, state: &AppState) {
     use std::fmt::Write;
+    let behavioral_version = state.behavioral.version();
     let _ = writeln!(
         out,
         "# HELP mallard_build_info Version of this binary and of the loaded behavioral extension"
@@ -686,7 +688,7 @@ fn write_build_info(out: &mut String, state: &AppState) {
         out,
         "mallard_build_info{{version=\"{}\",behavioral_version=\"{}\"}} 1",
         escape_label(env!("CARGO_PKG_VERSION")),
-        escape_label(state.behavioral_version.as_deref().unwrap_or("none"))
+        escape_label(behavioral_version.as_deref().unwrap_or("none"))
     );
 }
 
@@ -718,6 +720,104 @@ async fn prometheus_metrics(
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
         build_metrics_body(&state),
     ))
+}
+
+// ── Listener ─────────────────────────────────────────────────────────────
+
+/// How long a client may take to send the head of a request, and how long a
+/// keep-alive connection may sit idle between requests (SI-14).
+///
+/// `axum::serve` sets no timer, so a connection that sent nothing, or sent half
+/// a request line every few minutes (slowloris), was held open for as long as
+/// the client liked, one file descriptor each. Thirty seconds is hyper's own
+/// default for the setting, long enough for a phone on a bad link to finish a
+/// request head and short enough that idle sockets do not pile up. Idle
+/// keep-alive connections share the limit; a reverse proxy that pools upstream
+/// connections for longer than this sees an occasional closed socket, which
+/// every HTTP/1.1 client must already retry.
+pub const HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Serve `app` on `listener` until `shutdown` completes, then drain.
+///
+/// This is `axum::serve(..).with_graceful_shutdown(..)` with the one thing it
+/// lacks, a header-read timeout, and nothing else changed:
+///
+/// - the peer address reaches handlers as `ConnectInfo<SocketAddr>`;
+/// - HTTP/1.1 is served (axum's default features include no HTTP/2 either);
+/// - when `shutdown` completes the listener is dropped, so no new connection is
+///   accepted, every open connection is told to finish its current request and
+///   close, and the returned future resolves once all of them have. The caller
+///   (`main`) flushes only after that, so an event accepted by an in-flight
+///   request is still in the buffer when the final flush runs.
+///
+/// A connection that has not finished sending a request head within
+/// `header_read_timeout` of connecting (or of its previous response) is closed.
+///
+/// # Errors
+///
+/// Never in practice: accept errors are logged and retried, as `axum::serve`
+/// does. The `Result` keeps the signature `main` already handles.
+pub async fn serve<F>(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    header_read_timeout: std::time::Duration,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    use axum::extract::ConnectInfo;
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    use hyper_util::server::graceful::GracefulShutdown;
+    use hyper_util::service::TowerToHyperService;
+    use tower::ServiceExt;
+
+    let mut http = hyper::server::conn::http1::Builder::new();
+    http.timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout);
+
+    let graceful = GracefulShutdown::new();
+    let mut shutdown = std::pin::pin!(shutdown);
+
+    loop {
+        let (stream, remote) = tokio::select! {
+            () = &mut shutdown => break,
+            accepted = listener.accept() => match accepted {
+                Ok(connection) => connection,
+                Err(e) => {
+                    // Usually descriptor exhaustion; spinning on it would only
+                    // burn a core, so back off as axum::serve does.
+                    tracing::warn!(error = %e, "Could not accept a connection");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    continue;
+                }
+            },
+        };
+
+        let service = app.clone().map_request(
+            move |mut request: axum::http::Request<hyper::body::Incoming>| {
+                request.extensions_mut().insert(ConnectInfo(remote));
+                request.map(axum::body::Body::new)
+            },
+        );
+        // No `.with_upgrades()`: nothing here upgrades a connection (no
+        // WebSocket, no CONNECT), and hyper-util cannot drain an upgradeable one.
+        let connection =
+            http.serve_connection(TokioIo::new(stream), TowerToHyperService::new(service));
+        // Registered before the task starts, so a shutdown that begins while
+        // this connection is being set up still waits for it.
+        let watched = graceful.watch(connection);
+        tokio::spawn(async move {
+            if let Err(e) = watched.await {
+                tracing::debug!(error = %e, peer = %remote, "Connection ended with an error");
+            }
+        });
+    }
+
+    // Stop accepting, then wait for every connection to finish.
+    drop(listener);
+    graceful.shutdown().await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1038,7 +1138,7 @@ mod tests {
                 )))
                 .await
                 .unwrap();
-            let expected = if dim.requires_behavioral() && !state.behavioral_extension_loaded {
+            let expected = if dim.requires_behavioral() && !state.behavioral.is_loaded() {
                 StatusCode::SERVICE_UNAVAILABLE
             } else {
                 StatusCode::OK
@@ -1105,7 +1205,7 @@ mod tests {
         // Reporting 200 with an empty body made a missing extension look like a
         // site with no data.
         let (state, _dir) = state_builder().build();
-        if state.behavioral_extension_loaded {
+        if state.behavioral.is_loaded() {
             return;
         }
         for uri in [
@@ -1399,5 +1499,189 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+}
+
+#[cfg(test)]
+mod serve_tests {
+    //! The listener, over real sockets: `oneshot` cannot see a connection that
+    //! sends nothing, or a shutdown that has to wait for one that is mid-request.
+    use super::*;
+    use axum::extract::ConnectInfo;
+    use axum::routing::get;
+    use std::net::SocketAddr;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    /// A shutdown trigger the test can pull.
+    struct Server {
+        addr: SocketAddr,
+        stop: Option<tokio::sync::oneshot::Sender<()>>,
+        task: tokio::task::JoinHandle<std::io::Result<()>>,
+    }
+
+    fn app() -> Router {
+        Router::new()
+            .route("/fast", get(|| async { "fast" }))
+            .route(
+                "/slow",
+                get(|| async {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    "slow"
+                }),
+            )
+            .route(
+                "/peer",
+                get(|ConnectInfo(addr): ConnectInfo<SocketAddr>| async move { addr.to_string() }),
+            )
+    }
+
+    async fn start(header_timeout: Duration) -> Server {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(serve(listener, app(), header_timeout, async move {
+            let _ = stopped.await;
+        }));
+        Server {
+            addr,
+            stop: Some(stop),
+            task,
+        }
+    }
+
+    impl Server {
+        fn shutdown(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                let _ = stop.send(());
+            }
+        }
+    }
+
+    /// Read until the peer closes, returning how long that took. Panics if it
+    /// takes longer than `limit`.
+    async fn closed_within(stream: &mut TcpStream, limit: Duration) -> Duration {
+        let started = Instant::now();
+        let mut buf = [0u8; 1024];
+        loop {
+            match tokio::time::timeout(limit, stream.read(&mut buf)).await {
+                Ok(Ok(0) | Err(_)) => return started.elapsed(),
+                Ok(Ok(_)) => {} // a response (408) before the close is fine
+                Err(elapsed) => {
+                    panic!("the server still had the connection open after {limit:?}: {elapsed}")
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_sends_nothing_is_closed_within_the_timeout() {
+        let server = start(Duration::from_millis(300)).await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        let took = closed_within(&mut stream, Duration::from_secs(5)).await;
+        assert!(
+            took >= Duration::from_millis(250),
+            "closed after {took:?}, before the timeout could have fired"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_half_sent_request_head_is_closed_within_the_timeout() {
+        // Slowloris: start a request and never finish it.
+        let server = start(Duration::from_millis(300)).await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        stream
+            .write_all(b"GET /fast HTTP/1.1\r\nHost: x\r\nX-Slow: ")
+            .await
+            .unwrap();
+        closed_within(&mut stream, Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn a_normal_request_is_served_and_sees_the_peer_address() {
+        let server = start(Duration::from_secs(5)).await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        let local = stream.local_addr().unwrap();
+        stream
+            .write_all(b"GET /peer HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.ends_with(&local.to_string()),
+            "handlers must see the client's address as ConnectInfo: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_keep_alive_connection_that_goes_quiet_is_closed() {
+        let server = start(Duration::from_millis(400)).await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        stream
+            .write_all(b"GET /fast HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"));
+        // Same connection, no second request: the idle limit applies.
+        closed_within(&mut stream, Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_accepting_and_waits_for_the_request_in_flight() {
+        // The property main's final flush depends on: serve() must not return
+        // until a request that was already running has been answered.
+        let mut server = start(Duration::from_secs(5)).await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        stream
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        server.shutdown();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !server.task.is_finished(),
+            "serve returned while a request was still being handled"
+        );
+        // No new connections once shutdown has begun.
+        let refused = tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(server.addr))
+            .await
+            .map(|r| r.is_err());
+        assert_eq!(refused, Ok(true), "the listener must stop accepting");
+
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.ends_with("slow"), "{response}");
+
+        let finished = tokio::time::timeout(Duration::from_secs(5), &mut server.task)
+            .await
+            .expect("serve must return once the connection has drained");
+        finished.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_idle_keep_alive_connections_at_once() {
+        let mut server = start(Duration::from_secs(30)).await;
+        let mut stream = TcpStream::connect(server.addr).await.unwrap();
+        stream
+            .write_all(b"GET /fast HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let _ = stream.read(&mut buf).await.unwrap();
+
+        server.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), &mut server.task)
+            .await
+            .expect("an idle connection must not hold up the drain")
+            .unwrap()
+            .unwrap();
     }
 }

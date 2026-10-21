@@ -47,7 +47,13 @@ struct RealtimeScope {
 }
 
 impl RealtimeScope {
-    fn new(site_id: &str, since: NaiveDateTime, until: NaiveDateTime, filters: &[Filter]) -> Self {
+    fn new(
+        site_id: &str,
+        since: NaiveDateTime,
+        until: NaiveDateTime,
+        filters: &[Filter],
+        source: &str,
+    ) -> Self {
         Self {
             site_id: site_id.to_string(),
             since,
@@ -55,8 +61,14 @@ impl RealtimeScope {
             // Only the filter half of this scope is ever read; the dates and
             // session window on it are unused.
             filters: super::QueryScope::new(site_id, "", "", "30 minutes")
-                .with_filters(filters.to_vec()),
+                .with_filters(filters.to_vec())
+                .with_source(source.to_string()),
         }
+    }
+
+    /// The relation events are read from; see [`QueryScope::events`].
+    fn events(&self) -> &str {
+        self.filters.events()
     }
 
     /// `site_id = ? AND timestamp BETWEEN ? AND ?`, plus the segment.
@@ -126,6 +138,45 @@ pub fn query_realtime_at(
     filters: &[Filter],
     now: NaiveDateTime,
 ) -> Result<RealtimeSnapshot, duckdb::Error> {
+    query_realtime_from(
+        conn,
+        super::EVENTS_ALL,
+        site_id,
+        window_minutes,
+        filters,
+        now,
+    )
+}
+
+/// The days of the cold tier a realtime window ending at `now` can read.
+///
+/// The window crosses midnight for the first minutes of every UTC day, so it is
+/// the day of `since` through the day of `now`, not just today.
+pub fn window_days(
+    window_minutes: u32,
+    now: NaiveDateTime,
+) -> (chrono::NaiveDate, chrono::NaiveDate) {
+    let since = now - chrono::Duration::minutes(i64::from(window_minutes.max(1)));
+    (since.date(), now.date())
+}
+
+/// [`query_realtime_at`] reading events from `source` instead of `events_all`.
+///
+/// `source` is a relation such as the one
+/// [`ColdReads::source`](super::scoped::ColdReads::source) builds for
+/// [`window_days`]; it must contain every event of the site in the window.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub fn query_realtime_from(
+    conn: &Connection,
+    source: &str,
+    site_id: &str,
+    window_minutes: u32,
+    filters: &[Filter],
+    now: NaiveDateTime,
+) -> Result<RealtimeSnapshot, duckdb::Error> {
     let window = window_minutes.max(1);
     let since = now - chrono::Duration::minutes(i64::from(window));
 
@@ -134,12 +185,13 @@ pub fn query_realtime_at(
     // breakdown row narrows "right now" the same way it narrows every other
     // panel. Without this the endpoint quietly ignored `filters` while the API
     // documentation promised every stats endpoint honoured them.
-    let scope = RealtimeScope::new(site_id, since, now, filters);
+    let scope = RealtimeScope::new(site_id, since, now, filters, source);
 
+    let events = scope.events();
     let sql = format!(
         "SELECT COUNT(DISTINCT visitor_id),
                 COUNT(*) FILTER (WHERE event_name = 'pageview')
-         FROM events_all
+         FROM {events}
          WHERE {}",
         scope.where_clause()
     );
@@ -173,9 +225,10 @@ fn query_top(
     column: &str,
 ) -> Result<Vec<RealtimeEntry>, duckdb::Error> {
     let where_clause = scope.where_clause();
+    let events = scope.events();
     let sql = format!(
         "SELECT COALESCE({column}, '(direct)') AS value, COUNT(DISTINCT visitor_id) AS visitors
-         FROM events_all
+         FROM {events}
          WHERE {where_clause}
          GROUP BY value
          ORDER BY visitors DESC, value
@@ -201,6 +254,7 @@ fn query_per_minute(
     until: NaiveDateTime,
 ) -> Result<Vec<u64>, duckdb::Error> {
     let where_clause = scope.where_clause();
+    let events = scope.events();
     let sql = format!(
         "WITH spine AS (
              SELECT UNNEST(generate_series(
@@ -212,7 +266,7 @@ fn query_per_minute(
          agg AS (
              SELECT DATE_TRUNC('minute', timestamp) AS bucket,
                     COUNT(*) FILTER (WHERE event_name = 'pageview') AS pageviews
-             FROM events_all
+             FROM {events}
              WHERE {where_clause}
              GROUP BY 1
          )

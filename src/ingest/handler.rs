@@ -181,11 +181,15 @@ pub struct AppState {
     pub metrics_token: Option<String>,
     /// Caps concurrent analytics queries.
     pub query_semaphore: Arc<tokio::sync::Semaphore>,
+    /// How long a query may queue for a slot and then run. From
+    /// `query_queue_wait_secs` and `query_deadline_secs`.
+    pub query_limits: crate::api::stats::QueryLimits,
     pub secure_cookies: bool,
-    /// Whether the DuckDB `behavioral` extension loaded at startup.
-    pub behavioral_extension_loaded: bool,
-    /// Version reported by the behavioral extension, when loaded.
-    pub behavioral_version: Option<String>,
+    /// Whether the DuckDB `behavioral` extension is loaded on every connection,
+    /// and which version. A server that started without it retries in the
+    /// background (`query::extension::retry_until_loaded`), so this can turn
+    /// true after startup.
+    pub behavioral: crate::query::extension::ExtensionState,
     /// Trust `X-Forwarded-For` / `X-Real-IP` for the client address.
     pub trust_proxy_headers: bool,
     /// Reverse proxies in front of this server; see `Config::trusted_proxy_hops`.

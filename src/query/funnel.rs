@@ -203,6 +203,7 @@ fn funnel_sql(scope: &QueryScope, window_interval: &str, modes: &str, steps: &[&
     let mode_arg = format!("'{}', ", effective_modes(modes).replace('\'', "''"));
 
     // One row per distinct "furthest step reached"; `cumulative` does the rest.
+    let events = scope.events();
     format!(
         "SELECT furthest, COUNT(*) AS visitors
          FROM (
@@ -210,7 +211,7 @@ fn funnel_sql(scope: &QueryScope, window_interval: &str, modes: &str, steps: &[&
                  window_funnel(INTERVAL '{window_interval}', {mode_arg}timestamp,
                      {step_conditions}
                  ) AS furthest
-             FROM events_all
+             FROM {events}
              WHERE {where_clause}
              GROUP BY visitor_id
          )

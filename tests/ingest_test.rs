@@ -564,7 +564,7 @@ async fn test_breakdowns_across_every_dimension() {
             &format!("/api/stats/breakdown/{slug}?site_id=example.com&period=30d"),
         )
         .await;
-        let expected = if dim.requires_behavioral() && !state.behavioral_extension_loaded {
+        let expected = if dim.requires_behavioral() && !state.behavioral.is_loaded() {
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::OK
@@ -1104,7 +1104,7 @@ async fn test_sessions_endpoint_reports_a_missing_extension() {
     // Without the extension the route must say so rather than returning zeros,
     // which are indistinguishable from a site where everyone bounced.
     let (state, _dir) = plain_state();
-    if state.behavioral_extension_loaded {
+    if state.behavioral.is_loaded() {
         return;
     }
     let response = get(&state, "/api/stats/sessions?site_id=example.com&period=30d").await;
@@ -1297,7 +1297,7 @@ async fn test_flow_rejects_bad_direction_and_page() {
 #[tokio::test]
 async fn test_behavioral_endpoints_report_unavailability_clearly() {
     let (state, _dir) = plain_state();
-    if state.behavioral_extension_loaded {
+    if state.behavioral.is_loaded() {
         return;
     }
     // A 200 with an empty body was indistinguishable from a site with no data.
@@ -2408,4 +2408,414 @@ async fn test_a_lone_start_date_is_a_bad_request() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// ── Streaming raw export ─────────────────────────────────────────────────
+//
+// The raw export used to build the whole file in memory (several copies of it,
+// S-12). It now streams: a blocking thread runs the query and feeds a bounded
+// channel that the response body drains. These tests pin the properties that
+// make that worth having.
+
+const EXPORT_DAY: &str = "2024-01-15";
+
+/// Insert `count` pageviews for `site` on `day`, one second apart so that
+/// `ORDER BY timestamp` has no ties. Straight into the hot table: building this
+/// many rows through the ingest endpoint would take far longer than the test.
+fn insert_rows(state: &Arc<AppState>, site: &str, day: &str, count: usize) {
+    assert!(count <= 86_000, "one row per second of a single day");
+    state
+        .buffer
+        .conn()
+        .lock()
+        .execute_batch(&format!(
+            "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname, browser) \
+             SELECT '{site}', 'v' || (i % 100), \
+                    TIMESTAMP '{day} 00:00:00' + INTERVAL (i) SECOND, \
+                    'pageview', '/p' || (i % 7), \
+                    CASE WHEN i % 3 = 0 THEN NULL ELSE 'Chrome' END \
+             FROM range({count}) t(i)"
+        ))
+        .expect("insert rows");
+}
+
+fn raw_export_uri(site: &str, format: &str) -> String {
+    format!(
+        "/api/stats/export?site_id={site}&start_date={EXPORT_DAY}&end_date={EXPORT_DAY}\
+         &kind=raw&format={format}"
+    )
+}
+
+#[tokio::test]
+async fn test_streamed_raw_export_is_byte_identical_to_the_buffered_one() {
+    use mallard_metrics::query::{QueryScope, export};
+    let (state, _dir) = plain_state();
+    // Two and a half chunks, so chunk joins are exercised.
+    insert_rows(&state, "stream.test", EXPORT_DAY, 25_000);
+    let scope = QueryScope::new("stream.test", EXPORT_DAY, "2024-01-16", "30 minutes");
+    let rows = {
+        let conn = state.buffer.conn();
+        let guard = conn.lock();
+        export::query_raw_export(&guard, &scope, 100_000).unwrap()
+    };
+    assert_eq!(rows.len(), 25_000);
+
+    for (format, want, content_type) in [
+        (
+            "csv",
+            export::to_csv(export::RAW_COLUMNS, &rows),
+            "text/csv; charset=utf-8",
+        ),
+        ("json", export::raw_to_json(&rows), "application/json"),
+    ] {
+        let response = get(&state, &raw_export_uri("stream.test", format)).await;
+        assert_eq!(response.status(), StatusCode::OK, "{format}");
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            content_type
+        );
+        let disposition = response
+            .headers()
+            .get("content-disposition")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            disposition.starts_with("attachment; filename=\"mallard-events-"),
+            "{disposition}"
+        );
+        assert!(
+            response.headers().get("content-length").is_none(),
+            "a streamed body has no length up front"
+        );
+        let text = body_text(response).await;
+        assert!(
+            text == want,
+            "{format}: the streamed export differs from the buffered one ({} vs {} bytes)",
+            text.len(),
+            want.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_streamed_raw_export_keeps_its_row_limit() {
+    let (state, _dir) = plain_state();
+    insert_rows(&state, "stream.test", EXPORT_DAY, 25_000);
+    let uri = format!("{}&limit=12345", raw_export_uri("stream.test", "csv"));
+    let text = body_text(get(&state, &uri).await).await;
+    assert_eq!(text.lines().count(), 12_345 + 1, "header plus the limit");
+
+    let too_many = format!("{}&limit=1000001", raw_export_uri("stream.test", "csv"));
+    assert_eq!(
+        get(&state, &too_many).await.status(),
+        StatusCode::BAD_REQUEST,
+        "the cap is unchanged"
+    );
+}
+
+#[tokio::test]
+async fn test_raw_export_with_nothing_to_export_is_still_a_valid_file() {
+    let (state, _dir) = plain_state();
+    let csv = body_text(get(&state, &raw_export_uri("nobody.test", "csv")).await).await;
+    assert_eq!(csv.lines().count(), 1, "just the header: {csv:?}");
+    assert!(csv.contains("pathname"));
+    let json = body_text(get(&state, &raw_export_uri("nobody.test", "json")).await).await;
+    assert_eq!(json, "[]");
+}
+
+#[tokio::test]
+async fn test_raw_export_streams_with_back_pressure_and_stops_when_the_client_leaves() {
+    use std::time::Duration;
+    let (state, _dir) = plain_state();
+    // Many more chunks (10,000 rows each) than the channel and the socket can
+    // hold, so a producer that ignored back-pressure would run to the end.
+    insert_rows(&state, "stream.test", EXPORT_DAY, 80_000);
+
+    let response = get(&state, &raw_export_uri("stream.test", "csv")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+
+    // Let the producer fill the channel and block on it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The export still holds the shared tier lock, so an exclusive request (a
+    // flush or compaction) cannot get it: the query has not run to completion,
+    // which it would have, in milliseconds, if the rows were being collected.
+    let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+    let tier = state.tier_lock.clone();
+    let writer = std::thread::spawn(move || {
+        let _exclusive = tier.write();
+        let _ = acquired_tx.send(());
+    });
+    assert!(
+        acquired_rx
+            .recv_timeout(Duration::from_millis(400))
+            .is_err(),
+        "the export finished without anyone reading it: it is not streaming"
+    );
+    assert!(
+        state.query_semaphore.available_permits() < 10,
+        "the export should still hold its query slot"
+    );
+
+    // Reading makes progress...
+    let frame = body.frame().await.expect("a frame").expect("no error");
+    assert!(frame.is_data());
+
+    // ...and walking away releases everything promptly.
+    drop(body);
+    acquired_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the producer kept the tier lock after the client left");
+    writer.join().unwrap();
+    for _ in 0..100 {
+        if state.query_semaphore.available_permits() == 10 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the query slot was not returned after the client left");
+}
+
+#[tokio::test]
+async fn test_a_client_that_stops_reading_gets_a_truncated_body_not_a_clean_end() {
+    use mallard_metrics::api::stats::QueryLimits;
+    use std::time::Duration;
+    // The deadline bounds DuckDB's own work (a debug build sorting 50,000 rows
+    // on a busy machine needs a good fraction of a second) and is also the
+    // longest the producer waits for the client to take a chunk, so it is
+    // generous and the stall below is longer still.
+    let (state, _dir) = state_builder()
+        .query_limits(QueryLimits {
+            queue_wait: Duration::from_secs(5),
+            deadline: Duration::from_secs(2),
+        })
+        .build();
+    // More than the first chunk, the two the channel holds, and the one the
+    // producer is blocked sending.
+    insert_rows(&state, "stream.test", EXPORT_DAY, 50_000);
+
+    let response = get(&state, &raw_export_uri("stream.test", "csv")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+
+    // Stall well past the deadline, then read what is left.
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    let mut aborted = false;
+    let mut bytes = 0usize;
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else {
+            aborted = true;
+            break;
+        };
+        bytes += frame.into_data().map_or(0, |d| d.len());
+    }
+    assert!(
+        aborted,
+        "the body ended cleanly after {bytes} bytes: a truncated export would look complete"
+    );
+}
+
+#[tokio::test]
+async fn test_raw_export_answers_busy_before_it_starts_streaming() {
+    use mallard_metrics::api::stats::QueryLimits;
+    use std::time::Duration;
+    let (state, _dir) = state_builder()
+        .query_permits(0)
+        .query_limits(QueryLimits {
+            queue_wait: Duration::from_millis(50),
+            deadline: Duration::from_secs(1),
+        })
+        .build();
+    let response = get(&state, &raw_export_uri("stream.test", "csv")).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "an export that cannot get a slot is refused with a status, not a broken body"
+    );
+}
+
+// ── Site listing ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_sites_are_listed_most_active_first_with_30_day_counts() {
+    // The allowlist applies to ingestion too, so it has to name the sites that
+    // post events; "configured.test" is listed without ever having any.
+    let (state, _dir) = state_builder()
+        .allowed_sites(vec![
+            "busy.test".to_string(),
+            "quiet.test".to_string(),
+            "configured.test".to_string(),
+        ])
+        .build();
+    // Today's events, some flushed to Parquet and some still hot.
+    for _ in 0..4 {
+        post_event(&state, pageview("busy.test", "https://busy.test/")).await;
+    }
+    post_event(&state, pageview("quiet.test", "https://quiet.test/")).await;
+    flush(&state);
+    post_event(&state, pageview("busy.test", "https://busy.test/more")).await;
+    post_event(&state, pageview("quiet.test", "https://quiet.test/more")).await;
+    // A site whose only events are far outside the 30-day window.
+    state
+        .buffer
+        .conn()
+        .lock()
+        .execute_batch(
+            "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname) \
+             SELECT 'old.test', 'v' || i, TIMESTAMP '2024-01-15 10:00:00' + INTERVAL (i) MINUTE, \
+                    'pageview', '/' FROM range(3) t(i)",
+        )
+        .unwrap();
+    flush(&state);
+
+    let json = body_json(get(&state, "/api/sites").await).await;
+    let ids: Vec<&str> = json["sites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(
+        ids,
+        ["busy.test", "quiet.test", "configured.test", "old.test"],
+        "most active first, then the quiet ones alphabetically"
+    );
+    let counts: Vec<(&str, u64)> = json["details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["site_id"].as_str().unwrap(),
+                d["events_30d"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        counts,
+        [
+            ("busy.test", 5),
+            ("quiet.test", 2),
+            ("configured.test", 0),
+            ("old.test", 0)
+        ]
+    );
+}
+
+// ── Export memory measurement (not part of the normal run) ───────────────
+//
+// `cargo test --test ingest_test -- --ignored --nocapture --test-threads=1 \
+//     measure_export_memory` prints the peak extra resident memory of exporting
+// a million rows the old way (collect every row, then build the CSV) and the
+// new way (stream it to a client that discards it as it arrives). Run each in
+// its own process (`--exact`) so one cannot inflate the other's baseline.
+
+/// Resident set size in KiB, from `/proc/self/statm` (Linux).
+fn rss_kib() -> u64 {
+    let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    let pages: u64 = statm
+        .split_whitespace()
+        .nth(1)
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(0);
+    pages * 4
+}
+
+/// Samples this process's resident memory until finished.
+struct RssSampler {
+    done: Arc<std::sync::atomic::AtomicBool>,
+    peak: Arc<std::sync::atomic::AtomicU64>,
+    before: u64,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl RssSampler {
+    fn start() -> Self {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let done = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU64::new(0));
+        let before = rss_kib();
+        let thread = {
+            let (done, peak) = (Arc::clone(&done), Arc::clone(&peak));
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    peak.fetch_max(rss_kib(), Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        };
+        Self {
+            done,
+            peak,
+            before,
+            thread,
+        }
+    }
+
+    /// The largest increase over the starting size, in KiB.
+    fn finish(self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.done.store(true, Ordering::Relaxed);
+        self.thread.join().unwrap();
+        self.peak
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.before)
+    }
+}
+
+fn million_row_state() -> (Arc<AppState>, tempfile::TempDir) {
+    let (state, dir) = plain_state();
+    for day in 1..=12 {
+        insert_rows(&state, "big.test", &format!("2024-01-{day:02}"), 84_000);
+    }
+    (state, dir)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "memory measurement; see the comment above"]
+async fn measure_export_memory_streamed() {
+    let (state, _dir) = million_row_state();
+    let uri = "/api/stats/export?site_id=big.test&start_date=2024-01-01&end_date=2024-01-12\
+               &kind=raw&format=csv&limit=1000000";
+    let started = std::time::Instant::now();
+    let sampler = RssSampler::start();
+    let response = get(&state, uri).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let mut bytes = 0usize;
+    while let Some(frame) = body.frame().await {
+        bytes += frame.unwrap().into_data().map_or(0, |d| d.len());
+    }
+    let growth = sampler.finish();
+    println!(
+        "STREAMED: {bytes} bytes in {:?}; peak RSS growth {} MiB",
+        started.elapsed(),
+        growth / 1024
+    );
+}
+
+#[test]
+#[ignore = "memory measurement; see the comment above"]
+fn measure_export_memory_buffered() {
+    use mallard_metrics::query::{QueryScope, export};
+    let (state, _dir) = million_row_state();
+    let scope = QueryScope::new("big.test", "2024-01-01", "2024-01-13", "30 minutes");
+    let started = std::time::Instant::now();
+    let conn = state.buffer.conn();
+    let sampler = RssSampler::start();
+    let rows = {
+        let guard = conn.lock();
+        export::query_raw_export(&guard, &scope, 1_000_000).unwrap()
+    };
+    let text = export::to_csv(export::RAW_COLUMNS, &rows);
+    let (rows, bytes) = (rows.len(), text.len());
+    let growth = sampler.finish();
+    println!(
+        "BUFFERED: {rows} rows, {bytes} bytes in {:?}; peak RSS growth {} MiB",
+        started.elapsed(),
+        growth / 1024
+    );
 }
