@@ -116,9 +116,11 @@ function BehavioralHelp({ detail, compactView }) {
     <div class="placeholder placeholder-unavailable behavioral-help">
       <strong>Behavioral analytics is unavailable on this server</strong>
       <p>
-        Visits, bounce rate, funnels, retention, sequences, flow and entry and exit pages depend on
-        DuckDB's${' '}<code>behavioral</code> community extension, and it is not loaded. Page views,
-        events, breakdowns, goals and revenue are unaffected.
+        ${compactView
+          ? html`This report needs DuckDB's${' '}<code>behavioral</code> extension, which is not loaded. See Overview.`
+          : html`Visits, bounce rate, funnels, retention, sequences, flow and entry and exit pages depend on
+              DuckDB's${' '}<code>behavioral</code> community extension, and it is not loaded. Page views,
+              events, breakdowns, goals and revenue are unaffected.`}
       </p>
       ${!compactView &&
       html`
@@ -790,7 +792,7 @@ const RETENTION_MIN_ROTATION_DAYS = (RETENTION_WEEKS - 1) * 7;
  * missing the visitors first seen earlier that week, so it is labelled.
  */
 function RetentionGrid({ data }) {
-  const { cohorts, identity_supports_cohorts: supported } = data;
+  const { cohorts, identity_supports_cohorts: supported, visitor_salt_rotation_days: rotation } = data;
   // An informational note, not an error: nothing is broken, the server is set up
   // to forget visitors faster than this report needs it to remember them.
   const notice =
@@ -799,7 +801,7 @@ function RetentionGrid({ data }) {
       <div class="notice notice-info" role="note">
         <strong>Weeks after the first cannot be measured with the current setting.</strong>
         Retention follows the same visitor from one week to the next, but this server replaces visitor
-        IDs sooner than that, so a returning visitor looks like a new one. To measure ${RETENTION_WEEKS}-week
+        IDs${Number.isFinite(rotation) ? html` every ${rotation} day${rotation === 1 ? '' : 's'}` : ' sooner than that'}, so a returning visitor looks like a new one. To measure ${RETENTION_WEEKS}-week
         cohorts, set <code>visitor_salt_rotation_days</code> (environment variable${' '}
         <code>MALLARD_VISITOR_SALT_ROTATION_DAYS</code>) to at least ${RETENTION_MIN_ROTATION_DAYS} and
         restart. It applies to events collected from then on, and a longer setting lets a visitor be
@@ -1088,6 +1090,42 @@ class ToolPanel extends Component {
  * API key management. The plaintext key is returned once and never again, so it
  * stays on screen until dismissed rather than vanishing on the next render.
  */
+/** Snapshot the data on the server. Admin only: a 403 or 409 is shown in the server's own words. */
+class BackupSection extends Component {
+  constructor() {
+    super();
+    this.state = { busy: false, result: null };
+  }
+
+  async run() {
+    this.setState({ busy: true, result: null });
+    const res = await api.send('POST', '/api/admin/backup');
+    if (res.kind === 'unauthorized') return this.props.onAuthExpired();
+    this.setState({
+      busy: false,
+      result: res.kind === 'ok'
+        ? { ok: true, ...res.data }
+        : { ok: false, message: res.status === 403 ? 'This needs an admin key or an admin session.' : res.message },
+    });
+  }
+
+  render(_, { busy, result }) {
+    return html`
+      <section aria-labelledby="backup-title">
+        <h3 class="subhead" id="backup-title">Backup</h3>
+        <p class="muted">Snapshot the database and event files into the server's <code>backups</code> folder while it keeps running. Restoring is done on the server.</p>
+        <div class="inline-controls">
+          <button type="button" class="btn-secondary" disabled=${busy} onClick=${() => this.run()}>${busy ? 'Creating backup…' : 'Create backup'}</button>
+        </div>
+        <div role="status">
+          ${result && result.ok && html`<p>Backup <strong>${result.name}</strong> created: <code>${result.path}</code> (${num(result.hot_rows)} recent events, ${num(result.parquet_files)} archive files).</p>`}
+          ${result && !result.ok && html`<div class="placeholder placeholder-error">${result.message}</div>`}
+        </div>
+      </section>
+    `;
+  }
+}
+
 class KeysPanel extends Component {
   constructor() {
     super();
@@ -1180,6 +1218,7 @@ class KeysPanel extends Component {
                   </table>
                 </div>
               `}
+        <${BackupSection} onAuthExpired=${this.props.onAuthExpired} />
       </${ToolPanel}>
     `;
   }
@@ -1262,6 +1301,14 @@ const FILTER_LABELS = {
 // an event, so the server has no per-event predicate for them and answers 400.
 const FILTERABLE_SLUGS = new Set(ALL_BREAKDOWN_SLUGS.filter((slug) => slug !== 'entry-pages' && slug !== 'exit-pages'));
 
+/**
+ * Why session data is missing, from what the server says: 'rounded'
+ * (gdpr_mode / round_timestamps), 'extension' (the behavioral extension is not
+ * loaded) or 'unknown' (an older server that names no cause).
+ */
+const reasonFromMain = (value) => (value === 'timestamps_rounded' ? 'rounded' : value === 'extension_missing' ? 'extension' : 'unknown');
+const reasonFromCode = (code) => (code === 'session_data_unavailable' ? 'rounded' : code === 'behavioral_unavailable' ? 'extension' : 'unknown');
+
 // Reports computed from sessions or ordered events. `retention` is separate: it
 // needs the extension but not exact timestamps, so gdpr_mode leaves it working.
 const BEHAVIORAL_KEYS = new Set(['funnel', 'retention', 'sequences', 'flow']);
@@ -1291,7 +1338,10 @@ class Dashboard extends Component {
     const period = url.period || prefs.period || '30d';
     this.state = {
       sites: null,
-      siteId: url.siteId || prefs.siteId || '',
+      siteEvents: {},
+      // The address bar names a site; otherwise the busiest one is chosen once
+      // the list arrives (a remembered site would hide that default).
+      siteId: url.siteId || '',
       siteDraft: '',
       period: period === 'today' ? 'day' : period,
       startDate: url.startDate || prefs.startDate || '',
@@ -1323,6 +1373,7 @@ class Dashboard extends Component {
     this.wanted = new Set();
     this.fetched = new Set();
     this.behavioral = null;
+    this.reason = null;
     this.mainWaiters = [];
     this.onPop = () => this.restoreFromUrl();
     this.onVisibility = () => {
@@ -1403,32 +1454,6 @@ class Dashboard extends Component {
     return this.mainSettled ? Promise.resolve() : new Promise((resolve) => this.mainWaiters.push(resolve));
   }
 
-  /**
-   * Why session data is missing: 'extension' (the behavioral extension is not
-   * loaded), 'rounded' (it is, but gdpr_mode rounds timestamps to the hour, so
-   * sessions cannot be built) or 'unknown'. `/stats/main` reports only that it
-   * could not compute sessions, so the public health endpoint names the cause.
-   */
-  whyUnavailable(gen) {
-    if (!this.reasonPromise || this.reasonGen !== gen) {
-      this.reasonGen = gen;
-      this.reasonPromise = (async () => {
-        let reason = 'unknown';
-        try {
-          const res = await fetch('/health/detailed', { headers: { Accept: 'application/json' } });
-          const body = await res.json();
-          if (body.behavioral_extension_loaded === true) reason = 'rounded';
-          else if (body.behavioral_extension_loaded === false) reason = 'extension';
-        } catch (e) {
-          /* the health endpoint is a hint; without it the generic explanation is used */
-        }
-        if (gen === this.gen) this.setState({ reason });
-        return reason;
-      })();
-    }
-    return this.reasonPromise;
-  }
-
   /** Fetch one report. Stale results from an earlier view are dropped. */
   async load(key, { quiet = false } = {}) {
     const gen = this.gen;
@@ -1444,8 +1469,7 @@ class Dashboard extends Component {
       await this.whenMain();
       if (gen !== this.gen) return;
       if (this.behavioral === false) {
-        const reason = await this.whyUnavailable(gen);
-        if (gen !== this.gen) return;
+        const reason = this.reason;
         // Weekly retention does not depend on the order of events inside an
         // hour, so a rounded-timestamp server can still answer it.
         if (!(key === 'retention' && reason === 'rounded')) {
@@ -1464,13 +1488,15 @@ class Dashboard extends Component {
     }
     if (key === 'main') {
       this.behavioral = result.kind === 'ok' ? result.data.behavioral_available !== false : null;
+      // The server names the cause itself (`sessions_unavailable_reason`); an
+      // older one that does not leaves it 'unknown' and the generic help shows.
+      this.reason = this.behavioral === false ? reasonFromMain(result.data.sessions_unavailable_reason) : null;
+      this.setState({ reason: this.reason });
       this.mainSettled = true;
       this.mainWaiters.splice(0).forEach((resolve) => resolve());
     }
     if (result.kind === 'unavailable') {
-      // Name the cause; the code alone cannot tell a missing extension from rounded timestamps.
-      result.reason = await this.whyUnavailable(gen);
-      if (gen !== this.gen) return;
+      result.reason = reasonFromCode(result.code);
     }
     if (quiet && result.kind !== 'ok' && prev && prev.kind === 'ok') {
       this.setRes(key, { ...prev, loading: false, offline: true });
@@ -1501,6 +1527,7 @@ class Dashboard extends Component {
     this.fetched.clear();
     this.mainSettled = false;
     this.behavioral = null;
+    this.reason = null;
     this.persist();
     this.syncUrl(push);
     document.title = `${this.state.siteId} · Mallard Metrics`;
@@ -1574,10 +1601,16 @@ class Dashboard extends Component {
       return;
     }
     const sites = result.data.sites || [];
+    // `details` carries each site's events in the last 30 days, busiest first.
+    // An older server sends only the IDs; then no counts are shown.
+    const details = Array.isArray(result.data.details) ? result.data.details : [];
+    const siteEvents = Object.fromEntries(details.map((d) => [d.site_id, d.events_30d]));
+    const busiest = details.find((d) => sites.includes(d.site_id))?.site_id ?? sites[0];
     this.setState((prev) => ({
       sites,
-      // A saved or linked site that no longer exists falls back to a real one.
-      siteId: sites.length > 0 && !sites.includes(prev.siteId) ? sites[0] : prev.siteId,
+      siteEvents,
+      // A linked site that does not exist falls back to the busiest real one.
+      siteId: sites.length > 0 && !sites.includes(prev.siteId) ? busiest : prev.siteId,
     }));
   }
 
@@ -1701,7 +1734,7 @@ class Dashboard extends Component {
   /* Rendering ------------------------------------------------------------ */
 
   renderToolbar() {
-    const { sites, siteId, siteDraft, period, startDate, endDate, compare, rangeOpen, draftStart, draftEnd, rangeError, updatedAt } = this.state;
+    const { sites, siteEvents, siteId, siteDraft, period, startDate, endDate, compare, rangeOpen, draftStart, draftEnd, rangeError, updatedAt } = this.state;
     const refreshing = Object.values(this.state.res).some((r) => r && r.loading);
     const today = todayUTC();
     return html`
@@ -1710,7 +1743,7 @@ class Dashboard extends Component {
           ? html`
               <label class="field"><span class="field-label">Site</span>
                 <select value=${siteId} onChange=${(e) => this.change({ siteId: e.target.value })}>
-                  ${sites.map((site) => html`<option value=${site} title=${site}>${site}</option>`)}
+                  ${sites.map((site) => html`<option value=${site} title=${site}>${Object.hasOwn(siteEvents, site) ? `${site} · ${num(siteEvents[site])} events (30d)` : site}</option>`)}
                 </select>
               </label>`
           : html`
@@ -1808,7 +1841,7 @@ class Dashboard extends Component {
     return html`
       ${prev && html`<p class="comparison-note">Compared with ${fmtDate(prev.start_date)} – ${fmtDate(prev.end_date)}${baselineEmpty ? ' — no data in that period, so there is nothing to compare against' : ''}</p>`}
       ${unavailable && html`<${Unavailable} reason=${this.state.reason} />`}
-      <dl class="metrics-grid">
+      <dl class="metrics-grid metrics-grid-overview">
         <${MetricCard} label="Unique visitors" help=${HELP.visitors} value=${compact(m.unique_visitors)} full=${num(m.unique_visitors)} delta=${delta('unique_visitors')} />
         <${MetricCard} label="Pageviews" help=${HELP.pageviews} value=${compact(m.total_pageviews)} full=${num(m.total_pageviews)} delta=${delta('total_pageviews')} />
         <${MetricCard} label="Total events" help=${HELP.events} value=${compact(m.total_events)} full=${num(m.total_events)} delta=${delta('total_events')} />

@@ -14,7 +14,8 @@
  *
  * Failures are told apart by the `code` the server puts in every error body
  * (`bad_request`, `unauthorized`, `not_found`, `internal_error`,
- * `too_many_requests`, `behavioral_unavailable`, `query_timeout`), never by
+ * `too_many_requests`, `behavioral_unavailable`, `session_data_unavailable`,
+ * `query_timeout`, `conflict`), never by
  * matching the wording of its message, which is written for people and free to
  * change. A response with no code at all (a proxy's HTML page, an older server)
  * is classified by its status alone.
@@ -22,10 +23,10 @@
  * Every call resolves; none rejects. Callers switch on `result.kind`:
  *   ok           - `data` holds the parsed body
  *   unauthorized - the session ended (401)
- *   unavailable  - `behavioral_unavailable` (503): the report needs data this
- *                  server cannot provide, either because the `behavioral`
- *                  extension is not loaded or because gdpr_mode rounds
- *                  timestamps to the hour. A state of the deployment, not a fault.
+ *   unavailable  - 503 `behavioral_unavailable` (the `behavioral` extension is
+ *                  not loaded) or `session_data_unavailable` (gdpr_mode rounds
+ *                  timestamps to the hour); `code` says which. A state of the
+ *                  deployment, not a fault.
  *   timeout      - `query_timeout` (504): valid request, too much work
  *   busy         - 429 that outlasted the retries
  *   error        - anything else the server refused or failed; `message` is displayable
@@ -60,7 +61,9 @@ export const ERROR_CODES = [
   'internal_error',
   'too_many_requests',
   'behavioral_unavailable',
+  'session_data_unavailable',
   'query_timeout',
+  'conflict',
 ];
 
 export function errorCode(body) {
@@ -73,7 +76,7 @@ export function errorCode(body) {
  */
 export function classifyFailure(status, body) {
   const code = errorCode(body);
-  if (code === 'behavioral_unavailable') return 'unavailable';
+  if (code === 'behavioral_unavailable' || code === 'session_data_unavailable') return 'unavailable';
   if (code === 'query_timeout' || (code === null && status === 504)) return 'timeout';
   if (code === 'too_many_requests' || (code === null && status === 429)) return 'busy';
   return 'error';
