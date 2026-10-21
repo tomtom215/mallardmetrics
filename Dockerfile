@@ -28,7 +28,7 @@
 # .github/workflows/release.yml; this Dockerfile is the from-source path used by
 # `docker compose build` and by CI's Docker smoke test.
 
-FROM rust:1.98.0-bookworm AS builder
+FROM rust:1.99.0-bookworm AS builder
 
 WORKDIR /build
 
