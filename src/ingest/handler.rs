@@ -155,6 +155,8 @@ pub struct AppState {
     pub filter_bots: bool,
     pub sessions: SessionStore,
     pub api_keys: ApiKeyStore,
+    /// Share links and saved segments; see `api::share`.
+    pub share: crate::api::share::ShareState,
     /// Hashed admin password (Argon2id), persisted so a password set through
     /// the setup endpoint survives a restart.
     pub admin_password: crate::api::auth::AdminPasswordStore,
