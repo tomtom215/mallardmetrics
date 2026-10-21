@@ -201,6 +201,33 @@ groups:
             in 10 minutes on {{ $labels.instance }}. Either one client is
             misbehaving or MALLARD_RATE_LIMIT is below your real traffic.
 
+  - name: mallard-notifications
+    rules:
+      # The webhook cannot report its own failure, so Prometheus watches it. The
+      # counters are 0 and flat when webhook alerts are not configured.
+      - alert: MallardNotificationsFailing
+        expr: increase(mallard_notifications_failed_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mallard cannot deliver its webhook notifications"
+          description: >-
+            {{ $value | printf "%.0f" }} webhook notification(s) were abandoned
+            after their retries in the last hour on {{ $labels.instance }}
+            (kind {{ $labels.kind }}). Run `mallard-metrics --test-webhook` with
+            the same environment, and check the receiver, the egress route and
+            docs/src/alerts-and-reports.md.
+
+      - alert: MallardNotificationsDropped
+        expr: increase(mallard_notifications_dropped_total{kind!=""}[1h]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "Mallard discarded webhook notifications unsent"
+          description: >-
+            The notification queue overflowed on {{ $labels.instance }}: the
+            receiver has been unreachable long enough for 64 messages to pile up.
+
 # Not alertable yet (no such metric): free disk space on the data volume, size
 # and file count of the Parquet store, last retention/compaction success and
 # DuckDB query errors. Use node_exporter for disk space in the meantime, e.g.

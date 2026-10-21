@@ -27,6 +27,9 @@ const HOUSEKEEPING_INTERVAL: std::time::Duration = std::time::Duration::from_min
 /// How often data-retention cleanup runs.
 const RETENTION_INTERVAL: std::time::Duration = std::time::Duration::from_hours(24);
 
+/// How long shutdown lets a webhook delivery in flight finish.
+const WEBHOOK_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Exit code used for a configuration or startup failure.
 const EXIT_FAILURE: i32 = 1;
 
@@ -37,6 +40,7 @@ async fn main() {
     match args.first().map(String::as_str) {
         Some("--healthcheck") => std::process::exit(run_healthcheck().await),
         Some("--install-extension") => std::process::exit(run_install_extension()),
+        Some("--test-webhook") => std::process::exit(run_test_webhook().await),
         Some("--version" | "-V") => {
             println!("mallard-metrics {}", env!("CARGO_PKG_VERSION"));
             return;
@@ -59,7 +63,8 @@ fn print_help() {
          USAGE:\n    \
              mallard-metrics [CONFIG_FILE]\n    \
              mallard-metrics --healthcheck\n    \
-             mallard-metrics --install-extension\n\n\
+             mallard-metrics --install-extension\n    \
+             mallard-metrics --test-webhook\n\n\
          OPTIONS:\n    \
              CONFIG_FILE           Path to a TOML configuration file (optional)\n    \
              --healthcheck         Probe a running instance and exit 0 when healthy\n    \
@@ -67,6 +72,8 @@ fn print_help() {
                                    the data directory and exit. For deployments\n                          \
                                    whose runtime network has no outbound route:\n                          \
                                    run this once with one, then start normally.\n    \
+             --test-webhook        Send one test notification to the configured alert\n                          \
+                                   webhook (MALLARD_ALERTS_*) and exit 0 if it was accepted\n    \
              --version, -V         Print the version and exit\n    \
              --help, -h            Print this message\n\n\
          Configuration may also be supplied through MALLARD_* environment\n\
@@ -147,6 +154,35 @@ fn run_install_extension() -> i32 {
                  community-extensions.duckdb.org. Run it from a host or network that has one, against the \
                  same data directory."
             );
+            EXIT_FAILURE
+        }
+    }
+}
+
+/// Send one test notification to the configured webhook and exit.
+///
+/// Reads the environment only, like `--healthcheck`, and applies the same
+/// validation and the same address checks as the running server, so a URL that
+/// would be refused at startup is refused here with the same message.
+async fn run_test_webhook() -> i32 {
+    let loaded = match Config::load(None) {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("Configuration error: {e}");
+            return EXIT_FAILURE;
+        }
+    };
+    if let Err(e) = loaded.config.alerts.validate() {
+        eprintln!("Configuration error: {e}");
+        return EXIT_FAILURE;
+    }
+    match mallard_metrics::alerts::send_test(&loaded.config.alerts).await {
+        Ok(message) => {
+            println!("{message}");
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
             EXIT_FAILURE
         }
     }
@@ -282,6 +318,18 @@ async fn run(config_path: Option<&std::path::Path>) {
     };
 
     spawn_background_tasks(&config, &state);
+    let alerts = match mallard_metrics::alerts::start(
+        &state,
+        &config.alerts,
+        &config.site_ids,
+        config.flush_interval_secs,
+    ) {
+        Ok(handle) => handle,
+        Err(e) => {
+            eprintln!("Startup failed: webhook alerts: {e}");
+            std::process::exit(EXIT_FAILURE);
+        }
+    };
 
     let app = server::build_router(Arc::clone(&state));
     let addr = format!("{}:{}", config.host, config.port);
@@ -335,6 +383,14 @@ async fn run(config_path: Option<&std::path::Path>) {
             None
         }
     };
+
+    // Before the flush: a webhook receiver that hangs must not eat the time the
+    // flush needs, so the delivery in flight gets a short, fixed grace.
+    if let Some(alerts) = alerts {
+        alerts
+            .shutdown(WEBHOOK_SHUTDOWN_GRACE.min(shutdown_timeout))
+            .await;
+    }
 
     flush_on_shutdown(&state, shutdown_timeout).await;
 
@@ -586,6 +642,7 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
         started_at_unix: unix_now(),
         rate_limit_rejections_total: Arc::new(AtomicU64::new(0)),
         login_failures_total: Arc::new(AtomicU64::new(0)),
+        alert_metrics: Arc::default(),
         metrics_token,
         query_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
         query_limits,

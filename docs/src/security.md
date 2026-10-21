@@ -237,7 +237,8 @@ Every analytics endpoint runs under one semaphore of `MALLARD_MAX_CONCURRENT_QUE
 | Clickjacking | `X-Frame-Options: DENY` |
 | Protocol downgrade | `Strict-Transport-Security` (HSTS, 1 year) |
 | MIME sniffing | `X-Content-Type-Options: nosniff` |
-| Data exfiltration | The only outbound request is the one-time `behavioral` extension download; embedded DB; IP discarded after hashing |
+| Data exfiltration | Outbound requests are the one-time `behavioral` extension download and, only if you configure a webhook, signed aggregate-only notifications to that one destination ([Webhook Alerts and Reports](alerts-and-reports.md#security-properties)); embedded DB; IP discarded after hashing |
+| SSRF through the webhook | URL from configuration only; https required; internal, link-local and metadata addresses refused at connect time; no redirects; DNS rebinding defeated by connecting to the validated address |
 | PII leakage | IPs hashed then discarded; per-period ID rotation; no cookies; no IP in the bundled Caddy log |
 | CSV injection | Formula character escaping in export output |
 | Dependency vulnerabilities | `cargo-deny` in CI; `Cargo.lock` committed and enforced |

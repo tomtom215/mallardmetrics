@@ -34,6 +34,7 @@
   - [VPS Deployment Guide](deploy-vps.md)
   - [Fly.io Deployment](deploy-flyio.md)
 - [Monitoring](monitoring.md)
+- [Webhook Alerts and Reports](alerts-and-reports.md)
 - [Data Management](data-management.md)
 - [Backup and Restore](backup-restore.md)
 - [Troubleshooting](troubleshooting.md)

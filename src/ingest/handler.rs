@@ -179,6 +179,8 @@ pub struct AppState {
     pub started_at_unix: u64,
     pub rate_limit_rejections_total: Arc<AtomicU64>,
     pub login_failures_total: Arc<AtomicU64>,
+    /// Webhook notification counters (`src/alerts`), exported through `/metrics`.
+    pub alert_metrics: Arc<crate::alerts::AlertMetrics>,
     /// Bearer token required by `/metrics`. `None` leaves it open.
     pub metrics_token: Option<String>,
     /// Caps concurrent analytics queries.

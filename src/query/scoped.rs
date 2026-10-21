@@ -52,6 +52,22 @@ impl<'a> ColdReads<'a> {
         scoped_events_sql(&self.storage.files_for_range(site_id, from, to))
     }
 
+    /// Like [`ColdReads::source`], but for exactly the listed days rather than a
+    /// range. For a query over a few separate days (the same weekday in
+    /// consecutive weeks) that would otherwise open every file in between.
+    ///
+    /// The hot table is included once, not once per day.
+    pub fn source_for_days(&self, site_id: &str, days: &[NaiveDate]) -> String {
+        let mut days = days.to_vec();
+        days.sort_unstable();
+        days.dedup();
+        let files: Vec<_> = days
+            .iter()
+            .flat_map(|day| self.storage.files_for_range(site_id, *day, *day))
+            .collect();
+        scoped_events_sql(&files)
+    }
+
     /// Like [`ColdReads::source`], over every site that has a partition on disk.
     ///
     /// For the site listing, which counts recent events per site. Costs one

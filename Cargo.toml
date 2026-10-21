@@ -51,6 +51,15 @@ maxminddb = "0.32.0"
 argon2 = "0.6"
 rand = "0.10.2"
 tempfile = { version = "3.27", optional = true }
+# Outbound webhook client (src/alerts). Hand-rolled HTTP/1.1 over tokio-rustls so
+# the connection can be pinned to the address that passed the SSRF check; see
+# docs/src/alerts-and-reports.md for why this beat reqwest, ureq and hyper-rustls.
+# `ring` only: no aws-lc C++ build. The trust store is Mozilla's, compiled in.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1.0.10"
+# Already in the tree through hyper; parses the receiver's status line and headers.
+httparse = "1.10.1"
 
 [dev-dependencies]
 # Self-dependency so integration tests and benches see the `testing`
@@ -62,6 +71,9 @@ proptest = "1.11"
 tempfile = "3.27"
 tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1.5"
+# Test-only: a throwaway certificate for the local HTTPS receiver, so no private
+# key is committed to the repository.
+rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
 
 [[bench]]
 name = "ingest_bench"

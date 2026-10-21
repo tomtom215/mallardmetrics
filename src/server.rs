@@ -681,6 +681,7 @@ fn build_metrics_body(state: &AppState) -> String {
     write_gauges(&mut out, state);
     write_counters(&mut out, state);
     write_http_metrics(&mut out, state);
+    state.alert_metrics.write_prometheus(&mut out);
     out
 }
 

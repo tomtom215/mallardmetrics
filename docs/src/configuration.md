@@ -37,6 +37,7 @@ into an image.
 | `MALLARD_SECRET` | auto-generated | Key material for visitor IDs. **At least 16 characters** (counted as characters, after trimming whitespace); a shorter value stops startup with `MALLARD_SECRET is shorter than 16 characters. Use a random value, e.g. openssl rand -hex 32.` Empty or unset: a random UUID is generated once and stored in `data_dir/.secret` (mode 0600); an unreadable existing file also stops startup rather than silently replacing the secret. Changing the secret re-identifies every visitor. |
 | `MALLARD_ADMIN_PASSWORD` | unset | At least 12 characters and not one of a short list of obvious values; otherwise startup stops with `MALLARD_ADMIN_PASSWORD rejected: ...`. Takes precedence over a password stored by `/api/auth/setup`; never written to disk. Unset with no stored hash means **reads are open** until someone completes setup. |
 | `MALLARD_METRICS_TOKEN` | unset | Bearer token required by `GET /metrics`. Empty counts as unset. |
+| `MALLARD_ALERTS_WEBHOOK_SECRET` | unset | Key for the HMAC-SHA256 signature on webhook notifications. At least 16 characters, otherwise startup stops. Unset sends unsigned notifications (advisory). A `webhook_secret` key in the TOML file is rejected as an unknown field. See [Webhook Alerts and Reports](alerts-and-reports.md#request-signing). |
 | `RUST_LOG` | `mallard_metrics=info,tower_http=info` | `tracing` filter. |
 
 ## Server and storage
@@ -120,6 +121,23 @@ into an image.
 | `MALLARD_SUPPRESS_SCREEN_SIZE` / `suppress_screen_size` | bool | `false` | | Drop the width **and** the device type. |
 | `MALLARD_GEOIP_PRECISION` / `geoip_precision` | string | `city` | `city`, `region`, `country`, `none` | How much of a GeoIP result is stored. |
 
+## Webhook alerts and reports
+
+The `[alerts]` TOML table and `MALLARD_ALERTS_*` variables configure outbound
+webhook notifications. Nothing is sent, and nothing in the table is validated,
+until `webhook_url` (`MALLARD_ALERTS_WEBHOOK_URL`) is set. The URL and the
+signing secret can be set only here, never through the API. The table has about
+twenty keys, listed with defaults and ranges in
+[Webhook Alerts and Reports](alerts-and-reports.md#configuration-reference) and
+commented in `mallard-metrics.toml.example`. The ones that decide whether it is
+safe:
+
+| Variable / TOML key | Default | Effect |
+|---|---|---|
+| `MALLARD_ALERTS_WEBHOOK_URL` / `webhook_url` | unset | Destination. `https://` only, no `user:pass@`. Treat it as a secret (Slack and Discord URLs are tokens). |
+| `MALLARD_ALERTS_ALLOW_HTTP_WEBHOOK` / `allow_http_webhook` | `false` | Without it an `http://` URL stops startup. |
+| `MALLARD_ALERTS_ALLOW_PRIVATE_WEBHOOK_TARGETS` / `allow_private_webhook_targets` | `false` | Without it, loopback, private, link-local, CGNAT, multicast, unspecified and cloud-metadata addresses are refused, and a literal one stops startup. |
+
 ## Startup advisories
 
 These are logged as warnings and never block startup:
@@ -131,6 +149,9 @@ These are logged as warnings and never block startup:
 - `site_ids` empty **and** `rate_limit_per_ip = 0`: anyone who can reach the
   server can create sites and write events without limit.
 - `suppress_visitor_id` on.
+- Webhook alerts configured without `MALLARD_ALERTS_WEBHOOK_SECRET` (unsigned),
+  with `allow_private_webhook_targets` or `allow_http_webhook` on, or with traffic
+  alerts or reports enabled but no sites to cover.
 
 ## Datacenter traffic filter
 
