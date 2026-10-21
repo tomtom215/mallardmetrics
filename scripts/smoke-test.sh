@@ -41,7 +41,9 @@ SITE="smoke.test"
 UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 curl() { command curl -A "$UA" "$@"; }
 
-# shellcheck disable=SC2329  # invoked through the EXIT trap
+# SC2329 is the name newer ShellCheck gives SC2317; disable both so the same
+# comment holds on the runner image's version and a current one.
+# shellcheck disable=SC2317,SC2329  # invoked through the EXIT trap
 cleanup() {
   [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null
   rm -rf "$WORK"

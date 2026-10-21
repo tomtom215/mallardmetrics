@@ -49,7 +49,9 @@ check() { # name expected-extended-regex actual
     fail=$((fail + 1))
   fi
 }
-# shellcheck disable=SC2329  # invoked through the EXIT trap
+# SC2329 is the name newer ShellCheck gives SC2317; disable both so the same
+# comment holds on the runner image's version and a current one.
+# shellcheck disable=SC2317,SC2329  # invoked through the EXIT trap
 cleanup() {
   docker rm -f "${RUN_ID}-1" "${RUN_ID}-2" >/dev/null 2>&1
   docker network rm "$NET_INTERNAL" >/dev/null 2>&1

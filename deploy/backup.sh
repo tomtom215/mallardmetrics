@@ -90,7 +90,9 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-[[ "$KEEP" =~ ^[0-9]+$ ]] && [ "$KEEP" -ge 1 ] || die "--keep must be a positive integer"
+if ! { [[ "$KEEP" =~ ^[0-9]+$ ]] && [ "$KEEP" -ge 1 ]; }; then
+  die "--keep must be a positive integer"
+fi
 [ -d "$DATA_DIR" ] || die "data directory $DATA_DIR does not exist"
 [ -f "$COMPOSE_FILE" ] || die "compose file $COMPOSE_FILE not found"
 command -v rsync  >/dev/null || die "rsync is required (apt-get install rsync)"

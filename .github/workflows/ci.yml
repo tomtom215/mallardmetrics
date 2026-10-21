@@ -346,11 +346,14 @@ jobs:
             prom/prometheus:v3.7.0 test rules /m/prometheus-rules.test.yml
       - name: Build Caddy with the Cloudflare module
         run: docker build -f deploy/Dockerfile.caddy -t mallard-caddy:ci .
+      # The Cloudflare module checks the token's *format* when it provisions
+      # (35-50 characters of [A-Za-z0-9_-], or a cfut_/cfat_ prefix), so a
+      # placeholder like "ci" fails validation even though no API call is made.
       - name: Validate the Caddyfile
         run: |
           docker run --rm \
             -e DOMAIN=analytics.example.com -e ACME_EMAIL=ops@example.com \
-            -e CLOUDFLARE_API_TOKEN=ci \
+            -e CLOUDFLARE_API_TOKEN=ci-placeholder-token-never-sent-anywhere \
             -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" \
             mallard-caddy:ci caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
 

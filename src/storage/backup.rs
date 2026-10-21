@@ -59,7 +59,7 @@ pub struct BackupReport {
     pub linked: usize,
     /// Rows in the copied hot table.
     pub hot_rows: u64,
-    /// State files copied (see [`STATE_FILES`]).
+    /// State files copied (see `STATE_FILES`).
     pub state_files: usize,
 }
 

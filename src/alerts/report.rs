@@ -131,7 +131,7 @@ impl Report {
     /// which for a public site is anyone, and chat services give some characters
     /// meaning: `<!channel>`, `@everyone`, `<https://x|label>` and `[label](url)`
     /// would put a ping or a spoofed link into the operator's channel. So they
-    /// are reduced to a conservative alphabet here ([`chat_safe`]); the structured
+    /// are reduced to a conservative alphabet here (`chat_safe`); the structured
     /// `top_pages` / `top_sources` fields keep the real values for machines.
     pub fn text(&self) -> String {
         let period = if self.start == self.end {
