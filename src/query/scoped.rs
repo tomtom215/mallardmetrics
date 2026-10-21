@@ -138,14 +138,26 @@ mod tests {
                         ts,
                         name,
                         path,
-                        if visitor.len() % 2 == 0 {
+                        if visitor.len().is_multiple_of(2) {
                             "Chrome"
                         } else {
                             "Firefox"
                         },
-                        if visitor.len() % 3 == 0 { "US" } else { "DE" },
-                        if name == "purchase" { Some(9.5_f64) } else { None },
-                        if name == "purchase" { Some("USD") } else { None },
+                        if visitor.len().is_multiple_of(3) {
+                            "US"
+                        } else {
+                            "DE"
+                        },
+                        if name == "purchase" {
+                            Some(9.5_f64)
+                        } else {
+                            None
+                        },
+                        if name == "purchase" {
+                            Some("USD")
+                        } else {
+                            None
+                        },
                         if name == "purchase" {
                             Some(r#"{"plan":"pro","tier":{"n":1}}"#)
                         } else {
@@ -209,7 +221,13 @@ mod tests {
                 // A session that starts at 23:50 and carries on after midnight.
                 let next = d + 1;
                 let night = format!("{site}-night{d}");
-                fx.insert(site, &night, &format!("2024-01-{d:02} 23:50:00"), "pageview", "/");
+                fx.insert(
+                    site,
+                    &night,
+                    &format!("2024-01-{d:02} 23:50:00"),
+                    "pageview",
+                    "/",
+                );
                 fx.insert(
                     site,
                     &night,
@@ -231,9 +249,27 @@ mod tests {
         // in the hot table, so reads span both tiers.
         fx.flush();
         for site in ["a.com", "b.com"] {
-            fx.insert(site, &format!("{site}-hot"), "2024-01-17 09:00:00", "pageview", "/");
-            fx.insert(site, &format!("{site}-hot"), "2024-01-17 09:05:00", "pageview", "/pricing");
-            fx.insert(site, &format!("{site}-v0"), "2024-01-17 09:06:00", "purchase", "/checkout");
+            fx.insert(
+                site,
+                &format!("{site}-hot"),
+                "2024-01-17 09:00:00",
+                "pageview",
+                "/",
+            );
+            fx.insert(
+                site,
+                &format!("{site}-hot"),
+                "2024-01-17 09:05:00",
+                "pageview",
+                "/pricing",
+            );
+            fx.insert(
+                site,
+                &format!("{site}-v0"),
+                "2024-01-17 09:06:00",
+                "purchase",
+                "/checkout",
+            );
         }
     }
 
@@ -277,14 +313,18 @@ mod tests {
             if dim.requires_behavioral() && !behavioral {
                 continue;
             }
-            out.push(ser(
-                slug,
-                breakdowns::query_breakdown(conn, scope, dim, 50),
-            ));
+            out.push(ser(slug, breakdowns::query_breakdown(conn, scope, dim, 50)));
         }
         if behavioral {
-            let steps = ["pathname = '/'", "pathname = '/pricing'", "event_name = 'purchase'"];
-            out.push(ser("core_metrics", metrics::query_core_metrics(conn, scope)));
+            let steps = [
+                "pathname = '/'",
+                "pathname = '/pricing'",
+                "event_name = 'purchase'",
+            ];
+            out.push(ser(
+                "core_metrics",
+                metrics::query_core_metrics(conn, scope),
+            ));
             out.push(ser(
                 "session_metrics",
                 metrics::query_session_metrics(conn, scope),
@@ -329,7 +369,10 @@ mod tests {
         let scoped = all_reports(&guard, &narrowed, lookback, fx.behavioral);
         assert_eq!(baseline.len(), scoped.len());
         for ((name, want), (_, got)) in baseline.iter().zip(&scoped) {
-            assert_eq!(want, got, "{label}: {name} differs between events_all and the scoped read");
+            assert_eq!(
+                want, got,
+                "{label}: {name} differs between events_all and the scoped read"
+            );
         }
     }
 
@@ -348,12 +391,19 @@ mod tests {
                 std::env::var("MALLARD_REQUIRE_BEHAVIORAL").as_deref() != Ok("1"),
                 "MALLARD_REQUIRE_BEHAVIORAL=1 but the extension did not load"
             );
-            eprintln!("behavioral extension unavailable: comparing the non-behavioral reports only");
+            eprintln!(
+                "behavioral extension unavailable: comparing the non-behavioral reports only"
+            );
         }
         let cases: &[(&str, &str, &str, &str)] = &[
             ("a.com", "2024-01-11", "2024-01-15", "middle span"),
             ("a.com", "2024-01-12", "2024-01-13", "one day"),
-            ("b.com", "2024-01-12 23:55:00", "2024-01-14 00:03:00", "mid-day bounds across midnight"),
+            (
+                "b.com",
+                "2024-01-12 23:55:00",
+                "2024-01-14 00:03:00",
+                "mid-day bounds across midnight",
+            ),
             ("a.com", "2024-01-16", "2024-01-19", "reaches the hot tier"),
             ("b.com", "2024-01-17", "2024-01-18", "hot tier only"),
             ("a.com", "2024-01-01", "2024-02-01", "wider than the data"),
@@ -394,7 +444,10 @@ mod tests {
                 .storage
                 .compact_partition(&fx.writer.lock(), &fx.tier, "a.com", &date)
                 .expect("compact");
-            assert!(n > 0, "{date}: nothing was compacted, so the test is not mixing levels");
+            assert!(
+                n > 0,
+                "{date}: nothing was compacted, so the test is not mixing levels"
+            );
         }
         let filters = vec![
             Filter {
@@ -451,10 +504,24 @@ mod tests {
     #[test]
     fn scan_days_follow_the_scope_and_refuse_garbage() {
         let scope = QueryScope::new("a.com", "2024-01-10", "2024-01-14", "30 minutes");
-        assert_eq!(scope.scan_days(0), Some((day("2024-01-10"), day("2024-01-14"))));
-        assert_eq!(scope.scan_days(30), Some((day("2023-12-11"), day("2024-01-14"))));
-        let timed = QueryScope::new("a.com", "2024-01-10 23:55:00", "2024-01-11 00:03:00", "1 hour");
-        assert_eq!(timed.scan_days(0), Some((day("2024-01-10"), day("2024-01-11"))));
+        assert_eq!(
+            scope.scan_days(0),
+            Some((day("2024-01-10"), day("2024-01-14")))
+        );
+        assert_eq!(
+            scope.scan_days(30),
+            Some((day("2023-12-11"), day("2024-01-14")))
+        );
+        let timed = QueryScope::new(
+            "a.com",
+            "2024-01-10 23:55:00",
+            "2024-01-11 00:03:00",
+            "1 hour",
+        );
+        assert_eq!(
+            timed.scan_days(0),
+            Some((day("2024-01-10"), day("2024-01-11")))
+        );
         let bad = QueryScope::new("a.com", "yesterday", "2024-01-14", "30 minutes");
         assert_eq!(bad.scan_days(0), None);
         // A scope that cannot be narrowed keeps reading the view.
@@ -471,26 +538,36 @@ mod tests {
         // files, let a compaction swap them, then open the stale list.
         let fx = Fixture::new(2);
         for i in 0..2 {
-            fx.insert("a.com", &format!("v{i}"), "2024-01-10 10:00:00", "pageview", "/");
+            fx.insert(
+                "a.com",
+                &format!("v{i}"),
+                "2024-01-10 10:00:00",
+                "pageview",
+                "/",
+            );
             fx.flush();
         }
-        let stale = ColdReads::new(&fx.storage).source("a.com", day("2024-01-10"), day("2024-01-10"));
+        let stale =
+            ColdReads::new(&fx.storage).source("a.com", day("2024-01-10"), day("2024-01-10"));
         let merged = fx
             .storage
             .compact_partition(&fx.writer.lock(), &fx.tier, "a.com", "2024-01-10")
             .expect("compact");
         assert_eq!(merged, 2);
-        let result = fx
-            .writer
-            .lock()
-            .query_row(&format!("SELECT COUNT(*) FROM {stale}"), [], |r| r.get::<_, i64>(0));
+        let result =
+            fx.writer
+                .lock()
+                .query_row(&format!("SELECT COUNT(*) FROM {stale}"), [], |r| {
+                    r.get::<_, i64>(0)
+                });
         assert!(
             result.is_err(),
             "a pre-lock file list should reference files the compaction moved away"
         );
         // Listed again, under the lock, it is right.
         let _tier = fx.tier.read();
-        let fresh = ColdReads::new(&fx.storage).source("a.com", day("2024-01-10"), day("2024-01-10"));
+        let fresh =
+            ColdReads::new(&fx.storage).source("a.com", day("2024-01-10"), day("2024-01-10"));
         let n: i64 = fx
             .writer
             .lock()
@@ -529,7 +606,8 @@ mod tests {
         assert_eq!(readers.len(), 2);
 
         let compactor = {
-            let (fx, done, compactions) = (Arc::clone(&fx), Arc::clone(&done), Arc::clone(&compactions));
+            let (fx, done, compactions) =
+                (Arc::clone(&fx), Arc::clone(&done), Arc::clone(&compactions));
             std::thread::spawn(move || {
                 for round in 0..12 {
                     // New small files keep the planner finding work to merge.
@@ -555,7 +633,7 @@ mod tests {
 
         let mut queries = 0u32;
         while !done.load(Ordering::SeqCst) {
-            let _tier = fx.tier.read();
+            let tier = fx.tier.read();
             let source =
                 ColdReads::new(&fx.storage).source("a.com", day("2024-01-10"), day("2024-01-10"));
             let conn = readers.acquire();
@@ -572,7 +650,7 @@ mod tests {
             assert!(n >= total, "rows went missing: {n} < {total}");
             assert!(n <= total + 12, "rows were double counted: {n}");
             queries += 1;
-            drop(_tier);
+            drop(tier);
             std::thread::yield_now();
         }
         compactor.join().expect("compactor");

@@ -457,6 +457,7 @@ fn bench_query_scale(c: &mut Criterion) {
 /// reading less than the report needs. The scoped variants include the per-request
 /// file listing, as the handler pays it. Setup is outside `b.iter()` (L21).
 fn bench_report_scale(c: &mut Criterion) {
+    type Report = fn(&Connection, &QueryScope) -> usize;
     let (sites, days) = scale_shape();
     let site = format!("site{:03}.example.com", sites / 2);
     let first_day = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap()
@@ -489,11 +490,14 @@ fn bench_report_scale(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("report_scale");
     group.sample_size(10);
-    type Report = fn(&Connection, &QueryScope) -> usize;
     let reports: [(&str, Report); 3] = [
         ("main", |conn, scope| {
-            usize::try_from(metrics::query_event_metrics(conn, scope).unwrap().total_pageviews)
-                .unwrap()
+            usize::try_from(
+                metrics::query_event_metrics(conn, scope)
+                    .unwrap()
+                    .total_pageviews,
+            )
+            .unwrap()
         }),
         ("breakdown_pages", |conn, scope| {
             breakdowns::query_breakdown(conn, scope, breakdowns::Dimension::Page, 10)

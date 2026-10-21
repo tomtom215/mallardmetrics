@@ -5,8 +5,8 @@
 //! could not vary a single setting without restating every other one. This
 //! builder gives one definition with named overrides.
 
-use crate::api::stats::QueryLimits;
 use crate::api::auth::{ApiKeyStore, LoginAttemptTracker, SessionStore};
+use crate::api::stats::QueryLimits;
 use crate::ingest::buffer::EventBuffer;
 use crate::ingest::geoip::GeoIpReader;
 use crate::ingest::handler::AppState;
@@ -202,7 +202,7 @@ impl AppStateBuilder {
     ) -> Arc<AppState> {
         let storage = ParquetStorage::new(events_dir, 0);
         let tier_lock = crate::storage::TierLock::new();
-        let buffer = EventBuffer::new(1000, 0, Arc::clone(&conn), storage, tier_lock.clone());
+        let buffer = EventBuffer::new(1000, 0, conn, storage, tier_lock.clone());
 
         Arc::new(AppState {
             buffer,

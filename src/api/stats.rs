@@ -1,8 +1,8 @@
 use crate::api::errors::ApiError;
 use crate::ingest::handler::AppState;
+use crate::query::QueryScope;
 use crate::query::cache::{CacheKey, cache_key};
 use crate::query::scoped::ColdReads;
-use crate::query::QueryScope;
 use crate::query::{
     Filter, UNKNOWN_VALUE, breakdowns, events, export, flow, funnel, metrics, realtime, retention,
     revenue, sequences, timeseries,
@@ -677,7 +677,7 @@ where
             if elapsed >= allowed {
                 break;
             }
-            if tokio::time::timeout(allowed - elapsed, &mut finished_rx)
+            if tokio::time::timeout(allowed.saturating_sub(elapsed), &mut finished_rx)
                 .await
                 .is_ok()
             {
@@ -706,7 +706,14 @@ where
     let task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _finished = finished_tx;
-        execute_on_reader(&readers, &tier_lock, &storage, &task_deadline, started_tx, f)
+        execute_on_reader(
+            &readers,
+            &tier_lock,
+            &storage,
+            &task_deadline,
+            started_tx,
+            f,
+        )
     });
     Ok(RunningQuery {
         deadline,
@@ -938,7 +945,9 @@ pub async fn list_sites(State(state): State<Arc<AppState>>) -> Result<impl IntoR
     });
     let sites: Vec<&str> = details.iter().map(|d| d.site_id.as_str()).collect();
 
-    Ok(Json(serde_json::json!({ "sites": sites, "details": details })))
+    Ok(Json(
+        serde_json::json!({ "sites": sites, "details": details }),
+    ))
 }
 
 /// The headline metrics, with or without the session pass.
@@ -1011,9 +1020,13 @@ pub async fn get_main_stats(
             &params.site_id,
             &[&previous.start, &previous.end, &filter_key, "none"],
         );
-        let Json(baseline) = cached_scoped(&state, previous_key, previous_scope, 0, move |conn, scope| {
-            main_metrics(conn, scope, with_sessions)
-        })
+        let Json(baseline) = cached_scoped(
+            &state,
+            previous_key,
+            previous_scope,
+            0,
+            move |conn, scope| main_metrics(conn, scope, with_sessions),
+        )
         .await?;
 
         current.comparison = Some(metrics::ComparisonWindow::from_metrics(
@@ -1844,7 +1857,9 @@ impl futures_core::Stream for ExportStream {
         match this.rx.poll_recv(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Some(Ok(chunk))) => Poll::Ready(Some(Ok(chunk))),
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(std::io::Error::other(e.to_string())))),
+            Poll::Ready(Some(Err(e))) => {
+                Poll::Ready(Some(Err(std::io::Error::other(e.to_string()))))
+            }
             Poll::Ready(None) => {
                 if this.failed.swap(false, Ordering::SeqCst) {
                     Poll::Ready(Some(Err(std::io::Error::other(

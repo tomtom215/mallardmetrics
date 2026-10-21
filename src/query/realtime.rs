@@ -152,7 +152,10 @@ pub fn query_realtime_at(
 ///
 /// The window crosses midnight for the first minutes of every UTC day, so it is
 /// the day of `since` through the day of `now`, not just today.
-pub fn window_days(window_minutes: u32, now: NaiveDateTime) -> (chrono::NaiveDate, chrono::NaiveDate) {
+pub fn window_days(
+    window_minutes: u32,
+    now: NaiveDateTime,
+) -> (chrono::NaiveDate, chrono::NaiveDate) {
     let since = now - chrono::Duration::minutes(i64::from(window_minutes.max(1)));
     (since.date(), now.date())
 }

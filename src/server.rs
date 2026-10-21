@@ -1568,7 +1568,9 @@ mod serve_tests {
             match tokio::time::timeout(limit, stream.read(&mut buf)).await {
                 Ok(Ok(0) | Err(_)) => return started.elapsed(),
                 Ok(Ok(_)) => {} // a response (408) before the close is fine
-                Err(_) => panic!("the server still had the connection open after {limit:?}"),
+                Err(elapsed) => {
+                    panic!("the server still had the connection open after {limit:?}: {elapsed}")
+                }
             }
         }
     }

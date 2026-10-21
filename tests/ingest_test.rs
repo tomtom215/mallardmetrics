@@ -2550,7 +2550,9 @@ async fn test_raw_export_streams_with_back_pressure_and_stops_when_the_client_le
         let _ = acquired_tx.send(());
     });
     assert!(
-        acquired_rx.recv_timeout(Duration::from_millis(400)).is_err(),
+        acquired_rx
+            .recv_timeout(Duration::from_millis(400))
+            .is_err(),
         "the export finished without anyone reading it: it is not streaming"
     );
     assert!(
@@ -2581,31 +2583,34 @@ async fn test_raw_export_streams_with_back_pressure_and_stops_when_the_client_le
 async fn test_a_client_that_stops_reading_gets_a_truncated_body_not_a_clean_end() {
     use mallard_metrics::api::stats::QueryLimits;
     use std::time::Duration;
+    // The deadline bounds DuckDB's own work (a debug build sorting 50,000 rows
+    // on a busy machine needs a good fraction of a second) and is also the
+    // longest the producer waits for the client to take a chunk, so it is
+    // generous and the stall below is longer still.
     let (state, _dir) = state_builder()
         .query_limits(QueryLimits {
             queue_wait: Duration::from_secs(5),
-            // Also the longest the producer waits for the client to take a chunk.
-            deadline: Duration::from_millis(400),
+            deadline: Duration::from_secs(2),
         })
         .build();
-    insert_rows(&state, "stream.test", EXPORT_DAY, 80_000);
+    // More than the first chunk, the two the channel holds, and the one the
+    // producer is blocked sending.
+    insert_rows(&state, "stream.test", EXPORT_DAY, 50_000);
 
     let response = get(&state, &raw_export_uri("stream.test", "csv")).await;
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body();
 
     // Stall well past the deadline, then read what is left.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_millis(3500)).await;
     let mut aborted = false;
     let mut bytes = 0usize;
     while let Some(frame) = body.frame().await {
-        match frame {
-            Ok(frame) => bytes += frame.into_data().map_or(0, |d| d.len()),
-            Err(_) => {
-                aborted = true;
-                break;
-            }
-        }
+        let Ok(frame) = frame else {
+            aborted = true;
+            break;
+        };
+        bytes += frame.into_data().map_or(0, |d| d.len());
     }
     assert!(
         aborted,
@@ -2755,7 +2760,9 @@ impl RssSampler {
         use std::sync::atomic::Ordering;
         self.done.store(true, Ordering::Relaxed);
         self.thread.join().unwrap();
-        self.peak.load(Ordering::Relaxed).saturating_sub(self.before)
+        self.peak
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.before)
     }
 }
 

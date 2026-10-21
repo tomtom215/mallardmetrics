@@ -43,7 +43,7 @@ pub struct ExtensionState {
 }
 
 impl ExtensionState {
-    pub fn new(loaded: bool, version: Option<String>) -> Self {
+    pub const fn new(loaded: bool, version: Option<String>) -> Self {
         Self {
             loaded: AtomicBool::new(loaded),
             version: RwLock::new(version),
@@ -164,10 +164,10 @@ pub fn retry_once(state: &AppState) -> bool {
 
     // Cheapest first: the file may already be installed and a connection may
     // simply have missed its `LOAD`.
-    let mut report = load_everywhere(&writer, &state.readers);
+    let mut report = load_everywhere(writer, &state.readers);
     if !report.complete() {
-        match install_without_the_pool(&writer) {
-            Ok(()) => report = load_everywhere(&writer, &state.readers),
+        match install_without_the_pool(writer) {
+            Ok(()) => report = load_everywhere(writer, &state.readers),
             Err(e) => {
                 tracing::warn!(error = %e, "Could not install the behavioral extension; will retry");
                 return false;
@@ -304,10 +304,10 @@ mod tests {
         }
         let (state, _dir) = file_backed_state(2);
         let writer = state.buffer.conn();
-        let first = load_everywhere(&writer, &state.readers);
+        let first = load_everywhere(writer, &state.readers);
         assert!(first.complete());
         assert!(first.attempted > 0, "something lacked the extension");
-        let second = load_everywhere(&writer, &state.readers);
+        let second = load_everywhere(writer, &state.readers);
         assert_eq!(second.attempted, 0, "nothing left to do the second time");
         assert!(second.complete());
     }
@@ -332,7 +332,7 @@ mod tests {
                 extensions.to_string_lossy().replace('\'', "''")
             ))
             .expect("set directory");
-        let result = install_without_the_pool(&writer);
+        let result = install_without_the_pool(writer);
         // Either the download worked (network) and the file landed in the
         // directory the writer uses, or it failed having tried that directory.
         // It must never have written anywhere else.
@@ -367,7 +367,9 @@ mod tests {
 
     #[test]
     fn a_loaded_flag_short_circuits_the_retry() {
-        let state = state_builder().behavioral_extension_loaded(true).build_state();
+        let state = state_builder()
+            .behavioral_extension_loaded(true)
+            .build_state();
         // `build_state` takes the real extension state when it can; force the
         // claim so this exercises only the early return.
         state.behavioral.mark_loaded(None);

@@ -50,10 +50,11 @@ pub const fn rotation_supports_weeks(rotation_days: u32, weeks: u32) -> bool {
     rotation_days as u64 >= (weeks.saturating_sub(1) as u64) * 7
 }
 
-/// How many days before the report's start the cohort query reads, for a
-/// configured `lookback_days`. At least one: a lookback of zero would make
-/// "first seen" meaningless. Shared with the caller that picks which Parquet
-/// files to open, so the two cannot disagree about the window.
+/// How many days before the report's start the cohort query reads.
+///
+/// At least one: a lookback of zero would make "first seen" meaningless. Shared
+/// with the caller that picks which Parquet files to open, so the two cannot
+/// disagree about the window.
 pub const fn scan_lookback_days(lookback_days: u32) -> u32 {
     if lookback_days == 0 { 1 } else { lookback_days }
 }

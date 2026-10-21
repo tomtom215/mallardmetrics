@@ -818,35 +818,7 @@ impl Config {
                     .to_string(),
             );
         }
-        if self.query_queue_wait_secs == 0 {
-            return Err(
-                "query_queue_wait_secs must be > 0; 0 would answer 429 to every query that \
-                 does not get a slot at once, which is what a dashboard load does"
-                    .to_string(),
-            );
-        }
-        if self.query_deadline_secs == 0 {
-            return Err(
-                "query_deadline_secs must be > 0; 0 would interrupt every query as it starts"
-                    .to_string(),
-            );
-        }
-        // A request that queues for the full wait and then runs for the full
-        // deadline must still be answered by the query layer (a 504 that says
-        // what happened), not cut off by the request timeout (a bare 408).
-        let budget = self
-            .query_queue_wait_secs
-            .saturating_add(self.query_deadline_secs);
-        if budget > crate::server::REQUEST_TIMEOUT.as_secs() {
-            return Err(format!(
-                "query_queue_wait_secs ({}) + query_deadline_secs ({}) = {budget} s exceeds the \
-                 {} s request timeout; the request timeout would cut queries off before their \
-                 own deadline reports",
-                self.query_queue_wait_secs,
-                self.query_deadline_secs,
-                crate::server::REQUEST_TIMEOUT.as_secs()
-            ));
-        }
+        self.validate_query_budgets()?;
         if self.max_buffered_events > 0 && self.max_buffered_events < self.flush_event_count {
             return Err(format!(
                 "max_buffered_events ({}) must be >= flush_event_count ({}), \
@@ -921,6 +893,41 @@ impl Config {
                     "dashboard_origin is not a valid HTTP header value (got {origin:?})"
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// The analytics query budgets: both positive, and together inside the
+    /// request timeout.
+    fn validate_query_budgets(&self) -> Result<(), String> {
+        if self.query_queue_wait_secs == 0 {
+            return Err(
+                "query_queue_wait_secs must be > 0; 0 would answer 429 to every query that \
+                 does not get a slot at once, which is what a dashboard load does"
+                    .to_string(),
+            );
+        }
+        if self.query_deadline_secs == 0 {
+            return Err(
+                "query_deadline_secs must be > 0; 0 would interrupt every query as it starts"
+                    .to_string(),
+            );
+        }
+        // A request that queues for the full wait and then runs for the full
+        // deadline must still be answered by the query layer (a 504 that says
+        // what happened), not cut off by the request timeout (a bare 408).
+        let budget = self
+            .query_queue_wait_secs
+            .saturating_add(self.query_deadline_secs);
+        if budget > crate::server::REQUEST_TIMEOUT.as_secs() {
+            return Err(format!(
+                "query_queue_wait_secs ({}) + query_deadline_secs ({}) = {budget} s exceeds the \
+                 {} s request timeout; the request timeout would cut queries off before their \
+                 own deadline reports",
+                self.query_queue_wait_secs,
+                self.query_deadline_secs,
+                crate::server::REQUEST_TIMEOUT.as_secs()
+            ));
         }
         Ok(())
     }
@@ -1709,7 +1716,10 @@ visitor_salt_rotation_days = 30
         remove_env("MALLARD_QUERY_DEADLINE_SECS");
         let loaded = loaded.unwrap();
         assert_eq!(loaded.config.query_queue_wait_secs, 4, "env wins over toml");
-        assert_eq!(loaded.config.query_deadline_secs, 12, "a bad value is kept out");
+        assert_eq!(
+            loaded.config.query_deadline_secs, 12,
+            "a bad value is kept out"
+        );
         assert!(
             loaded
                 .warnings
