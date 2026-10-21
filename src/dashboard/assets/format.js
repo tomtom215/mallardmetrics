@@ -179,6 +179,24 @@ export function periodDays(period) {
   return { day: 1, today: 1, '7d': 7, '30d': 30, '90d': 90, '12mo': 365 }[period] ?? null;
 }
 
+/**
+ * The inclusive dates a `period` covers, matching the server: `Nd` is the last N
+ * calendar days including today (so `7d` is seven days, not eight), `day` is
+ * today alone, and `12mo` runs from the day after this date last year to today.
+ */
+export function periodRange(period, now = new Date()) {
+  const today = todayUTC(now);
+  if (period === '12mo') {
+    const y = now.getUTCFullYear() - 1;
+    const m = now.getUTCMonth();
+    // 29 February has no counterpart last year; clamp to the month's last day.
+    const day = Math.min(now.getUTCDate(), new Date(Date.UTC(y, m + 1, 0)).getUTCDate());
+    return { start: shiftDay(isoDay(new Date(Date.UTC(y, m, day))), -1), end: today };
+  }
+  const days = periodDays(period) || 30;
+  return { start: shiftDay(today, days - 1), end: today };
+}
+
 export const MAX_RANGE_DAYS = 366;
 
 /**
@@ -285,6 +303,26 @@ export function writeViewState({ siteId, period, startDate, endDate, compare, fi
   if (compare && compare !== 'none') p.set('compare', compare);
   if (filters && filters.length > 0) p.set('filters', serializeFilters(filters));
   return p.toString();
+}
+
+/* ── Retention ──────────────────────────────────────────────────────────── */
+
+/**
+ * What a retention cell may honestly show.
+ *
+ * 'value'        - a measured percentage
+ * 'pending'      - the week has not finished (`complete_weeks`), so there is
+ *                  nothing to compare yet; a 0% here would claim nobody returned
+ * 'unmeasurable' - the server forgets visitors sooner than this week, so the
+ *                  figure would be zero whatever the audience did
+ *
+ * Week 0 is the cohort itself and is always a value. A server that predates
+ * `complete_weeks` sends no count, and its cells are all treated as measured.
+ */
+export function retentionCellState(row, week, identitySupportsCohorts) {
+  if (week === 0) return 'value';
+  if (identitySupportsCohorts === false) return 'unmeasurable';
+  return typeof row.complete_weeks === 'number' && week >= row.complete_weeks ? 'pending' : 'value';
 }
 
 /* ── Charts ─────────────────────────────────────────────────────────────── */

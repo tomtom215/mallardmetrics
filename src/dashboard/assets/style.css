@@ -350,7 +350,7 @@ input[aria-invalid="true"] { border-color: var(--danger); }
 
 /* ── Tables ─────────────────────────────────────────────────────────── */
 
-.table-scroll { overflow-x: auto; }
+.table-scroll { overflow-x: auto; position: relative; }
 
 .data-table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
 .data-table th {
@@ -582,6 +582,8 @@ th.numeric { text-align: right; }
 @keyframes shimmer { from { background-position: 100% 0; } to { background-position: 0 0; } }
 .skel-rows { display: flex; flex-direction: column; gap: 0.6rem; padding: 0.25rem 0; }
 .skel-row { height: 1.25rem; }
+/* A header and ten table rows are about 25.5rem tall; reserve it so a breakdown arriving does not push the panels below it down. */
+.skel-table { gap: 1.05rem; min-height: 25.5rem; }
 .skel-value { height: 1.875rem; width: 60%; }
 .skel-label { height: 0.75rem; width: 80%; margin-top: 0.5rem; }
 .skel-chart { height: 100%; }
@@ -632,3 +634,62 @@ th.numeric { text-align: right; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
 }
+
+/* ── Follow-up: states, definitions, retention, long lists ─────────── */
+
+.placeholder strong { display: block; color: var(--text); }
+.placeholder-offline { padding: 0.75rem 1rem; text-align: left; }
+.placeholder-notice,
+.placeholder-info {
+  color: var(--text);
+  text-align: left;
+  border-left: 3px solid var(--warning);
+  border-radius: 0 8px 8px 0;
+}
+.placeholder-notice strong { color: var(--warning-fg); }
+.placeholder-info { border-left-color: var(--accent); margin-bottom: 1rem; }
+.placeholder-info strong { color: var(--accent); }
+.placeholder-info p { margin: 0.375rem 0 0; }
+.placeholder-notice p { margin: 0.375rem 0 0.625rem; }
+.realtime-empty { text-align: left; }
+.realtime-empty p { margin: 0.25rem 0 0; }
+
+.banner-offline { position: sticky; top: 0.5rem; z-index: 5; box-shadow: var(--shadow); }
+
+.notice-info { border-left-color: var(--accent); background: var(--accent-soft); }
+.notice-info strong { display: block; margin-bottom: 0.125rem; }
+
+.table-note { margin: 0.5rem 0 0; font-size: 0.8125rem; }
+.tag {
+  display: inline-block;
+  margin-left: 0.25rem;
+  padding: 0 0.375rem;
+  border: 1px solid var(--control-border);
+  border-radius: 999px;
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  vertical-align: 1px;
+}
+.retention-pending { color: var(--text-muted); }
+.retention-scroll {
+  /* A shadow at whichever edge has more to scroll to, so a phone shows that the
+     table continues instead of silently clipping it. */
+  background:
+    linear-gradient(to right, var(--surface) 30%, transparent) left center / 24px 100% no-repeat local,
+    linear-gradient(to left, var(--surface) 30%, transparent) right center / 24px 100% no-repeat local,
+    radial-gradient(farthest-side at 0 50%, rgba(0, 0, 0, 0.22), transparent) left center / 10px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%, rgba(0, 0, 0, 0.22), transparent) right center / 10px 100% no-repeat scroll;
+}
+.retention-table { min-width: 30rem; }
+.retention-table th[scope="row"] { border-bottom: 1px solid var(--border); position: sticky; left: 0; background: var(--surface); z-index: 1; }
+
+.breakdown-scroll { max-height: 26rem; overflow: auto; }
+.breakdown-scroll thead th { position: sticky; top: 0; background: var(--surface); z-index: 1; }
+.list-more { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 0.75rem; margin-top: 0.625rem; font-size: 0.8125rem; }
+
+.definitions { margin-top: 1rem; font-size: 0.8125rem; }
+.definitions summary { cursor: pointer; color: var(--accent); font-weight: 500; }
+.definitions dl { margin: 0.625rem 0 0; display: grid; gap: 0.625rem; }
+.definitions dt { font-weight: 600; color: var(--text); }
+.definitions dd { margin: 0; color: var(--text-muted); max-width: 70ch; }
