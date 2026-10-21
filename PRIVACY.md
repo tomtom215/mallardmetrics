@@ -19,8 +19,7 @@
 7. [The GitHub Pages / Live Demo Question](#the-github-pages--live-demo-question)
 8. [What Operators Must Do](#what-operators-must-do)
 9. [What Mallard Metrics Does Not Do](#what-mallard-metrics-does-not-do)
-10. [Comparison with Other Analytics Tools](#comparison-with-other-analytics-tools)
-11. [Definitions and Primary Sources](#definitions-and-primary-sources)
+10. [Definitions and Primary Sources](#definitions-and-primary-sources)
 
 ---
 
@@ -35,13 +34,16 @@ occur.
 
 | Data item | Source | Purpose | Lifetime |
 |---|---|---|---|
-| IP address | `X-Forwarded-For` / `X-Real-IP` / socket | GeoIP lookup + visitor ID derivation | Single request (~µs); dropped when handler returns |
-| Raw User-Agent string | `User-Agent` request header | UA parsing + bot detection + visitor ID derivation | Single request (~µs); dropped when handler returns |
+| IP address | The socket peer address, or, only when `trust_proxy_headers` is on, the entry of `X-Forwarded-For` / `X-Real-IP` that your own proxy wrote (see `MALLARD_TRUSTED_PROXY_HOPS`) | GeoIP lookup + visitor ID derivation | The request; dropped when the handler returns |
+| Raw User-Agent string | `User-Agent` request header | UA parsing + bot detection + visitor ID derivation | The request; dropped when the handler returns |
 
-**No IP address is ever written to the event buffer, to DuckDB or to Parquet.** On the
-analytics path it is never logged either: it exists only for the duration of the request,
-as GeoIP input and as HMAC input. The relevant code is in `src/ingest/handler.rs` and
-`src/ingest/visitor_id.rs`.
+**No IP address is written to the event buffer, to DuckDB or to Parquet.** The ingest
+handlers do not log it: it exists only for the duration of the request, as GeoIP input
+and as HMAC input. The relevant code is in `src/ingest/handler.rs` and
+`src/ingest/visitor_id.rs`. This describes Mallard itself. Your reverse proxy, load
+balancer, CDN and hosting provider may log the IP regardless; the bundled Caddy
+configuration (`deploy/Caddyfile`) is set to delete remote IP, headers and the
+query string from its logs, and any other proxy needs the same attention.
 
 There is one deliberate exception, and it is not on the analytics path. Authentication
 events — a failed login, a lockout, first-run setup, a logout, an API-key operation —
@@ -75,7 +77,7 @@ outside this application's control — see [GDPR obligations this triggers](#gdp
 | `os` | String (optional) | `Windows` | Until partition deleted |
 | `os_version` | String (optional) | `10.0` | Until partition deleted |
 | `device_type` | String (optional) | `desktop` | Until partition deleted |
-| `screen_size` | String (optional) | `1920` | Until partition deleted |
+| `screen_size` | String (optional); the viewport width in CSS pixels, not the physical screen | `1280` | Until partition deleted |
 | `country_code` | String (optional) | `DE` | Until partition deleted |
 | `region` | String (optional) | `Bavaria` | Until partition deleted |
 | `city` | String (optional) | `Munich` | Until partition deleted |
@@ -94,7 +96,7 @@ Retention period is controlled by `MALLARD_RETENTION_DAYS` (default: 0 = unlimit
 | Claim | Accurate? | Nuance |
 |---|---|---|
 | IP addresses are not stored | **Yes** | Not written anywhere to disk. Processed in RAM per-request only. |
-| Raw User-Agent strings are not stored | **Yes** | Only four parsed fields (browser name, version, OS name, version) are stored. |
+| Raw User-Agent strings are not stored | **Yes** | Only the parsed browser, browser version, OS, OS version and device type are stored. |
 | Visitor IDs are pseudonymous, not anonymous | **Yes** | See [Visitor Identification Architecture](#visitor-identification-architecture). |
 | Geographic data is stored | **Yes** | `country_code`, `region`, `city` are derived from the IP and stored permanently. |
 | Referrer URLs are stored | **Yes** | May include search queries or campaign parameters sent by the browser. |
@@ -152,7 +154,7 @@ with when the process happened to start.
 | IP not stored | Yes | Only the hash output is retained |
 | Different visitors produce different IDs | Yes | Property-tested |
 | Same visitor produces the same ID within a salt period | Yes | Enables deduplication without cookies |
-| Same visitor produces different IDs across salt periods | Yes | Salt rotates every `visitor_salt_rotation_days` (default: 1) |
+| Same visitor produces different IDs across salt periods | Yes | Salt rotates every `visitor_salt_rotation_days` (default: 1; periods are numbered from the Unix epoch, i.e. UTC) |
 | One visitor is not correlatable across two sites | Yes | The site ID is part of the HMAC input |
 | ID cannot be reversed to recover the IP | Practically yes | HMAC-SHA256 is one-way; brute-force over the IP space is impractical without the secret |
 
@@ -200,7 +202,7 @@ individual. The visitor ID is **pseudonymous** (Art. 4(5)) because:
    could in principle correlate those IPs to visitor IDs for the same salt period.
    Lengthening `visitor_salt_rotation_days` widens that window proportionally.
 3. Pseudonymous data therefore remains personal data subject to GDPR (Recital 26, confirmed
-   in EDPB Opinion 05/2022 on anonymisation techniques).
+   in Article 29 Working Party Opinion 05/2014 (WP216) on anonymisation techniques).
 
 The design substantially reduces re-identification risk, but does not eliminate GDPR
 applicability.
@@ -224,7 +226,7 @@ the server is located.
 **Yes.** The Court of Justice of the EU ruled in *Breyer v. Bundesrepublik Deutschland*
 (Case C‑582/14, 19 October 2016) that dynamic IP addresses constitute personal data for a
 website operator who has the legal means — such as seeking disclosure from the ISP — to
-identify the individual. Subsequent EDPB guidance reaffirms this.
+identify the individual. 
 
 Mallard Metrics processes (but does not store) IP addresses. That temporary processing still
 constitutes processing of personal data under GDPR Art. 4(2).
@@ -253,10 +255,8 @@ but operators **must**:
    - Contact information for the data controller
 3. **Honour objections** from data subjects (Art. 21 right to object)
 
-The EDPB's Guidelines 06/2020 on targeting of social media users and Guidelines 02/2019 on
-processing of personal data under Article 6(1)(b) GDPR provide relevant context, though
-they address different scenarios. The core balancing test is described in EDPB Opinion 06/2014
-on legitimate interests.
+The core balancing test is described in Article 29 Working
+Party Opinion 06/2014 (WP217) on legitimate interests.
 
 #### Consent (Art. 6(1)(a)) — an alternative
 
@@ -266,9 +266,9 @@ generally requires a consent banner. Once consent is withdrawn, processing must 
 #### Which basis is recommended?
 
 For a self-hosted analytics tool with privacy-preserving design, **legitimate interests is
-typically the appropriate basis**. The EDPB has acknowledged that privacy-respecting analytics
-can qualify. However, the specific balancing test must be performed by the operator for their
-deployment context.
+typically the appropriate basis**. That is the project's general reading, not a ruling:
+whether it holds depends on your data, your jurisdiction and the balancing test, which you
+must perform and document for your own deployment.
 
 ### Data subject rights under GDPR
 
@@ -311,12 +311,19 @@ requires prior **consent** for:
 > in the terminal equipment of a subscriber or user"
 > — Art. 5(3), ePrivacy Directive
 
-Mallard Metrics **does not set cookies** and **does not access terminal storage** on the
-visitor's device. The visitor ID is derived server-side from request data; no information is
-written to or read from the browser.
+Mallard Metrics **does not set cookies** and **writes nothing** to the visitor's device.
+The tracking script performs one read: it checks whether the `localStorage` key
+`mallard_ignore` has been set to `true` (a switch a site owner sets on their own browser
+to exclude themselves) and, if so, sends nothing. The value is never transmitted. The
+visitor ID is derived server-side from request data.
 
-**Consequence:** Art. 5(3) ePrivacy does not require consent for Mallard Metrics' visitor
-identification mechanism.
+**The project's reading** is that, because that single read exists only to honour an
+opt-out and nothing is stored, Art. 5(3) does not require consent for Mallard Metrics'
+visitor identification. This is the maintainers' interpretation, not a ruling, and
+national authorities differ on whether any access to terminal equipment, or a
+`mallard_ignore` read in particular, falls inside the rule. Confirm it with your own
+counsel before relying on it; the script is short and unminified
+(`tracking/script.js`) so counsel can read exactly what it does.
 
 However, this does not exempt the operator from GDPR (see above). The ePrivacy analysis and
 the GDPR analysis are separate inquiries.
@@ -335,7 +342,7 @@ specific jurisdictions should consult applicable national guidance.
 The California Consumer Privacy Act (Cal. Civ. Code § 1798.100 et seq.), as amended by CPRA,
 applies to **for-profit businesses** that meet at least one threshold:
 
-- Annual gross revenue exceeding $25 million
+- Annual gross revenue above the statutory threshold (originally $25 million; it is adjusted periodically, so check the current figure)
 - Buy, sell, receive, or share personal information of 100,000 or more California consumers
   or households per year
 - Derive 50% or more of annual revenue from selling or sharing personal information
@@ -415,7 +422,7 @@ Mallard Metrics provides two deployment profiles:
 | Profile | Target | Core metric impact | Regulatory posture |
 |---|---|---|---|
 | **Standard** (default) | Maximum analytics depth | Full unique-visitor counting, city-level geo, browser versions | Operator must complete LIA + privacy notice |
-| **GDPR-Friendly** (`gdpr_mode = true`) | Reduced fingerprinting surface | Daily unique visitors still tracked; geo limited to country; versions suppressed | Substantially reduced data processing scope; supports legitimate interests or consent-based deployments |
+| **GDPR-Friendly** (`gdpr_mode = true`) | Reduced fingerprinting surface | Daily unique visitors still tracked; geo limited to country; versions suppressed; session-based reports unavailable (below) | Reduced data processing scope. Whether it is enough for your lawful basis is for you and your counsel to decide |
 
 ### Activating GDPR-Friendly Mode
 
@@ -438,10 +445,10 @@ When `gdpr_mode = true`, the following transformations are applied **at ingestio
 | Setting | Effect | Privacy impact |
 |---|---|---|
 | `strip_referrer_query = true` | Strips `?query` and `#fragment` from referrer URLs before storing | Prevents leaking search terms (e.g. `?q=medical+condition`) |
-| `round_timestamps = true` | Timestamps stored at hour precision (e.g. `2024-03-15T14:00:00`) | Reduces fingerprinting via timing correlation |
+| `round_timestamps = true` | Timestamps rounded down to the hour (e.g. `2024-03-15T14:00:00`) | Reduces fingerprinting via timing correlation. **Cost:** events inside an hour can no longer be ordered, so sessions, funnels, sequences, flow and entry/exit pages answer `503`, and the session fields of `/api/stats/main` are `null` |
 | `suppress_browser_version = true` | Stores browser name only (`Chrome`, not `Chrome 120.0`) | Reduces UA-based fingerprinting |
 | `suppress_os_version = true` | Stores OS name only (`Windows`, not `Windows 10.0`) | Reduces UA-based fingerprinting |
-| `suppress_screen_size = true` | Omits screen width and device type entirely | Eliminates screen-size fingerprinting vector |
+| `suppress_screen_size = true` | Omits viewport width and device type entirely | Eliminates the viewport-size fingerprinting vector |
 | `geoip_precision = "country"` | Stores country code only; region and city set to NULL | City/region are more identifying than country |
 
 ### Fine-Grained Privacy Controls
@@ -459,7 +466,7 @@ retention_days = 30
 |---|---|---|---|
 | `gdpr_mode` | `MALLARD_GDPR_MODE` | `false` | Enable the GDPR-friendly bundle (forces all flags below on) |
 | `strip_referrer_query` | `MALLARD_STRIP_REFERRER_QUERY` | `false` | Strip `?query` and `#fragment` from referrer URLs |
-| `round_timestamps` | `MALLARD_ROUND_TIMESTAMPS` | `false` | Round timestamps to nearest hour |
+| `round_timestamps` | `MALLARD_ROUND_TIMESTAMPS` | `false` | Round timestamps down to the hour |
 | `suppress_visitor_id` | `MALLARD_SUPPRESS_VISITOR_ID` | `false` | Replace HMAC visitor ID with random UUID per request (breaks unique-visitor counting) |
 | `suppress_browser_version` | `MALLARD_SUPPRESS_BROWSER_VERSION` | `false` | Store browser name only |
 | `suppress_os_version` | `MALLARD_SUPPRESS_OS_VERSION` | `false` | Store OS name only |
@@ -495,7 +502,7 @@ This endpoint:
    (partition layout: `data/events/site_id={site_id}/date={date}/`)
 3. Refreshes the `events_all` VIEW so subsequent queries reflect the deletion
 
-Response:
+Response (the counts are illustrative):
 
 ```json
 {
@@ -507,6 +514,11 @@ Response:
   "parquet_partitions_deleted": 31
 }
 ```
+
+If a partition could not be removed, the response is `500` with `"status": "partial"`
+and a `failed_dates` list. The data for those dates is **still present**; retry
+until the response is `200`. The endpoint requires an admin credential and is refused
+until an admin password exists. Erased data is also dropped from the query cache.
 
 **Limitation:** Because visitor IDs are pseudonymous hashes (not names or email addresses),
 it is not possible to identify which stored rows correspond to a specific natural person
@@ -539,8 +551,9 @@ This section summarises the minimum obligations for a legally compliant deployme
 - [ ] Consider enabling `MALLARD_GDPR_MODE=true` for EU/EEA deployments
 - [ ] Do not collect custom `props` containing PII (names, emails, user IDs that are direct
   identifiers) without explicit legal basis and privacy notice disclosure
-- [ ] Enable `MALLARD_SECURE_COOKIES=true` in production (TLS deployments)
-- [ ] Set `MALLARD_SECRET` to a strong random value and protect it as a secret
+- [ ] Enable `MALLARD_SECURE_COOKIES=true` in production (TLS deployments); this protects the dashboard session cookie, not visitors, since the tracker sets no cookies
+- [ ] Set `MALLARD_SECRET` to a strong random value (at least 16 characters) and protect it as a secret
+- [ ] Check the logs of your reverse proxy, CDN and host: they may record visitor IPs even though Mallard does not
 
 ### Ongoing
 
@@ -556,37 +569,14 @@ This section summarises the minimum obligations for a legally compliant deployme
 The following activities are **not performed** by Mallard Metrics, regardless of configuration:
 
 - Does not set HTTP cookies
-- Does not read or write browser `localStorage` or `sessionStorage`
-- Does not use browser fingerprinting techniques that access device APIs (WebGL, Canvas, AudioContext)
+- Does not write to browser `localStorage` or `sessionStorage`; the tracking script reads one operator-set opt-out key (`mallard_ignore`) and never transmits it
+- Does not use fingerprinting techniques that access device APIs (WebGL, Canvas, AudioContext); the script reports the viewport width, the page URL and the referrer
 - Does not store raw IP addresses anywhere on disk
 - Does not store raw User-Agent strings anywhere on disk
-- Does not transmit collected data to any third party
+- Does not transmit collected data to any third party. The only outbound request the server makes is the one-time download of the `behavioral` extension from the DuckDB community repository
 - Does not perform cross-site tracking
 - Does not serve advertising
 - Does not sell data
-
----
-
-## Comparison with Other Analytics Tools
-
-| Feature | Mallard Metrics (Standard) | Mallard Metrics (GDPR Mode) | Google Analytics 4 | Plausible Analytics | Fathom Analytics |
-|---|---|---|---|---|---|
-| Self-hosted | Yes | Yes | No | Yes (paid) / No (cloud) | No |
-| Cookies set | No | No | Yes (session + persistent) | No | No |
-| IP stored | No | No | Yes (anonymised) | No | No |
-| Raw UA stored | No | No | Yes | No | No |
-| Browser version stored | Yes | No | Yes | Yes | Yes |
-| OS version stored | Yes | No | Yes | Yes | Yes |
-| Screen size stored | Yes | No | Yes | No | No |
-| Geo stored | Country/region/city | Country only | Country/region/city | Country only | Country only |
-| Referrer query stored | Yes | No | Yes | No | No |
-| Timestamp precision | Millisecond | Hour | Millisecond | Day | Day |
-| Visitor ID type | Daily-rotating HMAC hash | Daily-rotating HMAC hash | Persistent cookie-based | Daily-rotating hash | Daily-rotating hash |
-| Data erasure API | Yes (site + date range) | Yes (site + date range) | No (Google-controlled) | No | No |
-| GDPR applicability | Yes (pseudonymous data) | Yes (reduced scope) | Yes (personal data) | Yes (pseudonymous data) | Yes (pseudonymous data) |
-| Consent needed (ePrivacy) | No (no terminal storage access) | No | Yes (cookies) | No | No |
-| Consent needed (GDPR) | Depends on lawful basis | More defensible under LI | Yes (or other basis) | Depends on lawful basis | Depends on lawful basis |
-| Data controller | You (self-hosted operator) | You (self-hosted operator) | Google | Plausible or you | Fathom |
 
 ---
 
@@ -613,13 +603,11 @@ All legal citations below refer to publicly available primary sources.
 | Document | Relevance |
 |---|---|
 | CJEU Case C‑582/14, *Breyer v. Bundesrepublik Deutschland* (19 Oct 2016) | Dynamic IP addresses are personal data for website operators |
-| EDPB Opinion 05/2022 on the European Commission's Draft Decision pursuant to Art. 25(6) GDPR for the United States | Reaffirms pseudonymous data is personal data |
-| EDPB Guidelines 06/2020 on targeting of social media users | Elaborates on legitimate interests balancing test |
-| EDPB Guidelines 2/2019 on the processing of personal data under Article 6(1)(b) GDPR | Scope of necessity test for lawful bases |
-| Article 29 Working Party Opinion 06/2014 on legitimate interests | Detailed three-part test for legitimate interests |
+| Article 29 Working Party Opinion 05/2014 (WP216) on anonymisation techniques | Pseudonymised data remains personal data |
+| Article 29 Working Party Opinion 06/2014 (WP217) on legitimate interests | The balancing test for Art. 6(1)(f) |
 | ePrivacy Directive 2002/58/EC, Art. 5(3) | Terminal storage consent requirement ("cookie law") |
 | ICO Guidance on legitimate interests | Practical LIA template (UK-focused, broadly applicable) — ico.org.uk |
-| CNIL guidance on analytics without consent | France-specific guidance; one of the more permissive interpretations for privacy-preserving analytics — cnil.fr |
+| CNIL guidance on audience-measurement tools exempt from consent | France-specific conditions under which analytics may run without consent — cnil.fr |
 
 ### CCPA
 
