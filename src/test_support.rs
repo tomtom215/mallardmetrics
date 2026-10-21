@@ -250,6 +250,10 @@ impl AppStateBuilder {
             suppress_screen_size: self.suppress_screen_size,
             geoip_precision: self.geoip_precision,
             events_dir: events_dir.to_path_buf(),
+            // Inside the fixture's own directory: a sibling of it would be shared
+            // by every test (and left behind in the system temp directory).
+            data_dir: events_dir.to_path_buf(),
+            backup_dir: events_dir.join("backups"),
         })
     }
 

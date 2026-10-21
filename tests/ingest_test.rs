@@ -2819,3 +2819,101 @@ fn measure_export_memory_buffered() {
         growth / 1024
     );
 }
+
+// ── Online backup ────────────────────────────────────────────────────────
+
+fn backup_request(token: &str, query: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!("/api/admin/backup{query}"))
+        .header("cookie", format!("mm_session={token}"))
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_backup_endpoint_writes_a_snapshot_that_opens_on_its_own() {
+    let password = "correct-horse-battery";
+    let (state, _dir) = state_builder().admin_password(password).build();
+    let token = admin_session(&state, password).await;
+
+    post_event(&state, pageview("example.com", "https://example.com/a")).await;
+    flush(&state);
+    post_event(&state, pageview("example.com", "https://example.com/b")).await;
+    // One event is in Parquet, one is buffered; the backup must hold the flushed
+    // one and report the hot table honestly.
+
+    let response = send(&state, backup_request(&token, "?name=b1")).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let json = body_json(response).await;
+    assert_eq!(json["status"], "created");
+    assert_eq!(json["name"], "b1");
+    assert_eq!(json["parquet_files"], 1);
+
+    let path = std::path::PathBuf::from(json["path"].as_str().unwrap());
+    assert!(path.join("MANIFEST.json").exists());
+    let restored = duckdb::Connection::open(path.join("mallard.duckdb")).unwrap();
+    let cold: i64 = restored
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM read_parquet('{}/**/*.parquet')",
+                path.join("events").display()
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cold, 1, "the flushed event must be in the backup's Parquet");
+}
+
+#[tokio::test]
+async fn test_backup_endpoint_never_overwrites_and_validates_the_name() {
+    let password = "correct-horse-battery";
+    let (state, _dir) = state_builder().admin_password(password).build();
+    let token = admin_session(&state, password).await;
+
+    let first = send(&state, backup_request(&token, "?name=b1")).await;
+    assert_eq!(first.status(), StatusCode::CREATED);
+    let again = send(&state, backup_request(&token, "?name=b1")).await;
+    assert_eq!(again.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(again).await["code"], "conflict");
+
+    for bad in ["..", "a%2Fb", ".hidden", "a%20b"] {
+        let response = send(&state, backup_request(&token, &format!("?name={bad}"))).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{bad:?} must be refused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_backup_endpoint_needs_admin() {
+    let password = "correct-horse-battery";
+    let (state, _dir) = state_builder().admin_password(password).build();
+    let anonymous = send(
+        &state,
+        Request::builder()
+            .method("POST")
+            .uri("/api/admin/backup")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_a_default_backup_name_is_a_timestamp() {
+    let password = "correct-horse-battery";
+    let (state, _dir) = state_builder().admin_password(password).build();
+    let token = admin_session(&state, password).await;
+    let response = send(&state, backup_request(&token, "")).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let name = body_json(response).await["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(name.starts_with("mallard-20"), "{name}");
+}

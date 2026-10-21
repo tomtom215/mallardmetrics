@@ -24,9 +24,71 @@ A plain `cp` or `rsync` of a running instance can capture a database file and a
 WAL that do not belong together; the copy often fails to open, or opens without
 the most recent writes, and you find out when you restore. Copying `events/`
 while a compaction runs can also capture a merged file together with the files
-it replaced. The only consistent copy is one taken while the process is stopped.
+it replaced. The only consistent copies are one taken while the process is
+stopped and one taken by the server itself with the online backup below.
 The memory buffer is not part of any backup: events not flushed when the
 process stops are written by the shutdown flush, so stop gracefully (`SIGTERM`).
+
+## Online backup (no downtime)
+
+`POST /api/admin/backup` (admin scope) makes a consistent snapshot while the
+server keeps serving:
+
+```bash
+curl -X POST -H "Authorization: Bearer $ADMIN_KEY" \
+  "https://analytics.example.com/api/admin/backup?name=before-upgrade"
+# {"status":"created","name":"before-upgrade","path":"/data/backups/before-upgrade",
+#  "parquet_files":212,"parquet_bytes":48123456,"hot_rows":318,"state_files":3}
+```
+
+(The figures are an illustration; `state_files` is how many of `.secret`,
+`admin.json` and `api_keys.json` existed.)
+
+It writes `<data_dir>/backups/<name>/` (default name `mallard-<UTC timestamp>`)
+holding `mallard.duckdb`, `events/`, whichever of `.secret`, `admin.json` and
+`api_keys.json` exist, and a `MANIFEST.json`. The directory and the secrets in it
+are owner-only. `extensions/` is left out because it is downloaded again on start.
+
+How it stays consistent: the server takes the lock that a flush takes, so no
+flush, compaction, retention run or erasure can change either tier, and queries
+pause, while it checkpoints and copies the hot table and **hard-links** the
+Parquet files. A published Parquet file is never modified in place, so a link keeps
+exactly the bytes that existed at that moment and costs almost no disk. Queries
+and flushes wait only for that copy, which is short unless the hot table is
+large; ingestion keeps buffering throughout.
+
+Rules and limits:
+
+- `name` is only a name (letters, digits, `-`, `_`, `.`; not starting with a dot).
+  The endpoint cannot write anywhere but `<data_dir>/backups`. An existing name is
+  a `409`; backups are never overwritten. A backup is written to `<name>.partial`
+  and renamed last, so a directory without that suffix is complete.
+- **It is on the same disk.** Hard links share blocks with the live data, so this
+  protects against mistakes and corruption, not against losing the disk. Copy the
+  directory to another machine afterwards (`rsync -a`, which un-links on a
+  different filesystem), and delete old backups yourself: nothing prunes them.
+- Events still in the memory buffer are not in any backup (they are not durable
+  yet); `hot_rows` reports what the hot table held.
+- It needs an admin session or admin API key; `deploy/backup.sh` below needs a
+  stop and works without the API.
+
+### Restoring an online backup
+
+```bash
+docker compose -f deploy/docker-compose.production.yml stop mallard
+cd /srv/mallard/data
+sudo mv mallard.duckdb mallard.duckdb.old; sudo rm -f mallard.duckdb.wal
+sudo mv events events.old
+sudo cp -a backups/before-upgrade/mallard.duckdb backups/before-upgrade/events .
+sudo cp -a backups/before-upgrade/.secret backups/before-upgrade/admin.json \
+  backups/before-upgrade/api_keys.json . 2>/dev/null || true
+sudo chown -R 65532:65532 /srv/mallard/data
+docker compose -f deploy/docker-compose.production.yml start mallard
+```
+
+Keep `mallard.duckdb.old` and `events.old` until the checks under
+[Restore](#restore) pass. The restored database's `events_all` view is rebuilt at
+startup, so it needs no repair.
 
 ## What `deploy/backup.sh` does
 

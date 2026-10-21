@@ -1,3 +1,4 @@
+use crate::api::admin;
 use crate::api::auth;
 use crate::api::stats;
 use crate::dashboard;
@@ -114,6 +115,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/keys", get(auth::list_api_keys))
         .route("/keys/{key_hash}", delete(auth::revoke_api_key_handler))
         .route("/gdpr/erase", delete(stats::gdpr_erase))
+        .route("/admin/backup", post(admin::create_backup))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth::require_admin_auth,

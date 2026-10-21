@@ -8,6 +8,8 @@ pub enum ApiError {
     BadRequest(String),
     Unauthorized(String),
     NotFound(String),
+    /// 409 — the request is valid but conflicts with existing state.
+    Conflict(String),
     Internal(String),
     DatabaseError(duckdb::Error),
     /// 429 — the concurrent-query semaphore is exhausted.
@@ -32,6 +34,7 @@ impl std::fmt::Display for ApiError {
             Self::BadRequest(msg) => write!(f, "Bad request: {msg}"),
             Self::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
             Self::NotFound(msg) => write!(f, "Not found: {msg}"),
+            Self::Conflict(msg) => write!(f, "Conflict: {msg}"),
             Self::Internal(msg) => write!(f, "Internal error: {msg}"),
             Self::DatabaseError(e) => write!(f, "Database error: {e}"),
             Self::TooManyRequests(msg) => write!(f, "Too many requests: {msg}"),
@@ -59,6 +62,7 @@ impl ApiError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized(_) => StatusCode::UNAUTHORIZED,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
+            Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Internal(_) | Self::DatabaseError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
             Self::BehavioralUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
@@ -75,6 +79,7 @@ impl ApiError {
             Self::BadRequest(_) => "bad_request",
             Self::Unauthorized(_) => "unauthorized",
             Self::NotFound(_) => "not_found",
+            Self::Conflict(_) => "conflict",
             Self::Internal(_) | Self::DatabaseError(_) => "internal_error",
             Self::TooManyRequests(_) => "too_many_requests",
             Self::BehavioralUnavailable(_) => "behavioral_unavailable",
@@ -109,6 +114,7 @@ impl IntoResponse for ApiError {
             Self::BadRequest(msg)
             | Self::Unauthorized(msg)
             | Self::NotFound(msg)
+            | Self::Conflict(msg)
             | Self::TooManyRequests(msg)
             | Self::BehavioralUnavailable(msg)
             | Self::QueryTimeout(msg) => msg.clone(),
@@ -177,6 +183,7 @@ mod tests {
             (ApiError::BadRequest("x".into()), "bad_request"),
             (ApiError::Unauthorized("x".into()), "unauthorized"),
             (ApiError::NotFound("x".into()), "not_found"),
+            (ApiError::Conflict("x".into()), "conflict"),
             (ApiError::Internal("x".into()), "internal_error"),
             (
                 ApiError::from(duckdb::Error::QueryReturnedNoRows),

@@ -34,7 +34,9 @@ Funnels, retention (and the dashboard's Funnel, Retention, Sequence and Flow
 panels), sessions, sequences, flow and entry/exit pages answer `503`
 (`code: behavioral_unavailable`) and `/api/stats/main` returns `null` for
 `total_sessions`, `bounce_rate`, `avg_visit_duration_secs` and `views_per_visit`.
-Check:
+The extension is also retried in the background every 60 s, so
+`behavioral_extension_loaded` in `/health/detailed` can turn `true` after boot
+when the first download failed (for example the network came up late). Check:
 
 ```bash
 curl -s http://localhost:8000/health/detailed | grep behavioral
@@ -148,10 +150,11 @@ writes a file. Also check `mallard_last_flush_success_timestamp_seconds`.
 | Response | Where | Meaning | Action |
 |---|---|---|---|
 | `429` with `Retry-After: 1`, empty body | `POST`/`GET /api/event` | The per-site or per-IP rate limit. | Raise `rate_limit_per_site`/`per_ip` if real traffic is being cut (it counts in `mallard_rate_limit_rejections_total`); behind a proxy make sure `trust_proxy_headers` is on, or all visitors share one bucket. |
-| `429` `code: too_many_requests` | `/api/stats/*` | All `max_concurrent_queries` slots were busy for 10 s. | Retry; reduce panel fan-out; raise the limit if CPU allows. |
+| `429` `code: too_many_requests` | `/api/stats/*` | All `max_concurrent_queries` slots were busy for `query_queue_wait_secs` (default 5 s). | Retry; reduce panel fan-out; raise the limit if CPU allows. |
 | `429` with `Retry-After: <seconds>`, `{"error":"Too many failed attempts..."}` | login / setup | Lockout of that address. Behind a proxy without `trust_proxy_headers` it hits **everyone**. | Wait, or fix the proxy settings. |
-| `504` `code: query_timeout` | `/api/stats/*` | A statement ran 20 s and was interrupted. | Shorter date range, fewer filters; more `duckdb_threads`/memory; run `compact_after_files` (many small files slow every query). |
+| `504` `code: query_timeout` | `/api/stats/*` | A statement ran `query_deadline_secs` (default 20 s) and was interrupted. | Shorter date range, fewer filters; more `duckdb_threads`/memory; run `compact_after_files` (many small files slow every query). |
 | `408` | any | The 30 s request timeout. | Same as above, or a slow client. |
+| Connection closed with no response | any | The client sent nothing, or only part of a request head, for 30 s; idle keep-alive connections close at the same limit. HTTP/1 only. | A proxy must not hold idle upstream connections longer than 30 s without reuse; set its upstream keep-alive timeout below that. |
 | `503` ingest | `POST /api/event` | The buffer is at `max_buffered_events` (flushes failing: see disk full) or the server is shutting down. | Fix the flush; the tracker does not retry. |
 | `503` login `Server is busy` | `/api/auth/login` | Four password checks already running. | Retry; a flood of login attempts. |
 

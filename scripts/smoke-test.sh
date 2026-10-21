@@ -167,8 +167,13 @@ check goals      'purchase'             "$(curl -sS "$BASE/api/stats/goals?$Q")"
 check props      'plan'                 "$(curl -sS "$BASE/api/stats/properties?$Q")"
 check propvalues 'pro'                  "$(curl -sS "$BASE/api/stats/property-values?$Q&key=plan")"
 check sites      "$SITE"                "$(curl -sS "$BASE/api/sites")"
+check sites_details '"events_30d":[0-9]+' "$(curl -sS "$BASE/api/sites")"
 check export_csv 'date'                 "$(curl -sS "$BASE/api/stats/export?$Q")"
 check export_raw 'timestamp'            "$(curl -sS "$BASE/api/stats/export?$Q&kind=raw")"
+# A raw export streams: chunked, so no Content-Length to promise up front.
+RAW_HEADERS="$(curl -sS -D - -o /dev/null "$BASE/api/stats/export?$Q&kind=raw")"
+check export_raw_chunked 'transfer-encoding: chunked' "$RAW_HEADERS"
+absent export_raw_no_length 'content-length' "$RAW_HEADERS"
 
 # Every dimension the router accepts, so a new one cannot ship unexercised.
 for dim in pages entry-pages exit-pages referrers sources countries regions \
@@ -219,6 +224,14 @@ check setup '200' \
   "$(curl -sS -o /dev/null -w '%{http_code}' -c "$COOKIE_JAR" -X POST "$BASE/api/auth/setup" \
       -H 'Content-Type: application/json' -d '{"password":"a-sufficiently-long-password"}')"
 check keys_authed   '200' "$(code -b "$COOKIE_JAR" "$BASE/api/keys")"
+check backup_unauth '401' "$(code -X POST "$BASE/api/admin/backup")"
+check backup_created '201' \
+  "$(curl -sS -o "$WORK/backup.json" -w '%{http_code}' -b "$COOKIE_JAR" -X POST "$BASE/api/admin/backup?name=smoke")"
+check backup_reports_files '"parquet_files":[0-9]+' "$(cat "$WORK/backup.json")"
+check backup_contents 'MANIFEST.json' "$(ls "$WORK/data/backups/smoke")"
+check backup_has_database 'mallard.duckdb' "$(ls "$WORK/data/backups/smoke")"
+check backup_is_not_overwritten '409' "$(code -b "$COOKIE_JAR" -X POST "$BASE/api/admin/backup?name=smoke")"
+check backup_rejects_a_path '400' "$(code -b "$COOKIE_JAR" -X POST "$BASE/api/admin/backup?name=..")"
 check keys_unauthed_after_setup '401' "$(code "$BASE/api/keys")"
 check login_wrong_password '401' \
   "$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE/api/auth/login" \

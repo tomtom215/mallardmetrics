@@ -40,6 +40,7 @@ http://your-instance.com
 | `GET` | `/api/keys` | admin | [Authentication](auth.md#get-apikeys) |
 | `DELETE` | `/api/keys/{key_hash}` | admin | [Authentication](auth.md#delete-apikeyskey_hash) |
 | `DELETE` | `/api/gdpr/erase` | admin | [Stats](stats.md#delete-apigdprerase) |
+| `POST` | `/api/admin/backup` | admin | [Auth](auth.md#post-apiadminbackup) |
 | `GET` | `/health`, `/health/ready`, `/health/detailed` | none | [Health](health.md) |
 | `GET` | `/metrics` | none, or bearer token | [Health & Metrics](health.md#get-metrics) |
 | `GET` | `/mallard.js`, `/js/script.js` | none | [Tracking Script](../tracking-script.md) |

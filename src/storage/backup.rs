@@ -21,8 +21,17 @@
 
 use crate::storage::TierLock;
 use duckdb::Connection;
+use parking_lot::Mutex;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// State files kept beside the database that a restore also needs.
+///
+/// Without `.secret` every visitor gets a new ID, without `admin.json` the
+/// restored instance is unconfigured and claimable, without `api_keys.json`
+/// every API key stops working. The `extensions/` directory is left out: it is
+/// downloaded again on start.
+const STATE_FILES: &[&str] = &[".secret", "admin.json", "api_keys.json"];
 
 /// File name of the copied database inside a backup directory.
 pub const BACKUP_DB_FILE: &str = "mallard.duckdb";
@@ -44,6 +53,8 @@ pub struct BackupReport {
     pub linked: usize,
     /// Rows in the copied hot table.
     pub hot_rows: u64,
+    /// State files copied (see [`STATE_FILES`]).
+    pub state_files: usize,
 }
 
 /// Why a backup could not be made.
@@ -97,8 +108,9 @@ fn is_safe_name(name: &str) -> bool {
 
 /// Create `<backups_root>/<name>` holding a consistent snapshot of both tiers.
 ///
-/// Blocking: takes the tier write lock for the whole copy, and the connection
-/// for the database half. Call from `spawn_blocking`.
+/// Blocking: takes the tier write lock for the whole copy, then the connection,
+/// in that order (a flush does the same; the opposite order can deadlock against
+/// one). Call from `spawn_blocking`, and do not hold the connection yourself.
 ///
 /// # Errors
 ///
@@ -106,8 +118,9 @@ fn is_safe_name(name: &str) -> bool {
 /// removed on error. An existing backup of the same name is an error, never
 /// overwritten.
 pub fn create_backup(
-    conn: &Connection,
+    conn: &Mutex<Connection>,
     tier: &TierLock,
+    data_dir: &Path,
     events_dir: &Path,
     backups_root: &Path,
     name: &str,
@@ -125,8 +138,11 @@ pub fn create_backup(
         fs::remove_dir_all(&partial)?;
     }
     fs::create_dir_all(&partial)?;
+    // The backup holds the secret and the credential hashes, so it is as
+    // sensitive as the data directory: owner only, whatever the umask says.
+    restrict_to_owner(&partial)?;
 
-    match snapshot_into(conn, tier, events_dir, &partial) {
+    match snapshot_into(conn, tier, data_dir, events_dir, backups_root, &partial) {
         Ok(mut report) => {
             fs::rename(&partial, &final_dir)?;
             sync_dir(backups_root);
@@ -143,12 +159,15 @@ pub fn create_backup(
 }
 
 fn snapshot_into(
-    conn: &Connection,
+    conn: &Mutex<Connection>,
     tier: &TierLock,
+    data_dir: &Path,
     events_dir: &Path,
+    backups_root: &Path,
     dest: &Path,
 ) -> Result<BackupReport, BackupError> {
     let _exclusive = tier.write();
+    let conn = conn.lock();
 
     // Fold the write-ahead log into the main file so the copy reads one state.
     conn.execute_batch("CHECKPOINT")?;
@@ -168,7 +187,26 @@ fn snapshot_into(
     conn.execute_batch("DETACH mallard_backup")?;
 
     let mut stats = TreeStats::default();
-    link_tree(events_dir, &dest.join(BACKUP_EVENTS_DIR), &mut stats)?;
+    link_tree(
+        events_dir,
+        &dest.join(BACKUP_EVENTS_DIR),
+        backups_root,
+        &mut stats,
+    )?;
+
+    let mut state_files = 0;
+    for name in STATE_FILES {
+        match fs::copy(data_dir.join(name), dest.join(name)) {
+            Ok(_) => {
+                restrict_to_owner(&dest.join(name))?;
+                state_files += 1;
+            }
+            // Not every deployment has all of them: no admin password yet, no
+            // API keys, or the secret supplied through the environment.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     let report = BackupReport {
         path: dest.to_path_buf(),
@@ -176,6 +214,7 @@ fn snapshot_into(
         parquet_bytes: stats.bytes,
         linked: stats.linked,
         hot_rows,
+        state_files,
     };
     let manifest = serde_json::json!({
         "format": 1,
@@ -184,6 +223,7 @@ fn snapshot_into(
         "hot_rows": report.hot_rows,
         "parquet_files": report.parquet_files,
         "parquet_bytes": report.parquet_bytes,
+        "state_files": report.state_files,
     });
     fs::write(
         dest.join(BACKUP_MANIFEST),
@@ -203,8 +243,10 @@ struct TreeStats {
 /// Mirror the published `.parquet` files under `src` into `dst`.
 ///
 /// Staging files (`.tmp`, `.pending`, `.del`) are skipped: they are not part of
-/// the readable tier and would restore as clutter.
-fn link_tree(src: &Path, dst: &Path, stats: &mut TreeStats) -> std::io::Result<()> {
+/// the readable tier and would restore as clutter. `skip` is never entered, so a
+/// backup directory that lives inside the events directory does not back itself
+/// up.
+fn link_tree(src: &Path, dst: &Path, skip: &Path, stats: &mut TreeStats) -> std::io::Result<()> {
     let entries = match fs::read_dir(src) {
         Ok(entries) => entries,
         // No Parquet written yet: the backup has an empty events directory.
@@ -219,8 +261,11 @@ fn link_tree(src: &Path, dst: &Path, stats: &mut TreeStats) -> std::io::Result<(
         let path = entry.path();
         let target = dst.join(entry.file_name());
         let kind = entry.file_type()?;
+        if path == skip {
+            continue;
+        }
         if kind.is_dir() {
-            link_tree(&path, &target, stats)?;
+            link_tree(&path, &target, skip, stats)?;
         } else if kind.is_file() && path.extension().is_some_and(|e| e == "parquet") {
             stats.bytes += entry.metadata()?.len();
             stats.files += 1;
@@ -231,6 +276,19 @@ fn link_tree(src: &Path, dst: &Path, stats: &mut TreeStats) -> std::io::Result<(
             }
         }
     }
+    Ok(())
+}
+
+/// Make a file or directory readable by its owner only.
+#[cfg(unix)]
+fn restrict_to_owner(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if path.is_dir() { 0o700 } else { 0o600 };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn restrict_to_owner(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -247,12 +305,12 @@ mod tests {
     use super::*;
     use crate::storage::schema;
 
-    fn fixture() -> (tempfile::TempDir, Connection, PathBuf) {
+    fn fixture() -> (tempfile::TempDir, Mutex<Connection>, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let conn = Connection::open(dir.path().join("live.duckdb")).unwrap();
         schema::init_schema(&conn).unwrap();
         let events = dir.path().join("events");
-        (dir, conn, events)
+        (dir, Mutex::new(conn), events)
     }
 
     fn insert(conn: &Connection, site: &str, ts: &str) {
@@ -277,15 +335,16 @@ mod tests {
     #[test]
     fn test_backup_holds_both_tiers_and_opens_on_its_own() {
         let (dir, conn, events) = fixture();
-        insert(&conn, "a.com", "2024-01-01 10:00:00");
-        insert(&conn, "a.com", "2024-01-01 11:00:00");
-        write_parquet(&conn, &events, "a.com", "2024-01-01", "0001.parquet");
-        conn.execute("DELETE FROM events", []).unwrap();
-        insert(&conn, "a.com", "2024-01-02 09:00:00");
+        insert(&conn.lock(), "a.com", "2024-01-01 10:00:00");
+        insert(&conn.lock(), "a.com", "2024-01-01 11:00:00");
+        write_parquet(&conn.lock(), &events, "a.com", "2024-01-01", "0001.parquet");
+        conn.lock().execute("DELETE FROM events", []).unwrap();
+        insert(&conn.lock(), "a.com", "2024-01-02 09:00:00");
 
         let roots = dir.path().join("backups");
         fs::create_dir_all(&roots).unwrap();
-        let report = create_backup(&conn, &TierLock::new(), &events, &roots, "b1").unwrap();
+        let report =
+            create_backup(&conn, &TierLock::new(), dir.path(), &events, &roots, "b1").unwrap();
 
         assert_eq!(report.hot_rows, 1);
         assert_eq!(report.parquet_files, 1);
@@ -315,15 +374,16 @@ mod tests {
     #[test]
     fn test_backup_is_unaffected_by_later_changes_to_the_live_tiers() {
         let (dir, conn, events) = fixture();
-        insert(&conn, "a.com", "2024-01-01 10:00:00");
-        write_parquet(&conn, &events, "a.com", "2024-01-01", "0001.parquet");
+        insert(&conn.lock(), "a.com", "2024-01-01 10:00:00");
+        write_parquet(&conn.lock(), &events, "a.com", "2024-01-01", "0001.parquet");
         let roots = dir.path().join("backups");
         fs::create_dir_all(&roots).unwrap();
-        let report = create_backup(&conn, &TierLock::new(), &events, &roots, "b1").unwrap();
+        let report =
+            create_backup(&conn, &TierLock::new(), dir.path(), &events, &roots, "b1").unwrap();
 
         // Erase and compact away the live copy, as the server may do at any time.
         fs::remove_dir_all(events.join("site_id=a.com")).unwrap();
-        conn.execute("DELETE FROM events", []).unwrap();
+        conn.lock().execute("DELETE FROM events", []).unwrap();
 
         let linked = report
             .path
@@ -340,8 +400,8 @@ mod tests {
     #[test]
     fn test_staging_files_are_not_backed_up() {
         let (dir, conn, events) = fixture();
-        insert(&conn, "a.com", "2024-01-01 10:00:00");
-        write_parquet(&conn, &events, "a.com", "2024-01-01", "0001.parquet");
+        insert(&conn.lock(), "a.com", "2024-01-01 10:00:00");
+        write_parquet(&conn.lock(), &events, "a.com", "2024-01-01", "0001.parquet");
         let partition = events.join("site_id=a.com/date=2024-01-01");
         for junk in [
             "0002.parquet.tmp",
@@ -352,7 +412,8 @@ mod tests {
         }
         let roots = dir.path().join("backups");
         fs::create_dir_all(&roots).unwrap();
-        let report = create_backup(&conn, &TierLock::new(), &events, &roots, "b1").unwrap();
+        let report =
+            create_backup(&conn, &TierLock::new(), dir.path(), &events, &roots, "b1").unwrap();
         assert_eq!(report.parquet_files, 1);
         let names: Vec<String> = fs::read_dir(
             report
@@ -372,7 +433,8 @@ mod tests {
         let roots = dir.path().join("backups");
         fs::create_dir_all(roots.join("b1")).unwrap();
         fs::write(roots.join("b1/keep"), b"precious").unwrap();
-        let err = create_backup(&conn, &TierLock::new(), &events, &roots, "b1").unwrap_err();
+        let err =
+            create_backup(&conn, &TierLock::new(), dir.path(), &events, &roots, "b1").unwrap_err();
         assert!(matches!(err, BackupError::Exists(_)), "{err}");
         assert_eq!(fs::read(roots.join("b1/keep")).unwrap(), b"precious");
     }
@@ -383,7 +445,8 @@ mod tests {
         let roots = dir.path().join("backups");
         fs::create_dir_all(&roots).unwrap();
         for bad in ["", "..", "../x", "a/b", ".hidden", "a b", "a\\b", "x..y"] {
-            let err = create_backup(&conn, &TierLock::new(), &events, &roots, bad).unwrap_err();
+            let err = create_backup(&conn, &TierLock::new(), dir.path(), &events, &roots, bad)
+                .unwrap_err();
             assert!(matches!(err, BackupError::BadName(_)), "{bad:?}: {err}");
         }
     }
@@ -397,19 +460,145 @@ mod tests {
         let roots = dir.path().join("backups");
         fs::create_dir_all(&roots).unwrap();
 
-        let result = create_backup(&conn, &TierLock::new(), &events, &roots, "b1");
+        let result = create_backup(&conn, &TierLock::new(), dir.path(), &events, &roots, "b1");
         assert!(matches!(result, Err(BackupError::Io(_))), "{result:?}");
         assert!(!roots.join("b1").exists());
         assert!(!roots.join("b1.partial").exists());
     }
 
     #[test]
-    fn test_no_parquet_yet_gives_an_empty_events_directory() {
+    fn test_a_backup_and_a_flush_do_not_deadlock() {
+        // A flush takes the tier lock and then the connection. A backup that took
+        // them the other way round would deadlock against it, and the failure
+        // would be a hang, so the work runs on a thread and the test waits with
+        // a timeout instead of joining.
         let (dir, conn, events) = fixture();
+        let conn = std::sync::Arc::new(conn);
+        let tier = TierLock::new();
+        let roots = dir.path().join("backups");
+        fs::create_dir_all(&roots).unwrap();
+        let dir_path = dir.path().to_path_buf();
+
+        let flusher = {
+            let (conn, tier) = (std::sync::Arc::clone(&conn), tier.clone());
+            std::thread::spawn(move || {
+                for _ in 0..300 {
+                    let _tier = tier.write();
+                    let _conn = conn.lock();
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let backer = {
+            let conn = std::sync::Arc::clone(&conn);
+            std::thread::spawn(move || {
+                for i in 0..20 {
+                    create_backup(
+                        &conn,
+                        &tier,
+                        dir_path.as_path(),
+                        &events,
+                        &roots,
+                        &format!("b{i}"),
+                    )
+                    .unwrap();
+                }
+                let _ = done_tx.send(());
+            })
+        };
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .is_ok(),
+            "backups deadlocked against a flush-ordered locker"
+        );
+        backer.join().unwrap();
+        flusher.join().unwrap();
+        drop(dir);
+    }
+
+    #[test]
+    fn test_a_backup_directory_inside_the_events_directory_is_not_backed_up() {
+        let (dir, conn, events) = fixture();
+        insert(&conn.lock(), "a.com", "2024-01-01 10:00:00");
+        write_parquet(&conn.lock(), &events, "a.com", "2024-01-01", "0001.parquet");
+        let roots = events.join("backups");
+        fs::create_dir_all(&roots).unwrap();
+
+        let first =
+            create_backup(&conn, &TierLock::new(), dir.path(), &events, &roots, "b1").unwrap();
+        let second =
+            create_backup(&conn, &TierLock::new(), dir.path(), &events, &roots, "b2").unwrap();
+
+        assert_eq!(first.parquet_files, 1);
+        assert_eq!(
+            second.parquet_files, 1,
+            "the first backup's files must not be counted in the second"
+        );
+        assert!(!second.path.join(BACKUP_EVENTS_DIR).join("backups").exists());
+    }
+
+    #[test]
+    fn test_state_files_are_copied_and_the_backup_is_owner_only() {
+        let (dir, conn, events) = fixture();
+        fs::write(dir.path().join(".secret"), b"visitor-secret").unwrap();
+        fs::write(dir.path().join("admin.json"), b"{}").unwrap();
+        // api_keys.json is absent: no keys have been created.
+        let roots = dir.path().join("backups");
+        fs::create_dir_all(&roots).unwrap();
+
+        let report =
+            create_backup(&conn, &TierLock::new(), dir.path(), &events, &roots, "b1").unwrap();
+
+        assert_eq!(report.state_files, 2);
+        assert_eq!(
+            fs::read(report.path.join(".secret")).unwrap(),
+            b"visitor-secret"
+        );
+        assert!(report.path.join("admin.json").exists());
+        assert!(!report.path.join("api_keys.json").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&report.path), 0o700, "the backup directory");
+            assert_eq!(mode(&report.path.join(".secret")), 0o600, "the secret");
+        }
+    }
+
+    #[test]
+    fn test_an_in_memory_database_can_be_backed_up() {
+        // Production databases are files, but the in-process test fixtures are
+        // not, and a backup that only works for one of them cannot be tested
+        // through the HTTP layer.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        schema::init_schema(&conn).unwrap();
         insert(&conn, "a.com", "2024-01-01 10:00:00");
         let roots = dir.path().join("backups");
         fs::create_dir_all(&roots).unwrap();
-        let report = create_backup(&conn, &TierLock::new(), &events, &roots, "b1").unwrap();
+        let conn = Mutex::new(conn);
+        let report = create_backup(
+            &conn,
+            &TierLock::new(),
+            dir.path(),
+            &dir.path().join("events"),
+            &roots,
+            "m1",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(report.hot_rows, 1);
+    }
+
+    #[test]
+    fn test_no_parquet_yet_gives_an_empty_events_directory() {
+        let (dir, conn, events) = fixture();
+        insert(&conn.lock(), "a.com", "2024-01-01 10:00:00");
+        let roots = dir.path().join("backups");
+        fs::create_dir_all(&roots).unwrap();
+        let report =
+            create_backup(&conn, &TierLock::new(), dir.path(), &events, &roots, "b1").unwrap();
         assert_eq!(report.parquet_files, 0);
         assert_eq!(report.hot_rows, 1);
         assert!(report.path.join(BACKUP_EVENTS_DIR).is_dir());

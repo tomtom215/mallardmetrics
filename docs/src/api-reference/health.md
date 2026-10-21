@@ -69,7 +69,7 @@ trusted (those are on `/metrics`, which can be token-protected).
 | `buffered_events` / `buffer_empty` | integer / boolean | Events in memory, not yet flushed (and not yet queryable). |
 | `dropped_events` | integer | Events discarded because the buffer hit `max_buffered_events`. Non-zero means data loss. |
 | `geoip_loaded` | boolean | A GeoIP database was opened. |
-| `behavioral_extension_loaded` | boolean | The extension installed and loaded at startup, at version 0.10.0 or newer. |
+| `behavioral_extension_loaded` | boolean | The extension is loaded, at version 0.10.0 or newer. Normally decided at startup; if the first install failed, a background task retries every 60 s and this can turn `true` later. |
 | `behavioral_version` | string or `null` | Version the extension reports. |
 | `read_connections` | integer | Size of the read pool (1 means reads share the writer connection). |
 | `filter_bots` | boolean | Bot filtering is on. |

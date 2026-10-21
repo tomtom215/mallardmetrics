@@ -152,6 +152,40 @@ Revokes the key with that SHA-256 hex hash.
 
 ---
 
+## `POST /api/admin/backup`
+
+Admin scope. Snapshots both storage tiers while serving; see
+[Backup and Restore](../backup-restore.md#online-backup-no-downtime) for what is
+in it and how to restore.
+
+| Parameter | Default | Description |
+|---|---|---|
+| `name` | `mallard-<UTC timestamp>` | Directory name under `<data_dir>/backups`: 1-128 characters of letters, digits, `-`, `_` or `.`, not starting with a dot. |
+
+```bash
+curl -X POST "https://your-instance.com/api/admin/backup?name=before-upgrade" \
+  -H "Authorization: Bearer mm_admin..."
+```
+
+```json
+{
+  "status": "created",
+  "name": "before-upgrade",
+  "path": "/data/backups/before-upgrade",
+  "parquet_files": 212,
+  "parquet_bytes": 48123456,
+  "hot_rows": 318,
+  "state_files": 3
+}
+```
+
+`201` on success. `400` for an unsafe `name`, `409` (`code: conflict`) when a backup
+of that name exists (nothing is overwritten), `401`/`403` without an admin
+credential (including before setup), `500` if the copy fails (the partial
+directory is removed).
+
+---
+
 ## Using API keys
 
 ```bash

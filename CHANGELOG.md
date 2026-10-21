@@ -94,6 +94,21 @@ few startup conditions that used to be accepted are now refused; read
 
 ### Added
 
+- `MALLARD_QUERY_QUEUE_WAIT_SECS` (default 5) and `MALLARD_QUERY_DEADLINE_SECS`
+  (default 20), TOML `query_queue_wait_secs` and `query_deadline_secs`: how long
+  a request waits for a query slot (then `429`) and how long a statement may run
+  (then it is interrupted and the request gets `504`). Together they must not
+  exceed the 30 s request timeout.
+- `GET /api/sites` is ordered by events in the last 30 days and gains a
+  `details` array of `{site_id, events_30d}`; `sites` keeps its shape.
+- **Online backup:** `POST /api/admin/backup` (admin) snapshots the database and
+  the Parquet files consistently while serving, plus `.secret`, `admin.json` and
+  `api_keys.json`, into `<data_dir>/backups/<name>/` (owner-only, never
+  overwritten). Parquet files are hard-linked, so it costs almost no disk or time.
+  `deploy/backup.sh` remains for the stop-and-copy layout.
+- The raw export (`kind=raw`) streams: no `Content-Length`, memory does not grow
+  with `limit` (about 170 MiB against about 1 GiB at 1,000,000 rows, debug
+  build, 3 runs). A failure after the first byte aborts the connection.
 - `MALLARD_TRUSTED_PROXY_HOPS` (TOML `trusted_proxy_hops`).
 - `/metrics`: `mallard_build_info{version,behavioral_version}`,
   `mallard_last_flush_success_timestamp_seconds`,
@@ -132,6 +147,17 @@ few startup conditions that used to be accepted are now refused; read
 
 ### Changed
 
+- Reports read only the Parquet files a request can touch (the site and the
+  date range, widened for the retention lookback) instead of every file. One
+  site and one week on 100 sites x 90 days: main 4.2 ms against 618-659 ms,
+  breakdown 5.1-5.5 ms against 608-645 ms, timeseries 6.3-7.5 ms against
+  574-630 ms (release Criterion, 4-core 2.1 GHz Xeon, 3 runs). A differential
+  test demands identical results from both paths.
+- The listener closes a connection that sends no complete request head within
+  30 s, and idle keep-alive connections close at the same limit (HTTP/1 only).
+  A proxy's upstream keep-alive timeout must be shorter than 30 s.
+- The `behavioral` extension is retried every 60 s if the first install failed,
+  so `behavioral_extension_loaded` can turn true after boot.
 - The `events_all` view reads hive keys as explicit types and enables the
   Parquet metadata cache; a site-and-week query over 9,000 files measured 1.36 s
   to 0.6 s in that change's informal benchmark.

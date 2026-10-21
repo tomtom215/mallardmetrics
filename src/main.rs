@@ -606,6 +606,8 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
         suppress_screen_size: config.suppress_screen_size,
         geoip_precision: config.geoip_precision.clone(),
         events_dir,
+        data_dir: config.data_dir.clone(),
+        backup_dir: config.data_dir.join("backups"),
     }))
 }
 

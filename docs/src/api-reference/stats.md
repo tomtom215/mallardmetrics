@@ -104,11 +104,21 @@ plain-text `400` from the query-string parser, not a JSON error.
 
 Site IDs that have data — from the query view, from the on-disk partitions, and
 from the configured `site_ids` allowlist (so a configured site with no data yet
-is listed). Sorted, de-duplicated. Events still in the in-memory buffer are not
-counted until they are flushed.
+is listed). De-duplicated, **ordered by events in the last 30 days (busiest
+first), then by ID**. Events still in the in-memory buffer are not counted until
+they are flushed.
+
+`details` carries the figure the order is based on, so a client can show it or
+choose a default site. A configured site with no data has `events_30d: 0`.
 
 ```json
-{"sites": ["blog.example.com", "example.com"]}
+{
+  "sites": ["example.com", "blog.example.com"],
+  "details": [
+    {"site_id": "example.com", "events_30d": 8412},
+    {"site_id": "blog.example.com", "events_30d": 97}
+  ]
+}
 ```
 
 ---
@@ -367,11 +377,22 @@ CSV fields are quoted, internal quotes doubled, and values beginning with `=`,
 `+`, `-`, `@`, tab or carriage return are prefixed with an apostrophe so a
 spreadsheet does not evaluate them as formulas.
 
-The response is built in memory rather than streamed (the chunked exporter in
-`src/query/export.rs` is not wired into the HTTP handler yet), so `limit` is also
-a memory bound: the 100,000-row default is a few tens of megabytes, and the
-1,000,000-row ceiling a few hundred. Export in date-range slices rather than
-raising the limit on a memory-constrained host. The response carries
+A **raw** export is streamed: the server writes it in chunks as DuckDB produces
+the rows, so there is no `Content-Length` (the response is `Transfer-Encoding:
+chunked`) and memory use does not grow with `limit`. A 1,000,000-row export grew
+the process by about 170 MiB streamed against about 1 GiB buffered in a debug
+build (3 runs each). The daily export is small and is not streamed.
+
+Streaming has consequences worth knowing:
+
+- A failure after the first byte cannot change the status code, so the server
+  aborts the connection and a client sees a truncated body or a connection reset
+  rather than a complete file. Check the size or row count of what you received.
+- The export holds the same lock that queries hold while it runs, and a pending
+  flush waits for it, so it is capped at 120 s in total. A client that stops
+  reading is cut off after the query deadline.
+- A raw export of a large range is still work for the server; export in
+  date-range slices when you can. The response carries
 `Content-Disposition: attachment; filename="mallard-daily-<start>.csv"`
 (`mallard-events-<start>.json` for raw JSON).
 

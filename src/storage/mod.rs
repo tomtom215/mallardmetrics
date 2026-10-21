@@ -407,9 +407,11 @@ mod tests {
         // These two are not the same kind of state, and conflating them has
         // produced contradictory comments before. `CREATE OR REPLACE VIEW`
         // writes to the database catalog, which every connection shares;
-        // `LOAD <extension>` arms the connection that runs it. So startup must
-        // load the extension on each reader, while a view refresh on the writer
-        // is enough for all of them.
+        // `LOAD <extension>` on the writer also arms the readers cloned from it
+        // (`query::extension::tests::loading_on_the_writer_arms_cloned_readers`
+        // pins this; earlier comments here said otherwise and were wrong).
+        // Startup still loads on each reader, which is idempotent, so the check
+        // does not depend on that behaviour holding in every DuckDB release.
         let dir = tempfile::tempdir().unwrap();
         let conn = Connection::open(dir.path().join("test.duckdb")).unwrap();
         crate::storage::schema::init_schema(&conn).unwrap();

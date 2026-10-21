@@ -332,7 +332,7 @@ const fn default_max_concurrent_queries() -> usize {
 }
 
 const fn default_query_queue_wait_secs() -> u64 {
-    10
+    5
 }
 
 const fn default_query_deadline_secs() -> u64 {
@@ -1625,16 +1625,19 @@ visitor_salt_rotation_days = 30
     }
 
     #[test]
-    fn test_query_budgets_default_to_exactly_the_request_timeout() {
-        // 10 s queued + 20 s running is the whole 30 s request timeout; the
-        // defaults must validate, and the limit is an inclusive bound.
+    fn test_query_budgets_default_to_less_than_the_request_timeout() {
+        // The bound is inclusive, so budgets that sum to exactly the request
+        // timeout validate, and then race it: whichever fires first decides
+        // between a 504 with an explanation and a bare timeout. The defaults
+        // keep a margin so the query layer always answers first.
         let config = Config::default();
         assert_eq!(config.validate(), Ok(()));
         let limits = config.query_limits();
         assert_eq!(limits, crate::api::stats::QueryLimits::DEFAULT);
-        assert_eq!(
-            limits.queue_wait + limits.deadline,
-            crate::server::REQUEST_TIMEOUT
+        assert!(
+            limits.queue_wait + limits.deadline + std::time::Duration::from_secs(1)
+                <= crate::server::REQUEST_TIMEOUT,
+            "the defaults must leave at least a second under the request timeout"
         );
     }
 

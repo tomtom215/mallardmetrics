@@ -82,7 +82,9 @@ into an image.
 |---|---|---|---|---|
 | `MALLARD_CACHE_TTL` / `cache_ttl_secs` | u64 | `60` | `0` disables | Lifetime of cached report results (all read endpoints except realtime and export). |
 | `MALLARD_CACHE_MAX_ENTRIES` / `cache_max_entries` | usize | `10000` | `0` = unbounded | LRU cap on the cache. |
-| `MALLARD_MAX_CONCURRENT_QUERIES` / `max_concurrent_queries` | usize | `10` | `0` = unlimited | Query slots. Waiters queue for up to 10 s, then get `429`. |
+| `MALLARD_MAX_CONCURRENT_QUERIES` / `max_concurrent_queries` | usize | `10` | `0` = unlimited | Query slots. Waiters queue for up to `query_queue_wait_secs`, then get `429`. |
+| `MALLARD_QUERY_QUEUE_WAIT_SECS` / `query_queue_wait_secs` | u64 | `5` | `> 0` | How long a request waits for a query slot before it gets `429` (with `Retry-After: 1`). |
+| `MALLARD_QUERY_DEADLINE_SECS` / `query_deadline_secs` | u64 | `20` | `> 0` | How long a statement may run before DuckDB interrupts it and the request gets `504` (`query_timeout`). The two budgets together must not exceed the 30 s request timeout, so the query layer answers, with an explanation, before the timeout does; the defaults leave 5 s of margin. |
 | `MALLARD_SESSION_WINDOW_MINUTES` / `session_window_minutes` | u32 | `30` | `> 0` | Inactivity gap that ends a visit. |
 | `MALLARD_REALTIME_WINDOW_MINUTES` / `realtime_window_minutes` | u32 | `5` | `> 0` | Window `/api/stats/realtime` treats as "now". |
 

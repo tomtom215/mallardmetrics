@@ -212,6 +212,10 @@ pub struct AppState {
     pub geoip_precision: String,
     /// Events directory, needed by the GDPR erasure endpoint.
     pub events_dir: std::path::PathBuf,
+    /// The data directory: where the small state files a backup also needs live.
+    pub data_dir: std::path::PathBuf,
+    /// Where `POST /api/admin/backup` writes snapshots: `<data_dir>/backups`.
+    pub backup_dir: std::path::PathBuf,
 }
 
 impl AppState {

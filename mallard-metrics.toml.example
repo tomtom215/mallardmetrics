@@ -90,7 +90,7 @@ max_concurrent_queries = 10    # MALLARD_MAX_CONCURRENT_QUERIES — excess retur
 # and how long a statement may then run before it is interrupted and the request
 # gets 504. Both must be > 0, and together they must not exceed the 30 s request
 # timeout, so the query layer answers (with a message) before the timeout does.
-query_queue_wait_secs = 10     # MALLARD_QUERY_QUEUE_WAIT_SECS
+query_queue_wait_secs = 5      # MALLARD_QUERY_QUEUE_WAIT_SECS
 query_deadline_secs = 20       # MALLARD_QUERY_DEADLINE_SECS
 
 # Inactivity gap that ends a session. Used by every sessionize-based metric:

@@ -186,8 +186,11 @@ outside the lock.
 
 `ReaderPool` holds `read_connections` (default 4) DuckDB connections cloned from
 the writer, handed out round-robin. They share one buffer pool and catalog, so a
-view refresh on the writer is seen by all of them, but the extension is armed
-per connection and is loaded on each. With `read_connections` 0 or 1 reads share
+view refresh on the writer is seen by all of them, and so is `LOAD behavioral`
+on the writer (a test pins this). Startup still loads it on each reader, which
+is idempotent, and a background task retries every 60 s if the first install
+failed, so `behavioral_extension_loaded` in `/health/detailed` can turn true
+after boot. With `read_connections` 0 or 1 reads share
 the writer connection and a slow query can block ingestion.
 
 **Lock order.** Flush: tier lock, then connection. Readers take their

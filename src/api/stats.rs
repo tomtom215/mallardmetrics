@@ -434,10 +434,10 @@ pub struct QueryLimits {
 }
 
 impl QueryLimits {
-    /// The defaults: 10 s in the queue plus 20 s of execution, which is the 30 s
-    /// request timeout exactly.
+    /// The defaults: 5 s in the queue plus 20 s of execution, which leaves a 5 s
+    /// margin under the 30 s request timeout.
     pub const DEFAULT: Self = Self {
-        queue_wait: Duration::from_secs(10),
+        queue_wait: Duration::from_secs(5),
         deadline: Duration::from_secs(20),
     };
 }
