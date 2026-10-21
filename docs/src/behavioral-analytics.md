@@ -14,14 +14,31 @@ INSTALL behavioral FROM community;
 LOAD behavioral;
 ```
 
-That requires outbound network access on first run; the extension is cached
-afterwards. `GET /health/detailed` reports both
+That requires outbound network access on first run (DuckDB fetches
+`http://community-extensions.duckdb.org/v<duckdb version>/<platform>/behavioral.duckdb_extension.gz`);
+the extension is cached in the extension directory afterwards, and on an
+isolated network it can be seeded once with `mallard-metrics --install-extension`
+(see [Troubleshooting](troubleshooting.md#running-the-extension-install-step-offline)).
+
+Requirements:
+
+- **Version 0.10.0 or newer.** An older cached build is refused at startup with a
+  message telling you to delete `behavioral.duckdb_extension` from the extension
+  directory so a current one is downloaded.
+- **A glibc platform**: `linux_amd64`, `linux_arm64`, `osx_amd64`, `osx_arm64`.
+  The community repository publishes no musl build, so an Alpine/musl binary can
+  never load it. The official image is glibc (distroless `cc-debian12`).
+- The extension is published per DuckDB version; Mallard 0.2.0 bundles DuckDB 1.5.6.
+
+`GET /health/detailed` reports both
 `behavioral_extension_loaded` and `behavioral_version`, and `GET /metrics`
 exposes the `mallard_behavioral_extension` gauge.
 
-**When the extension is unavailable, these endpoints return `503` with an
-explanation**, and `/api/stats/main` reports its session-derived fields as
-`null`. That is deliberate: the previous release returned `200` with zeros and
+**When the extension is unavailable, these endpoints return `503`**
+(`code: behavioral_unavailable`) **with an explanation**, and `/api/stats/main`
+reports its session-derived fields as `null`. The same happens while
+`round_timestamps` is on (`gdpr_mode` turns it on), because events within one
+hour can no longer be ordered; retention is the exception and keeps working. That is deliberate: the previous release returned `200` with zeros and
 empty arrays, which is indistinguishable from a site that genuinely has no
 sessions and no conversions. A missing dependency should look like a missing
 dependency.
@@ -61,16 +78,23 @@ Raising the rotation is a privacy decision, not a tuning knob — see
 **Endpoint:** `GET /api/stats/sessions`
 
 `sessionize(timestamp, INTERVAL '<session_window_minutes> minutes')` groups a
-visitor's events into sessions; a gap longer than the window starts a new one.
-The window defaults to 30 minutes and is configurable through
-`session_window_minutes`.
+visitor's events (of every kind) into sessions; a gap longer than the window
+starts a new one. The window defaults to 30 minutes (`session_window_minutes`).
+Only sessions with at least one pageview are counted.
+
+```json
+{"total_sessions":6,"avg_session_duration_secs":350.0,"avg_pages_per_session":1.5,"bounce_rate":0.3333333333333333}
+```
 
 | Field | Description |
 |---|---|
-| `total_sessions` | Distinct sessions in range |
-| `avg_session_duration_secs` | Mean time from a session's first event to its last |
-| `avg_pages_per_session` | Mean pageviews per session |
-| `bounce_rate` | Fraction of sessions with exactly one pageview, 0.0–1.0 |
+| `total_sessions` | Counted sessions in range |
+| `avg_session_duration_secs` | Mean of last event minus first event |
+| `avg_pages_per_session` | Mean pageviews per counted session |
+| `bounce_rate` | Fraction of counted sessions that are exactly one event, a pageview. A custom event ends the bounce. 0.0–1.0 |
+
+Exact definitions, with a worked example, are on
+[Metric Definitions](metric-definitions.md). Filters select whole sessions.
 
 The same figures appear on `/api/stats/main`, computed in the same pass rather
 than a second one.
@@ -90,7 +114,7 @@ GET /api/stats/funnel?site_id=example.com
 | Parameter | Default | Description |
 |---|---|---|
 | `steps` | (required) | 2–32 comma-separated steps |
-| `window` | `1 day` | Maximum elapsed time from first step to last |
+| `window` | `1 day` | Maximum elapsed time from first step to last. `<n> <unit>` with unit `second(s)` (up to 86,400), `minute(s)` (1,440), `hour(s)` (720), `day(s)` (365) or `week(s)` (52); anything else is a `400` |
 | `modes` | (none) | Comma-separated ordering modes, below |
 
 Step format:
@@ -136,7 +160,15 @@ Any combination, comma-separated:
 | `allow_reentry` | A repeat of the entry condition restarts the funnel |
 | `timestamp_dedup` | Events sharing the previous step's timestamp are skipped |
 
-An unrecognised mode is a `400`, not a `500`.
+An unrecognised mode is a `400`, not a `500`. So is `allow_reentry` without
+`strict_order` (the extension refuses that combination); the `400` message in
+that case reads "Unknown funnel mode", which is misleading.
+
+**Default.** The server adds `strict_once` to whatever you pass unless you passed
+`strict_once` or `strict_increase`, so one event fills at most one step. Without
+it the `behavioral` extension (0.10.0+, which follows ClickHouse `windowFunnel`)
+lets one event satisfy several steps. See
+[Metric Definitions](metric-definitions.md#funnels).
 
 ---
 
@@ -154,7 +186,9 @@ Cohorts are defined by a visitor's first-seen week. `weeks` must be between
       "cohort_date": "2024-01-01",
       "cohort_size": 4,
       "retained": [4, 2, 1, 0],
-      "retention_rates": [1.0, 0.5, 0.25, 0.0]
+      "retention_rates": [1.0, 0.5, 0.25, 0.0],
+      "complete_weeks": 2,
+      "partial_first_week": false
     }
   ],
   "identity_supports_cohorts": false,
@@ -166,9 +200,14 @@ Cohorts are defined by a visitor's first-seen week. `weeks` must be between
 `retention_rates[i]` is that as a fraction of `cohort_size`. Index 0 is the
 cohort week itself.
 
-Only cohorts that formed inside the queried range are reported, and the
-first-seen scan is bounded by the range — an earlier release scanned the site's
-entire history on every request.
+`complete_weeks` is the number of leading weeks that have fully elapsed (later
+zeros mean "not yet"), and `partial_first_week` marks a cohort whose first week
+began before the report's start. Weeks start on Monday (UTC).
+
+Only cohorts that formed inside the queried range are reported. "First seen" is
+looked up from `visitor_salt_rotation_days` before the range start, because an
+ID cannot outlive its salt; the scan is bounded rather than reading the site's
+entire history.
 
 ---
 
