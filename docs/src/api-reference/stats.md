@@ -147,6 +147,7 @@ choose a default site. A configured site with no data has `events_30d: 0`.
 | `views_per_visitor` | `total_pageviews / unique_visitors`. Previously called `pages_per_visit`, which is not what it measured. |
 | `total_sessions`, `bounce_rate`, `avg_visit_duration_secs`, `views_per_visit` | Need the `behavioral` extension, and exact timestamps. **`null` when unavailable** (extension not loaded, or `gdpr_mode`/`round_timestamps` on), which is meaningfully different from `0`. Definitions: [Metric definitions](../metric-definitions.md). |
 | `behavioral_available` | Whether those four could be computed. |
+| `sessions_unavailable_reason` | Present only when they could not: `"timestamps_rounded"` (`round_timestamps`/`gdpr_mode`; a privacy setting) or `"extension_missing"` (the `behavioral` extension is not loaded). |
 | `comparison` | Present only when `compare` was requested. See below. |
 
 ### Comparing against an earlier period
@@ -243,7 +244,8 @@ Other dimensions omit `sessions` and count events.
 | `events` | `event_name` |
 
 \* Need the `behavioral` extension and exact timestamps; `503`
-(`behavioral_unavailable`) without the extension or under `gdpr_mode`.
+(`behavioral_unavailable`) without the extension, or `session_data_unavailable`
+under `gdpr_mode`.
 They cannot be used in `filters`.
 
 An unknown dimension returns `400` listing the available ones. `limit` defaults
@@ -346,7 +348,8 @@ documented in full under [Behavioral Analytics](../behavioral-analytics.md).
 They return **`503`** (`code: behavioral_unavailable`) with an explanatory
 `error` when the `behavioral` extension is not loaded, rather than an empty `200`
 that reads as "no data". Sessions, funnel, sequences, flow and the entry/exit
-breakdowns also return `503` while `round_timestamps` is on (it is switched on by
+breakdowns return `503` with the different `code: session_data_unavailable`
+while `round_timestamps` is on (it is switched on by
 `gdpr_mode`), because events inside one hour can no longer be ordered; retention
 and every non-session report keep working. `/api/stats/main` then reports its
 session fields as `null`.

@@ -22,8 +22,8 @@
 # Use a glibc build of the binary (the *-unknown-linux-gnu release archive). A
 # musl build runs but cannot install the DuckDB `behavioral` extension, so
 # funnels, retention, sessions, sequences and flow answer 503. The first start
-# downloads the extension into the state directory and needs outbound HTTPS to
-# community-extensions.duckdb.org; afterwards it loads from disk.
+# downloads the extension into the state directory and needs outbound HTTP (port 80,
+# not HTTPS) to community-extensions.duckdb.org; afterwards it loads from disk.
 #
 # Backups: stop the service, copy /var/lib/mallard-metrics, start it again. A
 # copy of the live DuckDB file is not guaranteed to open (see deploy/backup.sh).

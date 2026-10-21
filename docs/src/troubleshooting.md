@@ -80,7 +80,7 @@ and, with no route to the repository (run in an empty network namespace):
 ```
 Could not install the behavioral extension: IO Error: Failed to download extension "behavioral" at URL "http://community-extensions.duckdb.org/v1.5.6/linux_amd64/behavioral.duckdb_extension.gz"
 ...
-This step needs outbound HTTPS to the DuckDB community extension repository. Run it from a host or network that has one, against the same data directory.
+This step needs outbound HTTP (plain port 80, not HTTPS) to community-extensions.duckdb.org. A firewall that only allows egress on 443 blocks it. Run it from a host or network that has one, against the same data directory.
 ```
 
 (exit status 0 and 1.) Things to know:

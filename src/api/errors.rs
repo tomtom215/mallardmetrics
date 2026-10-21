@@ -20,6 +20,13 @@ pub enum ApiError {
     /// not available. Previously these requests returned `200` with an empty
     /// body, so the dashboard showed "no data" for a site full of data.
     BehavioralUnavailable(String),
+    /// 503 — the report needs exact event timestamps and this instance stores
+    /// them rounded to the hour (`round_timestamps`, enabled by `gdpr_mode`).
+    ///
+    /// A different cause from [`Self::BehavioralUnavailable`] with a different
+    /// remedy (a privacy setting, not an install), so a client must be able to
+    /// tell them apart without parsing the message.
+    SessionDataUnavailable(String),
     /// 504 — the query passed its deadline and was interrupted.
     ///
     /// The caller's request was valid and the server is healthy; the work was
@@ -40,6 +47,9 @@ impl std::fmt::Display for ApiError {
             Self::TooManyRequests(msg) => write!(f, "Too many requests: {msg}"),
             Self::BehavioralUnavailable(msg) => {
                 write!(f, "Behavioral extension unavailable: {msg}")
+            }
+            Self::SessionDataUnavailable(msg) => {
+                write!(f, "Session data unavailable: {msg}")
             }
             Self::QueryTimeout(msg) => write!(f, "Query timed out: {msg}"),
         }
@@ -65,7 +75,9 @@ impl ApiError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Internal(_) | Self::DatabaseError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::TooManyRequests(_) => StatusCode::TOO_MANY_REQUESTS,
-            Self::BehavioralUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::BehavioralUnavailable(_) | Self::SessionDataUnavailable(_) => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::QueryTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
         }
     }
@@ -83,6 +95,7 @@ impl ApiError {
             Self::Internal(_) | Self::DatabaseError(_) => "internal_error",
             Self::TooManyRequests(_) => "too_many_requests",
             Self::BehavioralUnavailable(_) => "behavioral_unavailable",
+            Self::SessionDataUnavailable(_) => "session_data_unavailable",
             Self::QueryTimeout(_) => "query_timeout",
         }
     }
@@ -117,6 +130,7 @@ impl IntoResponse for ApiError {
             | Self::Conflict(msg)
             | Self::TooManyRequests(msg)
             | Self::BehavioralUnavailable(msg)
+            | Self::SessionDataUnavailable(msg)
             | Self::QueryTimeout(msg) => msg.clone(),
         };
 
@@ -193,6 +207,10 @@ mod tests {
             (
                 ApiError::behavioral_required("Funnel analysis"),
                 "behavioral_unavailable",
+            ),
+            (
+                ApiError::SessionDataUnavailable("x".into()),
+                "session_data_unavailable",
             ),
             (ApiError::QueryTimeout("x".into()), "query_timeout"),
         ];

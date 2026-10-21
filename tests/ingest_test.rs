@@ -1207,6 +1207,9 @@ async fn test_retention_reports_counts_and_the_identity_caveat() {
     // The default one-day salt rotation cannot support week-over-week cohorts,
     // and the response has to say so rather than presenting zeros as a finding.
     assert_eq!(json["identity_supports_cohorts"], false);
+    // The value behind the caveat travels with it, so a client does not have to
+    // parse prose to tell an operator what to raise.
+    assert_eq!(json["visitor_salt_rotation_days"], 1);
     assert!(
         json["caveat"]
             .as_str()
@@ -1240,6 +1243,7 @@ async fn test_retention_caveat_absent_with_a_long_rotation() {
         body_json(get(&state, "/api/stats/retention?site_id=example.com&weeks=4").await).await;
     assert_eq!(json["identity_supports_cohorts"], true);
     assert!(json["caveat"].is_null());
+    assert_eq!(json["visitor_salt_rotation_days"], 60);
 }
 
 #[tokio::test]
@@ -2379,12 +2383,16 @@ async fn test_session_analyses_are_refused_when_timestamps_are_rounded() {
                 .contains("rounded"),
             "{uri}: {body}"
         );
+        // A privacy setting, not a missing install: clients must be able to
+        // tell, without parsing the message, because the remedies differ.
+        assert_eq!(body["code"], "session_data_unavailable", "{uri}: {body}");
     }
 
     // Headline metrics still answer; only the session-derived fields drop out.
     let main = body_json(get(&state, "/api/stats/main?site_id=example.com&period=30d").await).await;
     assert_eq!(main["total_pageviews"], 3);
     assert_eq!(main["behavioral_available"], false);
+    assert_eq!(main["sessions_unavailable_reason"], "timestamps_rounded");
     assert!(main["bounce_rate"].is_null(), "{main}");
     assert!(main["total_sessions"].is_null(), "{main}");
 
@@ -2916,4 +2924,35 @@ async fn test_a_default_backup_name_is_a_timestamp() {
         .unwrap()
         .to_string();
     assert!(name.starts_with("mallard-20"), "{name}");
+}
+
+#[tokio::test]
+async fn test_a_funnel_mode_combination_error_names_the_real_problem() {
+    let (state, _dir) = state_builder().build();
+    if !require_behavioral(&state, "funnel modes") {
+        return;
+    }
+    let combo = get(
+        &state,
+        "/api/stats/funnel?site_id=example.com&period=30d&steps=page:/,page:/about&modes=allow_reentry",
+    )
+    .await;
+    assert_eq!(combo.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(combo).await;
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(message.contains("requires 'strict_order'"), "{body}");
+    assert!(!message.contains("Unknown"), "{body}");
+
+    let typo = get(
+        &state,
+        "/api/stats/funnel?site_id=example.com&period=30d&steps=page:/,page:/about&modes=strict_ordr",
+    )
+    .await;
+    assert_eq!(typo.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        body_json(typo).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Unknown funnel mode")
+    );
 }

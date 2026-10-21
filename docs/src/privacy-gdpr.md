@@ -88,7 +88,7 @@ visitors entirely.
 
 **Analytical cost (verified).** Because time is rounded to the hour, events
 inside an hour cannot be ordered, so sessions, funnels, sequences, flow and the
-entry/exit page reports answer `503` (`behavioral_unavailable`), and the session
+entry/exit page reports answer `503` (`session_data_unavailable`), and the session
 fields on `/api/stats/main` are `null`. Counts, breakdowns, time series, goals,
 revenue, properties and retention still work. If you need sessions, enable the
 individual flags instead and leave `round_timestamps` off. The server warns at

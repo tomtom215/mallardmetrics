@@ -99,6 +99,13 @@ few startup conditions that used to be accepted are now refused; read
   a request waits for a query slot (then `429`) and how long a statement may run
   (then it is interrupted and the request gets `504`). Together they must not
   exceed the 30 s request timeout.
+- API errors: `session_data_unavailable` (503) is now distinct from
+  `behavioral_unavailable` for analyses refused under `gdpr_mode`; `/api/stats/main`
+  gains `sessions_unavailable_reason` (`"timestamps_rounded"` or
+  `"extension_missing"`) when session figures are `null`; the retention response
+  gains `visitor_salt_rotation_days`; `conflict` (409) is a new code. A funnel
+  `modes=allow_reentry` 400 now says it requires `strict_order` instead of
+  "Unknown funnel mode".
 - `GET /api/sites` is ordered by events in the last 30 days and gains a
   `details` array of `{site_id, events_30d}`; `sites` keeps its shape.
 - **Online backup:** `POST /api/admin/backup` (admin) snapshots the database and

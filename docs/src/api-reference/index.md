@@ -86,7 +86,9 @@ The `/api/stats/*`, `/api/sites` and `/api/gdpr/erase` handlers return
 | `not_found` | 404 | For example, revoking an unknown key. |
 | `internal_error` | 500 | A server-side fault. The body never contains internals; the cause is in the server log. |
 | `too_many_requests` | 429 | No query slot became free within 10 s. Carries `Retry-After: 1`. |
-| `behavioral_unavailable` | 503 | The `behavioral` extension is not loaded, **or** `gdpr_mode`/`round_timestamps` makes the analysis meaningless. |
+| `behavioral_unavailable` | 503 | The `behavioral` extension is not loaded. Fix: the install (see [Troubleshooting](../troubleshooting.md#behavioral-endpoints-answer-503)). |
+| `session_data_unavailable` | 503 | `gdpr_mode`/`round_timestamps` stores timestamps rounded to the hour, so sessions, funnels, sequences, flow and entry/exit pages cannot be computed. Not an install problem: the fix is the privacy setting. |
+| `conflict` | 409 | The request conflicts with existing state, for example a backup of that name exists. |
 | `query_timeout` | 504 | The statement overran its 20 s deadline and was interrupted. Use a shorter range or fewer filters. |
 
 Not every error body is JSON. These are produced before or outside the handlers

@@ -840,7 +840,7 @@ fn behavioral_error(state: &AppState, feature: &str, err: ApiError) -> ApiError 
 /// Counts, breakdowns, time series and weekly retention are unaffected.
 fn require_exact_timestamps(state: &AppState, feature: &str) -> Result<(), ApiError> {
     if state.round_timestamps {
-        return Err(ApiError::BehavioralUnavailable(format!(
+        return Err(ApiError::SessionDataUnavailable(format!(
             "{feature} is not available while timestamps are rounded to the hour \
              (round_timestamps, enabled by gdpr_mode): events within an hour can no \
              longer be put in order."
@@ -1006,6 +1006,16 @@ pub async fn get_main_stats(
         main_metrics(conn, scope, with_sessions)
     })
     .await?;
+    if !current.behavioral_available {
+        current.sessions_unavailable_reason = Some(
+            if state.round_timestamps {
+                "timestamps_rounded"
+            } else {
+                "extension_missing"
+            }
+            .to_string(),
+        );
+    }
 
     if let Some(mode) = compare {
         let previous = range.compared_with(mode)?;
@@ -1113,11 +1123,9 @@ pub async fn get_breakdown(
     })?;
 
     if dim.requires_behavioral() {
-        require_exact_timestamps(&state, "Entry and exit page breakdowns")?;
+        require_exact_timestamps(&state, "Entry and exit page reports")?;
         if !state.behavioral.is_loaded() {
-            return Err(ApiError::behavioral_required(
-                "Entry and exit page breakdowns",
-            ));
+            return Err(ApiError::behavioral_required("Entry and exit page reports"));
         }
     }
 
@@ -1414,12 +1422,8 @@ pub async fn get_funnel(
         ));
     }
 
-    let modes = funnel::normalize_modes(&params.modes).ok_or_else(|| {
-        ApiError::BadRequest(format!(
-            "Unknown funnel mode. Available: {}",
-            funnel::VALID_MODES.join(", ")
-        ))
-    })?;
+    let modes = funnel::normalize_modes(&params.modes)
+        .ok_or_else(|| ApiError::BadRequest(funnel::modes_error(&params.modes)))?;
 
     let steps = parse_steps(&params.steps, funnel::MIN_STEPS, funnel::MAX_STEPS)?;
 
@@ -1479,6 +1483,9 @@ pub struct RetentionResponse {
     pub identity_supports_cohorts: bool,
     /// Explanation shown when it cannot.
     pub caveat: Option<String>,
+    /// The configured visitor-ID rotation, in days, so a client can say the
+    /// real value (and what to raise it to) instead of parsing `caveat`.
+    pub visitor_salt_rotation_days: u32,
 }
 
 /// GET /api/stats/retention — weekly retention cohorts.
@@ -1561,6 +1568,7 @@ pub async fn get_retention(
         cohorts: cohorts.0,
         identity_supports_cohorts,
         caveat,
+        visitor_salt_rotation_days: state.visitor_salt_rotation_days,
     }))
 }
 

@@ -38,6 +38,11 @@ pub struct CoreMetrics {
     pub views_per_visit: Option<f64>,
     /// Whether session-derived fields above could be computed.
     pub behavioral_available: bool,
+    /// Why they could not: `"timestamps_rounded"` (a privacy setting; the fix is
+    /// to turn `round_timestamps`/`gdpr_mode` off) or `"extension_missing"`
+    /// (the `behavioral` extension is not loaded). Absent when they could.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions_unavailable_reason: Option<String>,
 
     /// The same site over an earlier window, when the caller asked to compare.
     ///
@@ -171,6 +176,8 @@ fn assemble(base: &BaseCounts, sessions: Option<&SessionAggregates>) -> CoreMetr
         avg_visit_duration_secs: sessions.map(|s| s.avg_duration_secs),
         views_per_visit: sessions.map(|s| s.avg_pages),
         behavioral_available: sessions.is_some(),
+        // The caller knows why sessions were skipped; it fills this in.
+        sessions_unavailable_reason: None,
         comparison: None,
     }
 }

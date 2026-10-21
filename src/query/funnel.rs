@@ -64,6 +64,25 @@ pub fn normalize_modes(raw: &str) -> Option<String> {
     Some(modes.join(", "))
 }
 
+/// Why [`normalize_modes`] refused `raw`, as a message for the caller.
+///
+/// An unknown name and a combination the extension rejects are different
+/// mistakes with different fixes, and saying "unknown mode" about a mode that
+/// is in the list sends people looking for a typo that is not there.
+pub fn modes_error(raw: &str) -> String {
+    let names: Vec<String> = raw
+        .split(',')
+        .map(|m| m.trim().to_ascii_lowercase())
+        .filter(|m| !m.is_empty())
+        .collect();
+    if names.iter().all(|m| VALID_MODES.contains(&m.as_str())) {
+        return "Funnel mode 'allow_reentry' requires 'strict_order' (pass both, e.g. \
+                modes=strict_order,allow_reentry)."
+            .to_string();
+    }
+    format!("Unknown funnel mode. Available: {}", VALID_MODES.join(", "))
+}
+
 /// Add `strict_once` unless the caller already chose a mode that gives each
 /// event a single step.
 ///
@@ -503,6 +522,19 @@ mod tests {
         );
         assert!(normalize_modes("drop_tables").is_none());
         assert!(normalize_modes("strict_order; DROP TABLE events").is_none());
+    }
+
+    #[test]
+    fn test_the_modes_error_names_the_actual_mistake() {
+        let combo = modes_error("allow_reentry");
+        assert!(combo.contains("requires 'strict_order'"), "{combo}");
+        assert!(!combo.contains("Unknown"), "{combo}");
+        let typo = modes_error("strict_ordr");
+        assert!(typo.starts_with("Unknown funnel mode"), "{typo}");
+        assert!(
+            typo.contains("strict_order"),
+            "the valid modes are listed: {typo}"
+        );
     }
 
     #[test]

@@ -143,8 +143,8 @@ fn run_install_extension() -> i32 {
         Err(e) => {
             eprintln!("Could not install the behavioral extension: {e}");
             eprintln!(
-                "This step needs outbound HTTPS to the DuckDB community extension \
-                 repository. Run it from a host or network that has one, against the \
+                "This step needs outbound HTTP (plain port 80, not HTTPS) to \
+                 community-extensions.duckdb.org. Run it from a host or network that has one, against the \
                  same data directory."
             );
             EXIT_FAILURE

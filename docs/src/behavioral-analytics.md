@@ -36,8 +36,9 @@ exposes the `mallard_behavioral_extension` gauge.
 
 **When the extension is unavailable, these endpoints return `503`**
 (`code: behavioral_unavailable`) **with an explanation**, and `/api/stats/main`
-reports its session-derived fields as `null`. The same happens while
-`round_timestamps` is on (`gdpr_mode` turns it on), because events within one
+reports its session-derived fields as `null` and says why in
+`sessions_unavailable_reason`. The same analyses answer `503` with
+`code: session_data_unavailable` while `round_timestamps` is on (`gdpr_mode` turns it on), because events within one
 hour can no longer be ordered; retention is the exception and keeps working. That is deliberate: the previous release returned `200` with zeros and
 empty arrays, which is indistinguishable from a site that genuinely has no
 sessions and no conversions. A missing dependency should look like a missing
@@ -65,7 +66,8 @@ With the default `visitor_salt_rotation_days = 1`:
 
 `GET /api/stats/retention` reports this directly: the response carries
 `identity_supports_cohorts`, and when it is `false` a `caveat` string explaining
-what to change. Retention over *N* weeks needs
+what to change, with the configured `visitor_salt_rotation_days` beside it so a
+client can state the real value without parsing the text. Retention over *N* weeks needs
 `visitor_salt_rotation_days >= (N - 1) * 7`.
 
 Raising the rotation is a privacy decision, not a tuning knob — see
@@ -192,7 +194,8 @@ Cohorts are defined by a visitor's first-seen week. `weeks` must be between
     }
   ],
   "identity_supports_cohorts": false,
-  "caveat": "visitor_salt_rotation_days is 1, so visitor identities do not survive…"
+  "caveat": "visitor_salt_rotation_days is 1, so visitor identities do not survive…",
+  "visitor_salt_rotation_days": 1
 }
 ```
 

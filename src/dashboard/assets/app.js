@@ -128,7 +128,7 @@ function BehavioralHelp({ detail, compactView }) {
             <li>Look for a <code>behavioral</code> line in the server log; it names the reason.</li>
             <li>
               The extension is installed from the DuckDB community repository at start-up, so the
-              server needs outbound HTTPS access to it. Offline hosts can place the extension file in
+              server needs outbound HTTP access (port 80) to it. Offline hosts can place the extension file in
               the extension directory (<code>MALLARD_EXTENSION_DIR</code>, default${' '}
               <code>&lt;data dir&gt;/extensions</code>).
             </li>
