@@ -65,12 +65,13 @@ fn query_by_currency(
     conn: &Connection,
     scope: &QueryScope,
 ) -> Result<Vec<RevenueByCurrency>, duckdb::Error> {
+    let events = scope.events();
     let sql = format!(
         "SELECT COALESCE(revenue_currency, '(unknown)') AS currency,
                 SUM(revenue_amount)::DOUBLE AS total,
                 COUNT(*) AS transactions,
                 COUNT(DISTINCT visitor_id) AS paying_visitors
-         FROM events_all
+         FROM {events}
          WHERE {} AND revenue_amount IS NOT NULL
          GROUP BY currency
          ORDER BY total DESC, currency",
@@ -107,12 +108,13 @@ fn query_by_dimension(
     scope: &QueryScope,
     column: &str,
 ) -> Result<Vec<RevenueByDimension>, duckdb::Error> {
+    let events = scope.events();
     let sql = format!(
         "SELECT COALESCE({column}, '(unknown)') AS value,
                 COALESCE(revenue_currency, '(unknown)') AS currency,
                 SUM(revenue_amount)::DOUBLE AS total,
                 COUNT(*) AS transactions
-         FROM events_all
+         FROM {events}
          WHERE {} AND revenue_amount IS NOT NULL
          GROUP BY value, currency
          ORDER BY total DESC, value

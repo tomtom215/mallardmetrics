@@ -63,9 +63,10 @@ pub fn query_goals(
     scope: &QueryScope,
 ) -> Result<Vec<GoalConversion>, duckdb::Error> {
     let where_clause = scope.where_clause();
+    let events = scope.events();
     let sql = format!(
         "WITH scoped AS (
-             SELECT visitor_id, event_name FROM events_all WHERE {where_clause}
+             SELECT visitor_id, event_name FROM {events} WHERE {where_clause}
          ),
          total AS (SELECT COUNT(DISTINCT visitor_id) AS visitors FROM scoped)
          SELECT event_name,
@@ -101,9 +102,10 @@ pub fn query_property_keys(
     conn: &Connection,
     scope: &QueryScope,
 ) -> Result<Vec<String>, duckdb::Error> {
+    let events = scope.events();
     let sql = format!(
         "SELECT DISTINCT UNNEST(json_keys({PROPS_JSON})) AS key
-         FROM events_all
+         FROM {events}
          WHERE {} AND props IS NOT NULL
          ORDER BY key
          LIMIT {TOP_N}",
@@ -151,11 +153,12 @@ pub fn query_property_values(
     } else {
         format!("json_extract_string({PROPS_JSON}, '$.{key}')")
     };
+    let events = scope.events();
     let sql = format!(
         "SELECT {extract} AS value,
                 COUNT(DISTINCT visitor_id) AS visitors,
                 COUNT(*) AS events
-         FROM events_all
+         FROM {events}
          WHERE {where_clause} AND props IS NOT NULL{event_filter}
          GROUP BY value
          HAVING value IS NOT NULL
@@ -173,17 +176,15 @@ pub fn query_property_values(
         })
     };
 
-    let rows: Vec<PropertyValue> = match event_name {
-        Some(name) => stmt
-            .query_map(
-                duckdb::params![scope.site_id, scope.start, scope.end, name],
-                map_row,
-            )?
-            .collect::<Result<_, _>>()?,
-        None => stmt
-            .query_map(duckdb::params_from_iter(scope.params()), map_row)?
-            .collect::<Result<_, _>>()?,
-    };
+    // The event name is the last placeholder, after the scope's own, which
+    // include one per segment filter. It used to be bound after only site, start
+    // and end, so a request that named an event *and* a segment failed with a
+    // parameter-count error.
+    let mut bound: Vec<&str> = scope.params();
+    bound.extend(event_name);
+    let rows: Vec<PropertyValue> = stmt
+        .query_map(duckdb::params_from_iter(bound), map_row)?
+        .collect::<Result<_, _>>()?;
     Ok(rows)
 }
 
@@ -293,6 +294,40 @@ mod tests {
         .unwrap();
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].value, "pro");
+    }
+
+    #[test]
+    fn test_property_values_for_one_event_honour_the_segment() {
+        // Regression: naming an event *and* a segment bound one parameter too
+        // few ("Wrong number of parameters passed to query") because the event
+        // name was bound right after the date range, ahead of the filter values.
+        let db = TestDb::new();
+        for (visitor, browser, plan) in [
+            ("v1", "Chrome", "pro"),
+            ("v2", "Firefox", "free"),
+            ("v3", "Chrome", "pro"),
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname, browser, props)
+                     VALUES ('test.com', ?, CAST('2024-01-15 10:00:00' AS TIMESTAMP), 'signup', '/', ?, ?)",
+                    duckdb::params![visitor, browser, format!(r#"{{"plan":"{plan}"}}"#)],
+                )
+                .unwrap();
+        }
+        let chrome = crate::query::test_support::filtered_scope(
+            "2024-01-01",
+            "2024-02-01",
+            "browsers==Chrome",
+        );
+        let values = query_property_values(&db.conn, &chrome, "plan", Some("signup")).unwrap();
+        assert_eq!(values.len(), 1, "{values:?}");
+        assert_eq!(values[0].value, "pro");
+        assert_eq!(values[0].visitors, 2);
+
+        // And without an event name the segment still applies.
+        let all = query_property_values(&db.conn, &chrome, "plan", None).unwrap();
+        assert_eq!(all.len(), 1);
     }
 
     #[test]

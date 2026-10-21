@@ -69,11 +69,12 @@ fn window(scope: &QueryScope) -> &str {
 /// Bind with [`per_session_params`]: the filter values come first because the
 /// segment expression sits in the `SELECT` list, ahead of the `WHERE`.
 pub fn per_session_cte(scope: &QueryScope) -> String {
+    let events = scope.events();
     format!(
         "WITH scoped AS (
              SELECT visitor_id, timestamp, event_name, pathname,
                     {segment} AS in_segment
-             FROM events_all WHERE {range}
+             FROM {events} WHERE {range}
          ),
          sessionized AS (
              SELECT *, sessionize(timestamp, INTERVAL '{window}') OVER (

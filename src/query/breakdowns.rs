@@ -245,12 +245,13 @@ fn breakdown_sql(dimension: Dimension, scope: &QueryScope, limit: usize) -> Stri
         }
         _ => {
             let where_clause = scope.where_clause();
+            let events = scope.events();
             format!(
                 "SELECT COALESCE({col}, '(unknown)') AS dim_value,
                         COUNT(DISTINCT visitor_id) AS visitors,
                         COUNT(*) FILTER (WHERE event_name = 'pageview') AS pageviews,
                         COUNT(*) AS events
-                 FROM events_all
+                 FROM {events}
                  WHERE {where_clause}
                  GROUP BY dim_value
                  ORDER BY visitors DESC, dim_value

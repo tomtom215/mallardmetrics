@@ -128,12 +128,13 @@ fn query_daily_top(
     scope: &QueryScope,
     column: &str,
 ) -> Result<Vec<(String, String)>, duckdb::Error> {
+    let events = scope.events();
     let sql = format!(
         "WITH per_day AS (
              SELECT STRFTIME(DATE_TRUNC('day', timestamp), '%Y-%m-%d') AS day,
                     COALESCE({column}, '(unknown)') AS value,
                     COUNT(DISTINCT visitor_id) AS visitors
-             FROM events_all
+             FROM {events}
              WHERE {where_clause}
              GROUP BY day, value
          ),
@@ -201,8 +202,9 @@ fn raw_export_sql(scope: &QueryScope, limit: usize) -> String {
         .map(|c| format!("CAST({c} AS VARCHAR)"))
         .collect::<Vec<_>>()
         .join(", ");
+    let events = scope.events();
     format!(
-        "SELECT {projection} FROM events_all WHERE {} ORDER BY timestamp LIMIT {limit}",
+        "SELECT {projection} FROM {events} WHERE {} ORDER BY timestamp LIMIT {limit}",
         scope.where_clause()
     )
 }

@@ -1,6 +1,8 @@
 use crate::api::errors::ApiError;
 use crate::ingest::handler::AppState;
 use crate::query::cache::{CacheKey, cache_key};
+use crate::query::scoped::ColdReads;
+use crate::query::QueryScope;
 use crate::query::{
     Filter, UNKNOWN_VALUE, breakdowns, events, export, flow, funnel, metrics, realtime, retention,
     revenue, sequences, timeseries,
@@ -500,12 +502,18 @@ impl Deadline {
 /// queued for a connection. It used to be taken first, so every request parked
 /// behind the four reader connections was also holding up the next flush
 /// (finding F-08), and ingest latency was tied to the slowest dashboard query.
+///
+/// `f` also receives a [`ColdReads`], which builds the per-request file list
+/// that replaces the all-files `events_all` view. It is created here, after the
+/// shared tier lock is held, because a list made earlier can name files a
+/// compaction has since moved (see `query::scoped`).
 fn execute_on_reader<T>(
     readers: &crate::storage::ReaderPool,
     tier_lock: &crate::storage::TierLock,
+    storage: &crate::storage::parquet::ParquetStorage,
     deadline: &Deadline,
     started: tokio::sync::oneshot::Sender<()>,
-    f: impl FnOnce(&duckdb::Connection) -> Result<T, duckdb::Error>,
+    f: impl FnOnce(&duckdb::Connection, ColdReads<'_>) -> Result<T, duckdb::Error>,
 ) -> Result<T, duckdb::Error> {
     let conn = readers.acquire();
     let (guard, _tier) = loop {
@@ -521,7 +529,7 @@ fn execute_on_reader<T>(
     // The deadline runs from here, not from when the request arrived. The
     // receiver is gone only if the watchdog was never started, which is fine.
     let _ = started.send(());
-    let result = f(&guard);
+    let result = f(&guard, ColdReads::new(storage));
     deadline.disarm();
     result
 }
@@ -546,7 +554,32 @@ where
     run_query_with(state, state.query_limits, f).await
 }
 
+/// [`run_query`] for a closure that reads only some of the cold tier.
+///
+/// The closure gets a [`ColdReads`] to narrow its scope or build a source with;
+/// it is valid only inside the closure, which runs under the tier read lock.
+async fn run_scoped<T, F>(state: &Arc<AppState>, f: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&duckdb::Connection, ColdReads<'_>) -> Result<T, duckdb::Error> + Send + 'static,
+{
+    run_scoped_with(state, state.query_limits, f).await
+}
+
 /// [`run_query`] with explicit limits.
+async fn run_query_with<T, F>(
+    state: &Arc<AppState>,
+    limits: QueryLimits,
+    f: F,
+) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce(&duckdb::Connection) -> Result<T, duckdb::Error> + Send + 'static,
+{
+    run_scoped_with(state, limits, move |conn, _| f(conn)).await
+}
+
+/// [`run_scoped`] with explicit limits: the implementation behind every query.
 ///
 /// # Waiting for a slot
 ///
@@ -567,14 +600,14 @@ where
 /// and the tier read lock (which blocks the next flush) indefinitely. The slot
 /// is released by the blocking task itself, not by the request future, so a
 /// client that disconnects cannot free a slot whose query is still running.
-async fn run_query_with<T, F>(
+async fn run_scoped_with<T, F>(
     state: &Arc<AppState>,
     limits: QueryLimits,
     f: F,
 ) -> Result<T, ApiError>
 where
     T: Send + 'static,
-    F: FnOnce(&duckdb::Connection) -> Result<T, duckdb::Error> + Send + 'static,
+    F: FnOnce(&duckdb::Connection, ColdReads<'_>) -> Result<T, duckdb::Error> + Send + 'static,
 {
     let permit = tokio::time::timeout(
         limits.queue_wait,
@@ -623,11 +656,12 @@ where
 
     let readers = state.readers.clone();
     let tier_lock = state.tier_lock.clone();
+    let storage = state.buffer.storage().clone();
     let task_deadline = Arc::clone(&deadline);
     let result = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _finished = finished_tx;
-        execute_on_reader(&readers, &tier_lock, &task_deadline, started_tx, f)
+        execute_on_reader(&readers, &tier_lock, &storage, &task_deadline, started_tx, f)
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Query task panicked: {e}")))?;
@@ -686,6 +720,30 @@ fn classify_error(err: duckdb::Error) -> ApiError {
     ApiError::DatabaseError(err)
 }
 
+/// Like [`cached_with`], for a report over a [`QueryScope`], reading only the
+/// files that scope can touch (F-06).
+///
+/// The scope is narrowed inside the query, under the tier read lock, so the
+/// file list and the statement see the same set of files. `lookback_days` widens
+/// the read for a query that scans before the scope's start (retention); pass 0
+/// otherwise. See `query::scoped` for why no other widening is needed.
+async fn cached_scoped<T, F>(
+    state: &Arc<AppState>,
+    key: CacheKey,
+    scope: QueryScope,
+    lookback_days: u32,
+    f: F,
+) -> Result<Json<T>, ApiError>
+where
+    T: Serialize + serde::de::DeserializeOwned + Send + 'static,
+    F: FnOnce(&duckdb::Connection, &QueryScope) -> Result<T, duckdb::Error> + Send + 'static,
+{
+    cached_with(state, key, move |conn, cold| {
+        f(conn, &cold.scope(scope, lookback_days))
+    })
+    .await
+}
+
 /// Run a cached, JSON-serialisable query.
 ///
 /// Caching now covers every read endpoint. It previously applied to two of
@@ -694,10 +752,10 @@ fn classify_error(err: duckdb::Error) -> ApiError {
 ///
 /// The cache epoch is read before the query runs and checked on insert, so a
 /// result computed before a GDPR erasure cannot be cached after it.
-async fn cached_query<T, F>(state: &Arc<AppState>, key: CacheKey, f: F) -> Result<Json<T>, ApiError>
+async fn cached_with<T, F>(state: &Arc<AppState>, key: CacheKey, f: F) -> Result<Json<T>, ApiError>
 where
     T: Serialize + serde::de::DeserializeOwned + Send + 'static,
-    F: FnOnce(&duckdb::Connection) -> Result<T, duckdb::Error> + Send + 'static,
+    F: FnOnce(&duckdb::Connection, ColdReads<'_>) -> Result<T, duckdb::Error> + Send + 'static,
 {
     if let Some(cached) = state.query_cache.get(key.as_str())
         && let Ok(value) = serde_json::from_str::<T>(&cached)
@@ -705,7 +763,7 @@ where
         return Ok(Json(value));
     }
     let epoch = state.query_cache.epoch();
-    let result = run_query(state, f).await?;
+    let result = run_scoped(state, f).await?;
     if let Ok(serialized) = serde_json::to_string(&result) {
         state.query_cache.insert_at(epoch, key, serialized);
     }
@@ -826,8 +884,8 @@ pub async fn get_main_stats(
     // Session figures computed from hour-rounded timestamps are artefacts of the
     // rounding; they are reported as unavailable instead.
     let with_sessions = !state.round_timestamps;
-    let Json(mut current) = cached_query(&state, key, move |conn| {
-        main_metrics(conn, &scope, with_sessions)
+    let Json(mut current) = cached_scoped(&state, key, scope, 0, move |conn, scope| {
+        main_metrics(conn, scope, with_sessions)
     })
     .await?;
 
@@ -844,8 +902,8 @@ pub async fn get_main_stats(
             &params.site_id,
             &[&previous.start, &previous.end, &filter_key, "none"],
         );
-        let Json(baseline) = cached_query(&state, previous_key, move |conn| {
-            main_metrics(conn, &previous_scope, with_sessions)
+        let Json(baseline) = cached_scoped(&state, previous_key, previous_scope, 0, move |conn, scope| {
+            main_metrics(conn, scope, with_sessions)
         })
         .await?;
 
@@ -876,8 +934,8 @@ pub async fn get_sessions(
         &params.site_id,
         &[&range.start, &range.end, &filter_key],
     );
-    cached_query(&state, key, move |conn| {
-        metrics::query_session_metrics(conn, &scope)
+    cached_scoped(&state, key, scope, 0, |conn, scope| {
+        metrics::query_session_metrics(conn, scope)
     })
     .await
     .map_err(|e| behavioral_error(&state, "Session metrics", e))
@@ -905,8 +963,8 @@ pub async fn get_timeseries(
             &filter_key,
         ],
     );
-    cached_query(&state, key, move |conn| {
-        timeseries::query_timeseries(conn, &scope, granularity)
+    cached_scoped(&state, key, scope, 0, move |conn, scope| {
+        timeseries::query_timeseries(conn, scope, granularity)
     })
     .await
 }
@@ -957,8 +1015,8 @@ pub async fn get_breakdown(
             &filter_key,
         ],
     );
-    cached_query(&state, key, move |conn| {
-        breakdowns::query_breakdown(conn, &scope, dim, limit)
+    cached_scoped(&state, key, scope, 0, move |conn, scope| {
+        breakdowns::query_breakdown(conn, scope, dim, limit)
     })
     .await
 }
@@ -973,8 +1031,13 @@ pub async fn get_realtime(
     let window = state.realtime_window_minutes;
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
     // Deliberately uncached: a cached "realtime" figure is not realtime.
-    let snapshot = run_query(&state, move |conn| {
-        realtime::query_realtime(conn, &site_id, window, &filters)
+    let snapshot = run_scoped(&state, move |conn, cold| {
+        // The instant is taken here, inside the query, as before: a request
+        // that queued must still report "the last N minutes" as of when it ran.
+        let now = chrono::Utc::now().naive_utc();
+        let (from, to) = realtime::window_days(window, now);
+        let source = cold.source(&site_id, from, to);
+        realtime::query_realtime_from(conn, &source, &site_id, window, &filters, now)
     })
     .await?;
     Ok(Json(snapshot))
@@ -996,8 +1059,8 @@ pub async fn get_revenue(
         &params.site_id,
         &[&range.start, &range.end, &filter_key],
     );
-    cached_query(&state, key, move |conn| {
-        revenue::query_revenue(conn, &scope)
+    cached_scoped(&state, key, scope, 0, |conn, scope| {
+        revenue::query_revenue(conn, scope)
     })
     .await
 }
@@ -1018,7 +1081,10 @@ pub async fn get_goals(
         &params.site_id,
         &[&range.start, &range.end, &filter_key],
     );
-    cached_query(&state, key, move |conn| events::query_goals(conn, &scope)).await
+    cached_scoped(&state, key, scope, 0, |conn, scope| {
+        events::query_goals(conn, scope)
+    })
+    .await
 }
 
 /// GET /api/stats/properties — custom property keys seen in range.
@@ -1037,8 +1103,8 @@ pub async fn get_property_keys(
         &params.site_id,
         &[&range.start, &range.end, &filter_key],
     );
-    cached_query(&state, key, move |conn| {
-        events::query_property_keys(conn, &scope)
+    cached_scoped(&state, key, scope, 0, |conn, scope| {
+        events::query_property_keys(conn, scope)
     })
     .await
 }
@@ -1106,8 +1172,8 @@ pub async fn get_property_values(
             &filter_key,
         ],
     );
-    cached_query(&state, cache, move |conn| {
-        events::query_property_values(conn, &scope, &key_name, event.as_deref())
+    cached_scoped(&state, cache, scope, 0, move |conn, scope| {
+        events::query_property_values(conn, scope, &key_name, event.as_deref())
     })
     .await
 }
@@ -1257,9 +1323,9 @@ pub async fn get_funnel(
             &filter_key,
         ],
     );
-    cached_query(&state, key, move |conn| {
+    cached_scoped(&state, key, scope, 0, move |conn, scope| {
         let refs: Vec<&str> = steps.iter().map(String::as_str).collect();
-        funnel::query_funnel(conn, &scope, &window, &modes, &refs)
+        funnel::query_funnel(conn, scope, &window, &modes, &refs)
     })
     .await
     .map_err(|e| behavioral_error(&state, "Funnel analysis", e))
@@ -1359,9 +1425,13 @@ pub async fn get_retention(
             &filter_key,
         ],
     );
-    let cohorts: Json<Vec<retention::RetentionCohort>> = cached_query(&state, key, move |conn| {
-        retention::query_retention(conn, &scope, weeks, lookback_days)
-    })
+    let cohorts: Json<Vec<retention::RetentionCohort>> = cached_scoped(
+        &state,
+        key,
+        scope,
+        retention::scan_lookback_days(lookback_days),
+        move |conn, scope| retention::query_retention(conn, scope, weeks, lookback_days),
+    )
     .await
     .map_err(|e| behavioral_error(&state, "Retention cohorts", e))?;
 
@@ -1423,9 +1493,9 @@ pub async fn get_sequences(
         &params.site_id,
         &[&range.start, &range.end, &params.steps, &filter_key],
     );
-    cached_query(&state, key, move |conn| {
+    cached_scoped(&state, key, scope, 0, move |conn, scope| {
         let refs: Vec<&str> = steps.iter().map(String::as_str).collect();
-        sequences::execute_sequence_match(conn, &scope, &refs)
+        sequences::execute_sequence_match(conn, scope, &refs)
     })
     .await
     .map_err(|e| behavioral_error(&state, "Sequence analysis", e))
@@ -1502,8 +1572,8 @@ pub async fn get_flow(
             &filter_key,
         ],
     );
-    cached_query(&state, key, move |conn| {
-        flow::query_flow(conn, &scope, &page, direction, limit)
+    cached_scoped(&state, key, scope, 0, move |conn, scope| {
+        flow::query_flow(conn, scope, &page, direction, limit)
     })
     .await
     .map_err(|e| behavioral_error(&state, "Flow analysis", e))
@@ -1575,8 +1645,10 @@ pub async fn get_export(
 
     let (body, filename) = match kind {
         export::ExportKind::Daily => {
-            let rows =
-                run_query(&state, move |conn| export::query_daily_export(conn, &scope)).await?;
+            let rows = run_scoped(&state, move |conn, cold| {
+                export::query_daily_export(conn, &cold.scope(scope, 0))
+            })
+            .await?;
             let body = match format {
                 export::ExportFormat::Csv => export::daily_to_csv(&rows),
                 export::ExportFormat::Json => {
@@ -1587,8 +1659,8 @@ pub async fn get_export(
         }
         export::ExportKind::Raw => {
             let limit = common.limit_or(DEFAULT_EXPORT_LIMIT, export::MAX_RAW_ROWS)?;
-            let rows = run_query(&state, move |conn| {
-                export::query_raw_export(conn, &scope, limit)
+            let rows = run_scoped(&state, move |conn, cold| {
+                export::query_raw_export(conn, &cold.scope(scope, 0), limit)
             })
             .await?;
             let body = match format {
@@ -2466,14 +2538,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_result_computed_before_an_erasure_is_not_cached_after_it() {
-        // Regression (S-10), end to end through `cached_query`.
+        // Regression (S-10), end to end through `cached_with`.
         let state = crate::test_support::state_builder()
             .cache_ttl_secs(60)
             .build_state();
         let key = cache_key("t", "a.com", &[]);
         let key_str = key.as_str().to_string();
 
-        let slow = cached_query(&state, key, |conn| {
+        let slow = cached_with(&state, key, |conn, _| {
             let v = conn.query_row("SELECT 1", [], |row| row.get::<_, i64>(0))?;
             std::thread::sleep(Duration::from_millis(300));
             Ok(v)
@@ -2491,7 +2563,7 @@ mod tests {
 
         // Without an erasure in between, the result is cached as before.
         let key = cache_key("t", "a.com", &[]);
-        let Json(second) = cached_query(&state, key, |_| Ok(2i64))
+        let Json(second) = cached_with(&state, key, |_, _| Ok(2i64))
             .await
             .expect("query");
         assert_eq!(second, 2);

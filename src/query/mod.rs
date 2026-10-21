@@ -13,6 +13,20 @@ pub mod sessions;
 pub mod timeseries;
 
 use breakdowns::Dimension;
+use chrono::{Days, NaiveDate, NaiveDateTime};
+
+pub mod scoped;
+
+/// The view over both storage tiers. See `storage::schema::setup_query_view`.
+pub const EVENTS_ALL: &str = "events_all";
+
+/// A date (`YYYY-MM-DD`) or timestamp (`YYYY-MM-DD HH:MM:SS`) as a timestamp.
+pub fn parse_bound(raw: &str) -> Option<NaiveDateTime> {
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .or_else(|| NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").ok())
+}
 
 #[cfg(any(test, feature = "testing"))]
 pub mod test_support;
@@ -107,6 +121,10 @@ pub struct QueryScope {
     pub session_window: String,
     /// Conditions narrowing the report; empty means the whole site.
     pub filters: Vec<Filter>,
+    /// The relation every query reads events from: the `events_all` view, or a
+    /// parenthesised subquery over just the files this scope can touch.
+    /// See [`scoped::ColdReads`].
+    source: String,
 }
 
 impl QueryScope {
@@ -122,7 +140,46 @@ impl QueryScope {
             end: end.into(),
             session_window: session_window.into(),
             filters: Vec::new(),
+            source: EVENTS_ALL.to_string(),
         }
+    }
+
+    /// The relation to put after `FROM`: [`EVENTS_ALL`] unless the scope was
+    /// narrowed with [`QueryScope::with_source`].
+    ///
+    /// Interpolated into SQL, which is safe because the only way to set it is
+    /// `with_source`, whose callers get the text from
+    /// [`scoped_events_sql`](crate::storage::schema::scoped_events_sql) (file
+    /// names this crate built, quote-escaped) and never from request input.
+    pub fn events(&self) -> &str {
+        &self.source
+    }
+
+    /// The same scope reading events from `source` instead of `events_all`.
+    #[must_use]
+    pub fn with_source(mut self, source: String) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// The days of the cold tier a query over this scope can read, inclusive,
+    /// or `None` when the bounds cannot be parsed (the caller then reads
+    /// everything, which is slower but never wrong).
+    ///
+    /// Every statement in this module restricts `timestamp` to `[start, end)`
+    /// and `site_id` to the scope's site, and partitions are keyed by site and
+    /// event date, so those are the only files that can hold a row it reads.
+    /// A session, funnel or flow never reaches outside that window either: the
+    /// SQL builds them from the rows its own range predicate returned, so there
+    /// is nothing to widen for. `lookback_days` is the one exception, for a
+    /// query whose SQL deliberately scans earlier than `start` (retention's
+    /// first-seen lookback). The end day is included although `end` is
+    /// exclusive: one extra directory listing, and no off-by-one at midnight.
+    pub fn scan_days(&self, lookback_days: u32) -> Option<(NaiveDate, NaiveDate)> {
+        let start = parse_bound(&self.start)?.date();
+        let end = parse_bound(&self.end)?.date();
+        let from = start.checked_sub_days(Days::new(u64::from(lookback_days)))?;
+        Some((from, end))
     }
 
     /// The same scope narrowed by `filters`.
