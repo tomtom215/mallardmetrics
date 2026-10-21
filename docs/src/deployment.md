@@ -1,107 +1,152 @@
 # Deployment
 
-## Production Checklist
+Mallard Metrics is one process plus a data directory. Pick a guide:
 
-Before going to production:
+| You have | Use |
+|---|---|
+| A generic Linux VPS and a Cloudflare-managed domain | [VPS Deployment Guide](deploy-vps.md): Caddy, TLS, encrypted volume, backups, one script |
+| Fly.io | [Fly.io Deployment](deploy-flyio.md) (not verified end to end; read its caveats) |
+| An existing Docker host with its own proxy | this page: Docker and Compose |
+| No Docker | this page: systemd |
 
-- [ ] Set `MALLARD_SECRET` to a random 32+ character string and keep it constant across restarts.
-- [ ] Set `MALLARD_ADMIN_PASSWORD` to a strong password.
-- [ ] Set `MALLARD_SECURE_COOKIES=true` when behind a TLS-terminating reverse proxy so session cookies carry the `Secure` flag.
-- [ ] Set `MALLARD_METRICS_TOKEN` to a secret token if the `/metrics` endpoint is publicly reachable.
-- [ ] Configure a TLS-terminating reverse proxy (nginx, Caddy, Traefik).
-- [ ] Mount a persistent volume for `data_dir` (contains `mallard.duckdb` and Parquet files).
-- [ ] Set `site_ids` to restrict event ingestion to your domains.
-- [ ] Configure `retention_days` to match your data retention policy.
-- [ ] Set `dashboard_origin` to your dashboard URL to enable CSRF protection.
-- [ ] Use `/health/ready` as your container or load-balancer readiness probe.
+None of the commands on this page that need Docker or a cloud account were run
+for this book (the build machine has no Docker daemon). The binary's behaviour
+(startup checks, health, extension install, proxy handling) was verified; image
+and compose commands were checked against the files in the repository only.
 
-**EU / GDPR deployments — additional steps:**
+## What the image is
 
-- [ ] Set `MALLARD_GDPR_MODE=true` (or enable individual flags) to reduce data collection surface.
-- [ ] Set `MALLARD_RETENTION_DAYS=30` (or your DPA-approved retention period) for Art. 5(1)(e) storage limitation compliance.
-- [ ] Set `MALLARD_GEOIP_PRECISION=country` (already forced by `gdpr_mode`; document it explicitly in your DPIA).
-- [ ] Document your legal basis for processing in a DPIA or privacy notice. See [PRIVACY.md](https://github.com/tomtom215/mallardmetrics/blob/main/PRIVACY.md) for the full analysis.
-- [ ] Use `DELETE /api/gdpr/erase?site_id=...&start_date=...&end_date=...` (Admin API key required) to honour Art. 17 erasure requests.
+- **glibc**, not musl: a release binary (or a build from the repository
+  `Dockerfile`) on distroless `gcr.io/distroless/cc-debian12:nonroot`: no shell, no
+  package manager, UID/GID **65532**, `/data` as the volume and working
+  directory, port 8000.
+- **There is no musl or Alpine build and no `FROM scratch` image.** The
+  `behavioral` DuckDB extension is not published for musl (the repository answers
+  `404` for `linux_amd64_musl` and `linux_arm64_musl`), so a musl binary would
+  serve everything except funnels, retention, sessions, sequences and flow, which
+  would answer `503` while the image passed its health check.
+- Platforms: `linux/amd64` and `linux/arm64`.
+- The image sets `HOME=/data`, `MALLARD_DATA_DIR=/data` and
+  `MALLARD_EXTENSION_DIR=/data/extensions`, so the extension is installed onto the
+  volume even with a read-only root filesystem.
+- `HEALTHCHECK` runs `/mallard-metrics --healthcheck` (exec form, because there is no
+  shell), every 30 s with a 20 s start period.
+- Images are `ghcr.io/tomtom215/mallardmetrics`. Tags are the semantic version
+  without `v` (`0.2.0`), `0.2`, `0`, and the commit SHA. **Pin a version** rather than
+  following a moving tag.
+
+## Production checklist
+
+- [ ] `MALLARD_SECRET`: a random value of **16+ characters** (`openssl rand -hex 32`),
+      kept constant. Shorter values stop startup.
+- [ ] `MALLARD_ADMIN_PASSWORD`: 12+ characters. Without it, the first visitor to reach
+      `/api/auth/setup` can claim the instance.
+- [ ] A TLS-terminating reverse proxy, then `MALLARD_SECURE_COOKIES=true` and
+      `MALLARD_DASHBOARD_ORIGIN=https://analytics.example.com`.
+- [ ] `MALLARD_TRUST_PROXY_HEADERS=true` and `MALLARD_TRUSTED_PROXY_HOPS` equal to the
+      number of proxies you own ([below](#behind-a-reverse-proxy)).
+- [ ] `MALLARD_METRICS_TOKEN` if `/metrics` is reachable beyond Prometheus.
+- [ ] A persistent volume for `/data`, writable by UID 65532.
+- [ ] `MALLARD_SITE_IDS` (or `MALLARD_RATE_LIMIT_PER_IP`): otherwise anyone can create
+      sites and write events (the server warns about this).
+- [ ] `MALLARD_RETENTION_DAYS` to match your retention policy.
+- [ ] `MALLARD_DUCKDB_MEMORY_LIMIT` about 60% of the container limit.
+- [ ] A stop grace period of at least 45 s (`stop_grace_period`, `docker run
+      --stop-timeout 45`, systemd `TimeoutStopSec=45`): the shutdown flush can take
+      up to the shutdown timeout.
+- [ ] The behavioral extension is seeded if the container has no outbound route.
+- [ ] [Backups](backup-restore.md) scheduled, and a restore tested.
+- [ ] [Monitoring](monitoring.md): scrape `/metrics`, alert on `/health/detailed`.
+- [ ] Use `/health/ready` for readiness.
+
+EU deployments additionally: see the checklist on
+[Privacy and GDPR](privacy-gdpr.md#checklist).
 
 ---
 
-## Docker (Recommended)
-
-### Pull and Run
+## Docker
 
 ```bash
 docker run -d \
   --name mallard-metrics \
   --restart unless-stopped \
+  --stop-timeout 45 \
   -p 127.0.0.1:8000:8000 \
   -v mallard-data:/data \
-  -e MALLARD_SECRET=your-random-32-char-secret \
-  -e MALLARD_ADMIN_PASSWORD=your-dashboard-password \
+  -e MALLARD_SECRET="$(openssl rand -hex 32)" \
+  -e MALLARD_ADMIN_PASSWORD='choose-a-long-password' \
   -e MALLARD_SECURE_COOKIES=true \
-  -e MALLARD_METRICS_TOKEN=your-prometheus-token \
-  ghcr.io/tomtom215/mallardmetrics
+  -e MALLARD_METRICS_TOKEN="$(openssl rand -hex 32)" \
+  ghcr.io/tomtom215/mallardmetrics:0.2.0
 ```
 
-The image is built `FROM scratch` with a static musl binary. It has no shell, no package manager, and no runtime dependencies.
+**Keep the generated secret**: store it where you keep other credentials. Losing it
+re-identifies every visitor. With `-p 127.0.0.1:8000:8000` the port is reachable only
+from the host; put a TLS proxy in front.
 
-### With a Config File
+The first start downloads the `behavioral` extension (a few MB) onto the volume, so
+the container needs outbound access once; it starts either way.
+
+With a config file:
 
 ```bash
-docker run -d \
-  --name mallard-metrics \
+docker run -d --name mallard-metrics --stop-timeout 45 \
   -v mallard-data:/data \
   -v /etc/mallard-metrics/config.toml:/config.toml:ro \
-  -e MALLARD_SECRET=... \
-  -e MALLARD_ADMIN_PASSWORD=... \
-  ghcr.io/tomtom215/mallardmetrics /config.toml
+  -e MALLARD_SECRET=... -e MALLARD_ADMIN_PASSWORD=... \
+  ghcr.io/tomtom215/mallardmetrics:0.2.0 /config.toml
 ```
-
----
 
 ## Docker Compose
 
-Save the following as `docker-compose.yml`:
-
-```yaml
-services:
-  mallard-metrics:
-    image: ghcr.io/tomtom215/mallardmetrics:latest
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8000:8000"
-    volumes:
-      - mallard-data:/data
-    environment:
-      MALLARD_SECRET: "${MALLARD_SECRET}"
-      MALLARD_ADMIN_PASSWORD: "${MALLARD_ADMIN_PASSWORD}"
-      MALLARD_SECURE_COOKIES: "true"
-      MALLARD_METRICS_TOKEN: "${MALLARD_METRICS_TOKEN}"
-      MALLARD_LOG_FORMAT: "json"
-
-volumes:
-  mallard-data:
-```
-
-Create a `.env` file (do not commit to source control):
+The repository's `docker-compose.yml` builds from the Dockerfile and is hardened
+(read-only root, no capabilities, `no-new-privileges`, memory and CPU limits, a
+45 s stop grace period, the self-probing healthcheck). To use it:
 
 ```bash
-MALLARD_SECRET=your-random-32-char-secret
-MALLARD_ADMIN_PASSWORD=your-dashboard-password
-MALLARD_METRICS_TOKEN=your-prometheus-bearer-token
-```
-
-Start:
-
-```bash
-docker compose up -d
+echo "MALLARD_SECRET=$(openssl rand -hex 32)" > .env
+echo "MALLARD_ADMIN_PASSWORD=choose-a-long-password" >> .env
+docker compose up -d --build        # first build compiles DuckDB: several minutes
 docker compose logs -f
 ```
 
+It binds `127.0.0.1:8000` by default (`MALLARD_BIND`, `MALLARD_HOST_PORT`) and
+reads `MALLARD_SECURE_COOKIES`, `MALLARD_METRICS_TOKEN`,
+`MALLARD_DASHBOARD_ORIGIN`, `MALLARD_TRUST_PROXY_HEADERS` (default `false`),
+`MALLARD_DUCKDB_MEMORY_LIMIT` (default 640 MB) and `MALLARD_DUCKDB_THREADS`
+(default 2) from the environment. Note the compose file does not pass
+`MALLARD_TRUSTED_PROXY_HOPS`; the default of 1 applies, which is right for one
+proxy. For an internet-facing host use `deploy/docker-compose.production.yml`, see the
+[VPS guide](deploy-vps.md).
+
+To run a released image instead of building, replace `build: .` with the `image:`
+line pointing at the tag you pinned.
+
 ---
 
-## Behind a Reverse Proxy
+## Behind a reverse proxy
 
-Mallard Metrics binds to `0.0.0.0:8000` by default (all interfaces). Set `MALLARD_HOST=127.0.0.1` to restrict to localhost when behind a reverse proxy.
+Mallard binds `0.0.0.0:8000` by default; set `MALLARD_HOST=127.0.0.1` when the proxy
+is on the same host. The client address feeds visitor IDs, GeoIP, the rate limiters
+and the login lockout, so get this right:
+
+1. Turn on `MALLARD_TRUST_PROXY_HEADERS=true` **only** when every request reaches
+   Mallard through your proxy. On a directly reachable server the header is
+   attacker-controlled.
+2. Set `MALLARD_TRUSTED_PROXY_HOPS` to the number of proxies **you** own. Each proxy
+   appends the address it received the connection from to `X-Forwarded-For`; Mallard
+   takes that many entries counting **from the right**. Entries on the left were
+   written by someone you do not control.
+
+| Topology | `TRUSTED_PROXY_HOPS` |
+|---|---|
+| Client → Caddy → Mallard | 1 |
+| Client → nginx → Mallard | 1 |
+| Client → CDN → nginx (or Caddy) → Mallard | 2 |
+
+Without step 1 every visitor is the proxy (and five wrong passwords from anyone lock
+the admin out); with too small a hop count traffic is attributed to a proxy; with too
+large a count a client chooses its own address.
 
 ### nginx
 
@@ -109,7 +154,6 @@ Mallard Metrics binds to `0.0.0.0:8000` by default (all interfaces). Set `MALLAR
 server {
     listen 443 ssl;
     server_name analytics.example.com;
-
     ssl_certificate     /etc/ssl/certs/analytics.example.com.crt;
     ssl_certificate_key /etc/ssl/private/analytics.example.com.key;
 
@@ -117,23 +161,18 @@ server {
         proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host $host;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Real-IP $remote_addr;
     }
 }
 ```
 
-> **Important:** the client IP feeds visitor-ID hashing, GeoIP lookup and the
-> per-IP rate limiter. Behind a proxy you must do *both* of the following:
->
-> 1. Configure the proxy to set `X-Forwarded-For` (or `X-Real-IP`) to the real
->    client address, **overwriting** anything the client sent.
-> 2. Set `MALLARD_TRUST_PROXY_HEADERS=true`.
->
-> Without step 2, every visitor is attributed to the proxy's own address.
-> Without step 1 — or with step 2 enabled on a directly reachable server — the
-> header is attacker-controlled, and any client can choose its own visitor ID,
-> geolocation and rate-limit bucket. The default is `false` precisely because
-> the unsafe direction is the one that fails silently.
+`$proxy_add_x_forwarded_for` appends the connecting address to whatever arrived,
+which is exactly what the hop rule expects, so with nginx as the only proxy
+`MALLARD_TRUSTED_PROXY_HOPS=1`. Setting `X-Forwarded-For $remote_addr;` instead is
+also safe for one proxy (a single entry). With a CDN in front of nginx, keep the
+appended form and use `2`. Confirm with a spoofed header:
+`curl -H 'X-Forwarded-For: 1.2.3.4' https://analytics.example.com/...` must not
+change which address Mallard attributes the request to. (Verified against a running
+server with hops 1: a forged leftmost entry is ignored.)
 
 ### Caddy
 
@@ -143,249 +182,149 @@ analytics.example.com {
 }
 ```
 
-Caddy sets `X-Forwarded-For` automatically; still set `MALLARD_TRUST_PROXY_HEADERS=true` so the server honours it.
+With no `trusted_proxies` configured Caddy discards a client-sent
+`X-Forwarded-For` and passes one entry, the address it accepted the connection from;
+use `MALLARD_TRUSTED_PROXY_HOPS=1`. Do not add `trusted_proxies` unless a CDN really
+sits in front. The bundled `deploy/Caddyfile` is this setup plus security headers and
+a log format that records no visitor data.
 
-### After-Proxy Configuration
+### CDN in front (Cloudflare and similar)
 
-Once behind a TLS reverse proxy, set these environment variables:
+Two correct ways, never mix them:
+
+- Make the **proxy** write the CDN's client header into `X-Forwarded-For` (for Caddy:
+  `header_up X-Forwarded-For {header.CF-Connecting-IP}`) and keep
+  `TRUSTED_PROXY_HOPS=1`, and firewall the origin to the CDN's published ranges so
+  nobody can bypass the CDN and forge the header.
+- Or keep the CDN's chain and count it: with CDN → nginx → Mallard, nginx appends the
+  CDN's address, the CDN appended the client's, so `TRUSTED_PROXY_HOPS=2`.
+
+If you cannot say how many proxies append, do not enable trust: a wrong count is
+silently wrong.
+
+### After the proxy
 
 ```bash
-# Enables Secure flag on session cookies
 MALLARD_SECURE_COOKIES=true
-
-# Restricts dashboard CORS and enables CSRF protection
-MALLARD_DASHBOARD_ORIGIN=https://analytics.example.com
+MALLARD_DASHBOARD_ORIGIN=https://analytics.example.com   # enables the CSRF origin check
 ```
 
 ---
 
-## Health and Readiness Probes
+## Health and readiness
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /health` | Liveness probe — returns `ok` if the process is alive |
-| `GET /health/ready` | Readiness probe — queries DuckDB; returns 503 if the database is not ready |
-| `GET /health/detailed` | JSON health report — version, buffer, auth, GeoIP, behavioral extension, cache status |
-
-### Kubernetes Example
+| `GET /health` | Liveness. |
+| `GET /health/ready` | Readiness: queries DuckDB; `503` if not ready. |
+| `GET /health/detailed` | Component status; `503` and `"degraded"` when the cold tier is unreadable. |
 
 ```yaml
 livenessProbe:
-  httpGet:
-    path: /health
-    port: 8000
+  httpGet: { path: /health, port: 8000 }
   initialDelaySeconds: 5
   periodSeconds: 10
-
 readinessProbe:
-  httpGet:
-    path: /health/ready
-    port: 8000
+  httpGet: { path: /health/ready, port: 8000 }
   initialDelaySeconds: 10
   periodSeconds: 15
   failureThreshold: 3
 ```
 
-### Container health checks
+The image has no shell, `curl` or `wget`, so Docker uses the binary itself:
+`mallard-metrics --healthcheck` requests `/health/ready` on the loopback address and
+exits non-zero if it does not answer 200. It reads **environment variables only**, so
+a `data_dir` or `port` set in a TOML file is not seen by it (the image's `MALLARD_*`
+variables are). Kubernetes ignores `HEALTHCHECK`; use the HTTP probes.
 
-The `FROM scratch` image has no shell and no `curl` or `wget`, so the binary
-probes itself: `mallard-metrics --healthcheck` reads the same configuration the
-server would, requests `/health/ready` on the loopback address, and exits
-non-zero if it does not answer.
+The server binds its port only after startup work, including an extension download
+attempt, so allow time on the first start (the image allows a 20 s start period).
 
-The image declares this already, so `docker run` and Swarm pick it up with no
-extra configuration:
+## Seeding the behavioral extension on an isolated network
 
-```dockerfile
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["/mallard-metrics", "--healthcheck"]
-```
-
-`docker-compose.yml` sets the same check explicitly. Under Kubernetes, prefer
-the HTTP probes above — the kubelet does not run a container's `HEALTHCHECK`.
-
-To check from outside the container instead:
+If the container has no outbound route (the production compose layout does this on
+purpose), run once:
 
 ```bash
-curl -sf http://localhost:8000/health/ready || exit 1
+docker run --rm --user 65532:65532 -v mallard-data:/data \
+  ghcr.io/tomtom215/mallardmetrics:0.2.0 --install-extension
 ```
+
+Details and the bare-metal and air-gapped variants:
+[Troubleshooting](troubleshooting.md#running-the-extension-install-step-offline).
 
 ---
 
-## Build from Source (Static musl Binary)
-
-To build a `FROM scratch`-compatible static binary:
+## Build from source
 
 ```bash
-# Install the musl target
-rustup target add x86_64-unknown-linux-musl
-
-# Build
-cargo build --release --target x86_64-unknown-linux-musl
-
-# The binary
-ls -lh target/x86_64-unknown-linux-musl/release/mallard-metrics
+git clone https://github.com/tomtom215/mallardmetrics.git
+cd mallardmetrics
+cargo build --release          # Rust 1.98.0, pinned by rust-toolchain.toml
+./target/release/mallard-metrics mallard-metrics.toml.example
 ```
 
-The resulting binary has no dynamic library dependencies:
+DuckDB is compiled from source (the `bundled` feature), which takes several minutes
+and a lot of disk (several GB in debug builds). Build for a `*-unknown-linux-gnu` or
+Apple target. `scripts/check-binary-abi.sh <binary> <glibc> <libstdc++>` verifies a
+binary does not need a newer glibc than the one it will run on (the image uses
+Debian 12: glibc 2.36). Do not build a musl target: the behavioral extension cannot
+load there.
+
+## GeoIP
+
+1. Create a free MaxMind account and download `GeoLite2-City.mmdb`.
+2. Put it on the data volume and point at it:
 
 ```bash
-ldd target/x86_64-unknown-linux-musl/release/mallard-metrics
-# not a dynamic executable
+docker run ... -v /path/GeoLite2-City.mmdb:/data/GeoLite2-City.mmdb:ro \
+  -e MALLARD_GEOIP_DB=/data/GeoLite2-City.mmdb ...
 ```
+
+A missing or unreadable file is not an error: geography is stored as `NULL` and
+`/health/detailed` shows `geoip_loaded: false`. The database is read at startup, so
+restart after replacing it. `MALLARD_GEOIP_PRECISION` limits what is stored.
+
+## Privacy mode
+
+`MALLARD_GDPR_MODE=true` bundles the privacy flags but also turns on
+`round_timestamps`, which disables session, funnel, sequence, flow and entry/exit
+reports. Read what it changes and what it costs on
+[Privacy and GDPR](privacy-gdpr.md#gdpr-mode) before enabling it.
 
 ---
 
-## GeoIP Setup
+## Graceful shutdown
 
-Mallard Metrics supports optional IP geolocation via MaxMind GeoLite2.
+On `SIGTERM` (docker stop, systemd stop) or `SIGINT`:
 
-1. Create a free account at [maxmind.com](https://www.maxmind.com/en/geolite2/signup).
-2. Download the `GeoLite2-City.mmdb` database.
-3. Configure the path:
+1. The server stops accepting connections and drains in-flight requests, for at most
+   `shutdown_timeout_secs` (default 30).
+2. The event buffer is closed (a late request gets `503`) and flushed to Parquet,
+   for at most `shutdown_timeout_secs` again.
+3. The process exits.
 
-```toml
-# config.toml
-geoip_db_path = "/data/GeoLite2-City.mmdb"
-```
+Typically this takes a fraction of a second; the worst case is twice the timeout, so
+give the platform at least `shutdown_timeout_secs + a margin` (45 s with the default
+works for a normal flush; use 70 s or more if you want the full worst case).
+Anything the platform's `SIGKILL` cuts off, including the unflushed buffer, is lost.
 
-Or with Docker:
+## systemd
 
-```bash
-docker run ... \
-  -v /path/to/GeoLite2-City.mmdb:/data/GeoLite2-City.mmdb:ro \
-  -e ... \
-  ghcr.io/tomtom215/mallardmetrics
-```
-
-If the file is missing or unreadable, country/region/city fields are stored as `NULL`. No error is raised.
-
-> **Note:** The MaxMind GeoLite2 database is updated monthly. Automate downloads with [geoipupdate](https://github.com/maxmind/geoipupdate).
-
----
-
-## GDPR-Friendly Deployment
-
-Mallard Metrics provides a configurable privacy mode designed to reduce the data-collection surface to a level that makes aggregate analytics possible under GDPR Art. 6(1)(f) legitimate interests (no consent required) for many EU operators. Consult your legal team; requirements vary by context and member-state law.
-
-### Activate GDPR Mode
-
-The quickest path is the `MALLARD_GDPR_MODE=true` preset, which bundles the recommended privacy settings:
+`deploy/systemd/mallard-metrics.service` is a hardened unit (dynamic user, state
+directory, sandboxing, `TimeoutStopSec=45`). Install a **glibc** release binary:
 
 ```bash
-docker run -d \
-  --name mallard-metrics \
-  --restart unless-stopped \
-  -p 127.0.0.1:8000:8000 \
-  -v mallard-data:/data \
-  -e MALLARD_SECRET=your-random-32-char-secret \
-  -e MALLARD_ADMIN_PASSWORD=your-dashboard-password \
-  -e MALLARD_SECURE_COOKIES=true \
-  -e MALLARD_GDPR_MODE=true \
-  -e MALLARD_RETENTION_DAYS=30 \
-  ghcr.io/tomtom215/mallardmetrics
+sudo install -m 0755 mallard-metrics /usr/local/bin/mallard-metrics
+sudo install -d -m 0700 /etc/mallard-metrics
+sudo install -m 0600 /dev/null /etc/mallard-metrics/mallard.env   # then edit
+sudo install -m 0644 deploy/systemd/mallard-metrics.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now mallard-metrics
 ```
 
-Or via TOML config:
-
-```toml
-gdpr_mode      = true
-retention_days = 30
-```
-
-### What GDPR Mode Does
-
-| Flag | Standard | GDPR Mode |
-|---|---|---|
-| Referrer stored as | Full URL (with query/fragment) | Path only — `?q=...` and `#...` stripped |
-| Timestamps | Millisecond precision | Rounded to nearest hour |
-| Browser info | Name + version | Name only (e.g. `"Chrome"`) |
-| OS info | Name + version | Name only (e.g. `"Windows"`) |
-| Screen / device | Stored | Omitted |
-| GeoIP | City-level | Country-level only |
-
-### Fine-Grained Privacy Flags
-
-Each setting can be controlled independently via environment variable or TOML key:
-
-| Env var | TOML key | Default | Effect |
-|---|---|---|---|
-| `MALLARD_GDPR_MODE` | `gdpr_mode` | `false` | Enable all flags below (except suppress_visitor_id) |
-| `MALLARD_STRIP_REFERRER_QUERY` | `strip_referrer_query` | `false` | Strip `?query` and `#fragment` from referrers |
-| `MALLARD_ROUND_TIMESTAMPS` | `round_timestamps` | `false` | Round timestamps to nearest hour |
-| `MALLARD_SUPPRESS_BROWSER_VERSION` | `suppress_browser_version` | `false` | Store browser name only |
-| `MALLARD_SUPPRESS_OS_VERSION` | `suppress_os_version` | `false` | Store OS name only |
-| `MALLARD_SUPPRESS_SCREEN_SIZE` | `suppress_screen_size` | `false` | Omit screen size and device type |
-| `MALLARD_GEOIP_PRECISION` | `geoip_precision` | `"city"` | `"city"` / `"region"` / `"country"` / `"none"` |
-| `MALLARD_SUPPRESS_VISITOR_ID` | `suppress_visitor_id` | `false` | Replace HMAC hash with random UUID per request (**breaks unique-visitor counting**) |
-
-> **Note on `suppress_visitor_id`:** This flag is intentionally *not* activated by `gdpr_mode` because it eliminates unique-visitor metrics entirely. The default HMAC-SHA256 visitor ID is pseudonymous personal data under GDPR Recital 26. Most operators can rely on Art. 6(1)(f) legitimate interests for aggregate analytics without suppressing visitor IDs.
-
-### Right to Erasure (Art. 17)
-
-Mallard Metrics supports data erasure requests via an authenticated API endpoint:
-
-```bash
-# Requires an Admin API key
-curl -X DELETE \
-  "https://analytics.example.com/api/gdpr/erase?site_id=mysite.com&start_date=2024-01-01&end_date=2024-12-31" \
-  -H "X-API-Key: mm_your_admin_key"
-```
-
-Response:
-
-```json
-{
-  "site_id": "mysite.com",
-  "start_date": "2024-01-01",
-  "end_date": "2024-12-31",
-  "db_records_deleted": 1423,
-  "parquet_partitions_deleted": 8
-}
-```
-
-**Important limitations:**
-- Erasure is by site and date range, not by individual visitor ID (visitor IDs are pseudonymous hashes and cannot be reverse-mapped to individuals).
-- After erasure, the `events_all` VIEW is refreshed automatically.
-- Consider setting `MALLARD_RETENTION_DAYS=30` for automated data minimisation under Art. 5(1)(e) in place of manual erasure requests.
-
----
-
-## Graceful Shutdown
-
-Mallard Metrics handles `SIGINT` (Ctrl+C) and `SIGTERM` (Docker stop, systemd stop). On receiving either signal:
-
-1. The server stops accepting new connections.
-2. In-flight requests are completed.
-3. Buffered events are flushed to DuckDB (persisted via WAL).
-
-The flush is bounded by `shutdown_timeout_secs` (default 30). If flushing takes longer, a warning is logged and the process exits.
-
----
-
-## Systemd Service
-
-For non-Docker deployments:
-
-```ini
-[Unit]
-Description=Mallard Metrics
-After=network.target
-
-[Service]
-Type=simple
-User=mallard
-ExecStart=/usr/local/bin/mallard-metrics /etc/mallard-metrics/config.toml
-Restart=on-failure
-RestartSec=5s
-Environment=MALLARD_SECRET=...
-Environment=MALLARD_ADMIN_PASSWORD=...
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-systemctl daemon-reload
-systemctl enable --now mallard-metrics
-```
+`mallard.env` holds `VAR=value` lines (no quotes, no `export`): `MALLARD_SECRET`,
+`MALLARD_ADMIN_PASSWORD`, `MALLARD_METRICS_TOKEN`, `MALLARD_SECURE_COOKIES=true`,
+`MALLARD_DASHBOARD_ORIGIN`, and behind a proxy `MALLARD_TRUST_PROXY_HEADERS=true`
+plus `MALLARD_TRUSTED_PROXY_HOPS`. The unit listens on `127.0.0.1:8000` and stores
+data in `/var/lib/mallard-metrics`. Back up by stopping the service and copying that
+directory ([Backup and Restore](backup-restore.md)).

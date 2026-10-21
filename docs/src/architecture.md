@@ -1,313 +1,320 @@
 # Architecture
 
-## Overview
+Mallard Metrics is one Rust binary: ingestion, storage, querying,
+authentication and the dashboard in one process, with DuckDB embedded. No
+message queue, no separate database. This page was checked against the source
+(0.2.0 line).
 
-Mallard Metrics is a single Rust binary that handles the complete analytics lifecycle: event ingestion, storage, querying, authentication, and dashboard serving. There are no external services, no message queues, and no separate database process.
+## Overview
 
 ```mermaid
 flowchart TD
-    TS["Tracking Script\nmallard.js ~3.8KB gzipped"]
-    DASH["Dashboard SPA\nPreact + HTM"]
+    TS["Tracking script\nmallard.js, about 4 KB gzipped"]
+    DASH["Dashboard SPA\nPreact + HTM, embedded"]
 
-    TS -->|"POST /api/event"| AXUM
-    DASH <-->|"GET /api/stats/*\nGET /api/keys/*"| AXUM
+    TS -->|"POST or GET /api/event"| AXUM
+    DASH <-->|"/api/stats/*\n/api/keys, /api/auth/*"| AXUM
 
-    subgraph BINARY["Single Binary — Single Process"]
-        AXUM["Axum HTTP Server\nport 8000"]
+    subgraph BINARY["Single process"]
+        AXUM["Axum HTTP server\nmiddleware: metrics, trace,\n30 s timeout, gzip, headers, request id"]
 
-        subgraph INGEST["Ingestion Pipeline"]
+        subgraph INGEST["Ingestion"]
             direction LR
-            OC["Origin Check\nRate Limiter"] --> BF["Bot Filter\nUA Parser"]
-            BF --> GEO["GeoIP Lookup\nVisitor ID Hash"]
-            GEO --> BUF["In-Memory\nEvent Buffer"]
+            VAL["Validate\nOrigin and site allowlist\nrate limits"] --> ENR["Bot filter\nUser-Agent, GeoIP\nvisitor ID"]
+            ENR --> BUF["In-memory buffer"]
         end
 
-        subgraph STORE["Two-Tier Storage"]
+        subgraph STORE["Storage"]
             direction LR
-            DB["DuckDB disk-based\nmallard.duckdb\nWAL durability"]
-            PQ["Parquet Files\nsite_id=*/date=*/*.parquet\nZSTD-compressed"]
-            VIEW["events_all VIEW\nhot union cold"]
-            DB -->|"COPY TO"| PQ
-            DB --> VIEW
-            PQ -->|"read_parquet()"| VIEW
+            HOT["Hot table\nmallard.duckdb"]
+            PQ["Parquet\nsite_id/date partitions\nZSTD"]
+            VIEW["events_all view\nhot UNION ALL cold"]
+            HOT -->|"flush"| PQ
+            HOT --> VIEW
+            PQ --> VIEW
         end
 
-        subgraph QUERY["Query Engine"]
+        subgraph QUERY["Queries"]
             direction LR
-            CACHE["TTL Query Cache"] --> QH["Stats\nSessions\nFunnels\nRetention\nSequences\nFlow"]
-            EXT["behavioral extension\nsessionize\nwindow_funnel\nretention\nsequence_match"] -.->|"optional"| CACHE
+            SEM["Query slots\nwait 10 s, run 20 s"] --> POOL["Reader pool\n4 connections"]
+            POOL --> QH["Stats, sessions, funnels,\nretention, sequences, flow"]
+            CACHE["TTL + LRU cache"] -.-> SEM
         end
 
-        AUTH["Auth Layer\nArgon2id passwords\n256-bit session tokens\nAPI keys SHA-256"] -.->|"guards"| AXUM
+        AUTH["Auth\nArgon2id, sessions, API keys"] -.->|"guards"| AXUM
 
-        AXUM --> OC
-        BUF -->|"flush"| DB
-        VIEW --> CACHE
+        AXUM --> VAL
+        BUF -->|"flush"| HOT
+        VIEW --> POOL
         QH --> AXUM
     end
 ```
 
----
+An accepted event lives first in the **in-memory buffer**, which is neither
+durable nor queryable. A flush moves it into the hot table and on to Parquet in
+one step. Everything else (hot table, Parquet) is durable; see
+[Data Management](data-management.md).
 
-## Event Ingestion Pipeline
+## Request handling
 
-Every `POST /api/event` request passes through a sequential pipeline of validation and enrichment steps before being buffered.
+Layers, outermost first (`src/server.rs`): HTTP metrics (so counters see the
+status the client receives), tracing, the 30-second timeout (`408`), response
+compression, security headers, `X-Request-ID`. Inside, `/api` has three groups:
 
-```mermaid
-flowchart TD
-    START(["POST /api/event\nJSON body"])
+| Group | Routes | Extra layers |
+|---|---|---|
+| Ingestion | `/api/event` (`POST`, `GET`, `HEAD`) | permissive CORS (24 h preflight cache), 64 KB body limit |
+| Auth | `/api/auth/*` | none (CSRF check inside the handlers) |
+| Protected | `/api/sites`, `/api/stats/*`, `/api/keys*`, `/api/gdpr/erase` | `require_auth` (reads), plus `require_admin_auth` for keys and erasure, dashboard CORS |
 
-    START --> SZ{"Body size\n&le; 64 KB?"}
-    SZ -->|"No"| R413["413 Request\nEntity Too Large"]
-    SZ -->|"Yes"| OC
+Outside `/api`: `/health*`, `/metrics`, `/mallard.js` and `/js/script.js` (the
+tracker is compiled into the binary from `tracking/script.js`), `/robots.txt`,
+`/.well-known/security.txt`, and the embedded dashboard for everything else.
 
-    OC{"Origin in\nallowlist?"}
-    OC -->|"No (if configured)"| R403["403 Forbidden"]
-    OC -->|"Yes"| RL
-
-    RL{"Rate limit\nexceeded?"}
-    RL -->|"Yes"| R429["429 Too Many Requests\nRetry-After header"]
-    RL -->|"No"| SITEID
-
-    SITEID{"site_id valid?\na-z A-Z 0-9 .-: max 256 chars"}
-    SITEID -->|"No"| R400["400 Bad Request"]
-    SITEID -->|"Yes"| BOT
-
-    BOT{"Bot\nUser-Agent?"}
-    BOT -->|"Yes"| DISCARD["Silently discarded\n202 Accepted"]
-    BOT -->|"No"| UA
-
-    UA["Parse User-Agent\nbrowser, OS, device type"]
-    UA --> GEO
-
-    GEO["GeoIP Lookup\ncountry, region, city\nGraceful fallback if no DB"]
-    GEO --> VID
-
-    VID["Compute Visitor ID\nHMAC-SHA256\nIP plus UA plus daily-salt\nDiscard IP immediately"]
-    VID --> URL
-
-    URL["Parse URL\npathname, hostname\nUTM parameters"]
-    URL --> BUF
-
-    BUF["Push to In-Memory Buffer"]
-    BUF --> THR{"Buffer count\n>= flush_event_count?"}
-    THR -->|"Yes"| FLUSH["Flush to DuckDB\nAppender API batch insert"]
-    THR -->|"No"| R202
-    FLUSH --> R202
-
-    R202(["202 Accepted"])
-```
-
----
-
-## Two-Tier Storage Model
-
-Mallard Metrics stores events in two complementary tiers, always queried together via the `events_all` VIEW.
-
-```mermaid
-flowchart LR
-    INGEST["Ingestion\nEvent Buffer"]
-
-    subgraph HOT["Hot Tier — DuckDB (mallard.duckdb)"]
-        EVENTS["events table\nrecently arrived events\nWAL-backed, survives SIGKILL"]
-    end
-
-    subgraph COLD["Cold Tier — Parquet on Disk"]
-        P1["site_id=example.com/\ndate=2024-01-15/\n0001.parquet"]
-        P2["site_id=example.com/\ndate=2024-01-16/\n0001.parquet"]
-        P3["site_id=other.org/\ndate=2024-01-15/\n0001.parquet"]
-    end
-
-    subgraph UNIFIED["Unified Query Layer"]
-        VIEW["events_all VIEW\nSELECT * FROM events\nUNION ALL\nSELECT * FROM read_parquet(...)"]
-    end
-
-    INGEST -->|"flush"| EVENTS
-    EVENTS -->|"COPY TO ZSTD"| P1
-    EVENTS -->|"COPY TO ZSTD"| P2
-    EVENTS -->|"COPY TO ZSTD"| P3
-    EVENTS -->|"hot events"| VIEW
-    P1 -->|"read_parquet()"| VIEW
-    P2 -->|"read_parquet()"| VIEW
-    P3 -->|"read_parquet()"| VIEW
-    VIEW --> ANALYTICS["Analytics Queries\nGET /api/stats/*"]
-```
-
-**Hot tier** (`data/mallard.duckdb`): Stores events that have been buffered but not yet flushed. Events here are immediately queryable. The DuckDB WAL provides durability — hot events survive a `SIGKILL` (crash), not just a graceful `SIGTERM`.
-
-**Cold tier** (`.parquet` files): After flushing, events are written as ZSTD-compressed Parquet files partitioned by site and date. These files are the primary durability layer for historical data and can be queried independently with any Parquet-compatible tool (DuckDB CLI, pandas, Apache Spark).
-
-Each file is written under a temporary `.parquet.tmp` name and renamed into
-place, and the read glob only matches `*.parquet`. A crash or a full disk
-mid-write therefore leaves a partial file that no query can see, rather than a
-truncated file that blocks every read of that partition. Any temporary files
-left by an earlier crash are swept at startup.
-
-**Compaction.** A 60-second flush interval writes about 1,440 files per site per
-day, and DuckDB reads the footer of every matching file on every query — so scan
-cost would grow with uptime. Once a partition holds more than
-`compact_after_files` files they are merged into one, again through a temporary
-file and a rename, so an interruption leaves either the old files or the new one
-and never neither.
-
-**The `events_all` VIEW** is created at startup and refreshed after each flush
-that wrote files. It transparently unions the hot and cold tiers so all
-analytics queries work correctly regardless of which tier the data resides in.
-DuckDB connections opened against one database share a catalog, so refreshing it
-on the writer connection is enough for the whole read pool.
-
-The cold-tier directory layout:
-
-```
-data/events/
-├── site_id=example.com/
-│   ├── date=2024-01-15/
-│   │   ├── 0001.parquet
-│   │   └── 0002.parquet
-│   └── date=2024-01-16/
-│       └── 0001.parquet
-└── site_id=other-site.org/
-    └── date=2024-01-15/
-        └── 0001.parquet
-```
-
----
-
-## Authentication Architecture
+## Event ingestion pipeline
 
 ```mermaid
 flowchart TD
-    subgraph CREDS["Credentials at Rest"]
-        HASH["Admin Password\nArgon2id hash PHC defaults\nmemory-only at runtime"]
-        KEYS["API Keys\nmm_ prefix plus 256-bit random\nSHA-256 hash on disk\nJSON file in data_dir"]
-        SESS["Session Tokens\n256-bit OS CSPRNG\nHashMap with TTL expiry\nHttpOnly SameSite=Strict"]
-    end
-
-    BROWSER["Browser"] -->|"POST /api/auth/login\npassword"| ARGON
-    ARGON["Argon2id verify"] -->|"match"| SESS
-    SESS -->|"session cookie\nHttpOnly Secure SameSite=Strict"| BROWSER
-
-    APICLIENT["API Client"] -->|"Authorization: Bearer mm_xxx\nor X-API-Key: mm_xxx"| KEYCHECK
-    KEYCHECK["SHA-256 hash\nconstant-time compare"] -->|"valid"| SCOPE
-
-    SCOPE{"Scope check"}
-    SCOPE -->|"ReadOnly key"| READONLY["GET /api/stats/*\nGET /api/keys/*"]
-    SCOPE -->|"Admin key"| ADMIN["All routes\nincluding POST /api/keys\nDELETE /api/keys/*"]
-
-    BROWSER -->|"GET /api/stats/*\nauto-sent cookie"| SESSMW
-    SESSMW["Session middleware\nTTL check"] -->|"valid"| ROUTE
-
-    ROUTE["Route Handler"]
-
-    CSRF["CSRF check\nOrigin vs dashboard_origin"] -.->|"state-mutating\nroutes only"| ROUTE
-    BF["Brute-force check\nper-IP attempt counting\nconfigurable lockout"] -.->|"login endpoint"| ARGON
+    START(["POST /api/event"]) --> SZ{"Body at most 64 KB?"}
+    SZ -->|"no"| R413["413"]
+    SZ -->|"yes"| JS{"Valid JSON,\nrequired fields?"}
+    JS -->|"no"| R4XX["400 / 415 / 422"]
+    JS -->|"yes"| OC{"Origin allowed?\nno Origin passes"}
+    OC -->|"no"| R403["403"]
+    OC -->|"yes"| LEN{"Fields non-empty\nand within limits?"}
+    LEN -->|"no"| R400["400"]
+    LEN -->|"yes"| SID{"Site ID characters valid?"}
+    SID -->|"no"| R400
+    SID -->|"yes"| AL{"site_ids set and\nd not in it?"}
+    AL -->|"yes"| R403
+    AL -->|"no"| RL{"Per-site or per-IP\nlimit exceeded?"}
+    RL -->|"yes"| R429["429 + Retry-After"]
+    RL -->|"no"| BOT{"Bot User-Agent?"}
+    BOT -->|"yes"| DROP["202, dropped"]
+    BOT -->|"no"| ENRICH["Parse User-Agent and hints\nGeoIP lookup\nvisitor ID, IP discarded\nURL path, UTM, referrer source\nprivacy flags applied"]
+    ENRICH --> PUSH["Push to buffer"]
+    PUSH --> CAP{"Buffer full\nor closed?"}
+    CAP -->|"yes"| R503["503"]
+    CAP -->|"no"| THR{"Reached\nflush_event_count?"}
+    THR -->|"yes"| FL["Flush on this request"]
+    THR -->|"no"| OK
+    FL --> OK(["202 Accepted"])
 ```
 
-### Key Security Properties
-
-| Property | Implementation |
-|---|---|
-| Password storage | Argon2id hash (PHC defaults), never stored in plaintext |
-| Session tokens | 256-bit OS CSPRNG; `HashMap` with TTL; cleared on restart |
-| API key storage | SHA-256 hash on disk; plaintext returned only at creation |
-| Timing attacks | Constant-time comparison for API key validation |
-| Session cookies | `HttpOnly; Secure; SameSite=Strict` |
-| CSRF | Origin/Referer validation on all state-mutating session-auth routes |
-| Brute force | Per-IP attempt counting; configurable lockout and `Retry-After` |
-
----
-
-## Behavioral Extension
-
-Advanced analytics rely on the DuckDB [`behavioral` extension](https://github.com/tomtom215/duckdb-behavioral), which provides window aggregate functions purpose-built for clickstream analysis.
+## Three tiers and one view
 
 ```mermaid
 flowchart LR
-    subgraph EXT["behavioral extension"]
-        SESS_F["sessionize()\nGroup events into sessions\nby visitor and time gap"]
-        FUNNEL_F["window_funnel()\nMulti-step ordered\nconversion funnel"]
-        RET_F["retention()\nWeekly cohort\nretention grid"]
-        SEQ_F["sequence_match()\nBehavioral pattern\ndetection"]
-        FLOW_F["sequence_next_node()\nNext-page\nflow analysis"]
+    ING["Ingestion"] --> BUF["Buffer (memory)\nlost on SIGKILL\nnot queryable"]
+
+    subgraph HOT["mallard.duckdb"]
+        EV["events table\nrows between insert and Parquet publish,\nor stranded by a failed write"]
     end
 
-    subgraph API["Behavioral Endpoints"]
-        direction TB
-        S["/api/stats/sessions"]
-        FU["/api/stats/funnel"]
-        R["/api/stats/retention"]
-        SQ["/api/stats/sequences"]
-        FL["/api/stats/flow"]
+    subgraph COLD["data_dir/events/"]
+        P1["site_id=a/date=D1/\n0001.parquet ... 0025.m1.parquet"]
+        P2["site_id=a/date=D2/ ..."]
     end
 
-    SESS_F --> S
-    FUNNEL_F --> FU
-    RET_F --> R
-    SEQ_F --> SQ
-    FLOW_F --> FL
-
-    CORE["Core analytics\n/api/stats/main\n/api/stats/timeseries\n/api/stats/breakdown/*"] -.->|"no extension\nrequired"| ALWAYS["Always available"]
+    BUF -->|"flush"| EV
+    EV -->|"stage, delete, publish"| P1
+    EV --> P2
+    EV --> VIEW["events_all view"]
+    P1 --> VIEW
+    P2 --> VIEW
+    VIEW --> Q["Analytics queries"]
 ```
 
-The extension is loaded at startup:
+`events_all` is `SELECT <columns> FROM events UNION ALL SELECT ... FROM
+read_parquet('events/site_id=*/date=*/*.parquet', hive_partitioning)` with the
+columns named explicitly so a new column cannot misalign against older files; the
+directory keys give the planner partition pruning by site. The glob is
+re-expanded on every query. On a fresh install, before any Parquet file exists,
+the view is hot-only; it is rebuilt after a flush that writes the first file and
+after retention or erasure removes partitions. `/health/detailed` reports the
+`cold_tier` state.
 
-```sql
-INSTALL behavioral FROM community;
-LOAD behavioral;
+## Flush, compaction and recovery
+
+```mermaid
+sequenceDiagram
+    participant W as Flush
+    participant T as Tier lock
+    participant H as Hot table
+    participant D as Disk
+    participant C as Compactor
+
+    W->>T: take exclusive lock, then writer connection
+    W->>H: recover interrupted flushes (once per process)
+    W->>H: insert drained buffer (one transaction)
+    loop each site-day, at most 256
+        W->>D: write NNNN.parquet.pending, fsync
+        W->>H: DELETE the partition rows (commit)
+        W->>D: rename to NNNN.parquet, fsync directory
+    end
+    W->>H: refresh events_all
+    W->>T: release
+    W->>C: compact touched partitions
+    C->>D: merge files of one level into NNNN.mK.parquet (no lock)
+    C->>T: exclusive lock for the swap only
+    C->>D: sources to .del, rename merged in, fsync, unlink .del
+    C->>T: release
 ```
 
-If loading fails — no network on first run, or an air-gapped environment — the
-extension-dependent endpoints return **`503` with an explanation** and
-`/api/stats/main` reports its session-derived fields as `null`. They deliberately
-do not return zeros: a flat `0.0` bounce rate is indistinguishable from a site
-where every visitor bounces, so a missing dependency would look like a finding.
+- **Crash points.** After the staged file is written: duplicate, dropped by
+  recovery because its rows are still hot. After the `DELETE`: the staged file is
+  the only copy and recovery publishes it. Decided by comparing row content
+  (`EXCEPT ALL`), not by "does the partition have hot rows". After the merged
+  file is published: leftover `.del` files are deleted. With a staging file plus
+  `.del` files: the sources are restored.
+- **Startup order** (`main.rs`): load and validate config; open DuckDB and apply
+  settings; run migrations; load the behavioral extension; clean temporary files;
+  recover pending flushes; build `events_all`; open the reader pool and load the
+  extension on each reader; load the secret, admin hash and API keys; spawn the
+  flush task (every `flush_interval_secs`), the retention task (if enabled; first
+  run at startup, then daily) and the 15-minute housekeeping task; bind and serve.
+  The port is not bound until the extension download attempt finished.
 
-Core analytics — visitors, pageviews, breakdowns, time series, goals, revenue and
-custom properties — continue working. `GET /health/detailed` reports both
-`behavioral_extension_loaded` and `behavioral_version`, and `GET /metrics`
-exposes the `mallard_behavioral_extension` gauge.
+## Concurrency: tier lock, connections, reader pool
 
----
+`TierLock` is a reader-writer lock around the windows in which hot table and
+Parquet disagree (a flush between its `DELETE` and the rename, a compaction swap,
+retention and erasure). Analytics queries hold the **shared** side only while they
+execute; writers hold the exclusive side only for those windows. A query can
+therefore never count a row twice or miss one. Compaction's expensive merge is
+outside the lock.
 
-## Module Map
+`ReaderPool` holds `read_connections` (default 4) DuckDB connections cloned from
+the writer, handed out round-robin. They share one buffer pool and catalog, so a
+view refresh on the writer is seen by all of them, but the extension is armed
+per connection and is loaded on each. With `read_connections` 0 or 1 reads share
+the writer connection and a slow query can block ingestion.
+
+**Lock order.** Flush: tier lock, then connection. Readers take their
+connection first, then *try* the tier lock; if a writer holds it they release the
+connection, wait for the writer, and start over, so a reader never blocks on the
+tier lock while holding a connection a flush needs.
+
+**Query execution.** Every report passes a semaphore of
+`max_concurrent_queries` slots. A request waits up to 10 s for a slot (`429`
+after), and a watchdog interrupts the statement through DuckDB's interrupt handle
+after 20 s (`504`), repeating the interrupt until the statement stops. Results
+are cached by endpoint, site, range, parameters and parsed filters for
+`cache_ttl_secs`; the cache is cleared for a site on erasure (an epoch check stops
+an in-flight result from being cached after an erasure) and entirely after
+retention removes data.
+
+## Shutdown
+
+```mermaid
+sequenceDiagram
+    participant OS as Signal
+    participant S as HTTP server
+    participant B as Buffer
+    participant D as Disk
+
+    OS->>S: SIGTERM or SIGINT
+    S->>S: stop accepting, drain in-flight requests
+    Note over S: bounded by shutdown_timeout_secs
+    S->>B: close buffer (late requests get 503)
+    B->>D: shutdown_flush: flush until buffer and hot table are empty
+    Note over B,D: bounded by shutdown_timeout_secs again
+    B-->>OS: exit
+```
+
+Draining comes first on purpose: closing the buffer first would turn requests
+that are still in flight into `503`s. Because each phase has its own bound, the
+worst case is twice `shutdown_timeout_secs`. `SIGKILL` skips all of it.
+
+## Authentication
+
+```mermaid
+flowchart TD
+    subgraph AT["At rest"]
+        HASH["Admin password\nArgon2id hash\ndata_dir/admin.json, 0600\nor MALLARD_ADMIN_PASSWORD"]
+        KEYS["API keys\nmm_ + 256-bit random\nSHA-256 hash in api_keys.json"]
+        SESS["Sessions\n256-bit tokens, in memory\nTTL, capped"]
+    end
+
+    BROWSER["Browser"] -->|"POST /api/auth/login"| LOCK{"Attempt counter\nper IPv4 or IPv6 /64"}
+    LOCK -->|"locked"| R429["429 + Retry-After"]
+    LOCK -->|"admitted, counted"| ARGON["Argon2id verify\nat most 4 at once"]
+    ARGON -->|"match"| SESS
+    SESS -->|"HttpOnly SameSite=Strict cookie"| BROWSER
+
+    CLIENT["API client"] -->|"Bearer or X-API-Key"| KEYCHK["SHA-256, constant-time compare"]
+    KEYCHK --> SCOPE{"Scope"}
+    SCOPE -->|"ReadOnly"| RD["read routes"]
+    SCOPE -->|"Admin"| AD["read + keys + erasure"]
+
+    SESS --> RD
+    SESS --> AD
+    CSRF["CSRF origin check\nwhen dashboard_origin is set"] -.-> AD
+```
+
+Before an admin password exists, read routes are open and admin routes answer
+`401`. See [Security](security.md).
+
+## Behavioral extension
+
+```mermaid
+flowchart LR
+    subgraph EXT["behavioral extension 0.10.0+"]
+        SESSF["sessionize()"]
+        FUNF["window_funnel()"]
+        RETF["retention()"]
+        SEQF["sequence_match()"]
+        FLOWF["sequence_next_node()"]
+    end
+
+    SESSF --> SE["/api/stats/main (session fields)\n/api/stats/sessions\nentry and exit pages"]
+    FUNF --> FU["/api/stats/funnel"]
+    RETF --> RE["/api/stats/retention"]
+    SEQF --> SQ["/api/stats/sequences"]
+    FLOWF --> FL["/api/stats/flow"]
+
+    CORE["visitors, pageviews, breakdowns,\ntime series, goals, revenue,\nproperties, realtime, export"] -.->|"no extension needed"| ALWAYS["always available"]
+```
+
+`INSTALL behavioral FROM community; LOAD behavioral;` runs at startup and the
+version must be at least 0.10.0. If it cannot load, the server still starts and
+the left-hand endpoints answer `503`; core analytics keep working. The same
+endpoints are refused while timestamps are rounded to the hour. The extension is
+published per DuckDB version and **only for glibc platforms**, which is why the
+image is glibc and there is no musl build. See
+[Behavioral Analytics](behavioral-analytics.md) and
+[Troubleshooting](troubleshooting.md#behavioral-endpoints-answer-503).
+
+## Module map
 
 | Module | Purpose |
 |---|---|
-| `lib.rs` | Library root; the binary is a thin wrapper over it |
-| `main.rs` | Startup, background tasks, `--healthcheck`, graceful shutdown |
-| `config.rs` | TOML + environment variable configuration, validation, advisories |
-| `server.rs` | Axum router, CORS, middleware stack, `/metrics`, health probes |
-| `test_support.rs` | `AppState` builder shared by unit and integration tests |
-| `ingest/handler.rs` | `POST /api/event` and the `GET` pixel; shared event construction |
-| `ingest/buffer.rs` | Bounded in-memory event buffer with periodic flush |
-| `ingest/visitor_id.rs` | HMAC-SHA256 visitor ID and epoch-aligned salt rotation |
-| `ingest/useragent.rs` | User-Agent and Client Hints parsing |
-| `ingest/geoip.rs` | MaxMind GeoIP reader with graceful fallback |
-| `ingest/ratelimit.rs` | Per-site and per-IP token-bucket rate limiters |
-| `storage/mod.rs` | `ReaderPool` — round-robin read connections |
-| `storage/schema.rs` | DuckDB table definitions and the `events_all` view |
-| `storage/parquet.rs` | Atomic Parquet writes, compaction, retention, erasure |
-| `storage/migrations.rs` | Schema versioning |
-| `query/mod.rs` | `QueryScope` — the site, range and session window every query shares |
-| `query/metrics.rs` | Core metrics, including `sessionize`-derived session metrics |
-| `query/breakdowns.rs` | Dimension breakdown queries |
-| `query/timeseries.rs` | Gap-filled time-bucketed aggregations |
-| `query/realtime.rs` | Last-N-minutes activity snapshot |
-| `query/funnel.rs` | `window_funnel` cumulative funnels with ordering modes |
-| `query/retention.rs` | Per-visitor weekly retention cohorts |
-| `query/sequences.rs` | `sequence_match` / `sequence_count` execution |
-| `query/flow.rs` | `sequence_next_node` forward and backward flow analysis |
-| `query/events.rs` | Goal conversions and custom property keys and values |
-| `query/revenue.rs` | Per-currency revenue totals |
-| `query/export.rs` | Daily and raw event export as CSV or JSON |
-| `query/cache.rs` | TTL + LRU query result cache |
-| `query/test_support.rs` | `TestDb` — a seeded database for query tests |
-| `api/stats.rs` | All analytics API handlers |
-| `api/errors.rs` | API error types, including the 503 for a missing extension |
-| `api/auth.rs` | Origin validation, session auth, API key management |
-| `dashboard/` | Embedded SPA (Preact + HTM, no build step) |
-| `tracking/script.js` | The tracking script, compiled into the binary |
-
-`query/sessions.rs` no longer exists: computing session metrics separately meant
-scanning the events twice for one dashboard panel, so it was folded into
-`query/metrics.rs`.
+| `main.rs` | Startup order, background tasks, `--healthcheck`, `--install-extension`, signals, shutdown |
+| `lib.rs` | Library root; the binary is a thin wrapper |
+| `config.rs` | TOML and environment configuration, validation, advisories |
+| `server.rs` | Router, middleware, CORS, security headers, `/metrics`, health probes |
+| `test_support.rs` | `AppState` builder for tests |
+| `ingest/handler.rs` | `POST/GET /api/event`; shared event construction; client-address resolution; `AppState` |
+| `ingest/buffer.rs` | Bounded in-memory buffer, flush, `shutdown_flush`, compaction trigger |
+| `ingest/visitor_id.rs` | Salt derivation and HMAC visitor ID |
+| `ingest/useragent.rs` | User-Agent and Client Hints parsing, bot detection |
+| `ingest/geoip.rs` | MaxMind reader |
+| `ingest/ratelimit.rs` | Token-bucket limiters (site, IP) with bounded key tables |
+| `storage/mod.rs` | `TierLock`, `ReaderPool` |
+| `storage/schema.rs` | Table, `events_all` view, extension loading and version check, cold-tier status |
+| `storage/parquet.rs` | Staged flush, recovery, compaction, retention, erasure |
+| `storage/migrations.rs` | Schema versioning (refuses a newer database) |
+| `query/mod.rs` | `QueryScope` (site, range, session window, filters) |
+| `query/sessions.rs` | The one definition of a session (shared by metrics and entry/exit) |
+| `query/metrics.rs` | Headline and session metrics |
+| `query/breakdowns.rs` | Twenty dimensions, entry/exit pages |
+| `query/timeseries.rs` | Gap-filled buckets |
+| `query/realtime.rs` | Last-N-minutes snapshot |
+| `query/funnel.rs`, `retention.rs`, `sequences.rs`, `flow.rs` | Behavioral reports |
+| `query/events.rs`, `revenue.rs` | Goals, properties, revenue |
+| `query/export.rs` | Daily and raw export (a chunked exporter exists but is not yet used by the handler) |
+| `query/cache.rs` | TTL and LRU result cache with an erasure epoch |
+| `api/stats.rs` | All analytics and erasure handlers, query execution (slots, deadline) |
+| `api/errors.rs` | `ApiError`, status and `code` mapping |
+| `api/auth.rs` | Sessions, API keys, admin password, CSRF, lockout, middleware |
+| `dashboard/` | Embedded SPA assets (`app.js`, `api.js`, `format.js`, `theme.js`, `style.css`) and the tracker route |

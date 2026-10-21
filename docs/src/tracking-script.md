@@ -2,7 +2,9 @@
 
 The tracking script is served from `GET /mallard.js` (and `GET /js/script.js`,
 an alias for people migrating from Plausible). It sets no cookies, writes nothing
-to browser storage, and is about 3.8 KB over the wire once gzipped.
+to browser storage (it **reads** one key, `mallard_ignore`, for the opt-out), and
+is about 4 KB over the wire once gzipped (4,008 bytes as served by the current
+build; 11,058 bytes raw). It is served with `Cache-Control: public, max-age=3600`.
 
 The script is compiled into the binary from a single source file,
 [`tracking/script.js`](https://github.com/tomtom215/mallardmetrics/blob/main/tracking/script.js).
@@ -28,10 +30,11 @@ browsers — it is deliberately kept short and readable rather than minified.
 | `data-exclude` | (none) | Comma-separated path patterns to skip. `*` is a wildcard, e.g. `/admin/*,/preview/*`. |
 | `data-include-local` | `false` | Also send from `localhost`, `file:` and private addresses. Off by default so local development does not pollute production data. |
 | `data-honor-dnt` | `false` | Skip tracking when the browser sends Do Not Track or Global Privacy Control. |
-| `data-hash` | `false` | Treat `hashchange` as a pageview, for hash-based routers. |
+| `data-hash` | `false` | Treat `hashchange` as a pageview, for hash-based routers. A route fragment is reported as a path: `#/pricing` becomes `/pricing`, and `/app/#/pricing` becomes `/app/pricing`. A fragment that does not start with `/` (`#section`) is not a route and is ignored. |
 | `data-outbound` | `false` | Record clicks on links to other origins as `Outbound Link: Click`. |
 | `data-downloads` | `false` | Record clicks on file links as `File Download`. |
 | `data-download-ext` | (common formats) | Override the extensions treated as downloads, e.g. `pdf,zip,csv`. |
+| `data-link-query` | `false` | Keep the query string and fragment on the URL reported by outbound-link and download events. By default only origin plus path is sent, because queries can carry tokens or email addresses. |
 
 ## What is sent
 
@@ -41,13 +44,14 @@ A pageview carries only what an aggregate report needs:
 |---|---|
 | `d` | `data-domain` |
 | `n` | Event name (`pageview`, or your own) |
-| `u` | `window.location.href` — the server keeps only the path |
-| `r` | `document.referrer`, **only when it is from another origin** |
-| `w` | `window.innerWidth` |
+| `u` | `window.location.href` — the server keeps only the path (and extracts `utm_*` first). With `data-hash`, a route fragment is folded into the path |
+| `r` | `document.referrer`, **only when it is from another origin**, and **only until the first in-page navigation**: later route changes send no referrer, because `document.referrer` still names the original source |
+| `w` | `window.innerWidth` (viewport width, not screen width) |
 
 Same-origin referrers are dropped in the browser. Sending them would make every
 internal navigation look like an acquisition, and your own site would appear as
-its own top traffic source.
+its own top traffic source. The width is stored as `screen_size`, so the
+`screen-sizes` breakdown is a viewport-width breakdown.
 
 The User-Agent is read from the request header server-side and parsed into
 browser and OS names. Where the browser sends
@@ -67,7 +71,8 @@ Repeated navigations to the same path do not double-count.
 
 A page the browser is *prerendering* is not counted while it is hidden — the
 visitor may never look at it. If the prerender is activated, the pageview fires
-then, once.
+then, once. A page restored from the back/forward cache (`pageshow` with
+`persisted`) is counted again, since the script does not re-run.
 
 ## Custom events
 
@@ -90,7 +95,7 @@ mallard('form_submit', {
 
 | Option | Type | Description |
 |---|---|---|
-| `props` | object | Custom properties, stored as JSON. Must be an object; anything else is dropped server-side. Query them at `/api/stats/property-values`. |
+| `props` | object | Custom properties, stored as JSON. Must be an object; anything else is dropped server-side (the event is still recorded). Max 4096 characters of JSON. Query them at `/api/stats/property-values`. |
 | `revenue` | number | Revenue amount, stored as `DECIMAL(12,2)`. |
 | `currency` | string | ISO 4217 alphabetic code, e.g. `"USD"`. Validated and uppercased. |
 | `url` | string | Override the recorded URL. |
@@ -135,11 +140,15 @@ Set `data-outbound` and `data-downloads` rather than writing your own handlers:
 ```
 
 Both use `navigator.sendBeacon`, which survives the page unload that follows the
-click — so no navigation delay is needed and no clicks are lost.
+click — so no navigation delay is needed and no clicks are lost. The events are
+named `Outbound Link: Click` and `File Download`, and carry the destination in the
+custom property `url` (origin plus path unless `data-link-query` is set); break it
+down at `/api/stats/property-values?key=url&event=Outbound%20Link%3A%20Click`.
 
 ## Opting out
 
-Two mechanisms, both entirely client-side:
+Two mechanisms, both entirely client-side. The script reads exactly one browser
+storage key, `mallard_ignore`; it writes nothing.
 
 ```javascript
 // Stop this browser from being counted, e.g. your own visits.
@@ -179,8 +188,12 @@ curl -X POST https://your-instance.com/api/event \
   }'
 ```
 
+Send a browser-like `User-Agent` from server-side code: the default of curl and
+many HTTP libraries is classed as a bot, and such events are answered `202` and
+dropped.
+
 There is also a pixel endpoint for contexts without JavaScript, such as HTML
-email:
+email (it always answers with a GIF; see the API reference for what it records):
 
 ```html
 <img src="https://your-instance.com/api/event?d=your-site.com&n=email_open&u=https%3A%2F%2Fexample.com%2Fnewsletter" width="1" height="1" alt="">

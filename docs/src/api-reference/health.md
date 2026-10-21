@@ -1,143 +1,122 @@
 # Health & Metrics Endpoints
 
-These endpoints are publicly accessible (no authentication required) and are designed for monitoring and orchestration systems.
+These endpoints need no login. They are meant for load balancers, orchestrators
+and Prometheus. All examples below are real output from a 0.2.0 binary.
 
 ---
 
 ## `GET /health`
 
-Simple liveness check. Returns HTTP 200 when the server process is running.
+Liveness. `200` with the plain-text body `ok` whenever the process answers.
 
 ```
 HTTP/1.1 200 OK
-Content-Type: text/plain
+content-type: text/plain; charset=utf-8
 
 ok
 ```
 
-Use this with your load balancer or container orchestrator liveness probe.
+Use it as a liveness probe. It does not touch the database.
 
 ---
 
 ## `GET /health/ready`
 
-Readiness probe. Executes a lightweight DuckDB query to verify the database is operational.
+Readiness. Runs `SELECT 1 FROM events_all LIMIT 0` on a read connection.
 
-**Success (200):**
-```
-HTTP/1.1 200 OK
-Content-Type: text/plain
+| Status | Body | Meaning |
+|---|---|---|
+| 200 | `ready` | DuckDB is reachable and `events_all` is queryable. |
+| 503 | `database not ready` | The query failed. |
 
-ready
-```
-
-**Not ready (503):**
-```
-HTTP/1.1 503 Service Unavailable
-Content-Type: text/plain
-
-database not ready
-```
-
-Use this as your Kubernetes readiness probe or Docker health check. Do not use it as a liveness probe — a 503 here means the database is temporarily unavailable, not that the process is dead.
+Use it as a readiness probe, not liveness: a `503` means "hold traffic", and
+restarting rarely helps. The container image's `HEALTHCHECK`
+(`mallard-metrics --healthcheck`) probes this path on the loopback address.
 
 ---
 
 ## `GET /health/detailed`
 
-Detailed system status in JSON. Returns component-level health information.
+Component status as JSON. Unauthenticated, so it deliberately omits whether an
+admin password is set, how many sessions are live, and whether proxy headers are
+trusted (those are on `/metrics`, which can be token-protected).
 
 ```json
 {
-  "status": "ok",
-  "version": "0.1.0",
-  "buffered_events": 42,
-  "auth_configured": true,
-  "geoip_loaded": false,
   "behavioral_extension_loaded": true,
+  "behavioral_version": "0.10.0",
+  "buffer_empty": true,
+  "buffered_events": 0,
+  "cache_empty": true,
+  "cache_entries": 0,
+  "cold_tier": "healthy",
+  "dropped_events": 0,
   "filter_bots": true,
-  "cache_entries": 3,
-  "cache_empty": false
+  "geoip_loaded": false,
+  "read_connections": 4,
+  "session_window": "30 minutes",
+  "status": "ok",
+  "version": "0.2.0",
+  "visitor_salt_rotation_days": 1
 }
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `status` | string | Always `"ok"` when the server is running. |
-| `version` | string | Binary version from `Cargo.toml`. |
-| `buffered_events` | integer | Events in the in-memory buffer, not yet flushed to Parquet. |
-| `auth_configured` | boolean | Whether an admin password has been set. |
-| `geoip_loaded` | boolean | Whether a MaxMind GeoLite2 database was successfully loaded. |
-| `behavioral_extension_loaded` | boolean | Whether the DuckDB `behavioral` extension loaded successfully at startup. |
-| `filter_bots` | boolean | Whether bot filtering is active. |
-| `cache_entries` | integer | Number of cached query results currently in memory. |
-| `cache_empty` | boolean | `true` if the query cache is empty. |
+| `status` | string | `"ok"`, or `"degraded"` (HTTP **503**) when `cold_tier` is `degraded`. |
+| `cold_tier` | string | `healthy`: the Parquet files are being read. `empty`: no Parquet files exist yet (normal on a fresh install). `degraded`: Parquet files exist but `events_all` does not read them, or reads a pattern that matches nothing, so reports silently omit flushed data. |
+| `version` | string | Binary version. |
+| `buffered_events` / `buffer_empty` | integer / boolean | Events in memory, not yet flushed (and not yet queryable). |
+| `dropped_events` | integer | Events discarded because the buffer hit `max_buffered_events`. Non-zero means data loss. |
+| `geoip_loaded` | boolean | A GeoIP database was opened. |
+| `behavioral_extension_loaded` | boolean | The extension installed and loaded at startup, at version 0.10.0 or newer. |
+| `behavioral_version` | string or `null` | Version the extension reports. |
+| `read_connections` | integer | Size of the read pool (1 means reads share the writer connection). |
+| `filter_bots` | boolean | Bot filtering is on. |
+| `session_window` | string | The session inactivity window as a DuckDB interval. |
+| `visitor_salt_rotation_days` | integer | Salt period; see [Privacy and GDPR](../privacy-gdpr.md). |
+| `cache_entries` / `cache_empty` | integer / boolean | Cached query results. |
+
+Removed since 0.1.x: `auth_configured`, `active_sessions` (use the
+`mallard_auth_configured` and `mallard_active_sessions` gauges).
+
+**A `503` here with `"status":"degraded"` is an outage that looks healthy**:
+ingestion and `/health` still succeed. See
+[Troubleshooting](../troubleshooting.md#degraded-cold-tier).
 
 ---
 
 ## `GET /metrics`
 
-Prometheus-compatible metrics in text exposition format (`text/plain; version=0.0.4`).
+Prometheus text exposition, `Content-Type: text/plain; version=0.0.4`.
 
-If `MALLARD_METRICS_TOKEN` is set, this endpoint requires `Authorization: Bearer <token>`. Returns `401 Unauthorized` without a valid token.
+If `MALLARD_METRICS_TOKEN` is set the request needs
+`Authorization: Bearer <token>` (compared in constant time). Without it the
+answer is `401` with the plain-text body `Unauthorized`.
 
-### Gauges
-
-```
-# HELP mallard_buffered_events Number of events in the in-memory buffer
-# TYPE mallard_buffered_events gauge
-mallard_buffered_events 42
-
-# HELP mallard_cache_entries Number of cached query results
-# TYPE mallard_cache_entries gauge
-mallard_cache_entries 3
-
-# HELP mallard_auth_configured Whether admin password is set
-# TYPE mallard_auth_configured gauge
-mallard_auth_configured 1
-
-# HELP mallard_geoip_loaded Whether GeoIP database is loaded
-# TYPE mallard_geoip_loaded gauge
-mallard_geoip_loaded 0
-
-# HELP mallard_filter_bots Whether bot filtering is enabled
-# TYPE mallard_filter_bots gauge
-mallard_filter_bots 1
-
-# HELP mallard_behavioral_extension Whether behavioral extension is loaded
-# TYPE mallard_behavioral_extension gauge
-mallard_behavioral_extension 1
+```bash
+curl -H "Authorization: Bearer $MALLARD_METRICS_TOKEN" http://localhost:8000/metrics
 ```
 
-### Counters
+The complete list of 23 metric families, with types and the exact `HELP` text, is on the
+[Monitoring](../monitoring.md#metric-reference) page. Highlights:
 
 ```
-# HELP mallard_events_ingested_total Total events ingested via POST /api/event
-# TYPE mallard_events_ingested_total counter
-mallard_events_ingested_total 158432
-
-# HELP mallard_flush_failures_total Total buffer flush failures
-# TYPE mallard_flush_failures_total counter
-mallard_flush_failures_total 0
-
-# HELP mallard_rate_limit_rejections_total Total requests rejected by per-site rate limiter
-# TYPE mallard_rate_limit_rejections_total counter
-mallard_rate_limit_rejections_total 17
-
-# HELP mallard_login_failures_total Total failed login attempts
-# TYPE mallard_login_failures_total counter
-mallard_login_failures_total 3
-
-# HELP mallard_cache_hits_total Total query cache hits
-# TYPE mallard_cache_hits_total counter
-mallard_cache_hits_total 9871
-
-# HELP mallard_cache_misses_total Total query cache misses
-# TYPE mallard_cache_misses_total counter
-mallard_cache_misses_total 1204
+# HELP mallard_build_info Version of this binary and of the loaded behavioral extension
+# TYPE mallard_build_info gauge
+mallard_build_info{version="0.2.0",behavioral_version="0.10.0"} 1
+# HELP mallard_events_dropped_total Events discarded because the buffer was at capacity
+# TYPE mallard_events_dropped_total counter
+mallard_events_dropped_total 0
+# HELP mallard_last_flush_success_timestamp_seconds Unix time of the last flush that completed without error (0 before the first)
+# TYPE mallard_last_flush_success_timestamp_seconds gauge
+mallard_last_flush_success_timestamp_seconds 1792541951
+# HELP mallard_http_requests_total HTTP responses served, by status class
+# TYPE mallard_http_requests_total counter
+mallard_http_requests_total{status="2xx"} 10
 ```
 
-### Prometheus Scrape Configuration
+### Prometheus scrape configuration
 
 ```yaml
 scrape_configs:
@@ -150,3 +129,8 @@ scrape_configs:
     authorization:
       credentials: your-metrics-bearer-token
 ```
+
+A ready-made scrape example, alert rules (with a unit-test file) and a Grafana
+dashboard are in `deploy/monitoring/` in the repository.
+
+`robots.txt` disallows `/api/`, `/health` and `/metrics`.
