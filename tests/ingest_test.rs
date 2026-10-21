@@ -2409,3 +2409,71 @@ async fn test_a_lone_start_date_is_a_bad_request() {
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
+
+// ── Site listing ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_sites_are_listed_most_active_first_with_30_day_counts() {
+    // The allowlist applies to ingestion too, so it has to name the sites that
+    // post events; "configured.test" is listed without ever having any.
+    let (state, _dir) = state_builder()
+        .allowed_sites(vec![
+            "busy.test".to_string(),
+            "quiet.test".to_string(),
+            "configured.test".to_string(),
+        ])
+        .build();
+    // Today's events, some flushed to Parquet and some still hot.
+    for _ in 0..4 {
+        post_event(&state, pageview("busy.test", "https://busy.test/")).await;
+    }
+    post_event(&state, pageview("quiet.test", "https://quiet.test/")).await;
+    flush(&state);
+    post_event(&state, pageview("busy.test", "https://busy.test/more")).await;
+    post_event(&state, pageview("quiet.test", "https://quiet.test/more")).await;
+    // A site whose only events are far outside the 30-day window.
+    state
+        .buffer
+        .conn()
+        .lock()
+        .execute_batch(
+            "INSERT INTO events (site_id, visitor_id, timestamp, event_name, pathname) \
+             SELECT 'old.test', 'v' || i, TIMESTAMP '2024-01-15 10:00:00' + INTERVAL (i) MINUTE, \
+                    'pageview', '/' FROM range(3) t(i)",
+        )
+        .unwrap();
+    flush(&state);
+
+    let json = body_json(get(&state, "/api/sites").await).await;
+    let ids: Vec<&str> = json["sites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(
+        ids,
+        ["busy.test", "quiet.test", "configured.test", "old.test"],
+        "most active first, then the quiet ones alphabetically"
+    );
+    let counts: Vec<(&str, u64)> = json["details"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["site_id"].as_str().unwrap(),
+                d["events_30d"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        counts,
+        [
+            ("busy.test", 5),
+            ("quiet.test", 2),
+            ("configured.test", 0),
+            ("old.test", 0)
+        ]
+    );
+}

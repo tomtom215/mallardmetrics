@@ -804,32 +804,101 @@ fn require_exact_timestamps(state: &AppState, feature: &str) -> Result<(), ApiEr
 
 // ── Endpoints ────────────────────────────────────────────────────────────
 
-/// GET /api/sites — site IDs that have data.
+/// One site in the `/api/sites` listing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteActivity {
+    pub site_id: String,
+    /// Events recorded in the last 30 days, today included (UTC). 0 for a site
+    /// that is known but quiet.
+    pub events_30d: u64,
+}
+
+/// Days of activity the site listing counts.
+pub const SITE_ACTIVITY_DAYS: u64 = 30;
+
+/// GET /api/sites — the sites that have data, most active first.
 ///
-/// The dashboard previously had no way to discover them, so an operator had to
-/// remember and retype each site ID.
+/// ```json
+/// {
+///   "sites": ["busy.example", "quiet.example"],
+///   "details": [
+///     {"site_id": "busy.example", "events_30d": 18423},
+///     {"site_id": "quiet.example", "events_30d": 0}
+///   ]
+/// }
+/// ```
+///
+/// `sites` is what the endpoint always returned, the IDs, and `details` carries
+/// the same IDs in the same order with their event counts over the last 30 days.
+/// The order is `events_30d` descending, then `site_id`, so a dashboard that
+/// opens the first site opens the one with traffic rather than the first
+/// alphabetically; it used to be alphabetical.
+///
+/// A site is listed if it has hot-tier rows, a Parquet partition on disk, or is
+/// in the configured allowlist. Sites are no longer discovered with a
+/// `SELECT DISTINCT` over `events_all`, which opened every Parquet file: the
+/// partition directories name the same sites, and the 30-day counts read only
+/// the files of the last 30 days.
 pub async fn list_sites(State(state): State<Arc<AppState>>) -> Result<impl IntoResponse, ApiError> {
     let configured = state.allowed_sites.clone();
     let storage = state.buffer.storage().clone();
 
-    let mut sites = run_query(&state, move |conn| {
-        let mut stmt = conn.prepare("SELECT DISTINCT site_id FROM events_all ORDER BY site_id")?;
-        let rows: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<_, _>>()?;
-        Ok(rows)
+    let today = chrono::Utc::now().date_naive();
+    let first_day = today
+        .checked_sub_days(chrono::Days::new(SITE_ACTIVITY_DAYS - 1))
+        .unwrap_or(today);
+    let since = first_day.to_string();
+    let until = today.succ_opt().unwrap_or(today).to_string();
+
+    let counted = run_scoped(&state, move |conn, cold| {
+        let source = cold.all_sites_source(first_day, today);
+        let mut counts = std::collections::BTreeMap::<String, u64>::new();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT site_id, COUNT(*) FROM {source} \
+             WHERE timestamp >= CAST(? AS TIMESTAMP) AND timestamp < CAST(? AS TIMESTAMP) \
+             GROUP BY site_id"
+        ))?;
+        let rows = stmt.query_map(duckdb::params![since, until], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })?;
+        for row in rows {
+            let (site, n) = row?;
+            counts.insert(site, n);
+        }
+        // Unflushed rows older than the window still make a site known.
+        let mut stmt = conn.prepare("SELECT DISTINCT site_id FROM events")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for row in rows {
+            counts.entry(row?).or_insert(0);
+        }
+        Ok(counts)
     })
     .await
-    // A site whose data lives only in Parquet is still discoverable from disk,
-    // and disk is also the fallback if the view cannot be queried.
-    .unwrap_or_default();
+    // Disk is also the fallback if the files cannot be queried.
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "Could not count recent events per site; listing sites without counts");
+        std::collections::BTreeMap::new()
+    });
 
-    sites.extend(storage.known_site_ids());
-    sites.extend(configured);
-    sites.sort_unstable();
-    sites.dedup();
+    let mut counts = counted;
+    for site in storage.known_site_ids().into_iter().chain(configured) {
+        counts.entry(site).or_insert(0);
+    }
+    let mut details: Vec<SiteActivity> = counts
+        .into_iter()
+        .map(|(site_id, events_30d)| SiteActivity {
+            site_id,
+            events_30d,
+        })
+        .collect();
+    details.sort_by(|a, b| {
+        b.events_30d
+            .cmp(&a.events_30d)
+            .then_with(|| a.site_id.cmp(&b.site_id))
+    });
+    let sites: Vec<&str> = details.iter().map(|d| d.site_id.as_str()).collect();
 
-    Ok(Json(serde_json::json!({ "sites": sites })))
+    Ok(Json(serde_json::json!({ "sites": sites, "details": details })))
 }
 
 /// The headline metrics, with or without the session pass.

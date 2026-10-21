@@ -52,6 +52,20 @@ impl<'a> ColdReads<'a> {
         scoped_events_sql(&self.storage.files_for_range(site_id, from, to))
     }
 
+    /// Like [`ColdReads::source`], over every site that has a partition on disk.
+    ///
+    /// For the site listing, which counts recent events per site. Costs one
+    /// directory listing per site and day.
+    pub fn all_sites_source(&self, from: NaiveDate, to: NaiveDate) -> String {
+        let files: Vec<_> = self
+            .storage
+            .known_site_ids()
+            .iter()
+            .flat_map(|site| self.storage.files_for_range(site, from, to))
+            .collect();
+        scoped_events_sql(&files)
+    }
+
     /// `scope` narrowed to the files its own time range can touch, widened by
     /// `lookback_days` for a query that deliberately reads before its start.
     ///
