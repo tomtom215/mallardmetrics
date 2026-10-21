@@ -25,6 +25,9 @@ sha2 = "0.11"
 subtle = "2.6.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# The `Stream` trait that `axum::body::Body::from_stream` takes; already in the
+# tree through tokio and axum.
+futures-core = "0.3.34"
 tokio = { version = "1.53.1", features = ["full"] }
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.0", features = ["cors", "compression-gzip", "trace", "timeout"] }

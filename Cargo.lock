@@ -1333,6 +1333,7 @@ dependencies = [
  "chrono",
  "criterion",
  "duckdb",
+ "futures-core",
  "hex",
  "hmac",
  "http-body-util",
