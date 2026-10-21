@@ -81,7 +81,7 @@ The `/api/stats/*`, `/api/sites` and `/api/gdpr/erase` handlers return
 
 | `code` | Status | Meaning |
 |---|---|---|
-| `bad_request` | 400 | Invalid parameter. `error` names it. |
+| `bad_request` | 400 | Invalid parameter. `error` names it. This includes a missing or mistyped query parameter and a malformed, mistyped or wrongly-typed JSON body on every route except `POST /api/event`; all are `400` (never `415` or `422`). |
 | `unauthorized` | 401 | Reserved. The auth middleware itself answers with an empty body. |
 | `not_found` | 404 | For example, revoking an unknown key. |
 | `internal_error` | 500 | A server-side fault. The body never contains internals; the cause is in the server log. |
@@ -98,13 +98,10 @@ Not every error body is JSON. These are produced before or outside the handlers
 |---|---|---|
 | No credentials, wrong key or no session on a read or admin route | 401 | empty |
 | `ReadOnly` key on an admin route; CSRF origin mismatch on an admin route | 403 | empty |
-| Missing or malformed query parameter (no `site_id`, no `start_date` on erase) | 400 | plain text: `Failed to deserialize query string: missing field ...` |
-| Malformed JSON body | 400 | plain text |
-| JSON body with a wrong type or a missing field | 422 | plain text |
-| JSON body without `Content-Type: application/json` | 415 | plain text |
+| Malformed body, wrong type, missing field or wrong `Content-Type` on `POST /api/event` | 400 | plain text (the browser beacon never reads it) |
 | Body over 64 KB on `/api/event` | 413 | plain text |
 | Request not finished in 30 s | 408 | empty |
-| `/api/auth/*` handler errors | 4xx/5xx | `{"error": "..."}` **without** `code` |
+| `/api/auth/*` handler errors | 4xx/5xx | `{"error": "..."}` **without** `code` (a malformed request body there *is* `bad_request` with a `code`) |
 | Ingest rejections (400, 403, 429) | | empty |
 
 Branch on the status first and use `code` when it is present.

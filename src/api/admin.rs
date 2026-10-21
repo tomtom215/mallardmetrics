@@ -1,10 +1,10 @@
 //! Operator actions that act on the whole instance.
 
-use crate::api::errors::ApiError;
+use crate::api::errors::{ApiError, ApiQuery};
 use crate::ingest::handler::AppState;
 use crate::storage::backup::{self, BackupError};
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::response::IntoResponse;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -33,7 +33,7 @@ pub struct BackupParams {
 /// `events/` over the data directory's (see the backup and restore page).
 pub async fn create_backup(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<BackupParams>,
+    ApiQuery(params): ApiQuery<BackupParams>,
 ) -> Result<impl IntoResponse, ApiError> {
     let name = params
         .name

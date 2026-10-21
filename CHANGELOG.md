@@ -99,6 +99,10 @@ few startup conditions that used to be accepted are now refused; read
   a request waits for a query slot (then `429`) and how long a statement may run
   (then it is interrupted and the request gets `504`). Together they must not
   exceed the 30 s request timeout.
+- A missing or mistyped query parameter, and a malformed, mistyped or
+  wrongly-typed JSON body, now answer `400` with `{"error", "code": "bad_request"}`
+  on every route except `POST /api/event`. They used to be plain-text `400`,
+  `415` or `422`.
 - API errors: `session_data_unavailable` (503) is now distinct from
   `behavioral_unavailable` for analyses refused under `gdpr_mode`; `/api/stats/main`
   gains `sessions_unavailable_reason` (`"timestamps_rounded"` or

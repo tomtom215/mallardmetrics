@@ -2956,3 +2956,54 @@ async fn test_a_funnel_mode_combination_error_names_the_real_problem() {
             .starts_with("Unknown funnel mode")
     );
 }
+
+// ── Extractor rejections are JSON like every other API error ─────────────
+
+#[tokio::test]
+async fn test_a_missing_query_parameter_is_a_json_bad_request() {
+    // axum's own Query extractor answers this with a plain-text 400, which was
+    // the one error response a client could not parse like the rest.
+    let (state, _dir) = state_builder().build();
+    let response = get(&state, "/api/stats/main?period=30d").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(body["code"], "bad_request", "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("site_id"),
+        "the message must name the missing parameter: {body}"
+    );
+}
+
+#[tokio::test]
+async fn test_a_malformed_json_body_is_a_json_bad_request() {
+    let (state, _dir) = state_builder().build();
+    for (body, content_type) in [
+        ("{not json", "application/json"),
+        (r#"{"password": 12}"#, "application/json"),
+        (r#"{"password":"x"}"#, "text/plain"),
+    ] {
+        let response = send(
+            &state,
+            Request::builder()
+                .method("POST")
+                .uri("/api/auth/login")
+                .header("content-type", content_type)
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            response.status().is_client_error(),
+            "{body:?} as {content_type}: {}",
+            response.status()
+        );
+        let json = body_json(response).await;
+        assert_eq!(
+            json["code"], "bad_request",
+            "{body:?} as {content_type}: {json}"
+        );
+    }
+}

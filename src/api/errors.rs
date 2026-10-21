@@ -1,6 +1,9 @@
 use axum::Json;
+use axum::extract::{FromRequest, FromRequestParts, Request};
 use axum::http::StatusCode;
+use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
+use serde::de::DeserializeOwned;
 
 /// API error type with HTTP status-code mapping.
 #[derive(Debug)]
@@ -140,6 +143,47 @@ impl IntoResponse for ApiError {
             return (status, [(axum::http::header::RETRY_AFTER, "1")], body).into_response();
         }
         (status, body).into_response()
+    }
+}
+
+/// A query string extractor whose failures are [`ApiError`]s.
+///
+/// axum's own `Query` answers a missing or malformed parameter with a plain-text
+/// 400, which is the one error response a client could not parse like the rest.
+/// This reports the same message as a JSON body with `code: bad_request`.
+pub struct ApiQuery<T>(pub T);
+
+impl<S, T> FromRequestParts<S> for ApiQuery<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        axum::extract::Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|axum::extract::Query(value)| Self(value))
+            .map_err(|rejection| ApiError::BadRequest(rejection.body_text()))
+    }
+}
+
+/// A JSON body extractor whose failures are [`ApiError`]s: the same reasoning as
+/// [`ApiQuery`] for a missing, malformed or wrongly-typed request body.
+pub struct ApiJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        Json::<T>::from_request(request, state)
+            .await
+            .map(|Json(value)| Self(value))
+            .map_err(|rejection| ApiError::BadRequest(rejection.body_text()))
     }
 }
 

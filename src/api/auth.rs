@@ -1,3 +1,4 @@
+use crate::api::errors::ApiJson;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::Json;
 use axum::extract::State;
@@ -1163,7 +1164,7 @@ pub async fn auth_setup(
     State(state): State<Arc<AppState>>,
     crate::ingest::handler::PeerAddr(peer): crate::ingest::handler::PeerAddr,
     headers: HeaderMap,
-    Json(body): Json<PasswordRequest>,
+    ApiJson(body): ApiJson<PasswordRequest>,
 ) -> impl IntoResponse {
     let ip = extract_client_ip_from(&state, &headers, peer);
 
@@ -1276,7 +1277,7 @@ pub async fn auth_login(
     State(state): State<Arc<AppState>>,
     crate::ingest::handler::PeerAddr(peer): crate::ingest::handler::PeerAddr,
     headers: HeaderMap,
-    Json(body): Json<PasswordRequest>,
+    ApiJson(body): ApiJson<PasswordRequest>,
 ) -> impl IntoResponse {
     let ip = extract_client_ip_from(&state, &headers, peer);
 
@@ -1462,7 +1463,7 @@ struct ApiKeyListItem {
 /// POST /api/keys — Create a new API key (requires admin session).
 pub async fn create_api_key(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateApiKeyRequest>,
+    ApiJson(body): ApiJson<CreateApiKeyRequest>,
 ) -> Response {
     if body.name.is_empty() || body.name.len() > 128 {
         return (
@@ -2474,7 +2475,7 @@ mod tests {
             State(Arc::clone(&state)),
             crate::ingest::handler::PeerAddr(None),
             HeaderMap::new(),
-            Json(PasswordRequest {
+            ApiJson(PasswordRequest {
                 password: "a guess".to_string(),
             }),
         );

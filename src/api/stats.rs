@@ -1,4 +1,4 @@
-use crate::api::errors::ApiError;
+use crate::api::errors::{ApiError, ApiQuery};
 use crate::ingest::handler::AppState;
 use crate::query::QueryScope;
 use crate::query::cache::{CacheKey, cache_key};
@@ -9,7 +9,7 @@ use crate::query::{
 };
 use crate::storage::parquet::ErasureReport;
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
 use axum::{Json, http::HeaderValue};
@@ -966,7 +966,7 @@ fn main_metrics(
 /// GET /api/stats/main — headline metrics.
 pub async fn get_main_stats(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<metrics::CoreMetrics>, ApiError> {
     let range = params.validated()?;
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
@@ -1052,7 +1052,7 @@ pub async fn get_main_stats(
 /// GET /api/stats/sessions — session-level metrics.
 pub async fn get_sessions(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<metrics::SessionMetrics>, ApiError> {
     let range = params.validated()?;
     require_exact_timestamps(&state, "Session metrics")?;
@@ -1076,7 +1076,7 @@ pub async fn get_sessions(
 /// GET /api/stats/timeseries — bucketed visitor and pageview counts.
 pub async fn get_timeseries(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<Vec<timeseries::TimeBucket>>, ApiError> {
     let range = params.validated()?;
     let granularity = timeseries::Granularity::for_span_days(range.days);
@@ -1110,7 +1110,7 @@ pub async fn get_timeseries(
 pub async fn get_breakdown(
     State(state): State<Arc<AppState>>,
     Path(dimension): Path<String>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<Vec<breakdowns::BreakdownRow>>, ApiError> {
     let range = params.validated()?;
     let limit = params.limit_or(DEFAULT_LIMIT, MAX_BREAKDOWN_LIMIT)?;
@@ -1154,7 +1154,7 @@ pub async fn get_breakdown(
 /// GET /api/stats/realtime — activity in the last few minutes.
 pub async fn get_realtime(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<realtime::RealtimeSnapshot>, ApiError> {
     validate_site_id(&params.site_id)?;
     let site_id = params.site_id.clone();
@@ -1176,7 +1176,7 @@ pub async fn get_realtime(
 /// GET /api/stats/revenue — revenue totals, per currency and dimension.
 pub async fn get_revenue(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<revenue::RevenueReport>, ApiError> {
     let range = params.validated()?;
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
@@ -1198,7 +1198,7 @@ pub async fn get_revenue(
 /// GET /api/stats/goals — conversions for every custom event.
 pub async fn get_goals(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<Vec<events::GoalConversion>>, ApiError> {
     let range = params.validated()?;
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
@@ -1220,7 +1220,7 @@ pub async fn get_goals(
 /// GET /api/stats/properties — custom property keys seen in range.
 pub async fn get_property_keys(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<StatsParams>,
+    ApiQuery(params): ApiQuery<StatsParams>,
 ) -> Result<Json<Vec<String>>, ApiError> {
     let range = params.validated()?;
     let filters = parse_filters(params.filters.as_deref().unwrap_or_default())?;
@@ -1258,7 +1258,7 @@ pub struct PropertyParams {
 /// GET /api/stats/property-values — one custom property, broken down by value.
 pub async fn get_property_values(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<PropertyParams>,
+    ApiQuery(params): ApiQuery<PropertyParams>,
 ) -> Result<Json<Vec<events::PropertyValue>>, ApiError> {
     let common = StatsParams {
         site_id: params.site_id.clone(),
@@ -1402,7 +1402,7 @@ fn parse_steps(raw: &str, min: usize, max: usize) -> Result<Vec<String>, ApiErro
 /// GET /api/stats/funnel — cumulative funnel analysis.
 pub async fn get_funnel(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<FunnelParams>,
+    ApiQuery(params): ApiQuery<FunnelParams>,
 ) -> Result<Json<Vec<funnel::FunnelStep>>, ApiError> {
     let common = StatsParams {
         site_id: params.site_id.clone(),
@@ -1491,7 +1491,7 @@ pub struct RetentionResponse {
 /// GET /api/stats/retention — weekly retention cohorts.
 pub async fn get_retention(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<RetentionParams>,
+    ApiQuery(params): ApiQuery<RetentionParams>,
 ) -> Result<Json<RetentionResponse>, ApiError> {
     let common = StatsParams {
         site_id: params.site_id.clone(),
@@ -1589,7 +1589,7 @@ pub struct SequenceParams {
 /// GET /api/stats/sequences — ordered pattern matching over event streams.
 pub async fn get_sequences(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<SequenceParams>,
+    ApiQuery(params): ApiQuery<SequenceParams>,
 ) -> Result<Json<sequences::SequenceMatchResult>, ApiError> {
     let common = StatsParams {
         site_id: params.site_id.clone(),
@@ -1656,7 +1656,7 @@ fn default_direction() -> String {
 /// GET /api/stats/flow — the pages around a given page.
 pub async fn get_flow(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<FlowParams>,
+    ApiQuery(params): ApiQuery<FlowParams>,
 ) -> Result<Json<Vec<flow::FlowNode>>, ApiError> {
     let common = StatsParams {
         site_id: params.site_id.clone(),
@@ -1741,7 +1741,7 @@ fn default_export_kind() -> String {
 /// GET /api/stats/export — download analytics data.
 pub async fn get_export(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<ExportParams>,
+    ApiQuery(params): ApiQuery<ExportParams>,
 ) -> Result<impl IntoResponse, ApiError> {
     let common = StatsParams {
         site_id: params.site_id.clone(),
@@ -2175,7 +2175,7 @@ fn erase_site_range(
 /// your privacy notice.
 pub async fn gdpr_erase(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<GdprEraseParams>,
+    ApiQuery(params): ApiQuery<GdprEraseParams>,
 ) -> Result<impl IntoResponse, ApiError> {
     validate_site_id(&params.site_id)?;
 
