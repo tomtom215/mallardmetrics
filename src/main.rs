@@ -526,6 +526,7 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
     } else {
         config.max_concurrent_queries
     };
+    let query_limits = config.query_limits();
 
     if config.gdpr_mode {
         tracing::info!(
@@ -567,6 +568,7 @@ fn build_state(config: &Config) -> Result<Arc<AppState>, String> {
         login_failures_total: Arc::new(AtomicU64::new(0)),
         metrics_token,
         query_semaphore: Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
+        query_limits,
         secure_cookies: config.secure_cookies,
         behavioral_extension_loaded: db.behavioral_loaded,
         behavioral_version: db.behavioral_version,

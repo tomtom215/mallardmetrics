@@ -86,6 +86,13 @@ cache_ttl_secs = 60            # MALLARD_CACHE_TTL          — 0 disables cachi
 cache_max_entries = 10000      # MALLARD_CACHE_MAX_ENTRIES  — 0 = unbounded; LRU eviction
 max_concurrent_queries = 10    # MALLARD_MAX_CONCURRENT_QUERIES — excess returns 429
 
+# How long a query may wait for one of those slots before the request gets 429,
+# and how long a statement may then run before it is interrupted and the request
+# gets 504. Both must be > 0, and together they must not exceed the 30 s request
+# timeout, so the query layer answers (with a message) before the timeout does.
+query_queue_wait_secs = 10     # MALLARD_QUERY_QUEUE_WAIT_SECS
+query_deadline_secs = 20       # MALLARD_QUERY_DEADLINE_SECS
+
 # Inactivity gap that ends a session. Used by every sessionize-based metric:
 # visits, bounce rate, visit duration, and entry/exit pages.
 session_window_minutes = 30    # MALLARD_SESSION_WINDOW_MINUTES

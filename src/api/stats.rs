@@ -416,12 +416,12 @@ fn parse_date(raw: &str, field: &str) -> Result<NaiveDate, ApiError> {
 
 /// How long a request may wait for a query slot, and how long a statement may run.
 ///
-/// The two budgets add up to less than the 30 s request timeout in `server.rs`,
-/// so a query that overruns is interrupted here, with a message, rather than
-/// being abandoned by the timeout layer while its blocking thread keeps going.
-/// They are constants because `Config` and `AppState` belong to other
-/// workstreams; [`run_query_with`] takes them as a parameter so the lead can
-/// wire configuration in without touching the logic.
+/// The two budgets must not add up to more than the 30 s request timeout in
+/// `server.rs` (`Config::validate` enforces it; the defaults use all of it), so
+/// a query that overruns is interrupted here, with a message, rather than being
+/// abandoned by the timeout layer while its blocking thread keeps going. They
+/// come from `query_queue_wait_secs` and `query_deadline_secs` and travel in
+/// `AppState::query_limits`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueryLimits {
     /// Longest a request waits for one of `max_concurrent_queries` slots.
@@ -431,8 +431,8 @@ pub struct QueryLimits {
 }
 
 impl QueryLimits {
-    /// 10 s in the queue plus 20 s of execution fits inside the 30 s request
-    /// timeout.
+    /// The defaults: 10 s in the queue plus 20 s of execution, which is the 30 s
+    /// request timeout exactly.
     pub const DEFAULT: Self = Self {
         queue_wait: Duration::from_secs(10),
         deadline: Duration::from_secs(20),
@@ -543,7 +543,7 @@ where
     T: Send + 'static,
     F: FnOnce(&duckdb::Connection) -> Result<T, duckdb::Error> + Send + 'static,
 {
-    run_query_with(state, QueryLimits::DEFAULT, f).await
+    run_query_with(state, state.query_limits, f).await
 }
 
 /// [`run_query`] with explicit limits.

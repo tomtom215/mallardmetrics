@@ -181,6 +181,9 @@ pub struct AppState {
     pub metrics_token: Option<String>,
     /// Caps concurrent analytics queries.
     pub query_semaphore: Arc<tokio::sync::Semaphore>,
+    /// How long a query may queue for a slot and then run. From
+    /// `query_queue_wait_secs` and `query_deadline_secs`.
+    pub query_limits: crate::api::stats::QueryLimits,
     pub secure_cookies: bool,
     /// Whether the DuckDB `behavioral` extension loaded at startup.
     pub behavioral_extension_loaded: bool,

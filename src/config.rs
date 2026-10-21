@@ -75,6 +75,15 @@ pub struct Config {
     /// Maximum concurrent analytics queries (0 = unlimited, default: 10).
     #[serde(default = "default_max_concurrent_queries")]
     pub max_concurrent_queries: usize,
+    /// Longest a request waits for a query slot before it gets `429`, in seconds
+    /// (default: 10). See [`Config::query_limits`] for how it relates to the
+    /// request timeout.
+    #[serde(default = "default_query_queue_wait_secs")]
+    pub query_queue_wait_secs: u64,
+    /// Longest an analytics statement may run before it is interrupted and the
+    /// request gets `504`, in seconds (default: 20).
+    #[serde(default = "default_query_deadline_secs")]
+    pub query_deadline_secs: u64,
     /// Force the Secure flag on session cookies regardless of dashboard_origin.
     /// Set to true when the server is deployed behind a TLS-terminating reverse proxy.
     #[serde(default)]
@@ -322,6 +331,14 @@ const fn default_max_concurrent_queries() -> usize {
     10
 }
 
+const fn default_query_queue_wait_secs() -> u64 {
+    10
+}
+
+const fn default_query_deadline_secs() -> u64 {
+    20
+}
+
 const fn default_read_connections() -> usize {
     4
 }
@@ -381,6 +398,8 @@ impl Default for Config {
             login_lockout_secs: default_login_lockout_secs(),
             cache_max_entries: default_cache_max_entries(),
             max_concurrent_queries: default_max_concurrent_queries(),
+            query_queue_wait_secs: default_query_queue_wait_secs(),
+            query_deadline_secs: default_query_deadline_secs(),
             secure_cookies: false,
             trust_proxy_headers: false,
             trusted_proxy_hops: default_trusted_proxy_hops(),
@@ -618,6 +637,16 @@ impl Config {
             config.max_concurrent_queries,
             usize
         );
+        parse_env_num!(
+            "MALLARD_QUERY_QUEUE_WAIT_SECS",
+            config.query_queue_wait_secs,
+            u64
+        );
+        parse_env_num!(
+            "MALLARD_QUERY_DEADLINE_SECS",
+            config.query_deadline_secs,
+            u64
+        );
         parse_env_bool!("MALLARD_SECURE_COOKIES", config.secure_cookies);
         parse_env_bool!("MALLARD_TRUST_PROXY_HEADERS", config.trust_proxy_headers);
         parse_env_num!(
@@ -714,6 +743,20 @@ impl Config {
         }
     }
 
+    /// The analytics query budgets as the query runner takes them.
+    ///
+    /// The runner interrupts a statement at `query_deadline_secs`, after at most
+    /// `query_queue_wait_secs` spent waiting for a slot, and
+    /// [`Config::validate`] keeps the two inside the request timeout, so a slow
+    /// query is answered by the query layer rather than abandoned by the
+    /// timeout layer while its blocking thread keeps running.
+    pub const fn query_limits(&self) -> crate::api::stats::QueryLimits {
+        crate::api::stats::QueryLimits {
+            queue_wait: std::time::Duration::from_secs(self.query_queue_wait_secs),
+            deadline: std::time::Duration::from_secs(self.query_deadline_secs),
+        }
+    }
+
     /// Returns the path to the events directory.
     pub fn events_dir(&self) -> PathBuf {
         self.data_dir.join("events")
@@ -774,6 +817,35 @@ impl Config {
                 "visitor_salt_rotation_days must be >= 1; 0 has no meaningful rotation period"
                     .to_string(),
             );
+        }
+        if self.query_queue_wait_secs == 0 {
+            return Err(
+                "query_queue_wait_secs must be > 0; 0 would answer 429 to every query that \
+                 does not get a slot at once, which is what a dashboard load does"
+                    .to_string(),
+            );
+        }
+        if self.query_deadline_secs == 0 {
+            return Err(
+                "query_deadline_secs must be > 0; 0 would interrupt every query as it starts"
+                    .to_string(),
+            );
+        }
+        // A request that queues for the full wait and then runs for the full
+        // deadline must still be answered by the query layer (a 504 that says
+        // what happened), not cut off by the request timeout (a bare 408).
+        let budget = self
+            .query_queue_wait_secs
+            .saturating_add(self.query_deadline_secs);
+        if budget > crate::server::REQUEST_TIMEOUT.as_secs() {
+            return Err(format!(
+                "query_queue_wait_secs ({}) + query_deadline_secs ({}) = {budget} s exceeds the \
+                 {} s request timeout; the request timeout would cut queries off before their \
+                 own deadline reports",
+                self.query_queue_wait_secs,
+                self.query_deadline_secs,
+                crate::server::REQUEST_TIMEOUT.as_secs()
+            ));
         }
         if self.max_buffered_events > 0 && self.max_buffered_events < self.flush_event_count {
             return Err(format!(
@@ -1543,6 +1615,109 @@ visitor_salt_rotation_days = 30
         assert!(geoip_precision_rank("region") > geoip_precision_rank("country"));
         assert!(geoip_precision_rank("country") > geoip_precision_rank("none"));
         assert!(geoip_precision_rank("district").is_none());
+    }
+
+    #[test]
+    fn test_query_budgets_default_to_exactly_the_request_timeout() {
+        // 10 s queued + 20 s running is the whole 30 s request timeout; the
+        // defaults must validate, and the limit is an inclusive bound.
+        let config = Config::default();
+        assert_eq!(config.validate(), Ok(()));
+        let limits = config.query_limits();
+        assert_eq!(limits, crate::api::stats::QueryLimits::DEFAULT);
+        assert_eq!(
+            limits.queue_wait + limits.deadline,
+            crate::server::REQUEST_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn test_query_budgets_must_fit_inside_the_request_timeout() {
+        let over = Config {
+            query_queue_wait_secs: 11,
+            ..Config::default()
+        };
+        let err = over.validate().unwrap_err();
+        assert!(err.contains("request timeout"), "{err}");
+
+        let long_deadline = Config {
+            query_queue_wait_secs: 1,
+            query_deadline_secs: 30,
+            ..Config::default()
+        };
+        assert!(long_deadline.validate().is_err());
+
+        let fits = Config {
+            query_queue_wait_secs: 2,
+            query_deadline_secs: 28,
+            ..Config::default()
+        };
+        assert_eq!(fits.validate(), Ok(()));
+        assert_eq!(fits.query_limits().deadline.as_secs(), 28);
+
+        // A value that would overflow the sum is refused, not wrapped.
+        let huge = Config {
+            query_queue_wait_secs: u64::MAX,
+            query_deadline_secs: 5,
+            ..Config::default()
+        };
+        assert!(huge.validate().is_err());
+    }
+
+    #[test]
+    fn test_zero_query_budgets_are_refused() {
+        let no_wait = Config {
+            query_queue_wait_secs: 0,
+            ..Config::default()
+        };
+        assert!(
+            no_wait
+                .validate()
+                .unwrap_err()
+                .contains("query_queue_wait_secs")
+        );
+        let no_deadline = Config {
+            query_deadline_secs: 0,
+            ..Config::default()
+        };
+        assert!(
+            no_deadline
+                .validate()
+                .unwrap_err()
+                .contains("query_deadline_secs")
+        );
+    }
+
+    #[test]
+    fn test_query_budgets_come_from_toml_and_the_environment() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(
+            &path,
+            "query_queue_wait_secs = 3\nquery_deadline_secs = 12\n",
+        )
+        .unwrap();
+        let loaded = Config::load(Some(&path)).unwrap();
+        assert_eq!(loaded.config.query_queue_wait_secs, 3);
+        assert_eq!(loaded.config.query_deadline_secs, 12);
+
+        set_env("MALLARD_QUERY_QUEUE_WAIT_SECS", "4");
+        set_env("MALLARD_QUERY_DEADLINE_SECS", "not-a-number");
+        let loaded = Config::load(Some(&path));
+        remove_env("MALLARD_QUERY_QUEUE_WAIT_SECS");
+        remove_env("MALLARD_QUERY_DEADLINE_SECS");
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.config.query_queue_wait_secs, 4, "env wins over toml");
+        assert_eq!(loaded.config.query_deadline_secs, 12, "a bad value is kept out");
+        assert!(
+            loaded
+                .warnings
+                .iter()
+                .any(|w| w.contains("MALLARD_QUERY_DEADLINE_SECS")),
+            "{:?}",
+            loaded.warnings
+        );
     }
 
     #[test]

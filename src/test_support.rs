@@ -5,6 +5,7 @@
 //! could not vary a single setting without restating every other one. This
 //! builder gives one definition with named overrides.
 
+use crate::api::stats::QueryLimits;
 use crate::api::auth::{ApiKeyStore, LoginAttemptTracker, SessionStore};
 use crate::ingest::buffer::EventBuffer;
 use crate::ingest::geoip::GeoIpReader;
@@ -41,6 +42,7 @@ pub struct AppStateBuilder {
     max_login_attempts: u32,
     login_lockout_secs: u64,
     query_permits: usize,
+    query_limits: QueryLimits,
     cache_ttl_secs: u64,
     secure_cookies: bool,
     behavioral_extension_loaded: bool,
@@ -70,6 +72,7 @@ impl Default for AppStateBuilder {
             max_login_attempts: 0,
             login_lockout_secs: 300,
             query_permits: 10,
+            query_limits: QueryLimits::DEFAULT,
             cache_ttl_secs: 0,
             secure_cookies: false,
             behavioral_extension_loaded: false,
@@ -110,6 +113,7 @@ impl AppStateBuilder {
     setter!(dashboard_origin, Option<String>);
     setter!(metrics_token, Option<String>);
     setter!(query_permits, usize);
+    setter!(query_limits, QueryLimits);
     setter!(cache_ttl_secs, u64);
     setter!(secure_cookies, bool);
     setter!(behavioral_extension_loaded, bool);
@@ -195,6 +199,7 @@ impl AppStateBuilder {
             login_failures_total: Arc::new(AtomicU64::new(0)),
             metrics_token: self.metrics_token,
             query_semaphore: Arc::new(tokio::sync::Semaphore::new(self.query_permits)),
+            query_limits: self.query_limits,
             secure_cookies: self.secure_cookies,
             // Tests that assert on behavioral endpoints opt in explicitly;
             // otherwise the real extension state is used so an environment with
