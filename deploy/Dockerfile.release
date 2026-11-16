@@ -17,7 +17,7 @@
 # volume is created root-owned and the non-root process cannot write to it.
 # Pinned to the build platform: it only runs mkdir, so emulating arm64 for it
 # would cost QEMU time for nothing, and the directory has no architecture.
-FROM --platform=$BUILDPLATFORM alpine:3.22 AS skeleton
+FROM --platform=$BUILDPLATFORM alpine:3.24 AS skeleton
 RUN mkdir /rootfs-data
 
 FROM gcr.io/distroless/cc-debian12:nonroot
